@@ -624,6 +624,12 @@ pub async fn serve(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    crate::runtime_metrics::global().configure(
+        env_config.status_counts_max_entries,
+        env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
+    );
 
     // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
     // their accept loops exit promptly during graceful drain. Without this,
@@ -675,6 +681,16 @@ pub async fn serve(
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_system_handle = crate::system_metrics::start_sampler(
+        Some(proxy_state.clone()),
+        env_config.runtime_metrics_system_sample_interval_ms,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+        env_config.runtime_metrics_window_1m_seconds,
+        env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
 
@@ -1034,8 +1050,13 @@ pub async fn serve(
     // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
     // mixing them in with listener handles loses that bound and lets a
     // stuck DNS / metrics task wedge shutdown indefinitely.
-    let mut background_handles: Vec<JoinHandle<()>> =
-        vec![dns_handle, overload_handle, metrics_handle];
+    let mut background_handles: Vec<JoinHandle<()>> = vec![
+        dns_handle,
+        overload_handle,
+        metrics_handle,
+        runtime_system_handle,
+        runtime_window_handle,
+    ];
     if let Some(h) = dns_retry_handle {
         background_handles.push(h);
     }

@@ -1247,8 +1247,14 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers` | Array | Array of identity provider configurations (required) |
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
 | `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
+| `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
+| `providers[].audiences` | String[] (optional) | Accepted JWT `aud` values; OR-matched |
+| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }`; empty prefix is treated as no prefix |
+| `providers[].from_params` | String[] (optional) | Query parameter token locations |
+| `providers[].forward_original_token` | Boolean (optional) | Forward the token-bearing header/query param to the backend (default `true`) |
+| `providers[].require_exp` | Boolean (optional) | Require an `exp` claim for this provider; expiry is always validated when present |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in the token |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token |
 | `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path |
@@ -1259,6 +1265,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
 | `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.

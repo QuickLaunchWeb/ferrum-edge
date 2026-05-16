@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -23,8 +23,13 @@ use super::{
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    workload_entry_service_key_from_host,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
+use crate::config::types::{
+    BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_TARGET_WEIGHT, PluginConfig, Proxy,
+    RetryConfig, validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
+};
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -380,8 +385,9 @@ fn peer_authentication(
 ///
 /// Parses:
 ///   - `spec.workloadSelector.matchLabels` → [`MeshSidecar::workload_selector`]
-///     with the Sidecar's own namespace (a `Sidecar` only ever targets
-///     workloads in its own namespace, per Istio semantics).
+///     with the Sidecar's own namespace. Istio only treats selector-less root
+///     namespace Sidecars as global defaults; labeled root Sidecars remain
+///     namespace-scoped.
 ///   - `spec.egress[].hosts` → [`MeshSidecarEgress::hosts`] (verbatim — the
 ///     slice builder parses each entry via `MeshSidecarEgress::parse_host_pattern`).
 ///   - `spec.egress[].port.number` → [`MeshSidecarEgress::port`] (optional).
@@ -390,14 +396,10 @@ fn peer_authentication(
 /// are deliberately not translated yet — egress scoping is the immediate
 /// compatibility gap; the other surfaces stay in the documented "deferred"
 /// table until separate PRs land them.
-fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
-    if object.metadata.namespace == acc.options.istio_root_namespace {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} is in the Istio root namespace '{}', but Ferrum Sidecar egress scoping is namespace-local today; it will not act as a mesh-wide default",
-            object.metadata.namespace, object.metadata.name, acc.options.istio_root_namespace
-        ));
-    }
-
+fn sidecar(
+    _acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = selector_from_istio(Some(selector_value));
@@ -415,7 +417,6 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
 
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
-    let mut port_scopes = BTreeSet::new();
     match object.spec.get("egress") {
         None => {
             // Istio: omitted egress inherits the namespace default outbound
@@ -465,19 +466,9 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
                     )?,
                     None => None,
                 };
-                if let Some(port) = port {
-                    port_scopes.insert(port);
-                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
-    }
-
-    if !port_scopes.is_empty() {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
-            object.metadata.namespace, object.metadata.name, port_scopes
-        ));
     }
 
     Ok(MeshSidecar {
@@ -579,14 +570,17 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
                 )
             })?;
             let prefix = match header.get("prefix") {
-                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
-                    invalid_resource(
-                        object,
-                        format!(
-                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
-                        ),
-                    )
-                })?),
+                Some(prefix) => {
+                    let prefix = prefix.as_str().ok_or_else(|| {
+                        invalid_resource(
+                            object,
+                            format!(
+                                "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                            ),
+                        )
+                    })?;
+                    (!prefix.is_empty()).then_some(prefix)
+                }
                 None => None,
             };
             Ok(JwtHeader {
@@ -852,6 +846,42 @@ fn translate_client_tls_settings(
     let client_certificate = string_field(value, "clientCertificate").map(ToOwned::to_owned);
     let private_key = string_field(value, "privateKey").map(ToOwned::to_owned);
     let subject_alt_names = string_array(value, "subjectAltNames");
+    if subject_alt_names.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.tls.subjectAltNames must not have more than {} entries (got {})",
+                MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+                subject_alt_names.len()
+            ),
+        ));
+    }
+    for (idx, san) in subject_alt_names.iter().enumerate() {
+        if san.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.tls.subjectAltNames[{idx}] must not exceed {} characters (got {})",
+                    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
+                    san.len()
+                ),
+            ));
+        }
+        if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.subjectAltNames[{idx}]: {e}"),
+            ));
+        }
+    }
+    if let Some(ref sni_value) = sni
+        && let Err(e) = validate_backend_tls_sni(sni_value)
+    {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.tls.sni: {e}"),
+        ));
+    }
     let insecure_skip_verify = value
         .get("insecureSkipVerify")
         .and_then(Value::as_bool)
@@ -1161,6 +1191,32 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
+    let service_raw = object
+        .spec
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or(&object.metadata.name);
+    let service_key = workload_entry_service_key_from_host(
+        service_raw,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    );
+    match service_key.as_ref() {
+        Some(key) if key.namespace != object.metadata.namespace => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "WorkloadEntry.service '{service_raw}' references Service namespace '{}' but WorkloadEntry namespace is '{}'; cross-namespace WorkloadEntry service hosts are not supported",
+                    key.namespace, object.metadata.namespace
+                ),
+            ));
+        }
+        _ => {}
+    }
+    let service_name = service_key
+        .map(|key| key.name)
+        .unwrap_or_else(|| service_raw.to_string());
+
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
         selector: WorkloadSelector {
@@ -1171,12 +1227,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
                 .unwrap_or_default(),
             namespace: Some(object.metadata.namespace.clone()),
         },
-        service_name: object
-            .spec
-            .get("service")
-            .and_then(Value::as_str)
-            .unwrap_or(&object.metadata.name)
-            .to_string(),
+        service_name,
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),
@@ -2566,8 +2617,10 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec,
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -3129,6 +3182,93 @@ mod tests {
             "spiffe://cluster.local/ns/default/sa/api"
         );
         assert_eq!(workload.service_account.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_host_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "service": "reviews.prod.svc.cluster.local"
+                }),
+            )],
+            options(),
+        )
+        .expect_err("cross-namespace WorkloadEntry service host must fail closed");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("WorkloadEntry.service"),
+            "error should mention WorkloadEntry.service: {err}"
+        );
+        assert!(
+            err.contains("reviews.prod.svc.cluster.local"),
+            "error should include the offending host: {err}"
+        );
+        assert!(
+            err.contains("cross-namespace"),
+            "error should identify the unsupported cross-namespace reference: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_two_label_cross_namespace_service_host_is_preserved() {
+        let mut prod_service = object(
+            "Service",
+            serde_json::json!({
+                "ports": [{"port": 80}]
+            }),
+        );
+        prod_service.metadata.name = "reviews".to_string();
+        prod_service.metadata.namespace = "prod".to_string();
+        let result = translate_k8s_objects(
+            &[
+                prod_service,
+                object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "service": "reviews.prod"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect("two-label cross-namespace WorkloadEntry service host should stay literal");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].service_name, "reviews.prod");
+    }
+
+    #[test]
+    fn workload_entry_two_label_dns_service_name_is_preserved() {
+        let mut com_service = object(
+            "Service",
+            serde_json::json!({
+                "ports": [{"port": 80}]
+            }),
+        );
+        com_service.metadata.name = "placeholder".to_string();
+        com_service.metadata.namespace = "com".to_string();
+        let result = translate_k8s_objects(
+            &[
+                com_service,
+                object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "service": "example.com"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect("two-label DNS WorkloadEntry service should remain valid");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].service_name, "example.com");
     }
 
     #[test]
@@ -3748,7 +3888,8 @@ mod tests {
                         "audiences": ["my-app"],
                         "fromHeaders": [
                             {"name": "Authorization", "prefix": "Bearer "},
-                            {"name": "X-Custom-Token"}
+                            {"name": "X-Custom-Token"},
+                            {"name": "X-Raw-Token", "prefix": ""}
                         ],
                         "fromParams": ["access_token"],
                         "forwardOriginalToken": true
@@ -3775,11 +3916,13 @@ mod tests {
             Some("https://www.googleapis.com/oauth2/v3/certs")
         );
         assert_eq!(rule.audiences, vec!["my-app"]);
-        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers.len(), 3);
         assert_eq!(rule.from_headers[0].name, "Authorization");
         assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
         assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
         assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_headers[2].name, "X-Raw-Token");
+        assert!(rule.from_headers[2].prefix.is_none());
         assert_eq!(rule.from_params, vec!["access_token"]);
         assert!(rule.forward_original_token);
     }
@@ -7872,8 +8015,10 @@ mod tests {
                     name: "mesh-default".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -7906,11 +8051,13 @@ mod tests {
                     name: "mesh-api".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({
                     "selector": {"matchLabels": {"app": "api"}},
                     "tracing": {"sampling": 50.0}
                 }),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -8033,11 +8180,13 @@ mod tests {
                         name: "api-overrides".to_string(),
                         namespace: "default".to_string(),
                         labels: HashMap::new(),
+                        deletion_timestamp: None,
                     },
                     spec: serde_json::json!({
                         "selector": {"matchLabels": {"app": "api"}},
                         "tracing": {"sampling": 99.0}
                     }),
+                    status: Value::Object(serde_json::Map::new()),
                 },
             ],
             options(),
@@ -8146,6 +8295,112 @@ mod tests {
             vec!["spiffe://example/sa/reviews".to_string()]
         );
         assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_too_many_subject_alt_names() {
+        let too_many_sans: Vec<String> = (0..=MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES)
+            .map(|i| format!("san-{i}.example.com"))
+            .collect();
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": too_many_sans
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("too many subjectAltNames must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames must not have more than"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_overlong_subject_alt_name() {
+        let overlong_san = format!(
+            "{}.example.com",
+            "a".repeat(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)
+        );
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": [overlong_san]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("overlong subjectAltNames entry must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames[0] must not exceed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_sni() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "sni": "*.mesh.internal"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard SNI must fail");
+
+        assert!(
+            err.to_string().contains("trafficPolicy.tls.sni"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_san_content() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": ["spiffe://cluster.local"]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("SPIFFE URI without path must fail");
+
+        assert!(err.to_string().contains("subjectAltNames[0]"), "got: {err}");
     }
 
     #[test]
@@ -8479,8 +8734,10 @@ mod tests {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({ "ports": ports_json }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8492,6 +8749,7 @@ mod tests {
                 name: name.to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "hosts": ["api.example.com"],
@@ -8500,6 +8758,7 @@ mod tests {
                     "route": [{"destination": destination}]
                 }]
             }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8681,6 +8940,7 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "ports": [
@@ -8688,6 +8948,7 @@ mod tests {
                     {"name": "grpc", "port": 9090}            // named entry survives
                 ]
             }),
+            status: Value::Object(serde_json::Map::new()),
         };
         let vs_missing = virtual_service_with_destination(
             "vs-missing",
@@ -8727,8 +8988,10 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({}),
+            status: Value::Object(serde_json::Map::new()),
         };
         let result =
             translate_k8s_objects(&[svc], options()).expect("Service with no ports must not panic");
@@ -9123,19 +9386,19 @@ mod tests {
         .expect("translation succeeds");
 
         // Sidecar must NOT produce the old Phase-D warning. Port scoping is
-        // parsed but not enforced yet, so that unsupported field gets a focused
-        // warning instead.
+        // parsed into the mesh model and enforced later when the Sidecar
+        // enforcement gate is enabled.
         assert!(
             !result.warnings.iter().any(|w| w.contains("Phase D")),
             "Sidecar translation must not emit the deferred warning; warnings = {:?}",
             result.warnings
         );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
-                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
-            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+                .any(|w| w.contains("egress port scoping")),
+            "Sidecar egress port should not emit a stale unsupported warning; warnings = {:?}",
             result.warnings
         );
 
@@ -9232,7 +9495,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_in_root_namespace_emits_scope_warning() {
+    fn sidecar_in_root_namespace_translates_without_scope_warning() {
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -9247,12 +9510,41 @@ mod tests {
         .expect("translation succeeds");
 
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| { w.contains("root namespace") && w.contains("namespace-local") }),
-            "root namespace Sidecar should emit scope warning; got {:?}",
+            result.warnings.is_empty(),
+            "root namespace Sidecar is now a supported cluster-wide default; warnings = {:?}",
             result.warnings
+        );
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.istio_root_namespace, "default");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert_eq!(mesh.sidecars[0].namespace, "default");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_workload_selector_is_namespace_scoped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options().with_istio_root_namespace("default".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let selector = mesh.sidecars[0]
+            .workload_selector
+            .as_ref()
+            .expect("selector should be preserved");
+        assert_eq!(selector.namespace.as_deref(), Some("default"));
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
         );
     }
 

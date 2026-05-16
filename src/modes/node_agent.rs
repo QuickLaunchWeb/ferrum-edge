@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
-use crate::capture::{CaptureConfig, IptablesPlan};
+use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan, XTABLES_LOCK_WAIT_SECONDS};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -714,8 +714,12 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            if let Err(setup_err) = execute(plan.commands, "setup").await {
-                let cleanup = IptablesPlan::cleanup_commands();
+            // Always try IPv6 cleanup: an earlier process/config may have
+            // created ip6tables chains even when the current plan has none.
+            let include_v6_cleanup = true;
+            let setup = setup_commands_for_plan(&plan);
+            if let Err(setup_err) = execute(setup, "setup").await {
+                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
                         error = %cleanup_err,
@@ -731,7 +735,7 @@ where
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = IptablesPlan::cleanup_commands();
+            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
             if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %e, "Failed to clean up iptables fallback rules");
             }
@@ -758,12 +762,62 @@ where
     }
 }
 
-/// Execute a list of shell commands (iptables setup or cleanup) sequentially.
+fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
+    let ip6tables_mode = plan.ip6tables_mode;
+    let mut commands = Vec::with_capacity(
+        plan.v4_commands.len() + plan.v6_commands.len() + usize::from(!plan.v6_commands.is_empty()),
+    );
+
+    if !plan.v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required {
+        commands.push(format!(
+            "command -v ip6tables >/dev/null 2>&1 || {{ echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }}\n\
+             ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1 || {{ echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }}"
+        ));
+    }
+
+    commands.extend(plan.v4_commands.iter().cloned());
+    match ip6tables_mode {
+        // The node agent runs commands one-by-one for clearer fallback errors, so
+        // auto-mode probes are wrapped per command instead of batched like the init script.
+        Ip6TablesMode::Auto => commands.extend(
+            plan.v6_commands
+                .iter()
+                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
+        ),
+        Ip6TablesMode::Required => commands.extend(plan.v6_commands.iter().cloned()),
+        Ip6TablesMode::Disabled => {}
+    }
+    commands
+}
+
+fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
+    let mut commands = IptablesPlan::cleanup_commands();
+    if include_v6 {
+        // Keep cleanup best-effort per command; stale v6 chains from an earlier
+        // config should not make node-agent fallback cleanup fail.
+        commands.extend(
+            IptablesPlan::cleanup_v6_commands()
+                .iter()
+                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
+        );
+    }
+    commands
+}
+
+fn ip6tables_best_effort_wrapped_command(cmd: &str) -> String {
+    format!(
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+    )
+}
+
+/// Execute a list of shell commands (iptables/ip6tables setup or cleanup)
+/// sequentially.
 ///
 /// Each command is run via `sh -c` so that shell operators (`||`, `2>/dev/null`)
-/// are interpreted correctly. Failures are logged but do not abort the remaining
-/// commands — iptables rules are idempotent, so partial application is safe and
-/// a subsequent retry will converge.
+/// are interpreted correctly. Execution stops on the first command failure so
+/// setup never reports success after a partially applied ruleset. Cleanup
+/// commands include their own best-effort `|| true` guards where continuing
+/// after an absent chain is safe.
 ///
 /// Only invoked from `handle_fallback`, which is reached only on `node_agent`
 /// mode after kernel-probe failure. The commands are formed from
@@ -868,7 +922,7 @@ fn cleanup_all_pods(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::CaptureMode;
+    use crate::capture::{CaptureMode, Ip6TablesMode};
     use crate::ebpf::MockEbpfBackend;
 
     #[test]
@@ -884,6 +938,7 @@ mod tests {
                 exclude_cidrs: vec!["10.0.0.1/32".to_string()],
                 exclude_ports: vec![15020],
                 exclude_inbound_ports: Vec::new(),
+                ip6tables_mode: Ip6TablesMode::Auto,
             },
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
@@ -1005,6 +1060,9 @@ mod tests {
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
+        let command_counts =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let command_counts_for_runner = std::sync::Arc::clone(&command_counts);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1012,10 +1070,15 @@ mod tests {
                 &config,
                 &probe,
                 &shutdown_tx,
-                move |_, phase| {
+                move |commands, phase| {
                     let phases = std::sync::Arc::clone(&phases_for_runner);
+                    let command_counts = std::sync::Arc::clone(&command_counts_for_runner);
                     async move {
                         phases.lock().expect("phases mutex").push(phase);
+                        command_counts
+                            .lock()
+                            .expect("command counts mutex")
+                            .push((phase, commands.len()));
                         Ok(())
                     }
                 },
@@ -1053,14 +1116,129 @@ mod tests {
         let startup_ready = Arc::new(AtomicBool::new(false));
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
+        let command_counts =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let command_counts_for_runner = std::sync::Arc::clone(&command_counts);
 
         let result = handle_fallback_with(
             &config,
             &probe,
             &shutdown_tx,
-            move |_, phase| {
+            move |commands, phase| {
+                let phases = std::sync::Arc::clone(&phases_for_runner);
+                let command_counts = std::sync::Arc::clone(&command_counts_for_runner);
+                async move {
+                    phases.lock().expect("phases mutex").push(phase);
+                    command_counts
+                        .lock()
+                        .expect("command counts mutex")
+                        .push((phase, commands.len()));
+                    anyhow::bail!("setup failed")
+                }
+            },
+            startup_ready.clone(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!startup_ready.load(Ordering::Acquire));
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["setup", "cleanup"]
+        );
+        let command_counts = command_counts.lock().expect("command counts mutex");
+        assert!(
+            command_counts
+                .iter()
+                .any(|(phase, count)| *phase == "setup" && *count > 1),
+            "fallback setup should execute individual plan commands, got {command_counts:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
+        let commands = cleanup_commands_for_plan(true);
+
+        assert!(
+            commands.iter().any(|cmd| cmd.contains("ip6tables")),
+            "cleanup should remove stale IPv6 chains even when current config disables IPv6 capture"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables -t nat -w 5 -L")),
+            "disabled-mode IPv6 cleanup should remain best-effort behind the auto nat probe"
+        );
+    }
+
+    #[test]
+    fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
+        let commands = cleanup_commands_for_plan(true);
+
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables -t nat -w 5 -L")),
+            "required-mode cleanup should still probe ip6tables instead of emitting noisy bare commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables not found; skipping IPv6 mesh capture rules")),
+            "required-mode cleanup should remain best-effort when ip6tables is absent"
+        );
+    }
+
+    #[test]
+    fn setup_commands_wait_for_xtables_lock() {
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let commands = setup_commands_for_plan(&plan);
+
+        assert!(
+            commands.iter().all(|cmd| cmd.contains(" -w 5 ")),
+            "setup commands should wait briefly for xtables lock: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fallback_iptables_setup_failure_is_fatal() {
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let probe = kernel_probe::KernelProbeResult {
+            kernel_release: "4.19.0".to_string(),
+            meets_version_requirement: false,
+            cgroup_v2_available: false,
+            bpf_fs_available: false,
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let phases_for_runner = std::sync::Arc::clone(&phases);
+
+        let result = handle_fallback_with(
+            &config,
+            &probe,
+            &shutdown_tx,
+            move |commands, phase| {
                 let phases = std::sync::Arc::clone(&phases_for_runner);
                 async move {
+                    if phase == "setup" {
+                        assert!(
+                            commands.len() > 1,
+                            "setup should pass individual commands, got {commands:?}"
+                        );
+                        assert!(
+                            commands.iter().all(|cmd| !cmd.contains('\n')),
+                            "v4-only setup should not be collapsed into a shell script: {commands:?}"
+                        );
+                    }
                     phases.lock().expect("phases mutex").push(phase);
                     anyhow::bail!("setup failed")
                 }

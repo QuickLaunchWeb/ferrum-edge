@@ -4,7 +4,7 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/health`, `/status`, `/metrics`, and `/overload`
+    All endpoints except `/health`, `/status`, exact `/metrics`, and `/overload`
     require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
@@ -191,6 +191,38 @@ paths:
                 # HELP ferrum_requests_total Total number of requests processed
                 # TYPE ferrum_requests_total counter
                 ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
+
+  /metrics/runtime:
+    get:
+      operationId: getRuntimeMetrics
+      summary: Runtime host metrics (JSON)
+      description: |
+        Returns a JWT-authenticated JSON snapshot for "how is this host doing
+        right now?": process CPU and memory, file descriptors, ephemeral-port
+        pressure, HTTP status rates, error classes, DNS cache outcomes, pool
+        churn, TCP resets, log-event counters, and the inline overload state.
+
+        The response is cached briefly (default 1000 ms, configurable with
+        `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
+        the background. Log counters mirror tracing events allowed by
+        `FERRUM_LOG_LEVEL` / `RUST_LOG`; the extra 1m/5m HTTP status windows
+        can be disabled with `FERRUM_METRICS_STATUS_TRACKING_ENABLED=false`.
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Runtime metrics snapshot
+          headers:
+            X-Cache:
+              schema:
+                type: string
+                enum: [hit, miss]
+              description: Whether this response was served from the runtime metrics cache
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeMetricsSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ── Charges ────────────────────────────────────────────────────────
   /charges:
@@ -1161,6 +1193,7 @@ paths:
                 - response_mock
                 - response_caching
                 - prometheus_metrics
+                - proxy_alerts
                 - otel_tracing
                 - ai_token_metrics
                 - ai_request_guard
@@ -3305,6 +3338,27 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+        backend_tls_sni:
+          type: [string, "null"]
+          maxLength: 253
+          description: >-
+            Optional backend TLS Server Name Indication override. Mesh
+            DestinationRule `trafficPolicy.tls.sni` projects to this field.
+            Stored/projected only — backend handshake SNI consumption is not
+            yet enforced (tracked by GAP-1B).
+        backend_tls_san_allow_list:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            maxLength: 2048
+          default: []
+          description: >-
+            Optional allow-list of backend certificate Subject Alternative
+            Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
+            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
+            projects to this field. Stored/projected only — SAN allow-list
+            verification is not yet enforced (tracked by GAP-1C).
         api_spec_id:
           type: [string, "null"]
           description: |
@@ -3860,6 +3914,179 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+
+    # ── Runtime metrics ─────────────────────────────────────────────
+    RuntimeMetricsSnapshot:
+      type: object
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, overload]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        uptime_seconds:
+          type: integer
+          format: uint64
+        mode:
+          type: string
+          enum: [database, file, cp, dp, mesh, injector, migrate]
+        ferrum_version:
+          type: string
+        system:
+          $ref: "#/components/schemas/RuntimeSystemSnapshot"
+        http:
+          $ref: "#/components/schemas/RuntimeHttpSnapshot"
+        errors:
+          $ref: "#/components/schemas/RuntimeErrorsSnapshot"
+        dns:
+          $ref: "#/components/schemas/RuntimeDnsSnapshot"
+        connections:
+          $ref: "#/components/schemas/RuntimeConnectionsSnapshot"
+        logs:
+          $ref: "#/components/schemas/RuntimeLogsSnapshot"
+        overload:
+          $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimeSystemSnapshot:
+      type: object
+      required: [sampled_at_unix_ms, platform, cpu, memory, file_descriptors, ephemeral_ports]
+      properties:
+        sampled_at_unix_ms:
+          type: integer
+          format: uint64
+        platform:
+          type: string
+          enum: [linux, macos, windows, other]
+        cpu:
+          type: object
+          properties:
+            process_percent: { type: number, format: float }
+            system_percent: { type: [number, "null"], format: float }
+            cgroup_quota_percent: { type: [number, "null"], format: float }
+            cpu_count: { type: integer }
+        memory:
+          type: object
+          properties:
+            rss_bytes: { type: integer, format: uint64 }
+            virtual_bytes: { type: integer, format: uint64 }
+            host_percent: { type: [number, "null"], format: float }
+            cgroup_percent: { type: [number, "null"], format: float }
+            cgroup_limit_bytes: { type: [integer, "null"], format: uint64 }
+            jemalloc_allocated_bytes: { type: [integer, "null"], format: uint64 }
+            jemalloc_resident_bytes: { type: [integer, "null"], format: uint64 }
+        file_descriptors:
+          type: object
+          properties:
+            current: { type: integer, format: uint64 }
+            max: { type: integer, format: uint64 }
+            ratio: { type: number, format: double }
+        ephemeral_ports:
+          type: object
+          properties:
+            range_low: { type: [integer, "null"] }
+            range_high: { type: [integer, "null"] }
+            range_size: { type: [integer, "null"] }
+            exhaustion_events: { type: integer, format: uint64 }
+            active_outbound_estimate: { type: integer, format: uint64 }
+
+    RuntimeHttpSnapshot:
+      type: object
+      properties:
+        total_requests: { type: integer, format: uint64 }
+        requests_per_second_1s: { type: integer, format: uint64 }
+        requests_per_second_1m: { type: integer, format: uint64 }
+        requests_per_second_5m: { type: integer, format: uint64 }
+        client_disconnects: { type: integer, format: uint64 }
+        status_codes:
+          type: object
+          properties:
+            totals:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1s:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_5m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            percent_total:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_1m:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_5m:
+              type: object
+              additionalProperties: { type: number, format: double }
+
+    RuntimeErrorsSnapshot:
+      type: object
+      properties:
+        by_class:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              http: { type: integer, format: uint64 }
+              grpc: { type: integer, format: uint64 }
+              stream: { type: integer, format: uint64 }
+              body: { type: integer, format: uint64 }
+        by_proxy:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint64
+
+    RuntimeDnsSnapshot:
+      type: object
+      properties:
+        lookups_total: { type: integer, format: uint64 }
+        cache_hits: { type: integer, format: uint64 }
+        cache_misses: { type: integer, format: uint64 }
+        stale_serves: { type: integer, format: uint64 }
+        errors: { type: integer, format: uint64 }
+        hit_ratio: { type: number, format: double }
+        error_ratio: { type: number, format: double }
+        cache_entries: { type: integer }
+
+    RuntimeConnectionsSnapshot:
+      type: object
+      properties:
+        active: { type: integer, format: uint64 }
+        active_requests: { type: integer, format: uint64 }
+        pool_handshakes_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        pool_evictions_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        tcp_rst_observed:
+          type: object
+          properties:
+            by_proxy:
+              type: object
+              additionalProperties:
+                type: object
+                additionalProperties: { type: integer, format: uint64 }
+            total: { type: integer, format: uint64 }
+
+    RuntimeLogsSnapshot:
+      type: object
+      description: Ferrum project tracing event counters after applying the output log-level filter.
+      properties:
+        by_level:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint64
+        by_category:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint64
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
@@ -4985,6 +5212,444 @@ components:
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
 
+    ProxyAlertsConfig:
+      type: object
+      description: |
+        Plugin: proxy_alerts — in-gateway anomaly notifications for proxy
+        traffic. Observes HTTP/gRPC transaction summaries, TCP/UDP stream
+        disconnect summaries, and WebSocket disconnect summaries, then sends
+        Trigger/Resolve notifications to Slack, Microsoft Teams, Discord, or
+        generic HTTP webhooks. See docs/proxy_alerts.md.
+      required: [channels, rules]
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Master runtime switch for this plugin instance.
+        default_cooldown_seconds:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          default: 300
+          description: Per-rule fallback cooldown. Cooldown is tracked per `(rule, proxy, channel)`.
+        default_min_request_count:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 50
+          description: Per-rule fallback for error-rate and latency-percentile rules.
+        default_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 3600
+          default: 60
+          description: Per-rule fallback sliding-window length.
+        default_resolved_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 86400
+          default: 300
+          description: Per-rule fallback recovery quiet period after a breach clears.
+        max_concurrent_dispatches:
+          type: integer
+          format: uint32
+          minimum: 1
+          default: 8
+          description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued.
+        quiet_hours_utc:
+          type: array
+          default: []
+          description: UTC time windows where Trigger alerts are suppressed. Resolve alerts still dispatch.
+          items:
+            $ref: "#/components/schemas/ProxyAlertsQuietHourWindow"
+        channels:
+          type: object
+          minProperties: 1
+          propertyNames:
+            pattern: "^[A-Za-z0-9_-]+$"
+          additionalProperties:
+            $ref: "#/components/schemas/ProxyAlertsChannel"
+          description: Map of channel name to channel definition. Rule `channels` entries reference these names.
+        rules:
+          type: array
+          minItems: 1
+          description: Alert rules evaluated per matched proxy.
+          items:
+            $ref: "#/components/schemas/ProxyAlertsRule"
+      example:
+        enabled: true
+        default_cooldown_seconds: 300
+        default_min_request_count: 50
+        default_window_seconds: 60
+        default_resolved_window_seconds: 300
+        max_concurrent_dispatches: 8
+        quiet_hours_utc:
+          - from: "23:00"
+            to: "06:00"
+            weekdays: [0, 6]
+        channels:
+          ops_slack:
+            type: slack
+            webhook_url_env: FERRUM_ALERTS_SLACK_WEBHOOK
+            channel_override: "#alerts-prod"
+          pagerduty_v2:
+            type: webhook
+            url_env: FERRUM_PAGERDUTY_EVENTS_URL
+            method: POST
+            headers:
+              Content-Type: application/json
+            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
+        rules:
+          - name: proxy_5xx_spike
+            enabled: true
+            type: error_rate
+            status_codes: [500, 501, 502, 503, 504]
+            threshold_percent: 5.0
+            min_request_count: 100
+            window_seconds: 60
+            channels: [ops_slack, pagerduty_v2]
+            cooldown_seconds: 300
+            recovery:
+              resolved_window_seconds: 300
+            severity: high
+
+    ProxyAlertsQuietHourWindow:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: UTC start time in strict HH:MM form.
+        to:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: UTC end time in strict HH:MM form. Values earlier than `from` wrap past midnight.
+        weekdays:
+          type: array
+          default: []
+          description: Days the window applies to (`0 = Sunday` ... `6 = Saturday`). Omit or use `[]` for every day.
+          items:
+            type: integer
+            minimum: 0
+            maximum: 6
+
+    ProxyAlertsChannel:
+      oneOf:
+        - $ref: "#/components/schemas/ProxyAlertsSlackChannel"
+        - $ref: "#/components/schemas/ProxyAlertsTeamsChannel"
+        - $ref: "#/components/schemas/ProxyAlertsDiscordChannel"
+        - $ref: "#/components/schemas/ProxyAlertsWebhookChannel"
+
+    ProxyAlertsSlackChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [slack]
+        webhook_url:
+          type: string
+          format: uri
+          description: Slack incoming webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Slack incoming webhook URL.
+        channel_override:
+          type: string
+          description: Optional Slack channel override, e.g. `#alerts-prod`.
+        username:
+          type: string
+          description: Optional bot username override.
+        icon_emoji:
+          type: string
+          description: Optional bot icon emoji, e.g. `:rotating_light:`.
+
+    ProxyAlertsTeamsChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [teams]
+        webhook_url:
+          type: string
+          format: uri
+          description: Microsoft Teams incoming webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Teams incoming webhook URL.
+
+    ProxyAlertsDiscordChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [discord]
+        webhook_url:
+          type: string
+          format: uri
+          description: Discord-compatible webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Discord webhook URL.
+        username:
+          type: string
+          description: Optional webhook username override.
+
+    ProxyAlertsWebhookChannel:
+      type: object
+      required: [type, body_template]
+      anyOf:
+        - required: [url]
+        - required: [url_env]
+      properties:
+        type:
+          type: string
+          enum: [webhook]
+        url:
+          type: string
+          format: uri
+          description: HTTP(S) endpoint URL. Prefer `url_env` for secrets.
+        url_env:
+          type: string
+          description: Environment variable containing the HTTP(S) endpoint URL.
+        method:
+          type: string
+          enum: [POST, PUT, PATCH]
+          default: POST
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          default:
+            Content-Type: application/json
+          description: Headers sent with the webhook request. JSON content types JSON-escape template substitutions.
+        body_template:
+          type: string
+          description: Template body. Supports generic notification variables plus proxy_alerts variables such as `${rule_name}`, `${proxy_name}`, `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`, and `${reason}`.
+
+    ProxyAlertsRule:
+      oneOf:
+        - $ref: "#/components/schemas/ProxyAlertsErrorRateRule"
+        - $ref: "#/components/schemas/ProxyAlertsStatusCodeCountRule"
+        - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
+        - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
+        - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+
+    ProxyAlertsRuleCommon:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Unique rule name within this plugin config.
+        enabled:
+          type: boolean
+          default: true
+          description: Disabled rules are skipped before validation.
+        window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 3600
+          description: Sliding-window length for this rule.
+        channels:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+          description: Channel names from the top-level `channels` map.
+        cooldown_seconds:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Per-rule cooldown override.
+        recovery:
+          oneOf:
+            - $ref: "#/components/schemas/ProxyAlertsRecovery"
+            - type: "null"
+          description: Optional resolved notification settings.
+        severity:
+          $ref: "#/components/schemas/ProxyAlertsSeverity"
+
+    ProxyAlertsRecovery:
+      type: object
+      properties:
+        resolved_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 86400
+          default: 300
+          description: How long the rule must stay below threshold before a Resolve notification is sent.
+
+    ProxyAlertsSeverity:
+      type: string
+      enum: [info, low, medium, high, critical]
+      default: medium
+
+    ProxyAlertsErrorRateRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, status_codes, threshold_percent, channels]
+          properties:
+            type:
+              type: string
+              enum: [error_rate]
+            status_codes:
+              $ref: "#/components/schemas/ProxyAlertsStatusCodeList"
+            threshold_percent:
+              type: number
+              format: double
+              exclusiveMinimum: 0
+              maximum: 100
+              description: Alert when the matching status-code percentage is at least this value.
+            min_request_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Minimum total requests in the window before the percentage can alert.
+
+    ProxyAlertsStatusCodeCountRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, status_codes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [status_code_count]
+            status_codes:
+              $ref: "#/components/schemas/ProxyAlertsStatusCodeList"
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching responses occur in the window.
+
+    ProxyAlertsLatencyPercentileRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, metric, percentile, threshold_ms, channels]
+          properties:
+            type:
+              type: string
+              enum: [latency_percentile]
+            metric:
+              type: string
+              enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+            percentile:
+              type: integer
+              minimum: 1
+              maximum: 99
+            threshold_ms:
+              type: number
+              format: double
+              exclusiveMinimum: 0
+              maximum: 300000
+              description: Alert when the bucket upper-bound estimate for the percentile is strictly greater than this threshold.
+            min_request_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Minimum observations in the window before the percentile can alert.
+
+    ProxyAlertsErrorClassRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, classes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [error_class]
+            classes:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/ErrorClass"
+              description: Error classes counted by this rule. HTTP rules also check `body_error_class`.
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching errors occur in the window.
+
+    ProxyAlertsStreamDisconnectCauseRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, causes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [stream_disconnect_cause]
+            causes:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/DisconnectCause"
+              description: Stream disconnect causes counted by this rule.
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching disconnects occur in the window.
+
+    ProxyAlertsStatusCodeList:
+      type: array
+      minItems: 1
+      items:
+        type: integer
+        minimum: 100
+        maximum: 599
+
+    ErrorClass:
+      type: string
+      enum:
+        - connection_timeout
+        - connection_refused
+        - connection_reset
+        - connection_closed
+        - dns_lookup_error
+        - tls_error
+        - read_write_timeout
+        - client_disconnect
+        - protocol_error
+        - response_body_too_large
+        - request_body_too_large
+        - connection_pool_error
+        - port_exhaustion
+        - graceful_remote_close
+        - request_error
+
+    DisconnectCause:
+      type: string
+      enum:
+        - idle_timeout
+        - recv_error
+        - backend_error
+        - graceful_shutdown
+
     OtelTracingConfig:
       type: object
       description: "Plugin: otel_tracing — W3C Trace Context propagation and OTLP span export."
@@ -5076,12 +5741,47 @@ components:
               discovery_url:
                 type: string
                 description: OIDC discovery URL (auto-discovers jwks_uri)
+              jwks:
+                oneOf:
+                  - type: string
+                  - type: object
+                description: Inline JWKS JSON string or object
               issuer:
                 type: string
                 description: Expected JWT iss claim — routes tokens to this provider
               audience:
                 type: string
                 description: Expected JWT aud claim
+              audiences:
+                type: array
+                items:
+                  type: string
+                description: Accepted JWT aud claims; OR matched
+              from_headers:
+                type: array
+                items:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                      description: Header name to read the token from
+                    prefix:
+                      type: string
+                      description: Optional token prefix to strip; empty string is treated as no prefix
+                description: Custom header token locations
+              from_params:
+                type: array
+                items:
+                  type: string
+                description: Custom query parameter token locations
+              forward_original_token:
+                type: boolean
+                default: true
+                description: Whether to forward the token-bearing header or query parameter upstream
+              require_exp:
+                type: boolean
+                description: Per-provider override for requiring an exp claim
               required_scopes:
                 type: array
                 items:
@@ -5120,6 +5820,10 @@ components:
         consumer_header_claim:
           type: string
           description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim)
+        require_exp:
+          type: boolean
+          default: true
+          description: Global default for requiring an exp claim
         jwks_refresh_interval_secs:
           type: integer
           format: uint64

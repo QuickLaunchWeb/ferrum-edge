@@ -162,6 +162,12 @@ pub async fn run(
     );
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    crate::runtime_metrics::global().configure(
+        env_config.status_counts_max_entries,
+        env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
+    );
 
     let grpc_secret = match env_config.cp_dp_grpc_jwt_secret.clone() {
         Some(secret) if !secret.is_empty() => secret,
@@ -480,13 +486,22 @@ pub async fn run(
     // When enabled, watches Istio + Gateway API CRDs and reconciles them into
     // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
     let _k8s_controller_handle = if env_config.k8s_controller_enabled {
+        if env_config.k8s_node_locality_enabled && !env_config.k8s_pod_discovery_enabled {
+            warn!(
+                "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
+                 FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
+            );
+        }
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
             cluster_domain: env_config.k8s_cluster_domain.clone(),
+            istio_root_namespace: env_config.k8s_istio_root_namespace.clone(),
             watch_namespaces: env_config.k8s_watch_namespaces.clone(),
             watch_istio: env_config.k8s_watch_istio_crds,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
+            pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
+            watch_node_locality: env_config.k8s_node_locality_enabled,
             debounce_ms: env_config.k8s_reconcile_debounce_ms,
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
             kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),
@@ -517,6 +532,18 @@ pub async fn run(
             }
         }
     } else {
+        if env_config.k8s_pod_discovery_enabled {
+            warn!(
+                "FERRUM_K8S_POD_DISCOVERY_ENABLED=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
+        if env_config.k8s_node_locality_enabled {
+            warn!(
+                "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
         None
     };
 
@@ -952,6 +979,16 @@ pub async fn run(
             }
         })
     };
+    let runtime_system_handle = crate::system_metrics::start_sampler(
+        None,
+        env_config.runtime_metrics_system_sample_interval_ms,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+        env_config.runtime_metrics_window_1m_seconds,
+        env_config.runtime_metrics_window_5m_seconds,
+        shutdown_tx.subscribe(),
+    );
 
     // Wait for ALL listener handles to exit, or the shutdown signal if no
     // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
@@ -1012,7 +1049,12 @@ pub async fn run(
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
     crate::modes::file::join_background_handles(
-        vec![db_poll_handle, mesh_registry_reaper_handle],
+        vec![
+            db_poll_handle,
+            mesh_registry_reaper_handle,
+            runtime_system_handle,
+            runtime_window_handle,
+        ],
         Duration::from_secs(5),
     )
     .await;

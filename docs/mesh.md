@@ -269,7 +269,7 @@ subsets:
 | `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
-| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify and leaves any existing client material untouched (Ferrum's `spiffe_identity`/`mtls_auth` plugins continue to supply the workload SVID — DR.tls does not yet project SPIFFE material onto `Upstream.backend_tls_*` directly). `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` and `subjectAltNames` are parsed and warned (no per-`Upstream` SNI/SAN override field today). When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
+| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify + projects the workload SVID paths from `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` onto the upstream client cert/key fields, failing slice apply if either path is missing so stale/global client material is not used. `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` projects to `Upstream.backend_tls_sni`; `subjectAltNames` project to `Upstream.backend_tls_san_allow_list` and onto `Proxy.resolved_tls` during config resolution. Backend handshake SNI consumption and SAN allow-list enforcement are tracked by GAP-1B / GAP-1C. When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
 | `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool.tcp.connectTimeout` | Supported | Top-level policy applies first; per-port `connectTimeout` lands on `Upstream.port_overrides[port].connect_timeout_ms` at apply time, then `GatewayConfig::resolve_dispatch_port_overrides()` projects it onto `Proxy.dispatch_port_overrides` for O(1) hot-path lookup. All four dispatch families consult it: HTTP/H2/H3 via `resolve_effective_proxy_for_target` (`src/proxy/mod.rs`), gRPC via the same helper threaded through `proxy_grpc_request*` (`src/proxy/grpc_proxy.rs`), TCP via `effective_backend_connect_timeout_ms` in `TcpConnParams` (`src/proxy/tcp_proxy.rs`), and HBONE via `effective_connect_timeout_ms` in `connect_backend` (`src/proxy/hbone_proxy.rs`). Ports outside 1-65535 rejected; duplicate port entries rejected; phantom ports (DR entry references a port unused by any `Upstream.target`) skipped with a warning at apply time. The admin API rejects POST/PUT setting `Upstream.port_overrides` directly — express per-port policy as a DestinationRule (SQL/MongoDB schemas don't persist the field) |
 | `trafficPolicy.portLevelSettings[].loadBalancer` / `outlierDetection` | Parsed but not enforced (warns) | Gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per upstream — switching algorithm / hash ring / outlier thresholds per destination port is not yet wired up. Warnings surface BOTH from the K8s translator (so YAML pushes flag the gap at translate time) AND from `apply_destination_rules` (so native MeshSubscribe / xDS slices flag it at apply time on the data plane) |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
@@ -368,12 +368,14 @@ Each `MeshJwtRule` specifies:
 | Field | Description |
 |---|---|
 | `issuer` | Expected JWT issuer (`iss` claim) |
-| `audiences` | Accepted audience values (`aud` claim) |
+| `audiences` | Accepted audience values (`aud` claim); any configured value may match |
 | `jwks_uri` | URL to fetch the JWKS key set |
-| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`) |
+| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`); keys are loaded from config without a fetch loop |
 | `from_headers` | Headers to extract the JWT from (with optional prefix stripping) |
 | `from_params` | Query parameters to extract the JWT from |
 | `forward_original_token` | Whether to forward the original token to the backend |
+
+Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
 
 ## PeerAuthentication
 
@@ -564,8 +566,10 @@ When `FERRUM_MESH_SIDECAR_ENFORCED=true`, the `MeshSlice` projection narrows `se
 Most specific wins:
 
 1. **Workload-scoped** Sidecar (`spec.workloadSelector.matchLabels` matches the workload's labels)
-2. **Namespace-default** Sidecar (no `workloadSelector`)
-3. **No Sidecar applies** → no narrowing (existing behavior)
+2. **Root-namespace workload-scoped** Sidecar (native config with a root-namespace `workloadSelector` whose selector namespace is omitted; Kubernetes `Sidecar` selectors stay namespace-scoped)
+3. **Namespace-default** Sidecar (no `workloadSelector`)
+4. **Root-namespace default** Sidecar (no `workloadSelector`, in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`)
+5. **No Sidecar applies** → no narrowing (existing behavior)
 
 ### Host Pattern Syntax
 
@@ -583,13 +587,12 @@ Each `spec.egress[].hosts` entry follows Istio scope-host syntax:
 
 The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly. `MeshService` entries match their short name, `{name}.{namespace}`, `{name}.{namespace}.svc`, and `{name}.{namespace}.svc.{cluster_domain}` aliases. On the control plane this suffix follows `FERRUM_K8S_CLUSTER_DOMAIN`; in local mesh mode it follows `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default Sidecar exists, omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
+When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default exists, Ferrum falls back to the root-namespace default Sidecar when one is present; otherwise omitted egress is treated as no narrowing. If a namespace-default Sidecar exists — even one with omitted egress — Ferrum does **not** fall through to the root-namespace default. This is an intentional divergence from upstream Istio for partial CP snapshots: the namespace-level object is treated as authoritative for that namespace, and an inheriting namespace default leaves the slice unnarrowed rather than guessing which root defaults the CP omitted. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. When an admitted egress host also sets `spec.egress[].port.number`, Ferrum narrows matching `MeshService` and `ServiceEntry` port lists to the union of admitted ports; `DestinationRule` resources remain host-scoped because they do not carry a resource port list in the slice.
 
-When multiple `Sidecar` resources in the same namespace apply at the same scope tier (two namespace-defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
+When multiple `Sidecar` resources apply at the same scope tier (two namespace-defaults, two root-namespace defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
 
 ### Known Limitations
 
-- `Sidecar` resources placed in the Istio root namespace (`istio-system` by default) are not yet treated as cluster-wide defaults. They apply only to workloads in their own namespace. Operators relying on a mesh-wide default `Sidecar` should declare a namespace-default `Sidecar` in each workload namespace until the root-namespace plumbing lands.
 - Slice narrowing today filters `services`, `service_entries`, and `destination_rules`. **Workload identity entries are not filtered** by Sidecar scope — every workload in the workload's own namespace continues to appear in the slice even when the applicable Sidecar only allows egress to a subset of services. This avoids breaking introspection and mTLS peer-identity lookups; workload-identity narrowing is tracked as a follow-up.
 
 ### Migration Notes
@@ -630,7 +633,7 @@ DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream.
 
 ### Deferred Fields
 
-TLS settings on DestinationRule (`trafficPolicy.tls`) are not yet translated -- use per-proxy `backend_tls_*` fields. Port-level traffic policy overrides are also deferred.
+Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields at slice-apply time. Backend handshake SNI consumption and SAN allow-list verification are follow-up enforcement steps, tracked separately from translation. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset. Port-level `connectionPool.tcp.connectTimeout` is enforced; port-level load balancer and outlier detection overrides are parsed and warned but not enforced per port.
 
 ## Observability
 
@@ -743,7 +746,7 @@ Port-list annotations merge with each other and with the injector-level `FERRUM_
 
 **Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
 
-**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission for forward compatibility, but `IptablesPlan::for_config` strips non-IPv4 CIDRs before emitting rules (with a `warn!` log naming each skipped CIDR). The init container only invokes the IPv4 `iptables` binary; feeding it a raw `-d fd00::/8` would fail the rule append and leave the capture chain half-populated. `ip6tables` fan-out is deferred. If an include list contains ONLY IPv6 CIDRs the outbound REDIRECT will not be emitted at all, so outbound capture is disabled for that pod — check init-container logs for the skip warning.
+**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) and `IptablesPlan::for_config` partitions rules by address family. Any IPv6 CIDR in either the include or exclude list activates the IPv6 address family: outbound IPv6 rules are rendered for the configured include/exclude lists, and inbound IPv6 capture emits the same default redirect/exclusion shape as IPv4. IPv4 rules are emitted through `iptables`; IPv6 rules are emitted through `ip6tables`. `FERRUM_MESH_IP6TABLES_ENABLED=auto` probes for `ip6tables` and skips only the IPv6 rule block when the binary is absent, so legacy IPv4-only nodes do not crash-loop. Set it to `true` to require `ip6tables` whenever IPv6 rules are present; this is all-or-nothing, so a missing `ip6tables` binary fails before any IPv4 rules are applied. Set it to `false` for permanent IPv4-only capture. The injector init-container script and node-agent iptables fallback both render from the same `IptablesPlan`, so their IPv6 wrapping semantics stay aligned.
 
 ### SPIFFE ID Derivation
 
@@ -914,6 +917,7 @@ The node agent exposes Prometheus counters on the read-only admin `/metrics` end
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
+| `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 
 ## VirtualService Translation
 
@@ -974,6 +978,31 @@ spec:
               name: http        # resolves to 8080 via the Service index above
 ```
 
+### Pod Auto-Discovery
+
+Control planes can opt into native Kubernetes service-registry discovery with `FERRUM_K8S_CONTROLLER_ENABLED=true` and `FERRUM_K8S_POD_DISCOVERY_ENABLED=true`. When enabled, the K8s controller watches `Pod`, `Service`, `EndpointSlice`, and `Node` resources in addition to the configured Istio/Gateway API watches. Ready Pods linked from EndpointSlices become mesh `Workload` entries, Services become mesh `MeshService` entries with their `spec.ports[]`, and Node `topology.kubernetes.io/region|zone` labels populate workload locality metadata for locality-aware load balancing follow-ups.
+
+Ferrum only surfaces Pods whose `Ready` condition and declared `readinessGates[]` are green, skips Pending/Failed/Succeeded/terminating Pods, and also honors EndpointSlice readiness/serving/terminating conditions. Explicit Istio `ServiceEntry` resources for the same service host override the auto-derived `MeshService`, and explicit `WorkloadEntry` resources for the same service override auto-derived Pod workloads while the Service can still reference those explicit identities. The flag defaults to `false` for one release so operators can validate RBAC and rollout impact before enabling Pod discovery.
+
+The controller service account needs `get`, `list`, and `watch` for namespaced `pods`, `services`, and `endpointslices`; add cluster-scoped `nodes` for locality metadata. Minimal RBAC:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-edge-k8s-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+```
+
 ## Istio Compatibility Gaps
 
 The following Istio mesh surfaces are either deferred or have Ferrum-specific support notes:
@@ -984,7 +1013,7 @@ The following Istio mesh surfaces are either deferred or have Ferrum-specific su
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or native/CRD slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin on topologies with an outbound capture listener; unknown destinations are rejected at the outbound gate with `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` (default 502), inbound sidecar/ambient traffic is not gated by this outbound policy, wildcard ServiceEntry hosts match one DNS label, resources with no declared ports admit any explicit Host port for that known destination, and empty registries fail closed |
 | `VirtualService` header/method/queryParam predicates beyond plugin capture | Partial | Plumbing in place via `mesh_route_dispatch` plugin (`FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL=true`); supported predicates are captured as plugin config. Routing-decision rewrites via `RequestContext.route_override_*` flow through HTTP-family dispatch sites (pool keys, capability registry, circuit breaker). Translator emits the plugin with `reject_unmatched: true` so requests that miss the predicates return 404 instead of falling through to the default backend (Envoy parity for VS match semantics; e.g., a `match.method=GET` route does not serve POST traffic). Same-path and URI-less ordered canary/default routes collapse into one Proxy with ordered dispatch rules so predicate misses can fall through when a later route exists. That collapse is destination-only; if route-local `fault`, `retries`, or `timeout` policy would have to apply to one dispatch rule but not its merged siblings, the VirtualService is rejected rather than widened. Unsupported predicate-only candidates (`regex`/`prefix` method/header/queryParam matchers, `authority`, `sourceNamespace`, `ignoreUriCase`, etc.) emit proxy-scoped `request_termination` instead of widening traffic. Admission plugins such as `mesh_authz` and rate limiting still evaluate the original public proxy identity; WebSocket overrides apply to the upgrade backend only, and HBONE CONNECT is not routed by this plugin because it branches before `before_proxy`. Query-param rules opt the whole proxy into decoded HTTP/3 query-param materialization so all plugins on that proxy observe decoded `ctx.query_params`. Multi-destination splits within a single `http[].route[]` still use generated upstreams; per-destination TLS on those generated upstreams comes from the upstream/DestinationRule materialization rather than per-rule `backend_tls`. |
-| Pod auto-discovery (K8s native service registry) | Deferred | Declare `WorkloadEntry` / `ServiceEntry` explicitly until a Pod watcher lands |
+| Pod auto-discovery (K8s native service registry) | Supported (opt-in) | Set `FERRUM_K8S_POD_DISCOVERY_ENABLED=true`; the CP watches Pod/Service/EndpointSlice/Node resources, surfaces only ready Pods, links Services through EndpointSlices, and lets explicit `WorkloadEntry` / `ServiceEntry` resources override auto-derived entries |
 | `WorkloadEntry` `weight` / `locality` / `serviceAccount` | Partial | Translated as workload metadata; locality-aware load balancing not yet wired (consumed by an upcoming PR). `serviceAccount` is kept separately from the SPIFFE path so introspection/audit doesn't need to parse it. |
 | `Telemetry.tracing[].providers[]` span emission | Partial | **Inline provider config only** — provider type inferred from the `name` field (`zipkin`/`datadog`/`lightstep`/`opentelemetry`) with required URL/endpoint fields on the entry itself; captured into the mesh slice and merged into `workload_metrics.tracing_provider`. Name-only references (`{name: "my-zipkin"}`) that rely on `meshConfig.extensionProviders` / `meshConfig.defaultProviders` lookup are **not yet supported** — they are gracefully skipped with a warning. Unrecognised provider names are also skipped (not hard-failed). Only the first `providers[]` entry is surfaced; multi-provider fan-out is deferred. Span emission to provider backends is not yet wired — sink-plugin follow-up. `Telemetry.tracing[].disableSpanReporting` and per-tag `CLIENT`/`SERVER` modes are deferred. |
 
@@ -1073,6 +1102,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | `cluster.local` | SPIFFE trust domain for ID derivation |
 | `FERRUM_MESH_CAPTURE_MODE` | `explicit` | Traffic capture mode: `explicit`, `iptables`, `ebpf` |
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |
+| `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto`, `true` (required/all-or-nothing), or `false` |
 
 ### Shared with CP/DP
 
