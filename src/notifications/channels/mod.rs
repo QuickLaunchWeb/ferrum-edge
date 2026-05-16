@@ -22,6 +22,9 @@ pub mod slack;
 pub mod teams;
 pub mod webhook;
 
+/// Webhook acknowledgements are normally a few hundred bytes. The 1 MiB cap is
+/// only a DoS guard so a misbehaving sink cannot make us stream an unbounded
+/// body just to keep the keep-alive connection reusable.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[allow(unused_imports)]
