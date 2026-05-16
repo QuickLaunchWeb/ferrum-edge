@@ -33,7 +33,8 @@ Pull Request
 Push to main
     └─► Five target release builds
             ├─► Replace latest GitHub prerelease
-            └─► Push Docker images to Docker Hub and GHCR
+            └─► Push per-arch Docker images to Docker Hub and GHCR
+                    └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
 ```
 
 ### Release Pipeline Flow
@@ -229,6 +230,13 @@ Pre-built binaries for all supported platforms:
 | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
 | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
 
+## Docker
+
+```bash
+docker pull ferrumedge/ferrum-edge:v0.2.0
+docker pull ghcr.io/ferrum-edge/ferrum-edge:v0.2.0
+```
+
 ## Checksums
 
 Verify the integrity of downloaded binaries:
@@ -237,6 +245,15 @@ Verify the integrity of downloaded binaries:
 abc123... ferrum-edge-linux-x86_64
 def456... ferrum-edge-linux-aarch64
 ...
+```
+
+## Usage
+
+Download the binary for your platform and make it executable:
+
+```bash
+chmod +x ferrum-edge-linux-x86_64
+FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 run
 ```
 ````
 
@@ -249,7 +266,7 @@ def456... ferrum-edge-linux-aarch64
 ```toml
 [package]
 name = "ferrum-edge"
-version = "0.9.0" # Update from Cargo.toml for each release
+version = "0.9.0" # Bump for each release
 ```
 
 **Release Process**:
@@ -524,7 +541,7 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
 3. Create new access token
 4. Copy token to `DOCKERHUB_TOKEN`
 
-For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare job-level `permissions: { contents: write }` for release creation and `permissions: { contents: read, packages: write }` for Docker/GHCR publishing. No repository-wide permission broadening is required as long as the default `GITHUB_TOKEN` permissions allow those per-job grants.
+For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare job-level `permissions: { contents: write }` for release creation and `permissions: { contents: read, packages: write }` for Docker/GHCR publishing. Repository **Settings → Actions → General → Workflow permissions** must allow read/write access (including `packages: write`) for those per-job grants to take effect.
 
 ### Secret Usage in Workflows
 
