@@ -286,7 +286,7 @@ fn decide_admin_bind_address(
 
     if !any_signal_present && is_default_unspecified {
         warn!(
-            "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no auth, allowlist, or explicit bind address configured; \
+            "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no allowlist or explicit bind address configured; \
              defaulting node-agent admin listener to 127.0.0.1:{port} so unauthenticated /metrics and /health \
              are not exposed on the network. To bind elsewhere, set one of: \
              FERRUM_ADMIN_BIND_ADDRESS=<address> (e.g. 0.0.0.0 if intentional), \
