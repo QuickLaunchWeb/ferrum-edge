@@ -108,6 +108,11 @@ pub fn append_backend_tls_pool_key_fields(
 /// `backend_tls_sni` intentionally affects the SNI extension and rustls'
 /// certificate-name verification while the TCP/QUIC dial target remains the
 /// selected backend host.
+///
+/// GAP-1B wires this helper into H2, gRPC, and native H3 backend dispatch.
+/// TCP+TLS, backend WebSocket, DTLS, and active health probes still use their
+/// protocol-specific server-name plumbing and should route through this helper
+/// when those paths grow backend SNI override support.
 pub fn backend_tls_server_name<'a>(tls: &'a BackendTlsConfig, host: &'a str) -> &'a str {
     tls.sni.as_deref().unwrap_or(host)
 }

@@ -304,12 +304,12 @@ impl Http2PoolManager {
         let connector = TlsConnector::from(tls_config);
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let server_name = ServerName::try_from(tls_server_name.to_string()).map_err(|e| {
-            Http2PoolError::BackendUnavailable {
+        let server_name = ServerName::try_from(tls_server_name)
+            .map(|name| name.to_owned())
+            .map_err(|e| Http2PoolError::BackendUnavailable {
                 message: format!("Invalid server name: {}", e),
                 source: Some(BackendUnavailableSource::InvalidDnsName),
-            }
-        })?;
+            })?;
 
         let Some(remaining) =
             crate::pool::remaining_connect_timeout(connect_started, connect_timeout)

@@ -711,12 +711,14 @@ impl GrpcPoolManager {
         let connector = TlsConnector::from(tls_config);
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let server_name = ServerName::try_from(tls_server_name.to_string()).map_err(|e| {
-            GrpcProxyError::backend_unavailable(
-                GrpcBackendUnavailableKind::InvalidServerName,
-                format!("Invalid server name: {}", e),
-            )
-        })?;
+        let server_name = ServerName::try_from(tls_server_name)
+            .map(|name| name.to_owned())
+            .map_err(|e| {
+                GrpcProxyError::backend_unavailable(
+                    GrpcBackendUnavailableKind::InvalidServerName,
+                    format!("Invalid server name: {}", e),
+                )
+            })?;
 
         let Some(remaining) =
             crate::pool::remaining_connect_timeout(connect_started, connect_timeout)

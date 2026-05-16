@@ -139,6 +139,17 @@ impl BackendCapabilityProbeTarget {
     }
 }
 
+fn mark_record_h2_tls_unsupported(record: &mut BackendCapabilityRecord) {
+    record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+    record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
+    // Backend still speaks HTTPS over HTTP/1.1 — record that explicitly so
+    // operators can see "h1 only" when eyeballing the registry.
+    record.plain_http.h1 = ProtocolSupport::Supported;
+    record.last_probe_at_unix_secs = now_unix_secs();
+    record.last_probe_error =
+        Some("H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path".to_string());
+}
+
 #[derive(Debug)]
 pub struct BackendCapabilityRegistry {
     entries: DashMap<String, Arc<BackendCapabilityRecord>>,
@@ -219,8 +230,7 @@ impl BackendCapabilityRegistry {
 
     /// Downgrade the cached H2/TLS classification for a backend target to
     /// `Unsupported` after observing an ALPN-driven HTTP/1.1 fallback
-    /// (`Http2PoolError::BackendSelectedHttp1`). No-op when the target has
-    /// no cached record.
+    /// (`Http2PoolError::BackendSelectedHttp1`).
     ///
     /// The direct H2 pool's per-key ALPN learning cache was removed in
     /// favor of this registry, so without this downgrade every subsequent
@@ -230,25 +240,31 @@ impl BackendCapabilityRegistry {
     /// `supports_direct_http2_backend` return false for subsequent
     /// requests so they go straight to reqwest. The gRPC h2 transport
     /// bucket is downgraded in lockstep since the same ALPN observation
-    /// is the signal for both.
-    pub fn mark_h2_tls_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
+    /// is the signal for both. If the target has no cached record yet,
+    /// this creates an H1-only record from the observed fallback.
+    pub fn mark_h2_tls_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) -> bool {
         let key = capability_key_for_proxy_target(proxy, target);
-        if let Some(mut entry) = self.entries.get_mut(&key)
-            && (!matches!(entry.plain_http.h2_tls, ProtocolSupport::Unsupported)
-                || !matches!(entry.grpc_transport.h2_tls, ProtocolSupport::Unsupported))
-        {
-            let mut new_record = (**entry).clone();
-            new_record.plain_http.h2_tls = ProtocolSupport::Unsupported;
-            new_record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
-            // Backend still speaks HTTPS over HTTP/1.1 — record that
-            // explicitly so operators can see "h1 only" when eyeballing
-            // the registry.
-            new_record.plain_http.h1 = ProtocolSupport::Supported;
-            new_record.last_probe_at_unix_secs = now_unix_secs();
-            new_record.last_probe_error = Some(
-                "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path".to_string(),
-            );
-            *entry = Arc::new(new_record);
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if matches!(entry.get().plain_http.h2_tls, ProtocolSupport::Unsupported)
+                    && matches!(
+                        entry.get().grpc_transport.h2_tls,
+                        ProtocolSupport::Unsupported
+                    )
+                {
+                    return false;
+                }
+                let mut new_record = (**entry.get()).clone();
+                mark_record_h2_tls_unsupported(&mut new_record);
+                entry.insert(Arc::new(new_record));
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let mut new_record = BackendCapabilityRecord::default();
+                mark_record_h2_tls_unsupported(&mut new_record);
+                entry.insert(Arc::new(new_record));
+                true
+            }
         }
     }
 
@@ -622,7 +638,7 @@ mod tests {
         record.grpc_transport.h2_tls = ProtocolSupport::Supported;
         registry.upsert(key, record);
 
-        registry.mark_h2_tls_unsupported(&proxy, None);
+        assert!(registry.mark_h2_tls_unsupported(&proxy, None));
 
         let fetched = registry.get(&proxy, None).unwrap();
         assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Unsupported);
@@ -639,11 +655,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_mark_h2_tls_unsupported_is_noop_when_no_cached_entry() {
+    fn registry_mark_h2_tls_unsupported_creates_h1_only_entry_when_missing() {
         let registry = BackendCapabilityRegistry::new();
         let proxy = minimal_proxy();
-        registry.mark_h2_tls_unsupported(&proxy, None);
-        assert!(registry.get(&proxy, None).is_none());
+        assert!(registry.mark_h2_tls_unsupported(&proxy, None));
+
+        let fetched = registry.get(&proxy, None).unwrap();
+        assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Unsupported);
+        assert_eq!(fetched.grpc_transport.h2_tls, ProtocolSupport::Unsupported);
+        assert_eq!(fetched.plain_http.h1, ProtocolSupport::Supported);
+        assert!(fetched.last_probe_error.is_some());
     }
 
     #[test]
