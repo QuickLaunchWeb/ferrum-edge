@@ -709,7 +709,9 @@ impl GrpcPoolManager {
 
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
-        let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
+        let tls_server_name =
+            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
+        let server_name = ServerName::try_from(tls_server_name.to_string()).map_err(|e| {
             GrpcProxyError::backend_unavailable(
                 GrpcBackendUnavailableKind::InvalidServerName,
                 format!("Invalid server name: {}", e),

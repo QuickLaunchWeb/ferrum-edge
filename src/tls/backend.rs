@@ -103,6 +103,15 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push(if verify_server_cert { '1' } else { '0' });
 }
 
+/// Return the TLS server name used for backend handshakes.
+///
+/// `backend_tls_sni` intentionally affects the SNI extension and rustls'
+/// certificate-name verification while the TCP/QUIC dial target remains the
+/// selected backend host.
+pub fn backend_tls_server_name<'a>(tls: &'a BackendTlsConfig, host: &'a str) -> &'a str {
+    tls.sni.as_deref().unwrap_or(host)
+}
+
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:
 /// proxy CA, else global CA, else webpki roots. Custom CAs are exclusive.
 pub fn build_root_cert_store(
@@ -533,6 +542,25 @@ mod tests {
             global_client_key,
             crls,
         }
+    }
+
+    #[test]
+    fn backend_tls_server_name_defaults_to_connect_host() {
+        let tls = BackendTlsConfig::default_verify();
+        assert_eq!(
+            backend_tls_server_name(&tls, "connect.mesh.internal"),
+            "connect.mesh.internal"
+        );
+    }
+
+    #[test]
+    fn backend_tls_server_name_honors_sni_override() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("service.mesh.internal".to_string());
+        assert_eq!(
+            backend_tls_server_name(&tls, "connect.mesh.internal"),
+            "service.mesh.internal"
+        );
     }
 
     fn new_test_client_config() -> rustls::ClientConfig {

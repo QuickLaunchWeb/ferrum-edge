@@ -10307,16 +10307,22 @@ async fn proxy_to_backend(
         let direct_h2_effective_proxy =
             resolve_backend_connection_proxy_for_target(proxy, upstream_target);
         let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
-        if can_use_direct_http2_pool(
+        let requires_direct_h2_for_sni = direct_h2_proxy.resolved_tls.sni.is_some();
+        let direct_h2_compatible = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) && supports_direct_http2_backend(state, proxy, upstream_target)
+        );
+        if direct_h2_compatible
+            && (supports_direct_http2_backend(state, proxy, upstream_target)
+                || requires_direct_h2_for_sni)
         {
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
-                    if should_fallback_to_reqwest_after_http2_pool_error(&e) {
+                    if should_fallback_to_reqwest_after_http2_pool_error(&e)
+                        && !requires_direct_h2_for_sni
+                    {
                         debug!(
                             proxy_id = %proxy.id,
                             error = %e,
@@ -10384,6 +10390,30 @@ async fn proxy_to_backend(
                     None,
                 );
             }
+        }
+        if requires_direct_h2_for_sni {
+            debug!(
+                proxy_id = %proxy.id,
+                retain_request_body = retain_request_body,
+                requires_request_body_buffering = requires_request_body_buffering,
+                enable_http2 = pool_config.enable_http2,
+                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend TLS SNI override requires direct HTTP/2 dispatch"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+            );
         }
         if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
