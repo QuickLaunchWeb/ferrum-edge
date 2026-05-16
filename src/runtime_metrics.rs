@@ -922,6 +922,14 @@ fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Va
             "active_requests": 0,
             "red_drop_probability_pct": 0.0,
             "port_exhaustion_events": 0,
+            "node_waypoint_drops": {
+                "cookie_unavailable": 0,
+                "unknown_cookie": 0,
+                "missing_pod_uid": 0,
+                "missing_workload_hash": 0,
+                "unknown_pod": 0,
+                "hash_mismatch": 0
+            },
             "actions": {
                 "disable_keepalive": false,
                 "reject_new_connections": false,

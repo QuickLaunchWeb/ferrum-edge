@@ -170,7 +170,7 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_XDS_NODE_CLUSTER` | No | `FERRUM_NAMESPACE` | xDS `Node.cluster` identity sent by mesh-mode ADS clients |
 | `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` | No | `10` | Mesh xDS client connect timeout. `0` disables the explicit tonic connect timeout |
 | `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
-| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, `east_west_gateway`, or `egress_gateway`. All share the same data-plane path |
+| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, `node_waypoint`, `east_west_gateway`, or `egress_gateway`. All share the same data-plane path |
 | `FERRUM_MESH_INBOUND_LISTEN_ADDR` | No | `0.0.0.0:15006` | Sidecar inbound mTLS listener address |
 | `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | No | `127.0.0.1:15001` | Mesh outbound capture listener address for plaintext-in to mTLS-out or HBONE encapsulation |
 | `FERRUM_MESH_HBONE_LISTEN_ADDR` | No | `0.0.0.0:15008` | Ambient HBONE termination listener address (Istio-flavored HBONE over mTLS) |

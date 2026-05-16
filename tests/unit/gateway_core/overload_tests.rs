@@ -1,6 +1,6 @@
 use ferrum_edge::overload::{
-    ConnectionGuard, OverloadConfig, OverloadLevel, OverloadState, RED_PROBABILITY_SCALE,
-    RequestGuard,
+    ConnectionGuard, NodeWaypointDropReason, OverloadConfig, OverloadLevel, OverloadState,
+    RED_PROBABILITY_SCALE, RequestGuard,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -637,4 +637,18 @@ fn snapshot_includes_port_exhaustion_events() {
     state.record_port_exhaustion();
     let snap = state.snapshot();
     assert_eq!(snap.port_exhaustion_events, 3);
+}
+
+#[test]
+fn snapshot_includes_node_waypoint_drop_counters() {
+    let state = OverloadState::new();
+    state.record_node_waypoint_drop(NodeWaypointDropReason::UnknownCookie);
+    state.record_node_waypoint_drop(NodeWaypointDropReason::MissingWorkloadHash);
+    state.record_node_waypoint_drop(NodeWaypointDropReason::MissingWorkloadHash);
+
+    let snap = state.snapshot();
+
+    assert_eq!(snap.node_waypoint_drops.unknown_cookie, 1);
+    assert_eq!(snap.node_waypoint_drops.missing_workload_hash, 2);
+    assert_eq!(snap.node_waypoint_drops.hash_mismatch, 0);
 }

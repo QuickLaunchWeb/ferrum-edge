@@ -1,6 +1,6 @@
 [package]
 name = "ferrum-ebpf-common"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Shared types between Ferrum eBPF programs and userspace loader"
 

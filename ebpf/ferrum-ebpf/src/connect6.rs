@@ -56,6 +56,8 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         addr: dst_ip,
         port: dst_port as u32,
         _pad: 0,
+        pod_uid: [0; 16],
+        workload_spiffe_hash: 0,
     };
     let _ = FERRUM_ORIG_DST6.insert(&key, &orig, 0);
 
