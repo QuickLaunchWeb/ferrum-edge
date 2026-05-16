@@ -46,6 +46,14 @@ pub struct MeshAuthz {
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match.
     trust_domain_aliases: Vec<TrustDomain>,
+    /// When `true`, the construction-time slice-level scope filter is
+    /// skipped and policies are filtered per-request using
+    /// [`RequestContext::node_waypoint_policy_scope`] instead. Used in
+    /// node-waypoint topology where one listener serves many pods and a
+    /// single proxy-identity filter doesn't fit. Default `false`
+    /// preserves the existing sidecar/ambient/east-west/egress-gateway
+    /// behaviour (slice-level filter at construction).
+    per_pod_policy_scoping: bool,
 }
 
 impl MeshAuthz {
@@ -80,16 +88,26 @@ impl MeshAuthz {
             slice.labels = labels;
         }
 
-        validate_scope_filter_identity(&slice)?;
+        let per_pod_policy_scoping = config
+            .get("per_pod_policy_scoping")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        // Pre-filter the slice's mesh_policies down to those whose `scope`
-        // applies to this proxy's workload identity. Done once at construction
-        // (cold path); the request hot path then iterates a smaller list.
-        let proxy_namespace = slice.namespace.clone();
-        let proxy_labels = slice.labels.clone();
-        slice.mesh_policies.retain(|policy| {
-            policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
-        });
+        if !per_pod_policy_scoping {
+            validate_scope_filter_identity(&slice)?;
+
+            // Pre-filter the slice's mesh_policies down to those whose `scope`
+            // applies to this proxy's workload identity. Done once at
+            // construction (cold path); the request hot path then iterates a
+            // smaller list. Skipped in node-waypoint mode because one listener
+            // serves many pods — filtering happens per request using the
+            // pod-scoped cache set on RequestContext.
+            let proxy_namespace = slice.namespace.clone();
+            let proxy_labels = slice.labels.clone();
+            slice.mesh_policies.retain(|policy| {
+                policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
+            });
+        }
 
         for policy in &mut slice.mesh_policies {
             normalize_mesh_policy_header_names(policy);
@@ -99,7 +117,37 @@ impl MeshAuthz {
             slice,
             has_header_rules,
             trust_domain_aliases,
+            per_pod_policy_scoping,
         })
+    }
+
+    /// Filter `slice.mesh_policies` against the request's per-pod scope.
+    ///
+    /// Cheap-ish: one `policy_scope_applies_to_workload` call per policy,
+    /// returning a filtered slice clone whose `mesh_policies` is a sublist.
+    /// Only invoked when `per_pod_policy_scoping == true` AND the request
+    /// carries a `node_waypoint_policy_scope`; the slice-level filter that
+    /// the non-node-waypoint path uses is otherwise the only filter.
+    fn slice_for_pod_scope(
+        &self,
+        scope: &crate::modes::mesh::runtime::PolicyScopeCache,
+    ) -> std::borrow::Cow<'_, MeshSlice> {
+        let filtered: Vec<MeshPolicy> = self
+            .slice
+            .mesh_policies
+            .iter()
+            .filter(|policy| scope.policy_applies(policy))
+            .cloned()
+            .collect();
+        if filtered.len() == self.slice.mesh_policies.len() {
+            // Fast path: all policies apply to this pod — share the existing
+            // slice without re-allocating mesh_policies.
+            std::borrow::Cow::Borrowed(&self.slice)
+        } else {
+            let mut narrowed = self.slice.clone();
+            narrowed.mesh_policies = filtered;
+            std::borrow::Cow::Owned(narrowed)
+        }
     }
 
     fn decision_to_result(
@@ -233,7 +281,21 @@ impl Plugin for MeshAuthz {
             headers,
             attributes: BTreeMap::new(),
         };
-        let decision = evaluate_mesh_authorization(&self.slice, &request);
+        // GAP-2M.4: per-pod scoping for node-waypoint topology.
+        //
+        // When `per_pod_policy_scoping` is enabled, the construction-time
+        // filter was skipped (`self.slice.mesh_policies` carries the full
+        // unfiltered set) and we filter per-request using the
+        // source-pod's PolicyScopeCache. Other topologies keep the
+        // pre-filtered slice — the borrowed Cow path is zero-allocation.
+        let effective_slice = if self.per_pod_policy_scoping
+            && let Some(scope) = ctx.node_waypoint_policy_scope.as_ref()
+        {
+            self.slice_for_pod_scope(scope)
+        } else {
+            std::borrow::Cow::Borrowed(&self.slice)
+        };
+        let decision = evaluate_mesh_authorization(effective_slice.as_ref(), &request);
         let result = self.decision_to_result(decision, &mut ctx.metadata);
         if matches!(
             result,

@@ -144,6 +144,36 @@ impl NodeWaypointIdentityResolver {
         self.policy_scopes_by_pod_uid.load().get(pod_uid).cloned()
     }
 
+    pub fn build_per_pod_scopes_from_workloads<'a, I>(
+        &self,
+        workloads: I,
+    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>>
+    where
+        I: IntoIterator<Item = &'a crate::modes::mesh::config::Workload>,
+    {
+        let workload_index: HashMap<&str, Arc<PolicyScopeCache>> = workloads
+            .into_iter()
+            .map(|workload| {
+                (
+                    workload.spiffe_id.as_str(),
+                    Arc::new(PolicyScopeCache::from_workload(workload)),
+                )
+            })
+            .collect();
+        if workload_index.is_empty() {
+            return HashMap::new();
+        }
+        self.identities_by_pod_uid
+            .iter()
+            .filter_map(|entry| {
+                let identity = entry.value();
+                workload_index
+                    .get(identity.spiffe_id.as_str())
+                    .map(|scope| (identity.pod_uid, scope.clone()))
+            })
+            .collect()
+    }
+
     pub fn resolve_stream(
         &self,
         stream: &TcpStream,
@@ -368,6 +398,98 @@ mod tests {
             from_cache.policy_applies(&policy),
             policy_scope_applies_to_workload(&policy, "default", &from_cache.labels)
         );
+    }
+
+    #[test]
+    fn build_per_pod_scopes_from_workloads_indexes_by_pod_uid_via_spiffe() {
+        use crate::identity::TrustDomain;
+        use crate::modes::mesh::config::{Workload, WorkloadSelector};
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+
+        let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let pod_b = parse_pod_uid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let pod_orphan = parse_pod_uid("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_a,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_b,
+            spiffe("spiffe://td/ns/default/sa/billing"),
+        ));
+        // pod_orphan has no Workload entry — it must not appear in the map.
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_orphan,
+            spiffe("spiffe://td/ns/default/sa/orphan"),
+        ));
+
+        let workloads = vec![
+            Workload {
+                spiffe_id: spiffe("spiffe://td/ns/default/sa/api"),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+                service_name: "api".to_string(),
+                addresses: Vec::new(),
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("td").expect("td"),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
+            },
+            Workload {
+                spiffe_id: spiffe("spiffe://td/ns/default/sa/billing"),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "billing".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+                service_name: "billing".to_string(),
+                addresses: Vec::new(),
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("td").expect("td"),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
+            },
+        ];
+
+        let map = resolver.build_per_pod_scopes_from_workloads(&workloads);
+
+        assert_eq!(map.len(), 2);
+        let scope_a = map.get(&pod_a).expect("api workload scope");
+        assert_eq!(scope_a.namespace, "default");
+        assert_eq!(scope_a.labels.get("app").map(String::as_str), Some("api"));
+        let scope_b = map.get(&pod_b).expect("billing workload scope");
+        assert_eq!(
+            scope_b.labels.get("app").map(String::as_str),
+            Some("billing")
+        );
+        assert!(
+            !map.contains_key(&pod_orphan),
+            "pod with no Workload entry must be omitted"
+        );
+    }
+
+    #[test]
+    fn build_per_pod_scopes_from_workloads_empty_workloads_returns_empty_map() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_a,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let map: HashMap<_, _> = resolver.build_per_pod_scopes_from_workloads(std::iter::empty());
+        assert!(map.is_empty());
     }
 
     #[test]

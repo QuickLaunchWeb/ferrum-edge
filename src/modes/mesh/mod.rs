@@ -1906,6 +1906,7 @@ fn inject_mesh_global_plugins(
         serde_json::json!({
             "mesh_slice": mesh_slice,
             "trust_domain_aliases": trust_domain_aliases,
+            "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
         }),
         &runtime.namespace,
     );
@@ -3219,6 +3220,15 @@ fn start_mesh_slice_apply_task(
                                 }
                                 if accepted && let Some(ref dns_proxy) = dns_proxy {
                                     dns_proxy.update_from_slice(slice);
+                                }
+                                if accepted
+                                    && runtime.topology == MeshTopology::NodeWaypoint
+                                    && let Some(resolver) =
+                                        proxy_state.node_waypoint_identity_resolver.as_ref()
+                                {
+                                    let scopes = resolver
+                                        .build_per_pod_scopes_from_workloads(&slice.workloads);
+                                    resolver.install_policy_scopes(scopes);
                                 }
                                 if applied {
                                     info!(

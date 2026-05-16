@@ -7038,6 +7038,14 @@ async fn handle_proxy_request_inner(
         // SPIFFE identity plugin consume the pod identity instead of baggage or
         // future TLS-peer derivation on this listener.
         ctx.peer_spiffe_id = Some(identity.spiffe_id.clone());
+        ctx.node_waypoint_pod_uid = Some(identity.pod_uid);
+        // GAP-2M.4: also resolve the per-pod PolicyScopeCache so mesh_authz
+        // can filter slice-level policies by the source pod's identity
+        // (namespace + labels) rather than relying on the proxy listener's
+        // shared identity, which is meaningless on a multi-pod listener.
+        if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
+            ctx.node_waypoint_policy_scope = resolver.policy_scope_for_pod(&identity.pod_uid);
+        }
     }
     // Store raw query string on ctx for lazy parsing. The local `query_string`
     // is kept for validation + URL building; the ctx copy is consumed by
