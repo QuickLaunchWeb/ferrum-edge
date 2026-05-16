@@ -187,11 +187,11 @@ pub struct MeshSlice {
 /// One opaque typed extension config, transported through xDS ECDS.
 ///
 /// `name` and `type_url` identify the extension; `value` is the
-/// already-serialized inner typed payload (length-prefixed varint bytes per
-/// the protobuf Any encoding rules). The DP-side consumer is responsible for
-/// recognizing `type_url` and deserializing `value` into its own
-/// representation; the xDS layer treats everything inside `value` as
-/// uninterpreted bytes.
+/// already-serialized inner typed payload. Do not include the protobuf field
+/// tag or length delimiter for `Any.value`; prost adds those when the outer
+/// `Any` is encoded. The DP-side consumer is responsible for recognizing
+/// `type_url` and deserializing `value` into its own representation; the xDS
+/// layer treats everything inside `value` as uninterpreted bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshExtensionConfig {
     pub name: String,

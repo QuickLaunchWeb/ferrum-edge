@@ -861,7 +861,7 @@ fn reverse_translate(
         sidecar_egress_scope: None,
         // GAP-2L.3: xDS-only deployments don't round-trip ECDS resources back
         // into the slice today. The DR-carrier path (GAP-2K) lands them
-        // alongside CDS via the same wire so this stays None unless future
+        // alongside CDS via the same wire so this stays empty unless future
         // ADS-side recovery wires it.
         extension_configs: Vec::new(),
     })
