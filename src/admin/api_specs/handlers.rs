@@ -40,7 +40,7 @@ enum ApiSpecError {
     /// Body too large (413)
     PayloadTooLarge(usize),
     /// Body collection error (non-size)
-    BodyCollect(String),
+    BodyCollect,
     /// Extraction/parse error (400)
     Extract(ExtractError),
     /// Generic 400 (invalid query params, etc.)
@@ -127,13 +127,10 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": format!("Request body too large (max {} MiB)", max_mib)}),
         ),
-        ApiSpecError::BodyCollect(msg) => {
-            tracing::warn!("failed to read api spec request body: {}", msg);
-            json_resp(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "Failed to read request body"}),
-            )
-        }
+        ApiSpecError::BodyCollect => json_resp(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Failed to read request body"}),
+        ),
         ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
@@ -717,7 +714,8 @@ async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>,
             if is_length_limit_error(e.as_ref()) {
                 Err(ApiSpecError::PayloadTooLarge(max_mib))
             } else {
-                Err(ApiSpecError::BodyCollect(e.to_string()))
+                tracing::warn!(error = %e, "failed to read api spec request body");
+                Err(ApiSpecError::BodyCollect)
             }
         }
     }
@@ -2563,9 +2561,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_collect_error_masks_transport_details() {
-        let resp = error_response(ApiSpecError::BodyCollect(
-            "hyper internal transport details".to_string(),
-        ));
+        let resp = error_response(ApiSpecError::BodyCollect);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = resp.into_body().collect().await.unwrap();
         let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();

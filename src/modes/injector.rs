@@ -246,6 +246,8 @@ fn parse_injector_admission_review_max_body_bytes_from_mib(
             "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be at most {MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB} MiB"
         ));
     }
+    // `parsed` is capped at 64 MiB above, so this cannot overflow on the
+    // supported 32-bit and 64-bit targets.
     Ok(parsed * MIB_BYTES)
 }
 
@@ -616,12 +618,13 @@ async fn handle_injector_request(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             if is_length_limit_error(e.as_ref()) {
+                let max_body_limit = admission_review_body_limit_display(max_body_bytes);
                 warn!(
                     remote_addr = %remote_addr,
                     max_body_bytes,
+                    max_body_limit = %max_body_limit,
                     "Injector AdmissionReview body exceeded configured limit"
                 );
-                let max_body_limit = admission_review_body_limit_display(max_body_bytes);
                 return Ok(response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!("AdmissionReview body too large (max {max_body_limit})"),
