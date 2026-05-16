@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -32,6 +32,7 @@ use crate::identity::spiffe::TrustDomain;
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
+const INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
@@ -573,12 +574,22 @@ async fn handle_injector_request(
         return Ok(response(StatusCode::NOT_FOUND, "not found"));
     }
 
-    let body = match req.into_body().collect().await {
+    let body = match Limited::new(req.into_body(), INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("length limit exceeded") {
+                return Ok(response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "AdmissionReview body too large (max 4 MiB)",
+                ));
+            }
             return Ok(response(
                 StatusCode::BAD_REQUEST,
-                format!("failed to read AdmissionReview body: {e}"),
+                format!("failed to read AdmissionReview body: {msg}"),
             ));
         }
     };
@@ -1599,6 +1610,31 @@ mod tests {
             .and_then(Value::as_str)
             .expect("denial message");
         assert!(message.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+    }
+
+    #[tokio::test]
+    async fn injector_request_rejects_oversized_admission_review_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = Arc::new(test_config(true, CaptureMode::Iptables));
+        let server = tokio::spawn(async move {
+            let (stream, remote_addr) = listener.accept().await.unwrap();
+            serve_injector_connection(stream, config, remote_addr).await;
+        });
+
+        let body = vec![b'x'; INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES + 1];
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/mutate"))
+            .header("connection", "close")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), StatusCode::PAYLOAD_TOO_LARGE);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("AdmissionReview body too large"));
+        server.await.unwrap();
     }
 
     #[test]
