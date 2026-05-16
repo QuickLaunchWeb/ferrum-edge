@@ -343,7 +343,9 @@ sha256sum -c ferrum-edge-*.sha256
 If automatic release fails:
 
 ```bash
-# Build binaries manually with the same release features as CI.
+# Build binaries manually with the same release features as CI. Install protoc
+# for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
+# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`).
 # Run macOS targets on a macOS host and the Windows MSVC target on Windows.
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
 cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
@@ -351,15 +353,21 @@ cargo build --features cloud-secrets --release --target x86_64-apple-darwin
 cargo build --features cloud-secrets --release --target aarch64-apple-darwin
 cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
-# Generate checksums
-find target \( -path '*/release/ferrum-edge' -o -path '*/release/ferrum-edge.exe' \) \
-  -exec sha256sum {} \; > checksums.txt
+# Stage platform-suffixed assets before checksums/upload, matching CI asset names.
+mkdir -p dist
+cp target/x86_64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-x86_64
+cp target/aarch64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-aarch64
+cp target/x86_64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-x86_64
+cp target/aarch64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-aarch64
+cp target/x86_64-pc-windows-msvc/release/ferrum-edge.exe dist/ferrum-edge-windows-x86_64.exe
+
+# Generate checksums.
+(cd dist && sha256sum ferrum-edge-* > checksums.txt)
 
 # Create release in GitHub UI or via gh:
-release_assets=$(find target \( -path '*/release/ferrum-edge' -o -path '*/release/ferrum-edge.exe' \))
 gh release create v0.2.0 \
-  $release_assets \
-  checksums.txt \
+  dist/ferrum-edge-* \
+  dist/checksums.txt \
   --title "Release v0.2.0" \
   --notes "$(cat release-notes.md)"
 ```
