@@ -2269,6 +2269,8 @@ fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
         "TOKEN",
         "PRIVATE_KEY",
         "CLIENT_KEY",
+        "API_KEY",
+        "CREDENTIAL",
     ]
     .iter()
     .any(|marker| upper.contains(marker))
@@ -2389,16 +2391,16 @@ fn telemetry_tracing_provider(
                 "collectorUrl",
                 &["collector_url"],
             )?;
-            let access_token = telemetry_provider_string_field_aliased(
+            let access_token_env = telemetry_provider_string_field_aliased(
                 object,
                 entry,
                 "lightstep",
-                "accessToken",
-                &["access_token"],
+                "accessTokenEnv",
+                &["access_token_env"],
             )?;
             TracingProvider::Lightstep {
                 collector_url,
-                access_token,
+                access_token_env,
             }
         }
         "opentelemetry" => {
@@ -4189,6 +4191,18 @@ mod tests {
                                     "name": "REDIS_PASSWORD",
                                     "defaultValue": "must-not-leak"
                                 }
+                            },
+                            "vendor_api_key": {
+                                "environment": {
+                                    "name": "DATADOG_API_KEY",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            },
+                            "cloud_credentials": {
+                                "environment": {
+                                    "name": "MY_APP_CREDENTIALS",
+                                    "defaultValue": "must-not-leak"
+                                }
                             }
                         }
                     }]
@@ -4207,6 +4221,8 @@ mod tests {
 
         assert!(!tracing.custom_tags.contains_key("admin_secret"));
         assert!(!tracing.custom_tags.contains_key("redis_password"));
+        assert!(!tracing.custom_tags.contains_key("vendor_api_key"));
+        assert!(!tracing.custom_tags.contains_key("cloud_credentials"));
     }
 
     #[test]
@@ -4557,7 +4573,7 @@ mod tests {
                         "providers": [{
                             "name": "lightstep",
                             "collectorUrl": "https://ingest.lightstep.com:443",
-                            "accessToken": "secret-token"
+                            "accessTokenEnv": "LIGHTSTEP_ACCESS_TOKEN"
                         }]
                     }]
                 }),
@@ -4575,13 +4591,15 @@ mod tests {
         match tracing.providers.first().expect("provider translated") {
             provider @ TracingProvider::Lightstep {
                 collector_url,
-                access_token,
+                access_token_env,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
-                assert_eq!(access_token, "secret-token");
+                assert_eq!(access_token_env, "LIGHTSTEP_ACCESS_TOKEN");
                 let debug = format!("{provider:?}");
-                assert!(debug.contains("<redacted>"));
-                assert!(!debug.contains("secret-token"));
+                assert!(debug.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                let serialized = serde_json::to_string(provider).expect("provider serializes");
+                assert!(serialized.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                assert!(!serialized.contains("secret-token"));
             }
             other => panic!("expected Lightstep, got {other:?}"),
         }

@@ -1098,13 +1098,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracing_provider_lightstep_requires_collector_and_token() {
+    async fn tracing_provider_lightstep_requires_collector_and_token_env() {
         let metrics = WorkloadMetrics::new(&json!({
+            "span_reporting_disabled": true,
             "tracing_provider": {
                 "kind": "lightstep",
                 "config": {
                     "collector_url": "https://ingest.lightstep.com:443",
-                    "access_token": "abc123"
+                    "access_token_env": "LIGHTSTEP_ACCESS_TOKEN"
                 }
             }
         }))
@@ -1116,10 +1117,10 @@ mod tests {
         {
             TracingProvider::Lightstep {
                 collector_url,
-                access_token,
+                access_token_env,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
-                assert_eq!(access_token, "abc123");
+                assert_eq!(access_token_env, "LIGHTSTEP_ACCESS_TOKEN");
             }
             other => panic!("expected Lightstep, got {other:?}"),
         }

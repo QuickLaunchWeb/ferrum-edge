@@ -807,12 +807,19 @@ pub(crate) fn trace_exporters_from_providers(
             }
             TracingProvider::Lightstep {
                 collector_url,
-                access_token,
-            } => Ok(Arc::new(LightstepTraceExporter::new(
-                collector_url.clone(),
-                access_token.clone(),
-                options.clone(),
-            )?) as Arc<dyn TraceExporter>),
+                access_token_env,
+            } => {
+                let access_token = std::env::var(access_token_env).map_err(|error| {
+                    format!(
+                        "Lightstep access token env var '{access_token_env}' is not set or unreadable: {error}"
+                    )
+                })?;
+                Ok(Arc::new(LightstepTraceExporter::new(
+                    collector_url.clone(),
+                    access_token,
+                    options.clone(),
+                )?) as Arc<dyn TraceExporter>)
+            }
             TracingProvider::OpenTelemetry { endpoint } => Ok(Arc::new(OtlpTraceExporter::new(
                 endpoint.clone(),
                 None,

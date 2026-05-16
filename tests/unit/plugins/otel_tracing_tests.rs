@@ -617,6 +617,9 @@ async fn test_workload_metrics_datadog_exporter_payload() {
 
 #[tokio::test]
 async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
+    // SAFETY: This test uses a unique process env key and only reads it during
+    // plugin construction. No other test in this module mutates the same key.
+    unsafe { std::env::set_var("FERRUM_TEST_LIGHTSTEP_TOKEN", "test-token") };
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/traces/otlp"))
@@ -637,7 +640,7 @@ async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
             "kind": "lightstep",
             "config": {
                 "collector_url": format!("{}/traces/otlp", mock_server.uri()),
-                "access_token": "test-token"
+                "access_token_env": "FERRUM_TEST_LIGHTSTEP_TOKEN"
             }
         }]
     }))
@@ -650,6 +653,8 @@ async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
         "GET /api/test"
     );
+    // SAFETY: Paired cleanup for the unique key set above.
+    unsafe { std::env::remove_var("FERRUM_TEST_LIGHTSTEP_TOKEN") };
 }
 
 #[tokio::test]

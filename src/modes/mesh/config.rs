@@ -486,7 +486,8 @@ pub enum TracingProvider {
     },
     Lightstep {
         collector_url: String,
-        access_token: String,
+        #[serde(alias = "accessTokenEnv")]
+        access_token_env: String,
     },
     #[serde(rename = "opentelemetry")]
     OpenTelemetry {
@@ -503,10 +504,13 @@ impl fmt::Debug for TracingProvider {
                 .field("agent_url", agent_url)
                 .field("service", service)
                 .finish(),
-            Self::Lightstep { collector_url, .. } => f
+            Self::Lightstep {
+                collector_url,
+                access_token_env,
+            } => f
                 .debug_struct("Lightstep")
                 .field("collector_url", collector_url)
-                .field("access_token", &"<redacted>")
+                .field("access_token_env", access_token_env)
                 .finish(),
             Self::OpenTelemetry { endpoint } => f
                 .debug_struct("OpenTelemetry")
