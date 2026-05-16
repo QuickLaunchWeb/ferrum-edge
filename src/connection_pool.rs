@@ -14,7 +14,8 @@ use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
+    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
+    append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -32,6 +34,8 @@ struct ReqwestPoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::CrlList,
     backend_h3_tls_configs: BackendTlsConfigCache,
+    backend_svid_generation: BackendSvidGeneration,
+    workload_svid_cert_path: Option<String>,
 }
 
 impl ReqwestPoolManager {
@@ -155,18 +159,26 @@ impl PoolManager for ReqwestPoolManager {
         buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
         buf.push('|');
         let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
+        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_cert_path
+            .as_deref());
+        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_key_path
+            .as_deref());
+        let svid_generation = backend_svid_generation_for_client_cert(
+            effective_client_cert_path,
+            self.workload_svid_cert_path.as_deref(),
+            self.backend_svid_generation.load(Ordering::Acquire),
+        );
         append_backend_tls_pool_key_fields(
             buf,
             &proxy.resolved_tls,
-            proxy.resolved_tls.client_cert_path.as_deref().or(self
-                .global_env_config
-                .backend_tls_client_cert_path
-                .as_deref()),
-            proxy.resolved_tls.client_key_path.as_deref().or(self
-                .global_env_config
-                .backend_tls_client_key_path
-                .as_deref()),
+            effective_client_cert_path,
+            effective_client_key_path,
             verify,
+            svid_generation,
         );
     }
 
@@ -195,6 +207,7 @@ pub struct ConnectionPool {
 
 impl ConnectionPool {
     /// Create a new connection pool manager with global configuration.
+    #[allow(dead_code)] // Used by focused tests and by callers that do not share SVID rotation state.
     pub fn new(
         global_config: PoolConfig,
         mtls_config: crate::config::EnvConfig,
@@ -202,16 +215,37 @@ impl ConnectionPool {
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
     ) -> Self {
+        Self::new_with_svid_generation(
+            global_config,
+            mtls_config,
+            dns_cache,
+            tls_policy,
+            crls,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_svid_generation(
+        global_config: PoolConfig,
+        mtls_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         let cleanup_interval =
             Duration::from_secs(mtls_config.pool_cleanup_interval_seconds.max(1));
         let shards = crate::util::sharding::pool_shard_amount(mtls_config.pool_shard_amount);
+        let workload_svid_cert_path = mtls_config.gateway_svid_cert_path.clone();
         let manager = Arc::new(ReqwestPoolManager {
             global_config: global_config.clone(),
             global_env_config: mtls_config,
             dns_cache,
             tls_policy,
             crls,
-            backend_h3_tls_configs: BackendTlsConfigCache::new(),
+            backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
+            backend_svid_generation,
+            workload_svid_cert_path,
         });
 
         Self {
@@ -305,6 +339,18 @@ impl ConnectionPool {
     #[allow(dead_code)]
     pub fn clear(&self) {
         self.pool.clear();
+    }
+
+    pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
+        self.pool
+            .manager()
+            .backend_h3_tls_configs
+            .drain_svid_generation(generation);
+    }
+
+    pub fn force_drain_svid_generation(&self, generation: u64) {
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.pool.invalidate_matching(|key| matcher.matches(key));
     }
 }
 

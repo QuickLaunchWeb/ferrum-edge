@@ -7,7 +7,9 @@
 //! `#[cfg(all(feature = "ebpf", target_os = "linux"))]`; default and non-Linux
 //! builds use `MockEbpfBackend` for lifecycle tests without kernel interaction.
 
+pub mod bpf_metrics;
 pub mod cgroup;
+pub mod event_consumer;
 pub mod kernel_probe;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod loader;

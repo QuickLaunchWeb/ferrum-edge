@@ -59,9 +59,10 @@ use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -82,7 +83,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
+use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
@@ -98,6 +99,7 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
+use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::{NoVerifier, TlsPolicy};
 
 use self::backend_capabilities::{
@@ -1539,16 +1541,37 @@ pub struct ProxyState {
     /// can hot-swap without blocking proxy readers.
     #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
     pub gateway_svid_bundle: SharedSvidBundle,
-    /// Startup SVID bundle loaded from files. CP-delivered trust bundles are an
+    /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
     pub gateway_file_svid_bundle: SharedSvidBundle,
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
+    /// Serializes the cold-path gateway SVID writers:
+    /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
+    pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
     /// Dynamic mesh inbound TLS config. Mesh mode updates this slot when
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Backend client SVID revision channel.
+    ///
+    /// The internal consumer side ([`spawn_backend_svid_rotation_task`]) holds
+    /// a `Receiver` and drives `backend_svid_generation` plus pool drains.
+    ///
+    /// The gateway SVID file watcher publishes to this sender when
+    /// `FERRUM_GATEWAY_SVID_*` files are configured and a validated reload
+    /// succeeds. Future in-memory producers can also wire in by cloning the
+    /// sender and handing the clone to `RotationConfig.revision_tx`
+    /// ([`crate::identity::rotation::RotationConfig::new`]) or
+    /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
+    /// bound, the channel stays at generation 0 — pool keys carry `|svidg=0`
+    /// and no rotation drain fires.
+    #[allow(dead_code)]
+    pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
+    /// Current backend client SVID generation shared by backend pools.
+    #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
+    pub backend_svid_generation: BackendSvidGeneration,
 }
 
 #[inline]
@@ -1639,6 +1662,309 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
     Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
+#[derive(Debug, Clone)]
+struct GatewaySvidFilePaths {
+    cert: PathBuf,
+    key: PathBuf,
+    trust_bundle: PathBuf,
+    expected_spiffe_id: Option<String>,
+}
+
+fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvidFilePaths> {
+    let (Some(cert), Some(key), Some(trust_bundle)) = (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+        env_config.gateway_svid_trust_bundle_path.as_deref(),
+    ) else {
+        return None;
+    };
+    Some(GatewaySvidFilePaths {
+        cert: PathBuf::from(cert),
+        key: PathBuf::from(key),
+        trust_bundle: PathBuf::from(trust_bundle),
+        expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewaySvidFileFingerprint {
+    cert: GatewaySvidFileStamp,
+    key: GatewaySvidFileStamp,
+    trust_bundle: GatewaySvidFileStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewaySvidFileStamp {
+    len: u64,
+    modified_nanos: Option<u128>,
+}
+
+fn gateway_svid_file_stamp(path: &Path) -> Result<GatewaySvidFileStamp, anyhow::Error> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("failed to stat {}: {}", path.display(), e))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(GatewaySvidFileStamp {
+        len: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn gateway_svid_file_fingerprint(
+    paths: &GatewaySvidFilePaths,
+) -> Result<GatewaySvidFileFingerprint, anyhow::Error> {
+    Ok(GatewaySvidFileFingerprint {
+        cert: gateway_svid_file_stamp(&paths.cert)?,
+        key: gateway_svid_file_stamp(&paths.key)?,
+        trust_bundle: gateway_svid_file_stamp(&paths.trust_bundle)?,
+    })
+}
+
+async fn run_gateway_svid_file_rotation_loop(
+    state: ProxyState,
+    paths: GatewaySvidFilePaths,
+    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    const GATEWAY_SVID_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let mut last_fingerprint = match gateway_svid_file_fingerprint(&paths) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Gateway SVID file watcher could not read startup fingerprint; continuing and will retry"
+            );
+            None
+        }
+    };
+    let mut interval = tokio::time::interval(GATEWAY_SVID_FILE_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return;
+        }
+
+        if let Some(shutdown) = shutdown_rx.as_mut() {
+            tokio::select! {
+                _ = interval.tick() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            interval.tick().await;
+        }
+
+        let next_fingerprint = match gateway_svid_file_fingerprint(&paths) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Gateway SVID file watcher could not inspect SVID files; keeping current backend identity"
+                );
+                continue;
+            }
+        };
+        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
+            continue;
+        }
+
+        let bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
+            &paths.cert,
+            &paths.key,
+            &paths.trust_bundle,
+            paths.expected_spiffe_id.as_deref(),
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    cert_path = %paths.cert.display(),
+                    key_path = %paths.key.display(),
+                    trust_bundle_path = %paths.trust_bundle.display(),
+                    "Gateway SVID files changed but reload failed; keeping current backend identity"
+                );
+                // Record the failing fingerprint so we don't re-warn every
+                // poll while the bad state is stable. The next genuine
+                // change (good or different-bad) will compare unequal and
+                // re-attempt the load.
+                last_fingerprint = Some(next_fingerprint);
+                continue;
+            }
+        };
+
+        let spiffe_id = bundle.spiffe_id.to_string();
+        state.install_gateway_file_svid_bundle(bundle);
+        state
+            .backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let revision = *state.backend_svid_rotation_tx.borrow();
+        last_fingerprint = Some(next_fingerprint);
+        info!(
+            spiffe_id = %spiffe_id,
+            svid_revision = revision,
+            "Gateway SVID files reloaded; backend SVID rotation published"
+        );
+    }
+}
+
+/// Bundle of the four backend pools whose entries are partitioned by SVID
+/// generation. Grouping them keeps the rotation-task signature manageable and
+/// makes "another pool joined the family" a one-line edit.
+///
+/// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
+/// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
+/// call on rotation — the H3 pool's TLS config cache is co-located on
+/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively.
+/// All four pools get a `force_drain_svid_generation()` call when the
+/// operator-configured drain window elapses, because each pool keeps its own
+/// `DashMap` of live connections.
+#[derive(Clone)]
+struct BackendPoolFamily {
+    connection_pool: Arc<ConnectionPool>,
+    http2_pool: Arc<Http2ConnectionPool>,
+    grpc_pool: Arc<GrpcConnectionPool>,
+    h3_pool: Arc<Http3ConnectionPool>,
+}
+
+impl BackendPoolFamily {
+    fn drain_tls_config_cache(&self, generation: u64) {
+        self.connection_pool
+            .drain_backend_tls_config_cache_svid_generation(generation);
+        self.http2_pool
+            .drain_backend_tls_config_cache_svid_generation(generation);
+        self.grpc_pool
+            .drain_backend_tls_config_cache_svid_generation(generation);
+    }
+
+    fn force_drain(&self, generation: u64) {
+        self.connection_pool.force_drain_svid_generation(generation);
+        self.http2_pool.force_drain_svid_generation(generation);
+        self.grpc_pool.force_drain_svid_generation(generation);
+        self.h3_pool.force_drain_svid_generation(generation);
+    }
+}
+
+struct BackendSvidRotationConsumer {
+    pools: BackendPoolFamily,
+    health_checker: Arc<HealthChecker>,
+    config: Arc<ArcSwap<GatewayConfig>>,
+    health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl BackendSvidRotationConsumer {
+    fn restart_health_checks(&self) {
+        let config = self.config.load_full();
+        self.health_checker
+            .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
+    }
+}
+
+fn spawn_backend_svid_rotation_task(
+    mut revision_rx: tokio::sync::watch::Receiver<u64>,
+    generation: BackendSvidGeneration,
+    consumer: BackendSvidRotationConsumer,
+    drain_seconds: u64,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut current_generation = *revision_rx.borrow();
+        generation.store(current_generation, Ordering::Release);
+        let mut shutdown_rx = shutdown_rx;
+
+        // Each rotation spawns its own delayed force-drain task targeting the
+        // outgoing generation. Tasks are tracked here so they can be aborted
+        // on graceful shutdown; otherwise each runs to completion independently
+        // so the operator's `drain_seconds` window is honoured per-generation
+        // even under rotation storms (e.g. a misbehaving CA issuing 30s certs).
+        // Each task only retains four `Arc` pool handles and ends with a
+        // single `invalidate_matching` pass per pool, so memory + CPU cost
+        // remains O(rotations within drain_seconds) which is bounded by the
+        // operator-chosen window.
+        let mut pending_force_drains: std::collections::VecDeque<tokio::task::JoinHandle<()>> =
+            std::collections::VecDeque::new();
+
+        loop {
+            // Reap finished tasks before each tick so the deque doesn't grow
+            // beyond the actually-in-flight count.
+            while let Some(front) = pending_force_drains.front() {
+                if front.is_finished() {
+                    pending_force_drains.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let changed = if let Some(shutdown) = shutdown_rx.as_mut() {
+                tokio::select! {
+                    changed = revision_rx.changed() => changed,
+                    _ = shutdown.changed() => {
+                        for handle in pending_force_drains.drain(..) {
+                            handle.abort();
+                        }
+                        return;
+                    }
+                }
+            } else {
+                revision_rx.changed().await
+            };
+            if changed.is_err() {
+                for handle in pending_force_drains.drain(..) {
+                    handle.abort();
+                }
+                return;
+            }
+
+            let next_generation = *revision_rx.borrow();
+            if next_generation == current_generation {
+                continue;
+            }
+
+            let old_generation = current_generation;
+            current_generation = next_generation;
+            generation.store(next_generation, Ordering::Release);
+            consumer.pools.drain_tls_config_cache(old_generation);
+            consumer.restart_health_checks();
+
+            info!(
+                old_svid_generation = old_generation,
+                new_svid_generation = next_generation,
+                drain_seconds,
+                "Backend client SVID rotation observed; new backend TLS connections will use fresh identity"
+            );
+
+            if drain_seconds > 0 {
+                let pools_for_drain = consumer.pools.clone();
+                let mut inner_shutdown = shutdown_rx.clone();
+                pending_force_drains.push_back(tokio::spawn(async move {
+                    let sleep = tokio::time::sleep(Duration::from_secs(drain_seconds));
+                    tokio::pin!(sleep);
+                    if let Some(shutdown) = inner_shutdown.as_mut() {
+                        tokio::select! {
+                            _ = &mut sleep => {}
+                            _ = shutdown.changed() => return,
+                        }
+                    } else {
+                        sleep.as_mut().await;
+                    }
+                    pools_for_drain.force_drain(old_generation);
+                    info!(
+                        old_svid_generation = old_generation,
+                        "Forced drain of backend pool entries from previous SVID generation completed"
+                    );
+                }));
+            }
+        }
+    })
+}
+
 impl ProxyState {
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
@@ -1648,16 +1974,17 @@ impl ProxyState {
     /// for future gateway-mesh features.
     ///
     /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. If another writer is introduced later, this
-    /// load/modify/store needs to become an atomic compare-and-swap update.
+    /// CP-delivered gateway trust. The gateway SVID file watcher can also swap
+    /// the SVID bundle, so all gateway SVID slot writes are serialized by
+    /// `gateway_svid_update_lock`.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
+        let _guard = self
+            .gateway_svid_update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.gateway_trust_bundles
             .store(Arc::new(Some(trust_bundles.clone())));
 
-        // SAFETY: the load-modify-store below is valid because CP-delivered
-        // gateway trust changes are applied only by the single DP gRPC apply
-        // loop. If another writer is added, convert this to a compare/swap or
-        // a dedicated synchronized update to avoid losing concurrent SVID edits.
         let current = self.gateway_svid_bundle.load_full();
         if let Some(mut bundle) = current.as_ref().clone() {
             bundle.trust_bundles = trust_bundles;
@@ -1665,11 +1992,46 @@ impl ProxyState {
         }
     }
 
-    /// Clear CP-delivered trust bundles and restore the startup file SVID.
+    /// Clear CP-delivered trust bundles and restore the latest file-loaded SVID.
     pub fn clear_gateway_trust_bundles(&self) {
+        let _guard = self
+            .gateway_svid_update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.gateway_trust_bundles.store(Arc::new(None));
         self.gateway_svid_bundle
             .store(self.gateway_file_svid_bundle.load_full());
+    }
+
+    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
+        let _guard = self
+            .gateway_svid_update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        self.gateway_file_svid_bundle
+            .store(Arc::new(Some(file_bundle.clone())));
+
+        let mut active_bundle = file_bundle;
+        let trust_snapshot = self.gateway_trust_bundles.load_full();
+        if let Some(trust_bundles) = trust_snapshot.as_ref() {
+            active_bundle.trust_bundles = trust_bundles.clone();
+        }
+        self.gateway_svid_bundle
+            .store(Arc::new(Some(active_bundle)));
+    }
+
+    fn start_gateway_svid_file_rotation_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let paths = gateway_svid_file_paths_from_env(&self.env_config)?;
+        let state = self.clone();
+        Some(tokio::spawn(run_gateway_svid_file_rotation_loop(
+            state,
+            paths,
+            shutdown_rx,
+        )))
     }
 
     /// Construct the gateway state and start the health checker.
@@ -1755,19 +2117,24 @@ impl ProxyState {
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-        let grpc_pool = Arc::new(GrpcConnectionPool::new(
+        let backend_svid_generation = Arc::new(AtomicU64::new(0));
+        let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
+            tokio::sync::watch::channel(0u64);
+        let grpc_pool = Arc::new(GrpcConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config.clone(),
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
-        let http2_pool = Arc::new(Http2ConnectionPool::new(
+        let http2_pool = Arc::new(Http2ConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config.clone(),
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
@@ -1785,20 +2152,22 @@ impl ProxyState {
             gateway_svid_bundle.clone(),
             pool_shard_amount,
         ));
-        let h3_pool = Arc::new(Http3ConnectionPool::new(
+        let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
+            backend_svid_generation.clone(),
         ));
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
         let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
-        let connection_pool = Arc::new(ConnectionPool::new(
+        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
@@ -1874,7 +2243,7 @@ impl ProxyState {
         // Drain the spawned task handles BEFORE wrapping in Arc so the
         // caller can await them in the background-drain phase. Drop is
         // a no-op safety net once the Vec is empty.
-        let health_check_handles = health_checker.take_active_check_handles();
+        let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
@@ -1890,6 +2259,23 @@ impl ProxyState {
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+        health_check_handles.push(spawn_backend_svid_rotation_task(
+            backend_svid_rotation_rx,
+            backend_svid_generation.clone(),
+            BackendSvidRotationConsumer {
+                pools: BackendPoolFamily {
+                    connection_pool: connection_pool.clone(),
+                    http2_pool: http2_pool.clone(),
+                    grpc_pool: grpc_pool.clone(),
+                    h3_pool: h3_pool.clone(),
+                },
+                health_checker: health_checker.clone(),
+                config: config_arc.clone(),
+                health_check_shutdown_rx: health_check_restart_rx.clone(),
+            },
+            env_config_arc.mesh_svid_rotation_drain_seconds,
+            health_check_restart_rx.clone(),
+        ));
 
         // Parse stream proxy bind address
         let stream_bind_addr: std::net::IpAddr = env_config_arc
@@ -2036,7 +2422,7 @@ impl ProxyState {
             consumer_index,
             load_balancer_cache,
             health_checker,
-            health_check_shutdown_rx: health_check_restart_rx,
+            health_check_shutdown_rx: health_check_restart_rx.clone(),
             circuit_breaker_cache,
             service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -2104,8 +2490,16 @@ impl ProxyState {
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
+            gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            backend_svid_rotation_tx,
+            backend_svid_generation,
         };
+        if let Some(handle) =
+            state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
+        {
+            health_check_handles.push(handle);
+        }
         Ok((state, health_check_handles))
     }
 
@@ -15833,6 +16227,25 @@ mod tests {
             .0
     }
 
+    #[tokio::test]
+    async fn backend_svid_rotation_channel_updates_pool_generation() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        assert_eq!(state.backend_svid_generation.load(Ordering::Acquire), 0);
+
+        state.backend_svid_rotation_tx.send_replace(7);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.backend_svid_generation.load(Ordering::Acquire) == 7 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("backend SVID generation should update");
+    }
+
     fn make_validation_proxy(id: &str, listen_path: &str) -> Proxy {
         serde_json::from_value(json!({
             "id": id,
@@ -16068,6 +16481,68 @@ mod tests {
         assert_eq!(
             svid.trust_bundles.local.x509_authorities,
             vec![vec![1, 2, 3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_gateway_file_svid_bundle_preserves_cp_trust_override_until_clear() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let cp_trust = test_runtime_trust_bundles("cp.local", vec![vec![4, 5, 6]]);
+        let first_file_svid = test_svid_bundle(test_runtime_trust_bundles(
+            "file.local",
+            vec![vec![1, 2, 3]],
+        ));
+        let rotated_file_svid = test_svid_bundle(test_runtime_trust_bundles(
+            "rotated.local",
+            vec![vec![7, 8, 9]],
+        ));
+
+        state.install_gateway_file_svid_bundle(first_file_svid);
+        state.update_gateway_trust_bundles(cp_trust);
+        state.install_gateway_file_svid_bundle(rotated_file_svid);
+
+        {
+            let loaded = state.gateway_file_svid_bundle.load_full();
+            let svid = loaded
+                .as_ref()
+                .as_ref()
+                .expect("file SVID should be updated");
+            assert_eq!(
+                svid.trust_bundles.local.trust_domain.as_str(),
+                "rotated.local"
+            );
+            assert_eq!(
+                svid.trust_bundles.local.x509_authorities,
+                vec![vec![7, 8, 9]]
+            );
+        }
+        {
+            let loaded = state.gateway_svid_bundle.load_full();
+            let svid = loaded
+                .as_ref()
+                .as_ref()
+                .expect("active SVID should remain present");
+            assert_eq!(svid.trust_bundles.local.trust_domain.as_str(), "cp.local");
+            assert_eq!(
+                svid.trust_bundles.local.x509_authorities,
+                vec![vec![4, 5, 6]]
+            );
+        }
+
+        state.clear_gateway_trust_bundles();
+
+        let loaded = state.gateway_svid_bundle.load_full();
+        let svid = loaded
+            .as_ref()
+            .as_ref()
+            .expect("active SVID should restore latest file trust");
+        assert_eq!(
+            svid.trust_bundles.local.trust_domain.as_str(),
+            "rotated.local"
+        );
+        assert_eq!(
+            svid.trust_bundles.local.x509_authorities,
+            vec![vec![7, 8, 9]]
         );
     }
 
