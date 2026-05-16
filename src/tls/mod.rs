@@ -531,6 +531,13 @@ impl MeshServerIdentity {
     }
 }
 
+/// Borrowed client CA bundle contents paired with their display path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientCaBundleRef<'a> {
+    pub path: &'a str,
+    pub pem: &'a [u8],
+}
+
 /// Load mesh server cert/key material once at startup.
 pub fn load_mesh_server_identity(
     cert_path: &str,
@@ -583,8 +590,10 @@ pub fn load_mesh_tls_config_with_identity(
 
     load_mesh_tls_config_with_identity_and_client_ca_bytes(
         identity,
-        client_ca_bundle_path,
-        client_ca_bundle_pem.as_deref(),
+        match (client_ca_bundle_path, client_ca_bundle_pem.as_deref()) {
+            (Some(path), Some(pem)) => Some(ClientCaBundleRef { path, pem }),
+            _ => None,
+        },
         client_auth,
         tls_policy,
         cert_expiry_warning_days,
@@ -599,18 +608,17 @@ pub fn load_mesh_tls_config_with_identity(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
     identity: &MeshServerIdentity,
-    client_ca_bundle_path: Option<&str>,
-    client_ca_bundle_pem: Option<&[u8]>,
+    client_ca_bundle: Option<ClientCaBundleRef<'_>>,
     client_auth: MeshClientAuth,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    if let (Some(ca_path), Some(ca_pem)) = (client_ca_bundle_path, client_ca_bundle_pem) {
+    if let Some(bundle) = client_ca_bundle {
         check_cert_expiry_from_pem_bytes(
-            ca_pem,
+            bundle.pem,
             "mesh client CA bundle",
-            ca_path,
+            bundle.path,
             cert_expiry_warning_days,
         )?;
     }
@@ -621,22 +629,15 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
 
     let mut config = match client_auth {
         MeshClientAuth::Required | MeshClientAuth::Optional => {
-            let ca_bundle_path = client_ca_bundle_path.ok_or_else(|| {
+            let ca_bundle = client_ca_bundle.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Mesh mTLS {:?} mode requires a client CA bundle path \
+                    "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
                      (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
                     client_auth
                 )
             })?;
-            let ca_bundle_pem = client_ca_bundle_pem.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
-                     from FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
-                    client_auth
-                )
-            })?;
 
-            let ca_certs: Vec<_> = certs(&mut &ca_bundle_pem[..])
+            let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
                 .filter_map(|r| r.ok())
                 .collect();
 
@@ -645,7 +646,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
             if added == 0 {
                 return Err(anyhow::anyhow!(
                     "No valid client CA certificates found in {}",
-                    ca_bundle_path
+                    ca_bundle.path
                 ));
             }
 
@@ -673,7 +674,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                 client_auth,
                 identity.cert_path(),
                 identity.key_path(),
-                ca_bundle_path,
+                ca_bundle.path,
             );
 
             builder

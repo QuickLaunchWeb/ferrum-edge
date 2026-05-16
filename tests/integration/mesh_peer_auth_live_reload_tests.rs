@@ -72,13 +72,13 @@ async fn send_plain_http(addr: SocketAddr) -> std::io::Result<Vec<u8>> {
 }
 
 async fn start_live_reload_listener_with_retry(
-    state: ProxyState,
+    state: &ProxyState,
 ) -> (
     SocketAddr,
     tokio::sync::watch::Sender<bool>,
     JoinHandle<Result<(), anyhow::Error>>,
 ) {
-    let mut last_error = String::new();
+    let mut errors = Vec::new();
     for attempt in 1..=5 {
         let reservation = reserve_port().await.expect("reserve proxy port");
         let port = reservation.drop_and_take_port();
@@ -96,40 +96,42 @@ async fn start_live_reload_listener_with_retry(
             .await
         });
 
-        match tokio::time::timeout(Duration::from_secs(2), started_rx).await {
+        let start_result = tokio::time::timeout(Duration::from_secs(2), started_rx).await;
+        let mut attempt_error = match start_result {
             Ok(Ok(())) => return (addr, shutdown_tx, listener),
             Ok(Err(error)) => {
-                last_error = format!("listener start signal dropped on attempt {attempt}: {error}");
+                format!("attempt {attempt}: listener start signal dropped: {error}")
             }
-            Err(error) => {
-                last_error = format!("listener start timed out on attempt {attempt}: {error}");
-            }
-        }
+            Err(error) => format!("attempt {attempt}: listener start timed out: {error}"),
+        };
 
         let _ = shutdown_tx.send(true);
         match tokio::time::timeout(Duration::from_secs(2), listener).await {
             Ok(Ok(Err(error))) => {
-                last_error = format!("{last_error}; listener returned error: {error}");
+                attempt_error = format!("{attempt_error}; listener returned error: {error}");
             }
             Ok(Err(error)) => {
-                last_error = format!("{last_error}; listener task join error: {error}");
+                attempt_error = format!("{attempt_error}; listener task join error: {error}");
             }
             Err(error) => {
-                last_error = format!("{last_error}; listener task did not stop: {error}");
+                attempt_error = format!("{attempt_error}; listener task did not stop: {error}");
             }
             Ok(Ok(Ok(()))) => {}
         }
+        errors.push(attempt_error);
     }
 
-    panic!("listener did not bind after retries: {last_error}");
+    panic!(
+        "listener did not bind after retries: {}",
+        errors.join(" | ")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap() {
     ensure_crypto_provider();
     let state = test_proxy_state(test_env_config());
-    let state_for_swap = state.clone();
-    let (addr, shutdown_tx, listener) = start_live_reload_listener_with_retry(state).await;
+    let (addr, shutdown_tx, listener) = start_live_reload_listener_with_retry(&state).await;
 
     let plaintext_response = send_plain_http(addr).await.expect("plaintext request");
     assert!(
@@ -138,7 +140,7 @@ async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap
         String::from_utf8_lossy(&plaintext_response)
     );
 
-    state_for_swap
+    state
         .mesh_inbound_tls
         .store(Arc::new(Some(strict_mesh_tls_config())));
 

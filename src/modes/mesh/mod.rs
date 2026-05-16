@@ -2487,8 +2487,9 @@ async fn serve_mesh_runtime(
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
     )?;
     // Keep the slot populated with startup TLS even when live reload is
-    // disabled. The flag controls which listener source is used; the slot
-    // itself always mirrors the current mesh inbound TLS state.
+    // disabled. The flag controls which listener source is used; without live
+    // reload the slot never updates again, so readers must not treat it as the
+    // current PeerAuthentication state.
     proxy_state
         .mesh_inbound_tls
         .store(Arc::new(frontend_tls.clone()));
@@ -2762,10 +2763,16 @@ fn live_reload_inbound_mtls_mode(
     Some(resolved)
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 struct MeshInboundClientCaBundle {
     path: String,
     pem: Arc<[u8]>,
+}
+
+impl PartialEq for MeshInboundClientCaBundle {
+    fn eq(&self, other: &Self) -> bool {
+        self.pem == other.pem
+    }
 }
 
 impl fmt::Debug for MeshInboundClientCaBundle {
@@ -2891,8 +2898,10 @@ fn load_mesh_frontend_tls(
     let mut tls_config = if let Some(bundle) = client_ca_bundle {
         tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
             server_identity,
-            Some(bundle.path.as_str()),
-            Some(bundle.pem.as_ref()),
+            Some(tls::ClientCaBundleRef {
+                path: bundle.path.as_str(),
+                pem: bundle.pem.as_ref(),
+            }),
             client_auth,
             tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -3001,9 +3010,10 @@ fn plan_mesh_inbound_tls_reload(
         return Some(MeshInboundTlsReloadPlan::Unchanged);
     }
     let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
-        warn!(
+        error!(
             mesh_slice_version = %slice.version,
-            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; skipping TLS slot update and applying proxy config only"
+            ?mtls_mode,
+            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; this is a programming error. Applying proxy config only; the inbound TLS slot remains at its previous value until restart and will be re-evaluated on later slice applies."
         );
         return Some(MeshInboundTlsReloadPlan::Unchanged);
     };
@@ -5465,18 +5475,7 @@ mod tests {
     async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let observed = proxy_state
-                    .current_config()
-                    .plugin_configs
-                    .iter()
-                    .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
-                    .and_then(|plugin| {
-                        plugin
-                            .config
-                            .pointer(&format!("/mesh_slice/labels/{key}"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
-                    });
+                let observed = mesh_authz_label(proxy_state, key);
                 if observed.as_deref() == Some(expected) {
                     return;
                 }
@@ -5485,6 +5484,21 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("mesh_authz label {key} did not become {expected}"));
+    }
+
+    fn mesh_authz_label(proxy_state: &ProxyState, key: &str) -> Option<String> {
+        proxy_state
+            .current_config()
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .and_then(|plugin| {
+                plugin
+                    .config
+                    .pointer(&format!("/mesh_slice/labels/{key}"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
     }
 
     async fn wait_for_mesh_inbound_tls(proxy_state: &ProxyState, expected_present: bool) {
@@ -6433,6 +6447,16 @@ mod tests {
         );
 
         mesh_state.install_slice(MeshSlice {
+            version: "good-disable".to_string(),
+            labels: [("app".to_string(), "good-baseline".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "good-baseline").await;
+
+        mesh_state.install_slice(MeshSlice {
             version: "bad-strict".to_string(),
             labels: [("app".to_string(), "bad-tls".to_string())].into(),
             ..slice_with_peer_auths(vec![peer_auth_with_port_override(
@@ -6440,26 +6464,15 @@ mod tests {
                 config::MtlsMode::Strict,
             )])
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(
             proxy_state.mesh_inbound_tls.load_full().is_none(),
             "failed TLS rebuild should keep the previous plaintext slot"
         );
-        let applied_label = proxy_state
-            .current_config()
-            .plugin_configs
-            .iter()
-            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
-            .and_then(|plugin| {
-                plugin
-                    .config
-                    .pointer("/mesh_slice/labels/app")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            });
-        assert!(
-            applied_label.is_none(),
+        assert_eq!(
+            mesh_authz_label(&proxy_state, "app").as_deref(),
+            Some("good-baseline"),
             "failed TLS rebuild should keep the previous proxy config"
         );
 
