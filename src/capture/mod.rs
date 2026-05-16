@@ -68,6 +68,15 @@ pub struct CaptureConfig {
     pub inbound_port: u16,
     pub outbound_port: u16,
     pub include_cidrs: Vec<String>,
+    /// True when `include_cidrs` came from operator or pod configuration rather
+    /// than the implicit catch-all default. When includeOutboundPorts is set,
+    /// the implicit default must not swallow all ports before port rules match.
+    pub include_cidrs_explicit: bool,
+    /// True when includeOutboundPorts was explicitly set to `*`. This must be
+    /// distinct from an empty `include_outbound_ports`, which means the
+    /// annotation was absent or empty and CIDR includes should drive capture.
+    pub include_all_outbound_ports: bool,
+    pub include_outbound_ports: Vec<u16>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
     /// TCP destination ports excluded from the inbound capture chain. Each
@@ -78,6 +87,16 @@ pub struct CaptureConfig {
 }
 
 impl CaptureConfig {
+    /// Build an `Explicit`-mode capture config with the implicit `0.0.0.0/0`
+    /// include CIDR default.
+    ///
+    /// `include_cidrs_explicit` is set to `false` here because the included
+    /// `0.0.0.0/0` is the implicit catch-all default, not an operator-supplied
+    /// value. Callers populating `include_cidrs` manually (e.g., tests) that
+    /// want the operator-supplied-`0.0.0.0/0` semantics — where the catch-all
+    /// is treated as an explicit choice rather than swallowed by
+    /// `includeOutboundPorts` narrowing — should also set
+    /// `include_cidrs_explicit: true` after construction.
     pub fn explicit(inbound_port: u16, outbound_port: u16) -> Self {
         Self {
             mode: CaptureMode::Explicit,
@@ -85,6 +104,9 @@ impl CaptureConfig {
             inbound_port,
             outbound_port,
             include_cidrs: vec!["0.0.0.0/0".to_string()],
+            include_cidrs_explicit: false,
+            include_all_outbound_ports: false,
+            include_outbound_ports: Vec::new(),
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
             exclude_inbound_ports: Vec::new(),
@@ -101,10 +123,10 @@ impl CaptureConfig {
             Some(raw) => Some(parse_proxy_uid(&raw)?),
             None => Some(DEFAULT_PROXY_UID),
         };
-        let include_cidrs = parse_cidr_env(
-            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
-                .unwrap_or_else(|| "0.0.0.0/0".to_string()),
-        );
+        let include_cidrs_raw = resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS");
+        let include_cidrs_explicit = include_cidrs_raw.is_some();
+        let include_cidrs =
+            parse_cidr_env(&include_cidrs_raw.unwrap_or_else(|| "0.0.0.0/0".to_string()));
         validate_cidr_list(&include_cidrs)?;
         let exclude_cidrs = parse_cidr_env(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
@@ -129,6 +151,9 @@ impl CaptureConfig {
             inbound_port: 15006,
             outbound_port: 15001,
             include_cidrs,
+            include_cidrs_explicit,
+            include_all_outbound_ports: false,
+            include_outbound_ports: Vec::new(),
             exclude_cidrs,
             exclude_ports,
             exclude_inbound_ports,
@@ -401,16 +426,43 @@ fn commands_for_family(
             &format!("-m owner --uid-owner {uid} -j RETURN"),
         ));
     }
-    for cidr in include_cidrs {
+    if config.include_all_outbound_ports {
         commands.push(idempotent_append(
             binary,
             "nat",
             "FERRUM_MESH_OUTBOUND",
-            &format!(
-                "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
-                config.outbound_port
-            ),
+            &format!("-p tcp -j REDIRECT --to-ports {}", config.outbound_port),
         ));
+    } else {
+        // includeOutboundPorts without an explicit include-CIDR annotation means
+        // "capture only these ports" rather than "add these ports to the
+        // implicit 0.0.0.0/0 catch-all". Explicit include CIDRs stay additive.
+        let emit_include_cidrs =
+            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+        if emit_include_cidrs {
+            for cidr in include_cidrs {
+                commands.push(idempotent_append(
+                    binary,
+                    "nat",
+                    "FERRUM_MESH_OUTBOUND",
+                    &format!(
+                        "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                        config.outbound_port
+                    ),
+                ));
+            }
+        }
+        for port in &config.include_outbound_ports {
+            commands.push(idempotent_append(
+                binary,
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!(
+                    "-p tcp --dport {port} -j REDIRECT --to-ports {}",
+                    config.outbound_port
+                ),
+            ));
+        }
     }
     // Inbound port exclusions MUST be appended before the catch-all REDIRECT
     // below — once REDIRECT fires the chain returns, so any RETURN rule placed
@@ -914,6 +966,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iptables_plan_keeps_cidr_redirect_when_include_ports_empty() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string()];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT --to-ports 15001")),
+            "CIDR-only include rule should remain when includeOutboundPorts is unset"
+        );
+    }
+
+    #[test]
+    fn iptables_plan_emits_per_port_redirects_when_include_ports_set() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_outbound_ports = vec![5432, 9092];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        for port in [5432, 9092] {
+            assert!(
+                plan.v4_commands.iter().any(|cmd| cmd.contains(&format!(
+                    "-p tcp --dport {port} -j REDIRECT --to-ports 15001"
+                ))),
+                "includeOutboundPorts REDIRECT missing for port {port}: {:?}",
+                plan.v4_commands
+            );
+        }
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT")),
+            "implicit catch-all CIDR must not capture all ports before port rules"
+        );
+    }
+
+    #[test]
+    fn iptables_plan_adds_include_ports_to_include_cidrs() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_outbound_ports = vec![5432];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        let scoped_port_rule = plan
+            .v4_commands
+            .iter()
+            .position(|cmd| cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001"))
+            .expect("includeOutboundPorts should redirect port 5432 independently");
+        assert!(
+            scoped_port_rule > 0,
+            "port include rule should be emitted after chain setup: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT")),
+            "includeOutboundPorts should not suppress CIDR-only redirects"
+        );
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 --dport 5432 -j REDIRECT")),
+            "includeOutboundPorts must be additive, not intersected with include CIDRs"
+        );
+    }
+
+    #[test]
+    fn iptables_plan_wildcard_include_ports_redirects_all_destinations() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_all_outbound_ports = true;
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -j REDIRECT --to-ports 15001")),
+            "wildcard includeOutboundPorts must redirect all outbound ports regardless of destination IP: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan.v4_commands.iter().any(|cmd| cmd.contains("--dport")),
+            "wildcard includeOutboundPorts should not emit port-narrowing rules: {:?}",
+            plan.v4_commands
+        );
+    }
+
+    #[test]
+    fn iptables_plan_combines_include_ports_with_ipv6_family_rules() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["fd00::/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_outbound_ports = vec![5432];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
+            "includeOutboundPorts should still redirect explicit ports on IPv4: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan.v4_commands.iter().any(|cmd| cmd.contains("fd00::/8")),
+            "IPv6 include CIDR must not appear in the IPv4 iptables plan: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|cmd| { cmd.contains("-p tcp -d fd00::/8 -j REDIRECT --to-ports 15001") }),
+            "IPv6 include CIDR should be rendered into ip6tables: {:?}",
+            plan.v6_commands
+        );
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
+            "includeOutboundPorts should also redirect explicit ports on IPv6 when the family is active: {:?}",
+            plan.v6_commands
+        );
+    }
+
+    #[test]
+    fn iptables_plan_orders_exclude_port_before_overlapping_include_port() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.exclude_ports = vec![5432];
+        config.include_outbound_ports = vec![5432];
+
+        let plan = IptablesPlan::for_config(&config);
+        let exclude_idx = plan
+            .v4_commands
+            .iter()
+            .position(|cmd| cmd.contains("-p tcp --dport 5432 -j RETURN"))
+            .expect("exclude port RETURN rule should be emitted");
+        let include_idx = plan
+            .v4_commands
+            .iter()
+            .position(|cmd| cmd.contains("--dport 5432 -j REDIRECT --to-ports 15001"))
+            .expect("include port REDIRECT rule should be emitted");
+
+        assert!(
+            exclude_idx < include_idx,
+            "excludeOutboundPorts must win over includeOutboundPorts by rule order: {:?}",
+            plan.v4_commands
+        );
+    }
     #[test]
     fn iptables_plan_partitions_ipv4_and_ipv6_cidrs() {
         let mut config = CaptureConfig::explicit(15006, 15001);
