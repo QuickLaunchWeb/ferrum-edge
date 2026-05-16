@@ -990,6 +990,29 @@ impl Http3ConnectionPool {
         key
     }
 
+    /// Build a target-keyed pool key using a pre-snapshotted SVID generation.
+    /// See [`pool_key_with_generation`] for the rationale (atomic-load
+    /// amortization + generation pinning across retry shards).
+    fn pool_key_for_target_with_generation(
+        &self,
+        proxy: &Proxy,
+        host: &str,
+        port: u16,
+        index: usize,
+        svid_generation: Option<u64>,
+    ) -> String {
+        let mut key = String::with_capacity(128);
+        Self::write_pool_key_with_host_and_generation(
+            &mut key,
+            host,
+            port,
+            proxy,
+            index,
+            svid_generation,
+        );
+        key
+    }
+
     /// Return the shard indices startup warmup should attempt for a proxy.
     #[doc(hidden)]
     pub fn warmup_shard_indices(
@@ -1304,11 +1327,17 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = self.pool_key_for_target_with_current_generation(
+        // Snapshot the SVID generation once; see `request()` for rationale —
+        // pinning across the cache probe + retry-shard fan-out prevents a
+        // mid-request rotation from fragmenting the lookup window across
+        // two `|svidg=N` values.
+        let svid_generation = self.svid_generation_for_proxy(proxy);
+        let key = self.pool_key_for_target_with_generation(
             proxy,
             target_host,
             target_port,
             start,
+            svid_generation,
         );
 
         let mut any_request_on_wire = false;
@@ -1342,11 +1371,12 @@ impl Http3ConnectionPool {
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = self.pool_key_for_target_with_current_generation(
+                        let fallback_key = self.pool_key_for_target_with_generation(
                             proxy,
                             target_host,
                             target_port,
                             fallback_index,
+                            svid_generation,
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
@@ -2511,11 +2541,15 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = self.pool_key_for_target_with_current_generation(
+        // Pin the SVID generation across cache probe + retry shards. See
+        // `request()` for the rationale.
+        let svid_generation = self.svid_generation_for_proxy(proxy);
+        let key = self.pool_key_for_target_with_generation(
             proxy,
             target_host,
             target_port,
             start,
+            svid_generation,
         );
 
         let mut any_request_on_wire = false;
@@ -2545,11 +2579,12 @@ impl Http3ConnectionPool {
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = self.pool_key_for_target_with_current_generation(
+                        let fallback_key = self.pool_key_for_target_with_generation(
                             proxy,
                             target_host,
                             target_port,
                             fallback_index,
+                            svid_generation,
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;

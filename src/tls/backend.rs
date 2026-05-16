@@ -57,20 +57,20 @@ pub struct BackendTlsConfigCache {
 }
 
 impl BackendTlsConfigCache {
-    #[allow(dead_code)] // Used by focused tests; production pools pass shared SVID generation state.
+    #[allow(dead_code)] // Used by focused tests with default shard sizing.
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[allow(dead_code)] // Convenience constructor for callers using default shard sizing.
-    pub fn with_svid_generation(_svid_generation: Arc<AtomicU64>) -> Self {
-        Self::with_svid_generation_and_shards(_svid_generation, 64)
-    }
-
-    pub fn with_svid_generation_and_shards(
-        _svid_generation: Arc<AtomicU64>,
-        shards: usize,
-    ) -> Self {
+    /// Build a cache sized to the pool's shard count.
+    ///
+    /// The SVID generation is intentionally NOT held on the cache: cache keys
+    /// are pre-tagged by callers via `append_backend_svid_generation_key_field`,
+    /// and a stale `|svidg=N` entry is evicted by `drain_svid_generation(N)`
+    /// when the rotation consumer task observes a revision bump. The cache
+    /// itself stays generation-agnostic — see the `BackendTlsConfigCache`
+    /// rustdoc for the full contract.
+    pub fn with_shards(shards: usize) -> Self {
         Self {
             configs: Arc::new(DashMap::with_shard_amount(shards)),
         }
@@ -1037,8 +1037,7 @@ mod tests {
     #[test]
     fn backend_tls_config_cache_rebuilds_after_svid_generation_changes() {
         ensure_crypto_provider();
-        let generation = Arc::new(AtomicU64::new(0));
-        let cache = BackendTlsConfigCache::with_svid_generation_and_shards(generation.clone(), 64);
+        let cache = BackendTlsConfigCache::with_shards(64);
         let builds = AtomicUsize::new(0);
 
         let first = cache
@@ -1054,7 +1053,6 @@ mod tests {
             })
             .expect("same generation config");
 
-        generation.store(1, Ordering::Release);
         let rotated = cache
             .get_or_try_build(tagged_test_key("backend-a", Some(1)), || {
                 builds.fetch_add(1, Ordering::Relaxed);

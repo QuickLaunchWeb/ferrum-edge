@@ -312,10 +312,7 @@ impl GrpcConnectionPool {
             dns_cache,
             tls_policy,
             crls,
-            tls_configs: BackendTlsConfigCache::with_svid_generation_and_shards(
-                backend_svid_generation.clone(),
-                shards,
-            ),
+            tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
         });

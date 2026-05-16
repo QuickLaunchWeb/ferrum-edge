@@ -1707,18 +1707,34 @@ fn spawn_backend_svid_rotation_task(
         generation.store(current_generation, Ordering::Release);
         let mut shutdown_rx = shutdown_rx;
 
-        // Tracks the in-flight force-drain task so a burst of rapid rotations
-        // (e.g. a misbehaving CA issuing 30s certs) doesn't pile up one
-        // delayed force-drain task per rotation, each holding clones of all
-        // four pools for the full drain window.
-        let mut active_force_drain: Option<tokio::task::JoinHandle<()>> = None;
+        // Each rotation spawns its own delayed force-drain task targeting the
+        // outgoing generation. Tasks are tracked here so they can be aborted
+        // on graceful shutdown; otherwise each runs to completion independently
+        // so the operator's `drain_seconds` window is honoured per-generation
+        // even under rotation storms (e.g. a misbehaving CA issuing 30s certs).
+        // Each task only retains four `Arc` pool handles and ends with a
+        // single `invalidate_matching` pass per pool, so memory + CPU cost
+        // remains O(rotations within drain_seconds) which is bounded by the
+        // operator-chosen window.
+        let mut pending_force_drains: std::collections::VecDeque<tokio::task::JoinHandle<()>> =
+            std::collections::VecDeque::new();
 
         loop {
+            // Reap finished tasks before each tick so the deque doesn't grow
+            // beyond the actually-in-flight count.
+            while let Some(front) = pending_force_drains.front() {
+                if front.is_finished() {
+                    pending_force_drains.pop_front();
+                } else {
+                    break;
+                }
+            }
+
             let changed = if let Some(shutdown) = shutdown_rx.as_mut() {
                 tokio::select! {
                     changed = revision_rx.changed() => changed,
                     _ = shutdown.changed() => {
-                        if let Some(handle) = active_force_drain.take() {
+                        for handle in pending_force_drains.drain(..) {
                             handle.abort();
                         }
                         return;
@@ -1728,7 +1744,7 @@ fn spawn_backend_svid_rotation_task(
                 revision_rx.changed().await
             };
             if changed.is_err() {
-                if let Some(handle) = active_force_drain.take() {
+                for handle in pending_force_drains.drain(..) {
                     handle.abort();
                 }
                 return;
@@ -1752,16 +1768,6 @@ fn spawn_backend_svid_rotation_task(
             );
 
             if drain_seconds > 0 {
-                // Coalesce: if a previous force-drain is still in flight,
-                // abort it and queue a single drain task for the latest
-                // generation. The in-memory pool entries for the older
-                // (now twice-stale) generation are still tagged by their
-                // own |svidg= marker — they're already gone from new
-                // dispatch the moment we bumped `generation`, the abort
-                // only skips the redundant DashMap scan.
-                if let Some(prev) = active_force_drain.take() {
-                    prev.abort();
-                }
                 let pools_for_drain = BackendPoolFamily {
                     connection_pool: pools.connection_pool.clone(),
                     http2_pool: pools.http2_pool.clone(),
@@ -1769,7 +1775,7 @@ fn spawn_backend_svid_rotation_task(
                     h3_pool: pools.h3_pool.clone(),
                 };
                 let mut inner_shutdown = shutdown_rx.clone();
-                active_force_drain = Some(tokio::spawn(async move {
+                pending_force_drains.push_back(tokio::spawn(async move {
                     let sleep = tokio::time::sleep(Duration::from_secs(drain_seconds));
                     tokio::pin!(sleep);
                     if let Some(shutdown) = inner_shutdown.as_mut() {

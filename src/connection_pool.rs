@@ -243,10 +243,7 @@ impl ConnectionPool {
             dns_cache,
             tls_policy,
             crls,
-            backend_h3_tls_configs: BackendTlsConfigCache::with_svid_generation_and_shards(
-                backend_svid_generation.clone(),
-                shards,
-            ),
+            backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
         });
