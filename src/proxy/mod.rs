@@ -84,7 +84,9 @@ use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
-use crate::modes::mesh::node_waypoint::{NodeWaypointIdentity, NodeWaypointIdentityResolver};
+use crate::modes::mesh::node_waypoint::{
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
@@ -114,6 +116,33 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+fn record_node_waypoint_identity_drop(
+    overload: &crate::overload::OverloadState,
+    error: &NodeWaypointIdentityError,
+) {
+    let reason = match error {
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => {
+            crate::overload::NodeWaypointDropReason::CookieUnavailable
+        }
+        NodeWaypointIdentityError::UnknownCookie(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownCookie
+        }
+        NodeWaypointIdentityError::MissingPodUid(_) => {
+            crate::overload::NodeWaypointDropReason::MissingPodUid
+        }
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => {
+            crate::overload::NodeWaypointDropReason::MissingWorkloadHash
+        }
+        NodeWaypointIdentityError::UnknownPod(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownPod
+        }
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
+    };
+    overload.record_node_waypoint_drop(reason);
+}
 
 /// Validate that every `mesh_route_dispatch` rule's
 /// `destination.upstream_id` points at a real upstream in the config.
@@ -2053,6 +2082,16 @@ impl ProxyState {
             gateway_trust_bundles,
         };
         Ok((state, health_check_handles))
+    }
+
+    /// Return a copy of this state with node-waypoint identity resolution
+    /// installed before listeners start accepting traffic.
+    pub fn with_node_waypoint_identity_resolver(
+        mut self,
+        resolver: Arc<NodeWaypointIdentityResolver>,
+    ) -> Self {
+        self.node_waypoint_identity_resolver = Some(resolver);
+        self
     }
 
     /// Start a background task that periodically removes stale zero-count
@@ -6122,6 +6161,7 @@ async fn run_accept_loop(
                                 match resolver.resolve_stream(&stream) {
                                     Ok(identity) => Some(identity),
                                     Err(error) => {
+                                        record_node_waypoint_identity_drop(&state.overload, &error);
                                         debug!(
                                             remote_addr = %remote_addr,
                                             error = %error,
@@ -6890,6 +6930,11 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
+        // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
+        // identity is the authenticated source workload for policy. It
+        // intentionally pre-populates `peer_spiffe_id` so mesh authz and the
+        // SPIFFE identity plugin consume the pod identity instead of baggage or
+        // future TLS-peer derivation on this listener.
         ctx.peer_spiffe_id = Some(identity.spiffe_id.clone());
     }
     // Store raw query string on ctx for lazy parsing. The local `query_string`

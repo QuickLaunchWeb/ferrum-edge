@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use ferrum_ebpf_common::OrigDst4;
+use ferrum_ebpf_common::{OrigDst4, OrigDst6};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 
@@ -42,6 +42,10 @@ pub enum NodeWaypointIdentityError {
     SocketCookieUnavailable(String),
     UnknownCookie(u64),
     MissingPodUid(u64),
+    MissingWorkloadHash {
+        cookie: u64,
+        pod_uid: [u8; 16],
+    },
     UnknownPod([u8; 16]),
     WorkloadHashMismatch {
         pod_uid: [u8; 16],
@@ -60,6 +64,11 @@ impl fmt::Display for NodeWaypointIdentityError {
             Self::MissingPodUid(cookie) => {
                 write!(f, "node-waypoint record for cookie {cookie} has no pod UID")
             }
+            Self::MissingWorkloadHash { cookie, pod_uid } => write!(
+                f,
+                "node-waypoint record for cookie {cookie} and pod {} has no workload SPIFFE hash",
+                pod_uid_label(pod_uid)
+            ),
             Self::UnknownPod(pod_uid) => {
                 write!(
                     f,
@@ -84,6 +93,7 @@ impl std::error::Error for NodeWaypointIdentityError {}
 
 pub struct NodeWaypointIdentityResolver {
     orig_dst4_by_cookie: DashMap<u64, OrigDst4>,
+    orig_dst6_by_cookie: DashMap<u64, OrigDst6>,
     identities_by_pod_uid: DashMap<[u8; 16], Arc<NodeWaypointIdentity>>,
     policy_scopes_by_pod_uid: Arc<ArcSwap<HashMap<[u8; 16], Arc<PolicyScopeCache>>>>,
 }
@@ -93,6 +103,7 @@ impl NodeWaypointIdentityResolver {
         let shards = crate::util::sharding::pool_shard_amount(pool_shard_override);
         Self {
             orig_dst4_by_cookie: DashMap::with_shard_amount(shards),
+            orig_dst6_by_cookie: DashMap::with_shard_amount(shards),
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
             policy_scopes_by_pod_uid: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
         }
@@ -104,6 +115,14 @@ impl NodeWaypointIdentityResolver {
 
     pub fn remove_orig_dst4(&self, cookie: u64) {
         self.orig_dst4_by_cookie.remove(&cookie);
+    }
+
+    pub fn record_orig_dst6(&self, cookie: u64, record: OrigDst6) {
+        self.orig_dst6_by_cookie.insert(cookie, record);
+    }
+
+    pub fn remove_orig_dst6(&self, cookie: u64) {
+        self.orig_dst6_by_cookie.remove(&cookie);
     }
 
     pub fn upsert_identity(&self, identity: NodeWaypointIdentity) -> Arc<NodeWaypointIdentity> {
@@ -140,21 +159,32 @@ impl NodeWaypointIdentityResolver {
         cookie: u64,
     ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
         let Some(record) = self.orig_dst4_by_cookie.get(&cookie) else {
+            if let Some(record) = self.orig_dst6_by_cookie.get(&cookie) {
+                return self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash);
+            }
             return Err(NodeWaypointIdentityError::UnknownCookie(cookie));
         };
-        let pod_uid = record.pod_uid;
-        let expected_hash = record.workload_spiffe_hash;
-        drop(record);
+        self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash)
+    }
 
+    fn resolve_record(
+        &self,
+        cookie: u64,
+        pod_uid: [u8; 16],
+        expected_hash: u64,
+    ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
         if pod_uid == [0; 16] {
             return Err(NodeWaypointIdentityError::MissingPodUid(cookie));
+        }
+        if expected_hash == 0 {
+            return Err(NodeWaypointIdentityError::MissingWorkloadHash { cookie, pod_uid });
         }
 
         let Some(identity) = self.identities_by_pod_uid.get(&pod_uid) else {
             return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
         };
         let identity = identity.clone();
-        if expected_hash != 0 && identity.workload_spiffe_hash != expected_hash {
+        if identity.workload_spiffe_hash != expected_hash {
             return Err(NodeWaypointIdentityError::WorkloadHashMismatch {
                 pod_uid,
                 expected: expected_hash,
@@ -208,6 +238,16 @@ mod tests {
         }
     }
 
+    fn orig_dst6(pod_uid: [u8; 16], workload_spiffe_hash: u64) -> OrigDst6 {
+        OrigDst6 {
+            addr: [0, 0, 0, 1],
+            port: 8080,
+            _pad: 0,
+            pod_uid,
+            workload_spiffe_hash,
+        }
+    }
+
     #[test]
     fn resolve_cookie_returns_enrolled_identity() {
         let resolver = NodeWaypointIdentityResolver::new(0);
@@ -233,6 +273,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cookie_returns_ipv6_enrolled_identity() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+        resolver.record_orig_dst6(7, orig_dst6(pod_uid, hash));
+
+        let resolved = resolver.resolve_cookie(7).expect("IPv6 identity resolves");
+        assert_eq!(resolved.pod_uid, pod_uid);
+        assert_eq!(resolved.spiffe_id.as_str(), "spiffe://td/ns/default/sa/api");
+    }
+
+    #[test]
     fn resolve_cookie_fails_closed_for_missing_pod_uid() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         resolver.record_orig_dst4(7, orig_dst4([0; 16], 0));
@@ -241,6 +295,25 @@ mod tests {
             .resolve_cookie(7)
             .expect_err("zero pod UID must fail closed");
         assert_eq!(error, NodeWaypointIdentityError::MissingPodUid(7));
+    }
+
+    #[test]
+    fn resolve_cookie_fails_closed_for_missing_workload_hash() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, 0));
+
+        let error = resolver
+            .resolve_cookie(7)
+            .expect_err("zero workload hash must fail closed");
+        assert_eq!(
+            error,
+            NodeWaypointIdentityError::MissingWorkloadHash { cookie: 7, pod_uid }
+        );
     }
 
     #[test]

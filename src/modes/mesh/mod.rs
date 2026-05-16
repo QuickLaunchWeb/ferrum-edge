@@ -2345,19 +2345,21 @@ async fn serve_mesh_runtime(
 
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let (mut proxy_state, health_check_handles) = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
-    if runtime.topology == MeshTopology::NodeWaypoint {
-        proxy_state.node_waypoint_identity_resolver = Some(Arc::new(
-            node_waypoint::NodeWaypointIdentityResolver::new(env_config.pool_shard_amount),
-        ));
+    let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
-    }
+        proxy_state.with_node_waypoint_identity_resolver(Arc::new(
+            node_waypoint::NodeWaypointIdentityResolver::new(env_config.pool_shard_amount),
+        ))
+    } else {
+        proxy_state
+    };
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,

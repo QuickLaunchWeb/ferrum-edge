@@ -38,7 +38,7 @@ Node-scoped sidecarless waypoint for pods captured by the node agent. This topol
 |---|---|---|---|
 | HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
 
-At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. Unknown cookies, zero pod UIDs, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
+At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
 
 ### East-West Gateway
 

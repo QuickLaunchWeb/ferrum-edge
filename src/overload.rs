@@ -127,6 +127,20 @@ pub struct OverloadState {
     /// Monotonic count of EADDRNOTAVAIL errors (ephemeral port exhaustion).
     /// Incremented from error classification sites; never reset.
     pub port_exhaustion_events: AtomicU64,
+
+    // ── Node-waypoint fail-closed drops ────────────────────────────────
+    /// Accepted sockets rejected because `SO_COOKIE` was unavailable.
+    pub node_waypoint_cookie_unavailable_drops: CachePadded<AtomicU64>,
+    /// Accepted sockets whose cookie was not enrolled by the node-agent.
+    pub node_waypoint_unknown_cookie_drops: CachePadded<AtomicU64>,
+    /// Enrolled cookie records missing a pod UID.
+    pub node_waypoint_missing_pod_uid_drops: CachePadded<AtomicU64>,
+    /// Enrolled cookie records missing a workload SPIFFE hash.
+    pub node_waypoint_missing_workload_hash_drops: CachePadded<AtomicU64>,
+    /// Enrolled pod UID records with no userspace identity.
+    pub node_waypoint_unknown_pod_drops: CachePadded<AtomicU64>,
+    /// Enrolled pod UID records whose SPIFFE hash mismatched userspace state.
+    pub node_waypoint_hash_mismatch_drops: CachePadded<AtomicU64>,
 }
 
 impl Default for OverloadState {
@@ -155,6 +169,12 @@ impl OverloadState {
             req_max: AtomicU64::new(0),
             loop_latency_us: AtomicU64::new(0),
             port_exhaustion_events: AtomicU64::new(0),
+            node_waypoint_cookie_unavailable_drops: CachePadded::new(AtomicU64::new(0)),
+            node_waypoint_unknown_cookie_drops: CachePadded::new(AtomicU64::new(0)),
+            node_waypoint_missing_pod_uid_drops: CachePadded::new(AtomicU64::new(0)),
+            node_waypoint_missing_workload_hash_drops: CachePadded::new(AtomicU64::new(0)),
+            node_waypoint_unknown_pod_drops: CachePadded::new(AtomicU64::new(0)),
+            node_waypoint_hash_mismatch_drops: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -209,6 +229,11 @@ impl OverloadState {
         self.port_exhaustion_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a node-waypoint accept-time identity failure.
+    pub fn record_node_waypoint_drop(&self, reason: NodeWaypointDropReason) {
+        reason.counter(self).fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Build a JSON-serializable snapshot for the admin endpoint.
     pub fn snapshot(&self) -> OverloadSnapshot {
         let fd_current = self.fd_current.load(Ordering::Relaxed);
@@ -225,6 +250,24 @@ impl OverloadState {
             red_drop_probability_pct: self.red_drop_probability.load(Ordering::Relaxed) as f64
                 / (RED_PROBABILITY_SCALE as f64 / 100.0),
             port_exhaustion_events: self.port_exhaustion_events.load(Ordering::Relaxed),
+            node_waypoint_drops: NodeWaypointDropSnapshot {
+                cookie_unavailable: self
+                    .node_waypoint_cookie_unavailable_drops
+                    .load(Ordering::Relaxed),
+                unknown_cookie: self
+                    .node_waypoint_unknown_cookie_drops
+                    .load(Ordering::Relaxed),
+                missing_pod_uid: self
+                    .node_waypoint_missing_pod_uid_drops
+                    .load(Ordering::Relaxed),
+                missing_workload_hash: self
+                    .node_waypoint_missing_workload_hash_drops
+                    .load(Ordering::Relaxed),
+                unknown_pod: self.node_waypoint_unknown_pod_drops.load(Ordering::Relaxed),
+                hash_mismatch: self
+                    .node_waypoint_hash_mismatch_drops
+                    .load(Ordering::Relaxed),
+            },
             pressure: PressureSnapshot {
                 file_descriptors: FdPressure {
                     current: fd_current,
@@ -340,8 +383,42 @@ pub struct OverloadSnapshot {
     pub active_requests: u64,
     pub red_drop_probability_pct: f64,
     pub port_exhaustion_events: u64,
+    pub node_waypoint_drops: NodeWaypointDropSnapshot,
     pub pressure: PressureSnapshot,
     pub actions: ActionSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeWaypointDropReason {
+    CookieUnavailable,
+    UnknownCookie,
+    MissingPodUid,
+    MissingWorkloadHash,
+    UnknownPod,
+    HashMismatch,
+}
+
+impl NodeWaypointDropReason {
+    fn counter(self, state: &OverloadState) -> &CachePadded<AtomicU64> {
+        match self {
+            Self::CookieUnavailable => &state.node_waypoint_cookie_unavailable_drops,
+            Self::UnknownCookie => &state.node_waypoint_unknown_cookie_drops,
+            Self::MissingPodUid => &state.node_waypoint_missing_pod_uid_drops,
+            Self::MissingWorkloadHash => &state.node_waypoint_missing_workload_hash_drops,
+            Self::UnknownPod => &state.node_waypoint_unknown_pod_drops,
+            Self::HashMismatch => &state.node_waypoint_hash_mismatch_drops,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct NodeWaypointDropSnapshot {
+    pub cookie_unavailable: u64,
+    pub unknown_cookie: u64,
+    pub missing_pod_uid: u64,
+    pub missing_workload_hash: u64,
+    pub unknown_pod: u64,
+    pub hash_mismatch: u64,
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -76,9 +76,13 @@ pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<(
 
 /// Read the kernel socket cookie for a TCP stream.
 ///
-/// Node-waypoint identity resolution uses this stable per-socket key to look
-/// up metadata captured by the node-agent eBPF programs. Non-Linux platforms
-/// do not expose `SO_COOKIE`, so node-waypoint topology fails closed there.
+/// Node-waypoint identity resolution uses this accepted-socket cookie as the
+/// lookup key for metadata captured by the node-agent eBPF programs. The
+/// accepted server-side socket has a different cookie than the source pod's
+/// connecting socket; the GAP-2M sockops/sk_lookup bridge is responsible for
+/// registering records keyed by this accept-side cookie before node-waypoint
+/// traffic is admitted. Non-Linux platforms do not expose `SO_COOKIE`, so
+/// node-waypoint topology fails closed there.
 #[cfg(target_os = "linux")]
 pub fn socket_cookie(stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
     use std::os::fd::AsRawFd;
