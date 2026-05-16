@@ -362,11 +362,65 @@ impl XdsAdsServer {
             &subscription.type_url,
             &snapshot.version,
         );
-        let resources = snapshot.filtered_resources(
+        let candidates = snapshot.filtered_resources(
             &subscription.type_url,
             &subscription.resource_names,
             subscription.wildcard,
         );
+        // True delta semantics — only include resources that have CHANGED
+        // since the client's last-known state, plus any resource the client
+        // explicitly re-subscribed to (so a re-subscribe always re-flows a
+        // fresh copy even if unchanged). The wire-byte reduction is the
+        // point of delta xDS; sending unchanged resources on every snapshot
+        // turn defeats the protocol's purpose.
+        //
+        // "Client's last-known state" is either:
+        //   1. `initial_resource_versions` — the client's per-resource
+        //      version map, sent in the first delta request after a
+        //      reconnect; or
+        //   2. the server-side `previous` snapshot, when we know what the
+        //      client ACKed last for this type URL over this stream.
+        //
+        // If neither source has the resource, treat it as new and include
+        // it. `resource.version` is always server-computed (see
+        // `per_resource_version`); a client-supplied version in
+        // `initial_resource_versions` can only suppress its own delivery by
+        // claiming a value that the server independently re-derives from
+        // current bytes, so a spoofed claim is at worst a self-DoS. On the
+        // previous-ACKed-snapshot path, the `value` byte-equality check is a
+        // defensive guard against the 64-bit truncation in the per-resource
+        // hash.
+        let explicit_wildcard_subscribe =
+            explicitly_subscribed_names.iter().any(|name| name == "*");
+        let explicit_subscribe_set: HashSet<&str> = explicitly_subscribed_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != "*")
+            .collect();
+        let previous_resources_by_name =
+            previous_resources_indexed(previous, &subscription.type_url);
+        let resources: Vec<_> = candidates
+            .into_iter()
+            .filter(|resource| {
+                if explicit_wildcard_subscribe
+                    || explicit_subscribe_set.contains(resource.name.as_str())
+                {
+                    return true;
+                }
+                if let Some(client_version) = initial_resource_versions.get(&resource.name)
+                    && client_version == &resource.version
+                {
+                    return false;
+                }
+                if let Some(prev_resource) = previous_resources_by_name.get(resource.name.as_str())
+                    && prev_resource.version == resource.version
+                    && prev_resource.value == resource.value
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
         let current_names: HashSet<String> = snapshot
             .resources(&subscription.type_url)
             .iter()
@@ -606,7 +660,25 @@ impl XdsAdsServer {
         request: &DeltaDiscoveryRequest,
         previous: Option<&XdsSnapshot>,
     ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        self.delta_response_for_request_with_fingerprint(
+        let _ = self.record_and_log_delta_ack(node_id, request);
+        self.delta_response_for_stream_request_without_ack(
+            node_id,
+            stream_config,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
+
+    fn delta_response_for_stream_request_without_ack(
+        &self,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
+        self.delta_response_for_request_with_fingerprint_without_ack(
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
@@ -625,32 +697,26 @@ impl XdsAdsServer {
         request: &DeltaDiscoveryRequest,
         previous: Option<&XdsSnapshot>,
     ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        if !request.response_nonce.is_empty() {
-            match self.record_delta_ack(node_id, request) {
-                AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
-                    node_id = %node_id,
-                    type_url = %request.type_url,
-                    "xDS delta ACK accepted"
-                ),
-                AckOutcome::Nacked { message } => {
-                    warn!(
-                        node_id = %node_id,
-                        type_url = %request.type_url,
-                        error = %message,
-                        "xDS delta NACK received"
-                    );
-                }
-                outcome => {
-                    warn!(
-                        node_id = %node_id,
-                        type_url = %request.type_url,
-                        outcome = ?outcome,
-                        "xDS delta ACK ignored"
-                    );
-                }
-            }
-        }
+        let _ = self.record_and_log_delta_ack(node_id, request);
+        self.delta_response_for_request_with_fingerprint_without_ack(
+            node_id,
+            config,
+            fingerprint,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
 
+    fn delta_response_for_request_with_fingerprint_without_ack(
+        &self,
+        node_id: &str,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
         let previous_subscription = subscriptions.get(&request.type_url);
         let (subscription, resource_names_changed, explicit_subscription_request) =
             build_delta_subscription(
@@ -679,6 +745,41 @@ impl XdsAdsServer {
         } else {
             None
         }
+    }
+
+    fn record_and_log_delta_ack(
+        &self,
+        node_id: &str,
+        request: &DeltaDiscoveryRequest,
+    ) -> Option<AckOutcome> {
+        if request.response_nonce.is_empty() {
+            return None;
+        }
+        let outcome = self.record_delta_ack(node_id, request);
+        match &outcome {
+            AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
+                node_id = %node_id,
+                type_url = %request.type_url,
+                "xDS delta ACK accepted"
+            ),
+            AckOutcome::Nacked { message } => {
+                warn!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    error = %message,
+                    "xDS delta NACK received"
+                );
+            }
+            outcome => {
+                warn!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    outcome = ?outcome,
+                    "xDS delta ACK ignored"
+                );
+            }
+        }
+        Some(outcome)
     }
 
     fn delta_responses_for_subscriptions(
@@ -737,6 +838,35 @@ impl XdsAdsServer {
             &stream_config.fingerprint,
             previous,
         )
+    }
+
+    fn delta_responses_for_stream_config_with_previous_by_type(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let snapshot = self.snapshot_for_stream_config(node_id, stream_config);
+        let responses = subscriptions
+            .values()
+            .filter_map(|subscription| {
+                let previous = previous_by_type
+                    .get(&subscription.type_url)
+                    .map(Arc::as_ref);
+                subscription_resources_changed(previous, &snapshot, subscription).then(|| {
+                    self.delta_response(
+                        &snapshot,
+                        previous,
+                        subscription,
+                        &HashMap::new(),
+                        &[],
+                        &[],
+                    )
+                })
+            })
+            .collect();
+        (snapshot, responses)
     }
 
     fn delta_responses_for_subscriptions_from_config_with_fingerprint(
@@ -1037,7 +1167,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             let mut stream_config =
                 XdsStreamConfig::new(server.config.load_full().as_ref().clone());
-            let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
+            let mut last_sent_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> = HashMap::new();
+            let mut last_accepted_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> =
+                HashMap::new();
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -1074,18 +1206,28 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        let previous = last_snapshot.clone();
-                        if let Some((snapshot, response)) = server.delta_response_for_stream_request(
+                        let ack_outcome = server.record_and_log_delta_ack(&current_node_id, &request);
+                        remember_delta_accepted_snapshot(
+                            ack_outcome.as_ref(),
+                            &request.type_url,
+                            &last_sent_snapshot_by_type,
+                            &mut last_accepted_snapshot_by_type,
+                        );
+                        let previous = last_accepted_snapshot_by_type
+                            .get(&request.type_url)
+                            .cloned();
+                        if let Some((snapshot, response)) = server.delta_response_for_stream_request_without_ack(
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
                             &request,
                             previous.as_deref(),
                         ) {
-                            last_snapshot = Some(snapshot);
+                            let response_type_url = response.type_url.clone();
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
                             }
+                            last_sent_snapshot_by_type.insert(response_type_url, snapshot);
                         }
                     }
                     update = updates.recv() => {
@@ -1101,17 +1243,19 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                    last_snapshot.as_deref(),
+                                    &last_accepted_snapshot_by_type,
                                 );
-                                last_snapshot = Some(snapshot);
                                 for response in responses {
+                                    let response_type_url = response.type_url.clone();
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
+                                    last_sent_snapshot_by_type
+                                        .insert(response_type_url, Arc::clone(&snapshot));
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1125,17 +1269,19 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                    last_snapshot.as_deref(),
+                                    &last_accepted_snapshot_by_type,
                                 );
-                                last_snapshot = Some(snapshot);
                                 for response in responses {
+                                    let response_type_url = response.type_url.clone();
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
+                                    last_sent_snapshot_by_type
+                                        .insert(response_type_url, Arc::clone(&snapshot));
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
@@ -1170,6 +1316,37 @@ fn resolve_stream_node_id(
             "xDS Node.id cannot change on an established stream: {current} -> {requested}"
         ))),
     }
+}
+
+fn remember_delta_accepted_snapshot(
+    ack_outcome: Option<&AckOutcome>,
+    type_url: &str,
+    last_sent_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    last_accepted_by_type: &mut HashMap<String, Arc<XdsSnapshot>>,
+) {
+    if !matches!(
+        ack_outcome,
+        Some(AckOutcome::Acked | AckOutcome::VersionDrift { .. })
+    ) {
+        return;
+    }
+    if let Some(snapshot) = last_sent_by_type.get(type_url) {
+        last_accepted_by_type.insert(type_url.to_string(), Arc::clone(snapshot));
+    }
+}
+
+fn previous_resources_indexed<'a>(
+    previous: Option<&'a XdsSnapshot>,
+    type_url: &str,
+) -> HashMap<&'a str, &'a super::snapshot::XdsResource> {
+    previous
+        .map(|prev| {
+            prev.resources(type_url)
+                .iter()
+                .map(|resource| (resource.name.as_str(), resource))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn subscription_resources_changed(
@@ -2398,5 +2575,401 @@ mod tests {
         drop(second);
         assert!(server.snapshot_cache.get("node-a").is_none());
         assert!(server.nonce_tracker.is_empty());
+    }
+
+    // ── Delta wire-byte reduction (GAP-2L.2) ──
+    //
+    // True delta xDS only sends resources the client doesn't already have:
+    // - Resources known via `initial_resource_versions` with a matching version
+    //   are omitted (the client already has the same bytes).
+    // - Resources whose previous snapshot version + value match are omitted
+    //   (no change since the last ACKed response for this type URL).
+    // - Explicit re-subscribes still re-flow a fresh copy of the resource.
+
+    #[test]
+    fn delta_response_skips_unchanged_resources_against_previous_snapshot() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        // Update only "admin"; keep "api" identical to provoke wire-byte
+        // reduction on the unchanged resource.
+        let mut next_config = gateway_config_with_services(&["api", "admin"], 1);
+        if let Some(mesh) = next_config.mesh.as_mut() {
+            for service in &mut mesh.services {
+                if service.name == "admin"
+                    && let Some(port) = service.ports.first_mut()
+                {
+                    port.port = 8081;
+                }
+            }
+        }
+        let next_snapshot = server.snapshot_for_config("node-a", &next_config);
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n == "cluster/default/api/8080"),
+            "unchanged resource should be omitted from delta response, got: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("cluster/default/admin/")),
+            "changed resource should appear, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn delta_response_skips_unchanged_resources_against_initial_resource_versions() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let cluster_version = snapshot
+            .resources(super::super::translator::CDS_TYPE_URL)
+            .iter()
+            .find(|r| r.name == cluster_name)
+            .map(|r| r.version.clone())
+            .expect("CDS resource should be present");
+
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), cluster_version)]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        assert!(
+            response.resources.is_empty(),
+            "client-known resource should be omitted on initial delta sync, got: {:?}",
+            response
+                .resources
+                .iter()
+                .map(|r| &r.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn delta_response_includes_resource_with_changed_version_against_initial() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let initial_resource_versions =
+            HashMap::from([(cluster_name.clone(), "v-stale".to_string())]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "stale-version resource should be re-flowed on initial delta sync"
+        );
+    }
+
+    #[test]
+    fn delta_response_resends_explicitly_resubscribed_unchanged_resource() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let next_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: vec![cluster_name.clone()],
+                wildcard: false,
+            },
+            &HashMap::new(),
+            std::slice::from_ref(&cluster_name),
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "explicit re-subscribe should re-flow the resource even when unchanged"
+        );
+    }
+
+    #[test]
+    fn delta_response_resends_explicit_wildcard_resubscribed_unchanged_resources() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        let next_snapshot = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &["*".to_string()],
+            &[],
+        );
+
+        let mut names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "cluster/default/admin/8080".to_string(),
+                "cluster/default/api/8080".to_string(),
+            ],
+            "explicit wildcard re-subscribe should re-flow unchanged resources"
+        );
+    }
+
+    #[test]
+    fn delta_ack_baseline_advances_on_ack_but_not_nack() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let type_url = super::super::translator::CDS_TYPE_URL.to_string();
+        let last_sent = HashMap::from([(type_url.clone(), Arc::clone(&snapshot))]);
+        let mut last_accepted = HashMap::new();
+
+        remember_delta_accepted_snapshot(
+            Some(&AckOutcome::Nacked {
+                message: "invalid cluster".to_string(),
+            }),
+            &type_url,
+            &last_sent,
+            &mut last_accepted,
+        );
+        assert!(
+            last_accepted.is_empty(),
+            "NACKed delta responses must not become the skip baseline"
+        );
+
+        remember_delta_accepted_snapshot(
+            Some(&AckOutcome::Acked),
+            &type_url,
+            &last_sent,
+            &mut last_accepted,
+        );
+        let accepted = last_accepted
+            .get(&type_url)
+            .expect("ACK should promote the last sent snapshot");
+        assert!(Arc::ptr_eq(accepted, &snapshot));
+    }
+
+    #[test]
+    fn delta_response_includes_new_resource_not_in_previous_snapshot() {
+        let server = test_server(gateway_config_with_services(&["api"], 0));
+        let previous =
+            server.snapshot_for_config("node-a", &gateway_config_with_services(&["api"], 0));
+        let next_snapshot = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "billing"], 1),
+        );
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster/default/billing/8080".to_string()],
+            "delta should ship the newly-introduced resource only"
+        );
+    }
+
+    /// Edge case: client reports a malformed (empty-string) version for a known
+    /// resource name in `initial_resource_versions`. The empty string cannot
+    /// match any server-computed per-resource version (which is a non-empty hex
+    /// hash), so the resource must be re-flowed. Spoofing the version field is
+    /// a no-op attack — the client just won't get the resource skipped.
+    #[test]
+    fn delta_response_reflows_resource_when_initial_version_is_empty_string() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), String::new())]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "malformed (empty-string) client version must not skip the resource"
+        );
+    }
+
+    /// Mixed scenario: one resource removed AND one unchanged across snapshots.
+    /// The delta filter must skip the unchanged resource on the response while
+    /// `removed_resources` still surfaces the dropped name — the two paths are
+    /// orthogonal.
+    #[test]
+    fn delta_response_emits_removed_resource_and_skips_unchanged_resource() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        // Drop "admin" entirely; keep "api" identical so it stays unchanged.
+        let next_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_services(&["api"], 0));
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            names.is_empty(),
+            "unchanged resource must be omitted from delta, got: {names:?}"
+        );
+        assert_eq!(
+            response.removed_resources,
+            vec!["cluster/default/admin/8080".to_string()],
+            "removed resource must still be surfaced alongside the delta filter"
+        );
+    }
+
+    /// Defensive guard: even if a malicious or buggy client tries to spoof
+    /// `initial_resource_versions` with a guessed hash that happens to match a
+    /// stale server-computed version (functionally impossible with a 64-bit
+    /// truncation, but check the contract anyway), the server's per-resource
+    /// version is always recomputed from current resource bytes. A client
+    /// claim is honored only when it byte-matches the server's current view,
+    /// so a stale claim cannot suppress a real change.
+    #[test]
+    fn delta_response_reflows_resource_when_content_changes_even_if_client_spoofs_old_version() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let initial_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let old_version = initial_snapshot
+            .resources(super::super::translator::CDS_TYPE_URL)
+            .iter()
+            .find(|r| r.name == cluster_name)
+            .map(|r| r.version.clone())
+            .expect("CDS resource should be present in initial snapshot");
+
+        // Server-side content changes — port flips from 8080 to 8081, which
+        // also renames the cluster. Build a fresh snapshot that carries a
+        // cluster with name `cluster/default/api/8081` AND keep the client
+        // claiming "I already have cluster/default/api/8080 at <old_version>".
+        let mut next_config = gateway_config_with_service(true, 1);
+        if let Some(mesh) = next_config.mesh.as_mut() {
+            for service in &mut mesh.services {
+                if let Some(port) = service.ports.first_mut() {
+                    port.port = 8081;
+                }
+            }
+        }
+        let next_snapshot = server.snapshot_for_config("node-a", &next_config);
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), old_version)]);
+
+        let response = server.delta_response(
+            &next_snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster/default/api/8081".to_string()],
+            "renamed resource must be shipped; client's stale claim for the old name only suppresses the old name (which no longer exists)"
+        );
+        assert_eq!(
+            response.removed_resources,
+            vec![cluster_name],
+            "old name absent from current snapshot must be reported removed even when client claimed a version for it"
+        );
     }
 }
