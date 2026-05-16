@@ -50,7 +50,7 @@ Push tag v* (e.g., v0.2.0)
 
 ## CI Pipeline (ci.yml)
 
-The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
+The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Format, test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation; rerun the latest workflow if a publish was canceled mid-flight.
 
@@ -128,7 +128,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. The shared-types test uses stable because the workflow installs `dtolnay/rust-toolchain@stable` after nightly; keep that ordering if the job is edited. When no eBPF files changed, the job no-ops and reports success.
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed, the job no-ops and reports success.
 
 #### 5. Performance Regression Job
 
@@ -149,7 +149,7 @@ python3 tests/performance/ci_overhead_bench.py \
   --output tests/performance/ci_results/overhead_results.json
 ```
 
-`--overhead-threshold 50` is a percentage threshold: the script fails when measured gateway overhead exceeds 50%.
+`--overhead-threshold 50` is a percentage threshold: the script fails when median gateway overhead across iterations exceeds 50%.
 
 **Failures**:
 - Indicate performance regression issues
