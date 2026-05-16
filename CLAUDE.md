@@ -115,11 +115,11 @@ Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend
 
 ### TLS Rotation
 
-All file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**.
+Most file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**, except for the narrow cases below.
 
 Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply for mesh HTTP/HBONE termination listeners. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config. Frontend cert/key paths still require restart.
 
-Narrow backend carve-out (infra-only until producers wire in): the backend TLS pools partition cache and pool keys by a `|svidg=<generation>` marker, drain old numeric generations on revision bump, and optionally force-drain old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. The consumer task (`spawn_backend_svid_rotation_task` in `src/proxy/mod.rs`) is wired and tested. The producer side — `RotationConfig.revision_tx` (Ferrum-as-issuer) or `SvidFetchHandle::with_revision_tx` (SPIRE-agent workload-API) — must be bound to a clone of `ProxyState.backend_svid_rotation_tx` by the mesh-mode startup that spawns rotation. Until that wiring lands, the channel stays at generation 0, keys carry `|svidg=0`, and no rotation drain fires. Backend CA bundles and operator-supplied backend client cert/key paths remain static startup inputs in all cases.
+Narrow backend carve-out: the `FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH` files are watched for backend client SVID rotation. A validated reload updates the gateway SVID slot, preserves any CP-delivered trust-bundle override, bumps the backend `|svidg=<generation>` marker, drains old backend TLS config caches, restarts active HTTP health probes, and optionally force-drains old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. Lower-level in-memory producers (`RotationConfig.revision_tx` for Ferrum-as-issuer, `SvidFetchHandle::with_revision_tx` for SPIRE-agent workload-API) may also bind to `ProxyState.backend_svid_rotation_tx` in future flows. Backend CA bundles and ordinary operator-supplied backend client cert/key paths remain static startup inputs.
 
 ### Graceful Shutdown
 
