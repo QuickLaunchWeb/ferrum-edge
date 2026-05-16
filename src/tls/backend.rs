@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use reqwest::ClientBuilder;
 use rustls::client::WebPkiServerVerifier;
@@ -45,10 +45,15 @@ pub enum TlsError {
 /// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
 /// in-memory session resumption state across new backend connections instead
 /// of resetting it on every reconnect.
+///
+/// Cache keys MUST be tagged with the backend SVID generation marker (or the
+/// `static` sentinel for operator-supplied certs) via
+/// [`append_backend_svid_generation_key_field`] before calling
+/// [`get_or_try_build`]. Drain operations rely on this contract to scope
+/// invalidation to the rotated generation only.
 #[derive(Clone, Default)]
 pub struct BackendTlsConfigCache {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
-    svid_generation: Arc<AtomicU64>,
 }
 
 impl BackendTlsConfigCache {
@@ -58,31 +63,36 @@ impl BackendTlsConfigCache {
     }
 
     #[allow(dead_code)] // Convenience constructor for callers using default shard sizing.
-    pub fn with_svid_generation(svid_generation: Arc<AtomicU64>) -> Self {
-        Self::with_svid_generation_and_shards(svid_generation, 64)
+    pub fn with_svid_generation(_svid_generation: Arc<AtomicU64>) -> Self {
+        Self::with_svid_generation_and_shards(_svid_generation, 64)
     }
 
-    pub fn with_svid_generation_and_shards(svid_generation: Arc<AtomicU64>, shards: usize) -> Self {
+    pub fn with_svid_generation_and_shards(
+        _svid_generation: Arc<AtomicU64>,
+        shards: usize,
+    ) -> Self {
         Self {
             configs: Arc::new(DashMap::with_shard_amount(shards)),
-            svid_generation,
         }
     }
 
     pub fn drain_svid_generation(&self, generation: u64) {
-        self.configs
-            .retain(|key, _| !backend_tls_pool_key_has_svid_generation(key, generation));
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.configs.retain(|key, _| !matcher.matches(key));
     }
 
+    /// Build or retrieve a cached `ClientConfig` for `key`. Callers MUST have
+    /// already appended the SVID generation marker to `key` — see the
+    /// rustdoc on [`BackendTlsConfigCache`]. A `debug_assert` catches drift
+    /// in tests; release builds skip the check.
     pub fn get_or_try_build<E, F>(&self, key: String, build: F) -> Result<Arc<ClientConfig>, E>
     where
         F: FnOnce() -> Result<ClientConfig, E>,
     {
-        let mut key = key;
-        let svid_generation = self.svid_generation();
-        if !backend_tls_pool_key_has_svid_field(&key) {
-            append_backend_svid_generation_key_field(&mut key, Some(svid_generation));
-        }
+        debug_assert!(
+            backend_tls_pool_key_has_svid_field(&key),
+            "BackendTlsConfigCache::get_or_try_build requires the key to be tagged with `|svidg=...`; call append_backend_svid_generation_key_field before this entry point"
+        );
         if let Some(existing) = self.configs.get(&key) {
             return Ok(existing.clone());
         }
@@ -97,9 +107,35 @@ impl BackendTlsConfigCache {
             }
         }
     }
+}
 
-    pub fn svid_generation(&self) -> u64 {
-        self.svid_generation.load(Ordering::Acquire)
+/// Pre-built matcher for SVID generation pool-key drain checks.
+///
+/// Building the matcher once and reusing it across every key in
+/// `force_drain_svid_generation` / `drain_svid_generation` avoids per-key
+/// `format!` allocations during a rotation drain pass.
+#[derive(Debug, Clone)]
+pub struct SvidGenerationMatcher {
+    /// `"|svidg=<generation>"` — matches keys whose generation segment is the
+    /// final field of the pool key.
+    end_segment: String,
+    /// `"|svidg=<generation>#"` — matches keys whose generation segment is
+    /// followed by a shard separator (`#shard`) at the end.
+    mid_segment: String,
+}
+
+impl SvidGenerationMatcher {
+    pub fn new(generation: u64) -> Self {
+        let end_segment = format!("|svidg={generation}");
+        let mid_segment = format!("{end_segment}#");
+        Self {
+            end_segment,
+            mid_segment,
+        }
+    }
+
+    pub fn matches(&self, key: &str) -> bool {
+        key.ends_with(&self.end_segment) || key.contains(&self.mid_segment)
     }
 }
 
@@ -132,9 +168,13 @@ pub fn backend_tls_pool_key_has_svid_field(key: &str) -> bool {
     key.contains("|svidg=")
 }
 
+/// Convenience wrapper around [`SvidGenerationMatcher`] for one-off matches
+/// (tests and ad-hoc inspection). Production hot paths build a single
+/// `SvidGenerationMatcher::new(generation)` and pass it into
+/// `pool.invalidate_matching` to avoid per-key segment allocation.
+#[allow(dead_code)]
 pub fn backend_tls_pool_key_has_svid_generation(key: &str, svid_generation: u64) -> bool {
-    let segment = format!("|svidg={svid_generation}");
-    key.ends_with(&segment) || key.contains(&format!("{segment}#"))
+    SvidGenerationMatcher::new(svid_generation).matches(key)
 }
 
 /// Append the backend TLS identity fields that partition runtime client caches.
@@ -964,20 +1004,27 @@ mod tests {
         }
     }
 
+    fn tagged_test_key(base: &str, generation: Option<u64>) -> String {
+        let mut key = base.to_string();
+        append_backend_svid_generation_key_field(&mut key, generation);
+        key
+    }
+
     #[test]
     fn backend_tls_config_cache_reuses_built_configs() {
         ensure_crypto_provider();
         let cache = BackendTlsConfigCache::new();
         let builds = AtomicUsize::new(0);
+        let key = tagged_test_key("backend-a", None);
 
         let first = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(key.clone(), || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
             .expect("first config");
         let second = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(key, || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
@@ -995,13 +1042,13 @@ mod tests {
         let builds = AtomicUsize::new(0);
 
         let first = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(tagged_test_key("backend-a", Some(0)), || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
             .expect("first config");
         let same_generation = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(tagged_test_key("backend-a", Some(0)), || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
@@ -1009,7 +1056,7 @@ mod tests {
 
         generation.store(1, Ordering::Release);
         let rotated = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(tagged_test_key("backend-a", Some(1)), || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
@@ -1018,6 +1065,23 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 2);
         assert!(Arc::ptr_eq(&first, &same_generation));
         assert!(!Arc::ptr_eq(&first, &rotated));
+    }
+
+    #[test]
+    fn svid_generation_matcher_anchors_segment_to_end_or_shard() {
+        let matcher = SvidGenerationMatcher::new(42);
+
+        assert!(matcher.matches("backend|443|some|fields|svidg=42"));
+        assert!(matcher.matches("backend|443|some|fields|svidg=42#0"));
+        assert!(matcher.matches("backend|443|some|fields|svidg=42#7"));
+
+        // Different generation: no false positive.
+        assert!(!matcher.matches("backend|443|some|fields|svidg=4"));
+        assert!(!matcher.matches("backend|443|some|fields|svidg=420"));
+        assert!(!matcher.matches("backend|443|some|fields|svidg=static"));
+
+        // Embedded but not anchored at end-or-shard: no false positive.
+        assert!(!matcher.matches("backend|443|svidg=42|some|fields|svidg=static"));
     }
 
     #[test]

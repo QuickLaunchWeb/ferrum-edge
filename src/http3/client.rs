@@ -33,8 +33,8 @@ use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
 use crate::tls::backend::{
-    BackendSvidGeneration, append_backend_tls_pool_key_fields,
-    backend_svid_generation_for_client_cert, backend_tls_pool_key_has_svid_generation,
+    BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,
+    backend_svid_generation_for_client_cert,
 };
 
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
@@ -831,8 +831,8 @@ impl Http3ConnectionPool {
     }
 
     pub fn force_drain_svid_generation(&self, generation: u64) {
-        self.pool
-            .invalidate_matching(|key| backend_tls_pool_key_has_svid_generation(key, generation));
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.pool.invalidate_matching(|key| matcher.matches(key));
     }
 
     fn current_svid_generation(&self) -> u64 {
@@ -942,6 +942,23 @@ impl Http3ConnectionPool {
     }
 
     fn pool_key_with_current_generation(&self, proxy: &Proxy, index: usize) -> String {
+        self.pool_key_with_generation(proxy, index, self.svid_generation_for_proxy(proxy))
+    }
+
+    /// Build a pool key using a pre-snapshotted generation.
+    ///
+    /// Callers that issue multiple key constructions inside a single request
+    /// should snapshot `svid_generation_for_proxy` once at the top and pass it
+    /// in. This avoids redundant `Ordering::Acquire` atomic loads per shard
+    /// and — more importantly — pins the generation across retry attempts so
+    /// a rotation landing mid-request can't fragment the lookup window across
+    /// two generations.
+    fn pool_key_with_generation(
+        &self,
+        proxy: &Proxy,
+        index: usize,
+        svid_generation: Option<u64>,
+    ) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key_with_host_and_generation(
             &mut key,
@@ -949,7 +966,7 @@ impl Http3ConnectionPool {
             proxy.backend_port,
             proxy,
             index,
-            self.svid_generation_for_proxy(proxy),
+            svid_generation,
         );
         key
     }
@@ -1128,6 +1145,15 @@ impl Http3ConnectionPool {
 
         let mut any_request_on_wire = false;
 
+        // Snapshot the SVID generation once at the top of the request so all
+        // pool key constructions (cache probe, slow-path build, retry shards)
+        // see the same value. Pinning the generation across attempts is also
+        // a correctness property: a rotation landing mid-`request()` could
+        // otherwise have the cache probe target `svidg=N` and the retry probe
+        // target `svidg=N+1`, fragmenting lookups across generations and
+        // missing live entries on either side.
+        let svid_generation = self.svid_generation_for_proxy(proxy);
+
         let cached = self.pool.cached_with(|buf| {
             Self::write_pool_key_with_host_and_generation(
                 buf,
@@ -1135,7 +1161,7 @@ impl Http3ConnectionPool {
                 proxy.backend_port,
                 proxy,
                 start,
-                self.svid_generation_for_proxy(proxy),
+                svid_generation,
             )
         });
         let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
@@ -1166,7 +1192,7 @@ impl Http3ConnectionPool {
 
         // Slow path: allocate pool key String for cache miss, error recovery,
         // and new connection creation.
-        let key = self.pool_key_with_current_generation(proxy, start);
+        let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
         // Try cached connection on the selected index first
         if let Some(pooled) = self.pool.cached(&key) {
@@ -1194,7 +1220,7 @@ impl Http3ConnectionPool {
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key =
-                            self.pool_key_with_current_generation(proxy, fallback_index);
+                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request(
@@ -2354,6 +2380,11 @@ impl Http3ConnectionPool {
 
         let mut any_request_on_wire = false;
 
+        // Snapshot the SVID generation once for the whole request. See
+        // `request()` for the rationale (atomic-load amortization plus
+        // generation pinning across retries).
+        let svid_generation = self.svid_generation_for_proxy(proxy);
+
         let cached = self.pool.cached_with(|buf| {
             Self::write_pool_key_with_host_and_generation(
                 buf,
@@ -2361,7 +2392,7 @@ impl Http3ConnectionPool {
                 proxy.backend_port,
                 proxy,
                 start,
-                self.svid_generation_for_proxy(proxy),
+                svid_generation,
             )
         });
         if let Some(pooled) = cached {
@@ -2386,7 +2417,7 @@ impl Http3ConnectionPool {
         }
 
         // Slow path: allocate pool key String
-        let key = self.pool_key_with_current_generation(proxy, start);
+        let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
@@ -2411,7 +2442,7 @@ impl Http3ConnectionPool {
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key =
-                            self.pool_key_with_current_generation(proxy, fallback_index);
+                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request_streaming(

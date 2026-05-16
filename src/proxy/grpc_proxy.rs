@@ -49,9 +49,8 @@ use crate::proxy::headers::{
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache,
+    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
     append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
-    backend_tls_pool_key_has_svid_generation,
 };
 
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
@@ -340,8 +339,8 @@ impl GrpcConnectionPool {
     }
 
     pub fn force_drain_svid_generation(&self, generation: u64) {
-        self.pool
-            .invalidate_matching(|key| backend_tls_pool_key_has_svid_generation(key, generation));
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.pool.invalidate_matching(|key| matcher.matches(key));
     }
 
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.

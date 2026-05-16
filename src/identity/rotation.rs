@@ -47,12 +47,28 @@ pub struct RotationConfig {
     /// Monotonic revision channel bumped after each successful post-initial
     /// rotation. Backend TLS pools subscribe to this to rebuild client identity
     /// configs without restarting.
+    ///
+    /// Production callers should hand in `ProxyState.backend_svid_rotation_tx`
+    /// so the consumer side (`spawn_backend_svid_rotation_task`) observes the
+    /// same channel; otherwise the producer/consumer pair drift and the
+    /// drain plumbing stays dormant. Construct a fresh channel only for unit
+    /// tests that don't have a ProxyState.
     pub revision_tx: watch::Sender<u64>,
 }
 
 impl RotationConfig {
-    pub fn new(ca: SharedCa, spiffe_id: SpiffeId, svid_ttl_secs: u64) -> Self {
-        let (revision_tx, _) = watch::channel(0u64);
+    /// Construct a rotation config with an explicit revision sender.
+    ///
+    /// `revision_tx` is the producer side of the channel
+    /// `ProxyState.backend_svid_rotation_tx` is the consumer of. Pass a
+    /// `.clone()` of the gateway's sender so revision bumps flow into the
+    /// backend pool drain task.
+    pub fn new(
+        ca: SharedCa,
+        spiffe_id: SpiffeId,
+        svid_ttl_secs: u64,
+        revision_tx: watch::Sender<u64>,
+    ) -> Self {
         Self {
             ca,
             spiffe_id,
@@ -61,6 +77,13 @@ impl RotationConfig {
             rotate_at_fraction: 0.5,
             revision_tx,
         }
+    }
+
+    /// Test-only constructor that synthesizes a private channel.
+    #[cfg(test)]
+    pub fn new_isolated(ca: SharedCa, spiffe_id: SpiffeId, svid_ttl_secs: u64) -> Self {
+        let (revision_tx, _) = watch::channel(0u64);
+        Self::new(ca, spiffe_id, svid_ttl_secs, revision_tx)
     }
 
     pub fn revision_receiver(&self) -> watch::Receiver<u64> {
@@ -110,12 +133,8 @@ async fn rotation_main(config: RotationConfig) {
 }
 
 fn bump_revision(revision_tx: &watch::Sender<u64>) -> u64 {
-    let mut next = 0;
-    revision_tx.send_modify(|revision| {
-        *revision = revision.saturating_add(1);
-        next = *revision;
-    });
-    next
+    revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
+    *revision_tx.borrow()
 }
 
 async fn mint_and_install(config: &RotationConfig) -> Result<(), String> {
