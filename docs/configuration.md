@@ -366,7 +366,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` | No | — | PEM trust bundle used to verify mesh SPIFFE peers for gateway-to-mesh TLS |
 | `FERRUM_GATEWAY_SPIFFE_ID` | No | — | Explicit SPIFFE URI fallback when the gateway SVID certificate has no SPIFFE URI SAN |
 | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to client CA bundle for mTLS verification |
-| `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
+| `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only); also bypasses backend SAN allow-list enforcement and logs a warning when an allow-list is configured |
 | `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
 | `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
 | `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
