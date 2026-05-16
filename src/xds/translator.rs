@@ -28,10 +28,21 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     resources.extend(translate_cds(slice));
     resources.extend(translate_eds(slice));
     resources.extend(translate_sds(slice));
-    let version = content_version(&slice.version, &resources);
+    // Per-resource versions are content-derived so two snapshots with the
+    // same resource bytes carry identical resource versions. This is the
+    // basis for delta xDS wire-byte reduction: clients that report the
+    // resource via `initial_resource_versions` (or that previously ACKed it on
+    // this stream) get the resource skipped on the next response when its
+    // content hasn't changed. The aggregate `snapshot.version` still
+    // changes whenever any resource bytes change.
+    //
+    // The per-resource hash deliberately excludes `slice.version` so a slice
+    // bumping its base version (e.g. on a `loaded_at` timestamp tick) does
+    // not invalidate every cached resource version on the client side.
     for resource in &mut resources {
-        resource.version = version.clone();
+        resource.version = per_resource_version(resource);
     }
+    let version = content_version(&slice.version, &resources);
     XdsSnapshot::new(slice.node_id.clone(), version, resources)
 }
 
@@ -218,4 +229,21 @@ fn content_version(base_version: &str, resources: &[XdsResource]) -> String {
     }
     let digest = hex::encode(hasher.finalize());
     format!("{base_version}:{}", &digest[..16])
+}
+
+/// Per-resource version: first 8 bytes (16 hex chars) of
+/// `SHA-256(type_url || 0x00 || name || 0x00 || value)`. Truncation keeps the
+/// version field small on the wire; with ~10k resources per type URL the
+/// birthday-bound collision probability is ~3e-12. On a live stream, the
+/// delta-response filter pairs this version check with a byte-equality check
+/// on `value` against the previous ACKed snapshot before skipping a resource;
+/// reconnect `initial_resource_versions` skips by the reported version match.
+fn per_resource_version(resource: &XdsResource) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(resource.type_url.as_bytes());
+    hasher.update([0]);
+    hasher.update(resource.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(&resource.value);
+    hex::encode(&hasher.finalize()[..8])
 }
