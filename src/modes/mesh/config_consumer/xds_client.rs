@@ -851,6 +851,7 @@ fn reverse_translate(
         // ADS resources consumed here. xDS deployments use the runtime env
         // fallback until MeshConfig translation is wired.
         outbound_traffic_policy: None,
+        sidecar_egress_scope: None,
     })
 }
 

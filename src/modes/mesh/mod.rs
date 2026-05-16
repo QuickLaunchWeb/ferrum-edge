@@ -243,6 +243,10 @@ pub struct MeshRuntimeConfig {
     /// in `MeshConfig` but the slice projection ignores them — behavior is
     /// identical to today, preserving safe-rollout semantics.
     pub sidecar_enforced: bool,
+    /// When `true`, compute Sidecar egress diagnostics while keeping the
+    /// unenforced slice output. Sourced from
+    /// `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` (default `false`).
+    pub sidecar_enforced_dry_run: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -404,6 +408,7 @@ impl MeshRuntimeConfig {
             outbound_traffic_policy,
             outbound_registry_reject_status,
             sidecar_enforced: env_config.mesh_sidecar_enforced,
+            sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
         })
     }
 
@@ -482,6 +487,7 @@ impl MeshRuntimeConfig {
                 .collect(),
             cluster_domain: self.cluster_domain.clone(),
             enforce_sidecar_egress: self.sidecar_enforced,
+            sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
         }
     }
 }
@@ -1843,6 +1849,7 @@ fn inject_mesh_global_plugins(
                 "registry": registry,
                 "outbound_listen_ports": outbound_listen_ports,
                 "reject_status": runtime.outbound_registry_reject_status,
+                "namespace": runtime.namespace.clone(),
             });
             ensure_global_plugin(
                 config,
@@ -3493,6 +3500,7 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3588,6 +3596,7 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
         }
     }
 
@@ -4551,6 +4560,7 @@ mod tests {
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
+            sidecar_egress_scope: None,
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);

@@ -79,6 +79,8 @@ pub struct MeshGrpcServer {
     /// per-subscriber slice request so DP-facing slices honor the operator's
     /// rollout decision. Default `false` preserves existing CP behavior.
     sidecar_enforced: bool,
+    /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
+    sidecar_enforced_dry_run: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
     cluster_domain: String,
@@ -92,6 +94,7 @@ pub struct MeshGrpcServerBuilder {
     expected_issuer: String,
     namespace: String,
     sidecar_enforced: bool,
+    sidecar_enforced_dry_run: bool,
     cluster_domain: String,
 }
 
@@ -105,6 +108,7 @@ impl MeshGrpcServerBuilder {
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
             namespace: default_namespace(),
             sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
@@ -134,6 +138,11 @@ impl MeshGrpcServerBuilder {
         self
     }
 
+    pub fn sidecar_enforced_dry_run(mut self, sidecar_enforced_dry_run: bool) -> Self {
+        self.sidecar_enforced_dry_run = sidecar_enforced_dry_run;
+        self
+    }
+
     pub fn cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
         self
@@ -151,6 +160,7 @@ impl MeshGrpcServerBuilder {
                 registry: self.registry,
                 namespace: self.namespace,
                 sidecar_enforced: self.sidecar_enforced,
+                sidecar_enforced_dry_run: self.sidecar_enforced_dry_run,
                 cluster_domain: self.cluster_domain,
             },
             tx_clone,
@@ -345,7 +355,8 @@ impl MeshConfigSync for MeshGrpcServer {
             inner.labels,
         )
         .with_cluster_domain(self.cluster_domain.clone())
-        .with_enforce_sidecar_egress(self.sidecar_enforced);
+        .with_enforce_sidecar_egress(self.sidecar_enforced)
+        .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.

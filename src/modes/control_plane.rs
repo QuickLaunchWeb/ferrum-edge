@@ -201,6 +201,7 @@ pub async fn run(
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
             .sidecar_enforced(env_config.mesh_sidecar_enforced)
+            .sidecar_enforced_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .cluster_domain(env_config.k8s_cluster_domain.clone())
             .build();
     let xds_server = if env_config.xds_enabled {
@@ -215,6 +216,7 @@ pub async fn run(
                 env_config.xds_stream_channel_capacity,
                 env_config.mesh_sidecar_enforced,
             )
+            .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone()),
         )
     } else {

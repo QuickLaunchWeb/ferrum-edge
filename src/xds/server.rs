@@ -80,6 +80,8 @@ pub struct XdsAdsServer {
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
     sidecar_enforced: bool,
+    /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
+    sidecar_enforced_dry_run: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
     cluster_domain: String,
@@ -211,8 +213,14 @@ impl XdsAdsServer {
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::default()),
             sidecar_enforced,
+            sidecar_enforced_dry_run: false,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
+    }
+
+    pub fn with_sidecar_enforcement_dry_run(mut self, dry_run: bool) -> Self {
+        self.sidecar_enforced_dry_run = dry_run;
+        self
     }
 
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
@@ -245,7 +253,8 @@ impl XdsAdsServer {
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
             .with_cluster_domain(self.cluster_domain.clone())
-            .with_enforce_sidecar_egress(self.sidecar_enforced);
+            .with_enforce_sidecar_egress(self.sidecar_enforced)
+            .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run);
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();

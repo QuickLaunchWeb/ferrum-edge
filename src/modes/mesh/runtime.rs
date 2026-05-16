@@ -5,12 +5,93 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use serde::Serialize;
 use tokio::sync::{Notify, watch};
+use tracing::{info, warn};
 
-use crate::modes::mesh::slice::MeshSlice;
+use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
+
+static MESH_EGRESS_SCOPE_STATE: OnceLock<MeshEgressScopeState> = OnceLock::new();
+
+pub fn mesh_egress_scope_state() -> &'static MeshEgressScopeState {
+    MESH_EGRESS_SCOPE_STATE.get_or_init(MeshEgressScopeState::new)
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MeshEgressScopeHealth {
+    pub sidecar_admitted_services: u64,
+    pub sidecar_denied_services: u64,
+}
+
+/// Process-local operator surface for the active mesh egress scope.
+///
+/// Updated only when a mesh slice is installed, never from the request path.
+pub struct MeshEgressScopeState {
+    current: Arc<ArcSwap<Option<MeshEgressScopeSnapshot>>>,
+    sidecar_admitted_services: AtomicU64,
+    sidecar_denied_services: AtomicU64,
+    dry_run_denials_active: AtomicBool,
+}
+
+impl MeshEgressScopeState {
+    fn new() -> Self {
+        Self {
+            current: Arc::new(ArcSwap::new(Arc::new(None))),
+            sidecar_admitted_services: AtomicU64::new(0),
+            sidecar_denied_services: AtomicU64::new(0),
+            dry_run_denials_active: AtomicBool::new(false),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<MeshEgressScopeSnapshot> {
+        self.current.load_full().as_ref().clone()
+    }
+
+    pub fn health(&self) -> MeshEgressScopeHealth {
+        MeshEgressScopeHealth {
+            sidecar_admitted_services: self.sidecar_admitted_services.load(Ordering::Relaxed),
+            sidecar_denied_services: self.sidecar_denied_services.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn install_from_slice(&self, slice: &MeshSlice) {
+        let snapshot = slice.sidecar_egress_scope.clone();
+        let admitted = snapshot
+            .as_ref()
+            .map(|scope| scope.sidecar_admitted_services as u64)
+            .unwrap_or(0);
+        let denied = snapshot
+            .as_ref()
+            .map(|scope| scope.sidecar_denied_services as u64)
+            .unwrap_or(0);
+        self.sidecar_admitted_services
+            .store(admitted, Ordering::Relaxed);
+        self.sidecar_denied_services
+            .store(denied, Ordering::Relaxed);
+
+        let dry_run_denied = snapshot
+            .as_ref()
+            .is_some_and(|scope| scope.dry_run && scope.sidecar_denied_services > 0);
+        let was_active = self
+            .dry_run_denials_active
+            .swap(dry_run_denied, Ordering::AcqRel);
+        if dry_run_denied && !was_active {
+            warn!(
+                sidecar_admitted_services = admitted,
+                sidecar_denied_services = denied,
+                "Sidecar egress dry-run would deny services; traffic is still admitted"
+            );
+        } else if !dry_run_denied && was_active {
+            info!("Sidecar egress dry-run denials recovered");
+        }
+
+        self.current.store(Arc::new(snapshot));
+    }
+}
 
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]
@@ -49,6 +130,7 @@ impl MeshRuntimeState {
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.
     pub fn install_slice(&self, slice: MeshSlice) {
+        mesh_egress_scope_state().install_from_slice(&slice);
         self.current.store(Arc::new(Some(slice)));
         self.revision_tx.send_modify(|revision| *revision += 1);
         let was_first = self.has_first.swap(true, Ordering::AcqRel);

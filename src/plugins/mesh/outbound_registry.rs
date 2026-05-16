@@ -87,10 +87,17 @@ pub struct OutboundRegistryConfig {
     /// every HTTP-family request that reaches this plugin.
     #[serde(default)]
     pub outbound_listen_ports: Vec<u16>,
+    /// Mesh namespace label used by the Prometheus decision counter.
+    #[serde(default = "default_namespace_label")]
+    pub namespace: String,
 }
 
 fn default_reject_status() -> u16 {
     502
+}
+
+fn default_namespace_label() -> String {
+    crate::config::types::default_namespace()
 }
 
 #[derive(Debug)]
@@ -118,6 +125,7 @@ pub struct OutboundRegistry {
     wildcard_any_port_suffixes: Vec<String>,
     outbound_listen_ports: Vec<u16>,
     reject_status: u16,
+    namespace: String,
 }
 
 impl OutboundRegistry {
@@ -182,6 +190,7 @@ impl OutboundRegistry {
             wildcard_any_port_suffixes,
             outbound_listen_ports,
             reject_status: parsed.reject_status,
+            namespace: parsed.namespace,
         })
     }
 
@@ -203,7 +212,7 @@ impl OutboundRegistry {
     /// the steady-state cost is two `HashSet::contains` reads plus an
     /// in-place lowercase copy (no heap allocation after the first call on
     /// each worker thread).
-    fn contains(&self, host: &str, port: Option<u16>) -> bool {
+    pub(crate) fn contains(&self, host: &str, port: Option<u16>) -> bool {
         HOST_NORMALISE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             buf.clear();
@@ -246,6 +255,17 @@ impl OutboundRegistry {
             || ctx
                 .frontend_listen_port
                 .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())
+    }
+
+    fn record_decision(&self, host: &str, decision: &'static str) {
+        HOST_NORMALISE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(host.len());
+            normalise_request_host_into(host, &mut buf);
+            crate::plugins::prometheus_metrics::global_registry()
+                .record_mesh_outbound_registry_decision(&self.namespace, buf.as_str(), decision);
+        });
     }
 }
 
@@ -391,10 +411,14 @@ impl Plugin for OutboundRegistry {
         // into `host` before plugin execution, so one lookup covers all
         // HTTP-family frontends.
         let Some(host_header) = ctx.headers.get("host") else {
+            self.record_decision("<missing>", "deny");
             return reject(self.reject_status, "host header required");
         };
         let (host, port) = split_host_header(host_header);
-        if !self.contains(host, port) {
+        if self.contains(host, port) {
+            self.record_decision(host, "admit");
+        } else {
+            self.record_decision(host, "deny");
             return reject(
                 self.reject_status,
                 "destination not in mesh registry (REGISTRY_ONLY policy)",
@@ -404,7 +428,7 @@ impl Plugin for OutboundRegistry {
     }
 }
 
-fn split_host_header(value: &str) -> (&str, Option<u16>) {
+pub(crate) fn split_host_header(value: &str) -> (&str, Option<u16>) {
     // IPv6-bracketed literals: `[::1]:8080` — split on `]:`.
     if value.starts_with('[')
         && let Some(end) = value.rfind("]:")
@@ -687,6 +711,45 @@ mod tests {
         ctx.headers = headers;
         let result = plugin.on_request_received(&mut ctx).await;
         assert!(matches!(result, PluginResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn records_admit_and_deny_decision_metrics() {
+        let plugin = OutboundRegistry::new(&json!({
+            "namespace": "gap2n-metrics",
+            "registry": ["reviews.svc:9090"],
+        }))
+        .expect("valid registry");
+
+        let mut admitted = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        admitted.headers = HashMap::from([("host".to_string(), "reviews.svc:9090".to_string())]);
+        assert!(matches!(
+            plugin.on_request_received(&mut admitted).await,
+            PluginResult::Continue
+        ));
+
+        let mut denied = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        denied.headers = HashMap::from([("host".to_string(), "unknown.svc:9090".to_string())]);
+        assert!(matches!(
+            plugin.on_request_received(&mut denied).await,
+            PluginResult::Reject { .. }
+        ));
+
+        let rendered = crate::plugins::prometheus_metrics::global_registry().render_uncached();
+        assert!(rendered.contains(
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"reviews.svc\",decision=\"admit\""
+        ));
+        assert!(rendered.contains(
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"unknown.svc\",decision=\"deny\""
+        ));
     }
 
     #[tokio::test]

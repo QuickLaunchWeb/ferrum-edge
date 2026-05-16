@@ -97,6 +97,29 @@ pub struct HboneRelayFailureKey {
     pub error_class: &'static str,
 }
 
+/// Mesh outbound registry admit/deny counters for one namespace/host pair.
+pub struct MeshOutboundRegistryDecisionCounters {
+    pub admit: TimestampedCounter,
+    pub deny: TimestampedCounter,
+}
+
+impl MeshOutboundRegistryDecisionCounters {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            admit: TimestampedCounter::new(epoch),
+            deny: TimestampedCounter::new(epoch),
+        }
+    }
+
+    fn increment(&self, decision: &'static str, epoch: Instant) {
+        match decision {
+            "admit" => self.admit.increment(epoch),
+            "deny" => self.deny.increment(epoch),
+            _ => {}
+        }
+    }
+}
+
 /// Map a `DisconnectCause` variant to its snake_case label, reusing static
 /// strings so hot-path label values cost nothing to copy.
 fn disconnect_cause_label(cause: Option<super::DisconnectCause>) -> &'static str {
@@ -259,6 +282,9 @@ pub struct MetricsRegistry {
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
+    /// Mesh outbound registry decisions keyed by mesh namespace and host.
+    pub mesh_outbound_registry_decisions:
+        DashMap<Arc<str>, DashMap<Arc<str>, MeshOutboundRegistryDecisionCounters>>,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Cached render output with generation timestamp
@@ -299,6 +325,7 @@ impl MetricsRegistry {
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
+            mesh_outbound_registry_decisions: DashMap::new(),
             node_agent_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -398,6 +425,32 @@ impl MetricsRegistry {
     pub fn set_node_agent_metrics(&self, metrics: Arc<NodeAgentMetrics>) {
         self.node_agent_metrics.store(Arc::new(Some(metrics)));
         self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn record_mesh_outbound_registry_decision(
+        &self,
+        mesh_namespace: &str,
+        host: &str,
+        decision: &'static str,
+    ) {
+        if let Some(hosts) = self.mesh_outbound_registry_decisions.get(mesh_namespace)
+            && let Some(counters) = hosts.get(host)
+        {
+            counters.increment(decision, self.epoch);
+            self.maybe_invalidate_cache();
+            return;
+        }
+
+        let hosts = self
+            .mesh_outbound_registry_decisions
+            .entry(Arc::from(mesh_namespace))
+            .or_default();
+        hosts
+            .entry(Arc::from(host))
+            .or_insert_with(|| MeshOutboundRegistryDecisionCounters::new(self.epoch))
+            .increment(decision, self.epoch);
+
+        self.maybe_invalidate_cache();
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
@@ -617,6 +670,12 @@ impl MetricsRegistry {
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
             + self.hbone_relay_failure_counter.len() * 240
+            + self
+                .mesh_outbound_registry_decisions
+                .iter()
+                .map(|entry| entry.value().len())
+                .sum::<usize>()
+                * 320
             + if self.node_agent_metrics.load().is_some() {
                 512
             } else {
@@ -841,6 +900,34 @@ impl MetricsRegistry {
                     "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
                     proxy_id, key.direction, error_class, ns_label, count
                 ));
+            }
+        }
+
+        if !self.mesh_outbound_registry_decisions.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions by destination host.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_outbound_registry_decisions_total counter\n");
+            for namespace_entry in self.mesh_outbound_registry_decisions.iter() {
+                let mesh_namespace = escape_label_value(namespace_entry.key().as_ref());
+                for host_entry in namespace_entry.value().iter() {
+                    let host = escape_label_value(host_entry.key().as_ref());
+                    let counters = host_entry.value();
+                    let admit = counters.admit.value.load(Ordering::Relaxed);
+                    if admit > 0 {
+                        output.push_str(&format!(
+                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"admit\"{}}} {}\n",
+                            mesh_namespace, host, ns_label, admit
+                        ));
+                    }
+                    let deny = counters.deny.value.load(Ordering::Relaxed);
+                    if deny > 0 {
+                        output.push_str(&format!(
+                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"deny\"{}}} {}\n",
+                            mesh_namespace, host, ns_label, deny
+                        ));
+                    }
+                }
             }
         }
 

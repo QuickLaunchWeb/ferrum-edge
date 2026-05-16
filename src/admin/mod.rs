@@ -39,7 +39,7 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
@@ -531,6 +531,17 @@ pub async fn handle_admin_request(
             });
         }
 
+        if state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
+            || state.mode == "mesh"
+        {
+            health_status["mesh"] = json!({
+                "egress_scope": crate::modes::mesh::runtime::mesh_egress_scope_state().health()
+            });
+        }
+
         if !startup_ready {
             health_status["status"] = json!("starting");
             return Ok(json_response(
@@ -824,6 +835,12 @@ pub async fn handle_admin_request(
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
 
+        // Mesh egress-scope operability
+        (Method::GET, ["mesh", "egress-scope"]) => handle_mesh_egress_scope_get(&state).await,
+        (Method::POST, ["mesh", "egress-scope", "test"]) => {
+            handle_mesh_egress_scope_test(&state, &body_bytes).await
+        }
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -849,6 +866,195 @@ pub async fn handle_admin_request(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
         )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MeshEgressScopeTestRequest {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+async fn handle_mesh_egress_scope_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(proxy_state) = state.proxy_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No proxy state available"}),
+        ));
+    };
+    let Some(scope) = current_mesh_egress_scope(proxy_state) else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "namespace": proxy_state.env_config.namespace,
+            "scope": scope,
+            "health": crate::modes::mesh::runtime::mesh_egress_scope_state().health(),
+        }),
+    ))
+}
+
+async fn handle_mesh_egress_scope_test(
+    state: &AdminState,
+    body_bytes: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(proxy_state) = state.proxy_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No proxy state available"}),
+        ));
+    };
+    let Some(scope) = current_mesh_egress_scope(proxy_state) else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    let candidate: MeshEgressScopeTestRequest = match serde_json::from_slice(body_bytes) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid JSON body: {e}")}),
+            ));
+        }
+    };
+    let host = candidate.host.trim();
+    if host.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "host is required"}),
+        ));
+    }
+
+    let (host, parsed_port) = crate::plugins::mesh::outbound_registry::split_host_header(host);
+    let port = candidate.port.or(parsed_port);
+    if port.is_some_and(|port| port == 0) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "port must be between 1 and 65535"}),
+        ));
+    }
+    let registry = match crate::plugins::mesh::outbound_registry::OutboundRegistry::new(&json!({
+        "registry": &scope.known_destinations,
+    })) {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::error!("failed to build mesh egress-scope test registry: {}", e);
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to build mesh egress-scope registry"}),
+            ));
+        }
+    };
+    let allowed = registry.contains(host, port);
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "allowed": allowed,
+            "decision": if allowed { "admit" } else { "deny" },
+            "host": host,
+            "port": port,
+            "dry_run": scope.dry_run,
+        }),
+    ))
+}
+
+fn current_mesh_egress_scope(
+    proxy_state: &ProxyState,
+) -> Option<crate::modes::mesh::slice::MeshEgressScopeSnapshot> {
+    let config = proxy_state.config.load_full();
+    let mesh = config.mesh.as_ref()?;
+    if let Some(scope) = crate::modes::mesh::runtime::mesh_egress_scope_state().snapshot() {
+        return Some(scope);
+    }
+    Some(mesh_config_egress_scope_snapshot(
+        mesh,
+        &proxy_state.env_config.namespace,
+        &proxy_state.env_config.k8s_cluster_domain,
+        proxy_state.env_config.mesh_sidecar_enforced,
+        proxy_state.env_config.mesh_sidecar_enforced_dry_run,
+    ))
+}
+
+fn mesh_config_egress_scope_snapshot(
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    namespace: &str,
+    cluster_domain: &str,
+    sidecar_enforced: bool,
+    dry_run: bool,
+) -> crate::modes::mesh::slice::MeshEgressScopeSnapshot {
+    use crate::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot, MeshSlice};
+
+    let scope_slice = MeshSlice {
+        namespace: namespace.to_string(),
+        workloads: mesh.workloads.clone(),
+        services: mesh.services.clone(),
+        service_entries: mesh.service_entries.clone(),
+        outbound_traffic_policy: mesh.outbound_traffic_policy,
+        ..MeshSlice::default()
+    };
+    let services = mesh
+        .services
+        .iter()
+        .map(|service| {
+            let mut hosts = vec![
+                service.name.clone(),
+                format!("{}.{}", service.name, service.namespace),
+                format!("{}.{}.svc", service.name, service.namespace),
+                format!(
+                    "{}.{}.svc.{}",
+                    service.name, service.namespace, cluster_domain
+                ),
+            ];
+            hosts.sort();
+            hosts.dedup();
+            let mut ports: Vec<u16> = service.ports.iter().map(|port| port.port).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            MeshEgressScopeResource {
+                namespace: service.namespace.clone(),
+                name: service.name.clone(),
+                hosts,
+                ports,
+            }
+        })
+        .collect();
+    let service_entries = mesh
+        .service_entries
+        .iter()
+        .map(|entry| {
+            let mut hosts = entry.hosts.clone();
+            hosts.sort();
+            hosts.dedup();
+            let mut ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            MeshEgressScopeResource {
+                namespace: entry.namespace.clone(),
+                name: entry.name.clone(),
+                hosts,
+                ports,
+            }
+        })
+        .collect();
+
+    MeshEgressScopeSnapshot {
+        sidecar_enforced,
+        dry_run,
+        sidecar_applied: sidecar_enforced && !dry_run,
+        sidecar_admitted_services: mesh.services.len(),
+        sidecar_denied_services: 0,
+        services,
+        service_entries,
+        known_destinations: scope_slice.build_known_destinations(cluster_domain),
     }
 }
 

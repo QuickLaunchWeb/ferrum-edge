@@ -8636,6 +8636,7 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             cluster_domain: "cluster.local".to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and
