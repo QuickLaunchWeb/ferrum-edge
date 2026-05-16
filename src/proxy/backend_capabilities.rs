@@ -146,8 +146,9 @@ fn mark_record_h2_tls_unsupported(record: &mut BackendCapabilityRecord) {
     // operators can see "h1 only" when eyeballing the registry.
     record.plain_http.h1 = ProtocolSupport::Supported;
     record.last_probe_at_unix_secs = now_unix_secs();
-    record.last_probe_error =
-        Some("H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path".to_string());
+    record.last_probe_error = Some(
+        "H2/TLS classified H1-only after ALPN-negotiated HTTP/1.1 on request path".to_string(),
+    );
 }
 
 #[derive(Debug)]
@@ -241,7 +242,12 @@ impl BackendCapabilityRegistry {
     /// requests so they go straight to reqwest. The gRPC h2 transport
     /// bucket is downgraded in lockstep since the same ALPN observation
     /// is the signal for both. If the target has no cached record yet,
-    /// this creates an H1-only record from the observed fallback.
+    /// this creates an initial H1-only record from the observed fallback;
+    /// a later active refresh can overwrite it if the backend changes.
+    ///
+    /// Returns `true` when the registry was mutated (including creation of
+    /// that initial H1-only record) and `false` when the key was already
+    /// marked H2/TLS-unsupported.
     pub fn mark_h2_tls_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) -> bool {
         let key = capability_key_for_proxy_target(proxy, target);
         match self.entries.entry(key) {

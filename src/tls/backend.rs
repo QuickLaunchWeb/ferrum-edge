@@ -122,6 +122,15 @@ pub fn backend_tls_server_name<'a>(tls: &'a BackendTlsConfig, host: &'a str) -> 
     tls.sni.as_deref().unwrap_or(host)
 }
 
+/// Return an owned rustls backend server name for pool-backed TLS handshakes.
+pub fn backend_tls_server_name_owned(
+    tls: &BackendTlsConfig,
+    host: &str,
+) -> Result<rustls::pki_types::ServerName<'static>, rustls::pki_types::InvalidDnsNameError> {
+    rustls::pki_types::ServerName::try_from(backend_tls_server_name(tls, host))
+        .map(|server_name| server_name.to_owned())
+}
+
 #[derive(Debug)]
 enum BackendServerVerifier {
     WebPki(Arc<WebPkiServerVerifier>),
@@ -831,6 +840,15 @@ mod tests {
             backend_tls_server_name(&tls, "connect.mesh.internal"),
             "service.mesh.internal"
         );
+    }
+
+    #[test]
+    fn backend_tls_server_name_owned_honors_sni_override() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("service.mesh.internal".to_string());
+        let server_name = backend_tls_server_name_owned(&tls, "connect.mesh.internal").unwrap();
+
+        assert_eq!(server_name.to_str(), "service.mesh.internal");
     }
 
     fn verify_backend_server_cert(

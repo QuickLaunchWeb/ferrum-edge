@@ -611,6 +611,41 @@ async fn dispatch_plain<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    if proxy.resolved_tls.sni.is_some() {
+        let backend_resolved_ip =
+            resolve_cross_protocol_backend_ip(state, proxy, upstream_target).await;
+        warn!(
+            proxy_id = %proxy.id,
+            backend_tls_sni = ?proxy.resolved_tls.sni,
+            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
+        );
+        record_backend_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            upstream_target,
+            cb_target_key,
+            502,
+            false,
+            cb_is_half_open_probe,
+            backend_start.elapsed(),
+        );
+        let mut outcome = write_error(
+            stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway"}"#,
+            backend_start,
+            raw_prebuffered_body_bytes,
+        )
+        .await?;
+        outcome.backend_target_url = Some(strip_query_from_backend_url(backend_url));
+        outcome.backend_resolved_ip = backend_resolved_ip;
+        outcome.error_class = Some(ErrorClass::RequestError);
+        return Ok(outcome);
+    }
+
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(c) => c,
         Err(e) => {

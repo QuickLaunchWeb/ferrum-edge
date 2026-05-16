@@ -297,19 +297,17 @@ impl Http2PoolManager {
         connect_started: Instant,
         connect_timeout: Duration,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
-        let tls_server_name =
-            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let server_name = ServerName::try_from(tls_server_name)
-            .map(|name| name.to_owned())
-            .map_err(|e| Http2PoolError::BackendUnavailable {
-                message: format!("Invalid server name: {}", e),
-                source: Some(BackendUnavailableSource::InvalidDnsName),
-            })?;
+        let server_name =
+            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
+                |e| Http2PoolError::BackendUnavailable {
+                    message: format!("Invalid server name: {}", e),
+                    source: Some(BackendUnavailableSource::InvalidDnsName),
+                },
+            )?;
 
         let Some(remaining) =
             crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
