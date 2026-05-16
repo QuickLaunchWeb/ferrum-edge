@@ -538,8 +538,10 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec,
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 

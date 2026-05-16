@@ -236,7 +236,7 @@ impl SpecExpose {
                     error = %e,
                     "spec_expose: failed to fetch spec document"
                 );
-                let mut headers = HashMap::new();
+                let mut headers = HashMap::with_capacity(1);
                 headers.insert("content-type".to_string(), "application/json".to_string());
                 PluginResult::Reject {
                     status_code: 502,
@@ -253,7 +253,7 @@ impl SpecExpose {
                 upstream_status = status,
                 "spec_expose: upstream returned non-success status"
             );
-            let mut headers = HashMap::new();
+            let mut headers = HashMap::with_capacity(1);
             headers.insert("content-type".to_string(), "application/json".to_string());
             return Err(PluginResult::Reject {
                 status_code: 502,
@@ -282,7 +282,7 @@ impl SpecExpose {
                 error = %e,
                 "spec_expose: failed to read spec response body"
             );
-            let mut headers = HashMap::new();
+            let mut headers = HashMap::with_capacity(1);
             headers.insert("content-type".to_string(), "application/json".to_string());
             PluginResult::Reject {
                 status_code: 502,

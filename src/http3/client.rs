@@ -722,6 +722,10 @@ impl PoolManager for Http3PoolManager {
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
     }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::Http3)
+    }
 }
 
 impl Http3ConnectionPool {

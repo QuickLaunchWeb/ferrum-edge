@@ -212,6 +212,10 @@ impl HboneConnectionPool {
         Ok(())
     }
 
+    pub fn pool_size(&self) -> usize {
+        self.entries.iter().map(|entry| entry.value().len()).sum()
+    }
+
     pub async fn get_tunnel(
         &self,
         proxy: &Proxy,
@@ -394,11 +398,19 @@ impl HboneConnectionPool {
         )
         .await
         {
-            Ok(Ok(sender)) => sender,
+            Ok(Ok(sender)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_handshake(crate::runtime_metrics::PoolKind::Hbone);
+                sender
+            }
             Ok(Err(err)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
                 return Err(err);
             }
             Err(_) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
                 return Err(HbonePoolError::ConnectStream {
                     authority,
                     message: format!(
@@ -411,7 +423,7 @@ impl HboneConnectionPool {
         self.entries
             .entry(key.to_string())
             .and_modify(|entries| {
-                prune_pool_entries(entries);
+                record_hbone_evictions(prune_pool_entries(entries));
                 entries.push(HbonePoolEntry {
                     sender: sender.clone(),
                     last_used_at: Instant::now(),
@@ -421,6 +433,7 @@ impl HboneConnectionPool {
                 if entries.len() > max_entries {
                     let overflow = entries.len() - max_entries;
                     entries.drain(0..overflow);
+                    record_hbone_evictions(overflow);
                 }
             })
             .or_insert_with(|| {
@@ -439,7 +452,7 @@ impl HboneConnectionPool {
 
     fn cached_sender(&self, key: &str, max_entries: usize) -> Option<CachedSender> {
         let mut entries = self.entries.get_mut(key)?;
-        prune_pool_entries(&mut entries);
+        record_hbone_evictions(prune_pool_entries(&mut entries));
         let mut pending = None;
         let mut pending_idx = None;
         let mut idx = 0;
@@ -453,6 +466,7 @@ impl HboneConnectionPool {
                 }
                 Some(Err(_)) => {
                     entries.remove(idx);
+                    record_hbone_evictions(1);
                     continue;
                 }
                 None => {
@@ -518,7 +532,7 @@ impl HboneConnectionPool {
         }
 
         self.entries.retain(|_, entries| {
-            prune_pool_entries(entries);
+            record_hbone_evictions(prune_pool_entries(entries));
             !entries.is_empty()
         });
         self.creation_locks.retain(|key, lock| {
@@ -897,7 +911,8 @@ fn current_svid_identity(
     Ok((bundle.spiffe_id.clone(), svid_fingerprint(bundle)?))
 }
 
-fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) {
+fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
+    let before = entries.len();
     entries.retain(|entry| {
         !entry_idle_expired(
             entry.last_used_at,
@@ -905,6 +920,12 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) {
             Instant::now(),
         )
     });
+    before.saturating_sub(entries.len())
+}
+
+fn record_hbone_evictions(count: usize) {
+    crate::runtime_metrics::global_ref()
+        .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
 fn entry_idle_expired(last_used_at: Instant, idle_timeout_seconds: u64, now: Instant) -> bool {
