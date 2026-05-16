@@ -1253,6 +1253,10 @@ pub struct MeshConfig {
     /// not appear in the slice-derived known-destinations registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+    /// Operator-defined ECDS resources served by the ADS translator as
+    /// `envoy.config.core.v3.TypedExtensionConfig` payloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_configs: Vec<crate::modes::mesh::slice::MeshExtensionConfig>,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -1280,6 +1284,7 @@ impl Default for MeshConfig {
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
+            extension_configs: Vec::new(),
         }
     }
 }

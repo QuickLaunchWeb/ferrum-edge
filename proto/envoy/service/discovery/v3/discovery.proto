@@ -108,3 +108,12 @@ message ClusterLoadAssignment {
 message Secret {
   string name = 1;
 }
+
+// ECDS payload: envoy.config.core.v3.TypedExtensionConfig minimal shim.
+// `name` identifies the extension config; `typed_config` is an opaque inner
+// payload (operator-defined `type_url` + bytes). xDS clients deserialize the
+// outer message, then dispatch based on `typed_config.type_url`.
+message TypedExtensionConfig {
+  string name = 1;
+  Any typed_config = 2;
+}
