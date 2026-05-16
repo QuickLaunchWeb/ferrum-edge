@@ -117,7 +117,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
 
 #### 5. Performance Regression Job
 
@@ -146,7 +146,7 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. All CI binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build runs on the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain; it does not use `cross`.
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. These cross-platform binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build runs on the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain; it does not use `cross`.
 
 #### 7. Latest Release and Docker Jobs
 
@@ -214,23 +214,31 @@ Creates a GitHub Release with all binaries and checksums only after the versione
 3. Attachments: All platform-specific binaries
 
 **Release Notes Example**:
-```markdown
+````markdown
 # Release v0.2.0
 
 ## Binaries
 
-- ferrum-edge-linux-x86_64
-- ferrum-edge-linux-aarch64
-- ferrum-edge-macos-x86_64
-- ferrum-edge-macos-aarch64
-- ferrum-edge-windows-x86_64.exe
+Pre-built binaries for all supported platforms:
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `ferrum-edge-linux-x86_64` |
+| Linux ARM64 | `ferrum-edge-linux-aarch64` |
+| macOS x86_64 | `ferrum-edge-macos-x86_64` |
+| macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
+| Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
 
 ## Checksums
 
+Verify the integrity of downloaded binaries:
+
+```
 abc123... ferrum-edge-linux-x86_64
 def456... ferrum-edge-linux-aarch64
 ...
 ```
+````
 
 ## How Releases Work
 
@@ -241,7 +249,7 @@ def456... ferrum-edge-linux-aarch64
 ```toml
 [package]
 name = "ferrum-edge"
-version = "<current-version>" # See Cargo.toml
+version = "0.9.0" # Update from Cargo.toml for each release
 ```
 
 **Release Process**:
@@ -382,6 +390,7 @@ do
 done)
 
 # Create release in GitHub UI or via gh:
+# The glob matches both binaries and their .sha256 sidecars.
 gh release create v0.2.0 \
   dist/ferrum-edge-* \
   --title "Release v0.2.0" \
