@@ -43,9 +43,7 @@ fn parse_one(name: &str, def: Value) -> NotificationChannel {
     (*arc).clone()
 }
 
-async fn spawn_raw_notification_response_server(
-    response: &'static [u8],
-) -> (SocketAddr, JoinHandle<()>) {
+async fn spawn_raw_notification_response_server(response: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
     // Currently used by the all-channel non-success test. It fully reads the
     // request headers before responding so future raw fixtures can reuse it
     // without depending on partial-read timing.
@@ -54,7 +52,7 @@ async fn spawn_raw_notification_response_server(
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request_headers(&mut socket).await;
-        socket.write_all(response).await.unwrap();
+        socket.write_all(&response).await.unwrap();
     });
     (addr, server)
 }
@@ -652,11 +650,14 @@ async fn webhook_chunked_response_body_at_drain_limit_is_allowed() {
             .await
             .unwrap();
 
-        let chunk = vec![b'x'; 1024 * 1024];
-        let head = format!("{:x}\r\n", chunk.len());
-        socket.write_all(head.as_bytes()).await.unwrap();
-        socket.write_all(&chunk).await.unwrap();
-        socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..4 {
+            let head = format!("{:x}\r\n", chunk.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&chunk).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
     });
 
     let webhook = WebhookChannel::new(
@@ -751,7 +752,8 @@ async fn non_success_status_errors_include_redacted_url_for_all_channels() {
 
     for (name, mut config) in configs {
         let (addr, server) = spawn_raw_notification_response_server(
-            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
         )
         .await;
         let url = format!("http://{addr}/hooks/TOKEN123?routing_key=abc123");
