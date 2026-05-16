@@ -21,6 +21,7 @@ fn weighted_target(host: &str, port: u16, weight: u32) -> UpstreamTarget {
         port,
         weight,
         tags: HashMap::new(),
+        locality: None,
         path: None,
     }
 }
@@ -34,6 +35,7 @@ fn tagged_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect(),
+        locality: None,
         path: None,
     }
 }
@@ -56,6 +58,7 @@ fn upstream_with_overrides(
         service_discovery: None,
         subsets: None,
         port_overrides,
+        source_locality: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,

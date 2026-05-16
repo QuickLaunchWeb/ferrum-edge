@@ -553,9 +553,69 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
+    project_mesh_source_locality(&mut config, mesh_slice);
     config.normalize_fields();
     config.resolve_upstream_tls();
     Ok(config)
+}
+
+fn project_mesh_source_locality(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+    let Some(locality) = mesh_source_workload_locality(mesh_slice) else {
+        return;
+    };
+    let loaded_at = config.loaded_at;
+    for upstream in &mut config.upstreams {
+        if upstream.source_locality.as_deref() != Some(locality) {
+            upstream.source_locality = Some(locality.to_string());
+            upstream.updated_at = loaded_at;
+        }
+    }
+}
+
+fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
+    // SPIFFE-matched workload is authoritative: if the configured workload
+    // identity matches a known workload, that workload's locality is the
+    // answer — even when it is `None`. Falling through to the label-based
+    // heuristic here would pick up a different pod's metadata and silently
+    // disagree with the SPIFFE source of truth.
+    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref()
+        && let Some(workload) = mesh_slice
+            .workloads
+            .iter()
+            .find(|workload| workload.spiffe_id.as_str() == spiffe_id)
+    {
+        return workload.locality.as_deref();
+    }
+
+    // Label-based fallback for native-discovery / non-SPIFFE deployments.
+    // Multi-replica Deployments commonly produce N workloads with identical
+    // labels and identical locality — accept those as a single answer.
+    // Bail out only when two label-matched workloads disagree on locality.
+    let mut matched_locality: Option<&str> = None;
+    for workload in &mesh_slice.workloads {
+        if workload.namespace != mesh_slice.namespace {
+            continue;
+        }
+        let labels_match = mesh_slice.labels.iter().all(|(key, value)| {
+            workload
+                .selector
+                .labels
+                .get(key)
+                .is_some_and(|candidate| candidate == value)
+        });
+        if !labels_match {
+            continue;
+        }
+        let Some(locality) = workload.locality.as_deref() else {
+            continue;
+        };
+        match matched_locality {
+            None => matched_locality = Some(locality),
+            Some(prev) if prev == locality => {}
+            Some(_) => return None,
+        }
+    }
+    matched_locality
 }
 
 fn gateway_config_from_mesh_slice(
@@ -836,6 +896,7 @@ fn build_east_west_service_proxies_and_upstreams(
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -919,6 +980,7 @@ fn build_east_west_service_targets(
                 port: target_port,
                 weight: 1,
                 tags: workload.selector.labels.clone(),
+                locality: workload.locality.clone(),
                 path: None,
             });
         }
@@ -1583,6 +1645,7 @@ fn build_egress_proxies_and_upstreams(
                     service_discovery: None,
                     subsets: None,
                     port_overrides: HashMap::new(),
+                    source_locality: None,
                     backend_tls_client_cert_path: None,
                     backend_tls_client_key_path: None,
                     backend_tls_verify_server_cert: true,
@@ -1647,6 +1710,7 @@ fn build_egress_upstream_targets(
                     port: target_port,
                     weight: 1,
                     tags: ep.labels.clone(),
+                    locality: None,
                     path: None,
                 })
             })
@@ -1659,6 +1723,7 @@ fn build_egress_upstream_targets(
             port: port_number,
             weight: 1,
             tags: std::collections::HashMap::new(),
+            locality: None,
             path: None,
         }]
     }
@@ -3994,6 +4059,7 @@ mod tests {
                 port: 8080,
                 weight: 1,
                 tags: HashMap::new(),
+                locality: None,
                 path: None,
             }],
             algorithm: LoadBalancerAlgorithm::RoundRobin,
@@ -4003,6 +4069,7 @@ mod tests {
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -4653,6 +4720,7 @@ mod tests {
             port: 9090,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         });
         let mut config = GatewayConfig {
@@ -4928,6 +4996,7 @@ mod tests {
             multi_cluster: None,
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
+            extension_configs: Vec::new(),
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
@@ -5928,9 +5997,11 @@ mod tests {
         let mut first = workload("reviews", "reviews");
         first.spiffe_id = shared_spiffe.clone();
         first.addresses = vec!["10.0.0.5".to_string()];
+        first.locality = Some("us-west/us-west-1/a".to_string());
         let mut second = workload("reviews", "reviews");
         second.spiffe_id = shared_spiffe.clone();
         second.addresses = vec!["10.0.0.6".to_string()];
+        second.locality = Some("us-west/us-west-1/b".to_string());
         let service = MeshService {
             name: "reviews".to_string(),
             namespace: "default".to_string(),
@@ -5955,6 +6026,132 @@ mod tests {
         let hosts: Vec<&str> = targets.iter().map(|target| target.host.as_str()).collect();
         assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
         assert!(targets.iter().all(|target| target.port == 9080));
+        let localities: Vec<Option<&str>> = targets
+            .iter()
+            .map(|target| target.locality.as_deref())
+            .collect();
+        assert_eq!(
+            localities,
+            vec![Some("us-west/us-west-1/a"), Some("us-west/us-west-1/b")]
+        );
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_projects_to_upstreams() {
+        let mut source = workload("api", "api");
+        source.addresses = vec!["10.0.0.9".to_string()];
+        source.locality = Some("us-east/us-east-1/a".to_string());
+        let source_spiffe = source.spiffe_id.as_str().to_string();
+        let mut config = GatewayConfig::default();
+        let loaded_at = config.loaded_at;
+        let now = chrono::Utc::now();
+        config.upstreams.push(Upstream {
+            id: "reviews".to_string(),
+            namespace: "default".to_string(),
+            name: Some("reviews".to_string()),
+            targets: vec![UpstreamTarget {
+                host: "10.0.0.5".to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-east/us-east-1/b".to_string()),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            workload_spiffe_id: Some(source_spiffe),
+            workloads: vec![source],
+            ..MeshSlice::default()
+        };
+
+        project_mesh_source_locality(&mut config, &mesh_slice);
+
+        assert_eq!(
+            config.upstreams[0].source_locality.as_deref(),
+            Some("us-east/us-east-1/a")
+        );
+        assert_eq!(config.upstreams[0].updated_at, loaded_at);
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_accepts_multi_replica_same_locality() {
+        let mut first = workload("reviews-1", "reviews");
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        let mut second = workload("reviews-2", "reviews");
+        second.locality = Some("us-west/us-west-1/a".to_string());
+        let mut third = workload("reviews-3", "reviews");
+        third.locality = Some("us-west/us-west-1/a".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: None,
+            workloads: vec![first, second, third],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            mesh_source_workload_locality(&slice),
+            Some("us-west/us-west-1/a")
+        );
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_returns_none_when_label_matches_disagree() {
+        let mut first = workload("reviews-1", "reviews");
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        let mut second = workload("reviews-2", "reviews");
+        second.locality = Some("us-west/us-west-1/b".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: None,
+            workloads: vec![first, second],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(mesh_source_workload_locality(&slice), None);
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_spiffe_match_without_locality_is_authoritative() {
+        // SPIFFE-matched workload has no locality — answer is `None`, even
+        // though another label-matching workload would supply one.
+        let mut source = workload("api", "api");
+        source.locality = None;
+        let spiffe = source.spiffe_id.as_str().to_string();
+
+        let mut sibling = workload("api-noisy", "api");
+        sibling.locality = Some("us-east/us-east-1/a".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            workload_spiffe_id: Some(spiffe),
+            workloads: vec![source, sibling],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(mesh_source_workload_locality(&slice), None);
     }
 
     #[test]
