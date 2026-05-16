@@ -87,7 +87,7 @@ impl DiscordChannel {
         let status = resp.status();
         if !status.is_success() {
             return Err(format!(
-                "discord dispatch returned non-success status {status}"
+                "discord dispatch returned non-success status {status} from {redacted_url}"
             ));
         }
         drain_response_body_redacted(resp, "discord", &redacted_url).await?;

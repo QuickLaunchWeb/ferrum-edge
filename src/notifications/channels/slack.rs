@@ -101,7 +101,7 @@ impl SlackChannel {
         let status = resp.status();
         if !status.is_success() {
             return Err(format!(
-                "slack dispatch returned non-success status {status}"
+                "slack dispatch returned non-success status {status} from {redacted_url}"
             ));
         }
         drain_response_body_redacted(resp, "slack", &redacted_url).await?;

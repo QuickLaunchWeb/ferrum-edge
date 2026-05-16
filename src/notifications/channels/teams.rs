@@ -85,7 +85,7 @@ impl TeamsChannel {
         let status = resp.status();
         if !status.is_success() {
             return Err(format!(
-                "teams dispatch returned non-success status {status}"
+                "teams dispatch returned non-success status {status} from {redacted_url}"
             ));
         }
         drain_response_body_redacted(resp, "teams", &redacted_url).await?;
