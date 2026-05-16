@@ -24,6 +24,12 @@ pub struct OrigDstKey {
 pub struct OrigDst4 {
     pub addr: u32,
     pub port: u32,
+    /// Kubernetes pod UID encoded as raw UUID bytes. Zero means "unknown" and
+    /// must be treated as fail-closed by node-waypoint identity resolution.
+    pub pod_uid: [u8; 16],
+    /// Stable first-eight-bytes SHA-256 hash of the workload SPIFFE ID.
+    /// Zero means the node-agent did not attach a hash for this socket.
+    pub workload_spiffe_hash: u64,
 }
 
 /// Original IPv6 destination stored before connect rewrite.
@@ -129,7 +135,7 @@ mod tests {
     #[test]
     fn type_sizes_are_bpf_aligned() {
         assert_eq!(mem::size_of::<OrigDstKey>(), 8);
-        assert_eq!(mem::size_of::<OrigDst4>(), 8);
+        assert_eq!(mem::size_of::<OrigDst4>(), 32);
         assert_eq!(mem::size_of::<OrigDst6>(), 24);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
         assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);

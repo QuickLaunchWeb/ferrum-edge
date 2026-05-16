@@ -10,6 +10,7 @@ pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
 pub mod hbone;
+pub mod node_waypoint;
 pub mod policy;
 pub mod runtime;
 pub mod slice;
@@ -88,6 +89,7 @@ pub struct MeshListener {
 
 /// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
 /// ambient selects HBONE termination instead of sidecar inbound mTLS,
+/// node-waypoint uses one HBONE listener for multiple node-local pods,
 /// east-west gateway delegates SNI passthrough to the stream listener manager,
 /// and egress gateway materializes HTTP-family proxies from external
 /// `ServiceEntry` resources for controlled mesh-to-external routing.
@@ -95,6 +97,7 @@ pub struct MeshListener {
 pub enum MeshTopology {
     Sidecar,
     Ambient,
+    NodeWaypoint,
     EastWestGateway,
     EgressGateway,
 }
@@ -104,10 +107,11 @@ impl MeshTopology {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
+            "node_waypoint" | "node-waypoint" => Ok(Self::NodeWaypoint),
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, east_west_gateway, or egress_gateway"
+                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, east_west_gateway, or egress_gateway"
             )),
         }
     }
@@ -116,6 +120,7 @@ impl MeshTopology {
         match self {
             Self::Sidecar => "sidecar",
             Self::Ambient => "ambient",
+            Self::NodeWaypoint => "node_waypoint",
             Self::EastWestGateway => "east_west_gateway",
             Self::EgressGateway => "egress_gateway",
         }
@@ -460,6 +465,11 @@ impl MeshRuntimeConfig {
                     addr: self.hbone_listen_addr,
                 },
             ],
+            MeshTopology::NodeWaypoint => vec![MeshListener {
+                direction: MeshTrafficDirection::Inbound,
+                kind: MeshListenerKind::HboneTermination,
+                addr: self.hbone_listen_addr,
+            }],
             MeshTopology::EastWestGateway => Vec::new(),
             MeshTopology::EgressGateway => vec![MeshListener {
                 direction: MeshTrafficDirection::Inbound,
@@ -2335,13 +2345,19 @@ async fn serve_mesh_runtime(
 
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let (proxy_state, health_check_handles) = ProxyState::new(
+    let (mut proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    if runtime.topology == MeshTopology::NodeWaypoint {
+        proxy_state.node_waypoint_identity_resolver = Some(Arc::new(
+            node_waypoint::NodeWaypointIdentityResolver::new(env_config.pool_shard_amount),
+        ));
+        info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
+    }
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -2612,6 +2628,7 @@ fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
     match runtime.topology {
         MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
         MeshTopology::Ambient => runtime.hbone_listen_addr.port(),
+        MeshTopology::NodeWaypoint => runtime.hbone_listen_addr.port(),
         MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
         // East-west gateways do SNI passthrough — no TLS termination, no port
         // override surface. Use inbound for stability; the resolved mode is
@@ -2623,8 +2640,8 @@ fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
 /// Reject `MtlsMode::Disable` on topologies whose inbound listener is
 /// fundamentally mTLS-only:
 ///
-/// - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running it plaintext
-///   is not a valid HBONE listener.
+/// - **Ambient / NodeWaypoint**: HBONE is HTTP/2 CONNECT over mTLS — running
+///   it plaintext is not a valid HBONE listener.
 /// - **EgressGateway**: the egress listener must verify sidecar client
 ///   certificates (already enforced for env-derived TLS materials by
 ///   `validate_egress_gateway_mtls_config`; this check covers the
@@ -2640,10 +2657,11 @@ fn validate_inbound_mtls_mode_for_topology(
         return Ok(());
     }
     match runtime.topology {
-        MeshTopology::Ambient => Err(anyhow::anyhow!(
-            "Mesh PeerAuthentication resolved to DISABLE on Ambient topology, but HBONE \
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on {} topology, but HBONE \
              (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
-             workload, or move it to Sidecar topology if plaintext-only is intended."
+             workload, or move it to Sidecar topology if plaintext-only is intended.",
+            runtime.topology.as_str()
         )),
         MeshTopology::EgressGateway => Err(anyhow::anyhow!(
             "Mesh PeerAuthentication resolved to DISABLE on EgressGateway topology, but the \
@@ -5196,6 +5214,32 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_listener_plan_uses_node_waypoint_hbone_only() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+
+                assert_eq!(plan.len(), 1);
+                assert_eq!(plan[0].direction, MeshTrafficDirection::Inbound);
+                assert_eq!(plan[0].kind, MeshListenerKind::HboneTermination);
+                assert_eq!(plan[0].addr.port(), 15008);
+            },
+        );
+    }
+
+    #[test]
     fn mesh_runtime_prepares_east_west_passthrough_proxies() {
         with_mesh_env(
             &[
@@ -6416,7 +6460,24 @@ mod tests {
         );
     }
 
-    // ── EgressGateway topology tests ─────────────────────────────────────
+    // ── Mesh topology tests ──────────────────────────────────────────────
+
+    #[test]
+    fn mesh_topology_parses_node_waypoint_variants() {
+        assert_eq!(
+            MeshTopology::parse("node_waypoint").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(
+            MeshTopology::parse("node-waypoint").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(
+            MeshTopology::parse("NODE_WAYPOINT").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(MeshTopology::NodeWaypoint.as_str(), "node_waypoint");
+    }
 
     #[test]
     fn mesh_topology_parses_egress_gateway_variants() {
@@ -6605,6 +6666,9 @@ mod tests {
         let ambient = runtime_with_topology(MeshTopology::Ambient);
         assert_eq!(inbound_mtls_resolution_port(&ambient), 15008);
 
+        let node_waypoint = runtime_with_topology(MeshTopology::NodeWaypoint);
+        assert_eq!(inbound_mtls_resolution_port(&node_waypoint), 15008);
+
         let egress = runtime_with_topology(MeshTopology::EgressGateway);
         assert_eq!(inbound_mtls_resolution_port(&egress), 15090);
 
@@ -6664,7 +6728,17 @@ mod tests {
         let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
             .expect_err("Disable on Ambient must be rejected");
 
-        assert!(err.to_string().contains("Ambient"));
+        assert!(err.to_string().contains("ambient"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_node_waypoint() {
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on NodeWaypoint must be rejected");
+
+        assert!(err.to_string().contains("node_waypoint"));
         assert!(err.to_string().contains("HBONE"));
     }
 
@@ -6698,6 +6772,7 @@ mod tests {
         for topology in [
             MeshTopology::Sidecar,
             MeshTopology::Ambient,
+            MeshTopology::NodeWaypoint,
             MeshTopology::EastWestGateway,
             MeshTopology::EgressGateway,
         ] {
