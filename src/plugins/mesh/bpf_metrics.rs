@@ -279,12 +279,13 @@ fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
         if prefix.is_empty() {
             return Err("__mesh_bpf_metrics: `prefix` must not be empty".to_string());
         }
-        if !prefix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        let mut chars = prefix.chars();
+        let first = chars.next().expect("prefix is not empty");
+        if !(first.is_ascii_alphabetic() || first == '_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             return Err(
-                "__mesh_bpf_metrics: `prefix` must be `[A-Za-z0-9_]+` to form valid Prometheus metric names"
+                "__mesh_bpf_metrics: `prefix` must match `[A-Za-z_][A-Za-z0-9_]*` to form valid Prometheus metric names"
                     .to_string(),
             );
         }
@@ -364,6 +365,11 @@ mod tests {
             MeshBpfMetrics::with_state(&serde_json::json!({ "prefix": "  " }), metrics())
                 .unwrap_err();
         assert!(empty_err.contains("must not be empty"));
+
+        let leading_digit_err =
+            MeshBpfMetrics::with_state(&serde_json::json!({ "prefix": "1tenant_bpf" }), metrics())
+                .unwrap_err();
+        assert!(leading_digit_err.contains("valid Prometheus"));
     }
 
     #[test]
