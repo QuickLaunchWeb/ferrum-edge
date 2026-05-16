@@ -6797,7 +6797,7 @@ components:
           format: uint64
           minimum: 1
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth. Values exceeding usize::MAX on the target platform are rejected at plugin load."
+          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth. Oversized numeric values are rejected at plugin load."
 
     LoadTestingConfig:
       type: object

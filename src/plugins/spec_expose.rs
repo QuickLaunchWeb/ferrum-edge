@@ -273,8 +273,8 @@ impl SpecExpose {
         // endpoint should not spend memory or time proving an oversized hint
         // wrong.
         // The plugin HTTP client is built without reqwest auto-decompression
-        // features. If that changes, content_length() can become None for
-        // encoded responses and the streaming guard still remains authoritative.
+        // features today. If that changes, do not rely on this hint for safety:
+        // the streaming guard still remains authoritative.
         if let Some(content_length) = response.content_length()
             && content_length > self.max_response_body_bytes as u64
         {

@@ -518,10 +518,18 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
         // The timeout below guards against this raw fixture hanging if the
         // request/response plumbing changes.
         let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
         let mut buf = [0; 1024];
-        // This fixture does not parse request headers. One read is enough to
-        // observe that the client sent a request before we emit the response.
-        let _ = socket.read(&mut buf).await.unwrap();
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+                break;
+            }
+        }
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",

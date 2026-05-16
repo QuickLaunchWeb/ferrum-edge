@@ -21,7 +21,8 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::Value;
 
-// Bound only the upfront allocation. One MiB covers common API specs and
+// Bound only the upfront allocation for every caller of
+// `read_response_body_bounded`. One MiB covers common API specs and
 // serverless-function responses without repeated tiny reallocations, while
 // larger in-limit bodies still grow one chunk at a time up to the configured
 // cap. This avoids letting Content-Length force a large allocation before the
@@ -53,7 +54,7 @@ impl std::fmt::Display for BoundedReadError {
             } => {
                 write!(
                     f,
-                    "response body size {} exceeds configured response body limit {}",
+                    "response body size {} exceeds configured max_response_body_bytes limit {}",
                     read_so_far, max_bytes
                 )
             }
@@ -74,9 +75,9 @@ pub fn parse_max_response_body_bytes(
     match config.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(v) => {
-            let raw = v.as_u64().ok_or_else(|| {
-                format!("{plugin_name}: '{key}' must be an unsigned integer, got: {v}")
-            })?;
+            let raw = v
+                .as_u64()
+                .ok_or_else(|| format!("{plugin_name}: '{key}' must be an unsigned integer"))?;
             if raw == 0 {
                 return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
             }
