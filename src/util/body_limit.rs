@@ -3,5 +3,12 @@
 use http_body_util::LengthLimitError;
 
 pub fn is_length_limit_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    error.downcast_ref::<LengthLimitError>().is_some()
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if err.downcast_ref::<LengthLimitError>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }

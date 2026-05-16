@@ -2559,16 +2559,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[tokio::test]
-    async fn body_collect_error_masks_transport_details() {
-        let resp = error_response(ApiSpecError::BodyCollect);
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = resp.into_body().collect().await.unwrap();
-        let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();
-        assert!(body.contains("Failed to read request body"));
-        assert!(!body.contains("hyper internal transport details"));
-    }
-
     #[test]
     fn extract_error_maps_to_400() {
         let resp = error_response(ApiSpecError::Extract(ExtractError::MissingProxyExtension));

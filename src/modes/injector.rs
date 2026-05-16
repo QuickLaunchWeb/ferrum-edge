@@ -652,6 +652,8 @@ fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
     if max_body_bytes % MIB_BYTES == 0 {
         format!("{} MiB", max_body_bytes / MIB_BYTES)
     } else {
+        // Production env parsing is MiB-aligned, but tests and direct
+        // InjectorConfig construction can still supply byte-granular caps.
         format!("{max_body_bytes} bytes")
     }
 }
@@ -1736,9 +1738,7 @@ mod tests {
                 }
             }
         });
-        let mut body = review.to_string();
-        assert!(body.len() < 1024);
-        body.push_str(&" ".repeat(1024 - body.len()));
+        let body = review.to_string();
 
         let mut config = test_config(true, CaptureMode::Explicit);
         config.admission_review_max_body_bytes = body.len();
