@@ -33,6 +33,7 @@ pub struct WatcherSelection {
     pub watch_gateway_api: bool,
     pub watch_core: bool,
     pub watch_node_locality: bool,
+    pub watch_mesh_config: bool,
 }
 
 pub const ISTIO_CRDS: &[CrdSpec] = &[
@@ -163,6 +164,14 @@ pub const K8S_NODE_LOCALITY_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec 
     namespaced: false,
 }];
 
+pub const ISTIO_MESH_CONFIG_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "ConfigMap",
+    plural: "configmaps",
+    namespaced: true,
+}];
+
 // Node labels can enrich workloads with topology.kubernetes.io/{region,zone},
 // but locality is optional. Keep Node out of the unconditional pod-discovery
 // watcher set so namespaced discovery does not require cluster-scoped RBAC.
@@ -225,6 +234,7 @@ pub async fn start_crd_watchers(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
+    istio_root_namespace: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
@@ -394,8 +404,24 @@ pub async fn start_crd_watchers(
         }
     }
 
+    let mut core_watch_plan: Vec<(&CoreResourceSpec, Vec<String>)> = Vec::new();
     if selection.watch_core {
-        for resource in selected_core_resources(selection.watch_node_locality) {
+        core_watch_plan.extend(
+            selected_core_resources(selection.watch_node_locality)
+                .into_iter()
+                .map(|resource| (resource, namespaces.clone())),
+        );
+    }
+    if selection.watch_mesh_config {
+        core_watch_plan.extend(
+            ISTIO_MESH_CONFIG_RESOURCES
+                .iter()
+                .map(|resource| (resource, vec![istio_root_namespace.clone()])),
+        );
+    }
+
+    if !core_watch_plan.is_empty() {
+        for (resource, resource_namespaces) in core_watch_plan {
             let api_version = if resource.group.is_empty() {
                 resource.version.to_string()
             } else {
@@ -411,7 +437,7 @@ pub async fn start_crd_watchers(
             let kind = resource.kind.to_string();
 
             for (api, ar, scope) in
-                build_apis_for_resource(&client, &ar, &namespaces, resource.namespaced)
+                build_apis_for_resource(&client, &ar, &resource_namespaces, resource.namespaced)
             {
                 if store_set
                     .lock()
@@ -535,6 +561,7 @@ pub fn spawn_crd_reprobe_task(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
+    istio_root_namespace: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -558,6 +585,7 @@ pub fn spawn_crd_reprobe_task(
                         store_set.clone(),
                         selection,
                         namespaces.clone(),
+                        istio_root_namespace.clone(),
                         shutdown.clone(),
                     ).await;
                     // New handles run independently; we don't need to track
@@ -621,5 +649,19 @@ mod tests {
         assert!(locality_kinds.contains("Pod"));
         assert!(locality_kinds.contains("Service"));
         assert!(locality_kinds.contains("EndpointSlice"));
+    }
+
+    #[test]
+    fn mesh_config_watcher_resource_is_root_namespace_configmap_only() {
+        assert_eq!(ISTIO_MESH_CONFIG_RESOURCES.len(), 1);
+        let resource = &ISTIO_MESH_CONFIG_RESOURCES[0];
+        assert_eq!(resource.group, "");
+        assert_eq!(resource.version, "v1");
+        assert_eq!(resource.kind, "ConfigMap");
+        assert_eq!(resource.plural, "configmaps");
+        assert!(
+            resource.namespaced,
+            "Istio meshConfig lives in the root namespace ConfigMap"
+        );
     }
 }

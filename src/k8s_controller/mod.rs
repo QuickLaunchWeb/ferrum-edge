@@ -78,6 +78,7 @@ pub async fn start_k8s_controller(
         watch_gateway_api = controller_config.watch_gateway_api,
         pod_discovery_enabled = controller_config.pod_discovery_enabled,
         watch_node_locality = controller_config.watch_node_locality,
+        istio_root_namespace = %controller_config.istio_root_namespace,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
         "Starting Kubernetes controller"
@@ -92,13 +93,16 @@ pub async fn start_k8s_controller(
         watch_gateway_api: controller_config.watch_gateway_api,
         watch_core: controller_config.pod_discovery_enabled,
         watch_node_locality: controller_config.watch_node_locality,
+        watch_mesh_config: controller_config.watch_istio,
     };
+    let istio_root_namespace = controller_config.istio_root_namespace.clone();
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
         store_set.clone(),
         watcher_selection,
         controller_config.watch_namespaces.clone(),
+        istio_root_namespace.clone(),
         shutdown.clone(),
     )
     .await;
@@ -136,6 +140,7 @@ pub async fn start_k8s_controller(
         store_set,
         watcher_selection,
         controller_config.watch_namespaces,
+        istio_root_namespace,
         shutdown,
         Duration::from_secs(300),
     );
