@@ -608,6 +608,11 @@ pub struct EnvConfig {
     /// and client CA verifier. Cert/key paths remain static operational
     /// inputs.
     pub mesh_peer_auth_live_reload_enabled: bool,
+    /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
+    /// Identities enrolled with a cgroup v2 path are evicted when the
+    /// cgroup is gone or its inode changes (pod restart). Set to `0` to
+    /// disable. Defaults to `30`.
+    pub mesh_node_waypoint_cgroup_sweep_interval_secs: u64,
 
     // Node agent
     /// Node-agent capture topology between the per-node capture manager and
@@ -1407,6 +1412,7 @@ impl Default for EnvConfig {
             mesh_sidecar_identity_narrowing: false,
             mesh_vs_header_routing_experimental: false,
             mesh_peer_auth_live_reload_enabled: false,
+            mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
@@ -1715,6 +1721,7 @@ impl EnvConfig {
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
+            mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
@@ -2095,6 +2102,7 @@ impl EnvConfig {
             mesh_sidecar_identity_narrowing,
             mesh_vs_header_routing_experimental,
             mesh_peer_auth_live_reload_enabled,
+            mesh_node_waypoint_cgroup_sweep_interval_secs,
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,
