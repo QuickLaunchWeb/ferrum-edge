@@ -38,6 +38,7 @@ use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
+use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
@@ -730,14 +731,21 @@ pub async fn handle_admin_request(
     let body_bytes = match Limited::new(req.into_body(), max_body_size).collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("length limit exceeded") {
+            if is_length_limit_error(e.as_ref()) {
                 return Ok(json_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),
                 ));
             }
-            Vec::new()
+            warn!(
+                path = %path,
+                error = %e,
+                "Admin request body collection failed"
+            );
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Failed to read request body"}),
+            ));
         }
     };
 

@@ -25,6 +25,7 @@ use crate::admin::api_specs::{
 use crate::admin::spec_codec;
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
+use crate::util::body_limit::is_length_limit_error;
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -39,7 +40,7 @@ enum ApiSpecError {
     /// Body too large (413)
     PayloadTooLarge(usize),
     /// Body collection error (non-size)
-    BodyCollect(String),
+    BodyCollect,
     /// Extraction/parse error (400)
     Extract(ExtractError),
     /// Generic 400 (invalid query params, etc.)
@@ -126,13 +127,10 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": format!("Request body too large (max {} MiB)", max_mib)}),
         ),
-        ApiSpecError::BodyCollect(msg) => {
-            tracing::warn!("failed to read api spec request body: {}", msg);
-            json_resp(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "Failed to read request body"}),
-            )
-        }
+        ApiSpecError::BodyCollect => json_resp(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Failed to read request body"}),
+        ),
         ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
@@ -713,11 +711,11 @@ async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>,
     match Limited::new(req.into_body(), max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes().to_vec()),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("length limit exceeded") {
+            if is_length_limit_error(e.as_ref()) {
                 Err(ApiSpecError::PayloadTooLarge(max_mib))
             } else {
-                Err(ApiSpecError::BodyCollect(msg))
+                tracing::warn!(error = %e, "failed to read api spec request body");
+                Err(ApiSpecError::BodyCollect)
             }
         }
     }
@@ -2561,16 +2559,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// Body-collection failures must surface a generic 400 with no leaked
+    /// transport details — the underlying error is logged via `tracing::warn`
+    /// instead. Regression guard against an earlier shape that forwarded the
+    /// raw hyper error string into the response body.
     #[tokio::test]
-    async fn body_collect_error_masks_transport_details() {
-        let resp = error_response(ApiSpecError::BodyCollect(
-            "hyper internal transport details".to_string(),
-        ));
+    async fn body_collect_error_returns_generic_400() {
+        let resp = error_response(ApiSpecError::BodyCollect);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = resp.into_body().collect().await.unwrap();
         let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();
         assert!(body.contains("Failed to read request body"));
-        assert!(!body.contains("hyper internal transport details"));
     }
 
     #[test]
