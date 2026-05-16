@@ -565,6 +565,14 @@ pub struct EnvConfig {
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
     /// config via `translate_k8s_objects()`. Default: false.
     pub k8s_controller_enabled: bool,
+    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Default:
+    /// false for one release; when true, CP also watches core resources and
+    /// derives mesh services/workloads from ready pods.
+    pub k8s_pod_discovery_enabled: bool,
+    /// Enable cluster-scoped Node watching to enrich auto-discovered pod
+    /// workloads with topology.kubernetes.io/{region,zone}. Requires
+    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. Default: false.
+    pub k8s_node_locality_enabled: bool,
     /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
     /// (requires ClusterRole). Default: "" (all).
     pub k8s_watch_namespaces: Vec<String>,
@@ -1324,6 +1332,8 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_vs_header_routing_experimental: false,
             k8s_controller_enabled: false,
+            k8s_pod_discovery_enabled: false,
+            k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
             k8s_reconcile_debounce_ms: 500,
@@ -1622,6 +1632,8 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
+            k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
+            k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
@@ -1992,6 +2004,8 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_vs_header_routing_experimental,
             k8s_controller_enabled,
+            k8s_pod_discovery_enabled,
+            k8s_node_locality_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,
             k8s_reconcile_debounce_ms,

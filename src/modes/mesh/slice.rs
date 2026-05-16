@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
+use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
@@ -297,18 +298,9 @@ impl MeshSlice {
             .filter(|w| w.namespace == namespace)
             .cloned()
             .collect();
-        let selected_workload = request.workload_spiffe_id.as_ref().and_then(|spiffe_id| {
-            workloads
-                .iter()
-                .find(|workload| workload.spiffe_id.as_str() == spiffe_id)
-        });
-        let effective_namespace = selected_workload
-            .map(|workload| workload.namespace.as_str())
-            .unwrap_or(namespace.as_str());
+        let effective_namespace = namespace.as_str();
         let effective_labels = if request.labels.is_empty() {
-            selected_workload
-                .map(|workload| labels_to_btree(&workload.selector.labels))
-                .unwrap_or_default()
+            inferred_workload_labels_for_request(&workloads, &request)
         } else {
             request.labels.clone()
         };
@@ -471,6 +463,42 @@ impl MeshSlice {
             outbound_traffic_policy: mesh.outbound_traffic_policy,
         }
     }
+}
+
+fn inferred_workload_labels_for_request(
+    workloads: &[Workload],
+    request: &MeshSliceRequest,
+) -> BTreeMap<String, String> {
+    let Some(spiffe_id) = request.workload_spiffe_id.as_deref() else {
+        return BTreeMap::new();
+    };
+    let mut matches = workloads
+        .iter()
+        .filter(|workload| workload.spiffe_id.as_str() == spiffe_id);
+    let Some(first) = matches.next() else {
+        return BTreeMap::new();
+    };
+    let mut common_labels = labels_to_btree(&first.selector.labels);
+    let mut match_count = 1usize;
+    for workload in matches {
+        match_count += 1;
+        common_labels.retain(|key, value| {
+            workload
+                .selector
+                .labels
+                .get(key)
+                .is_some_and(|candidate| candidate == value)
+        });
+    }
+    if match_count > 1 && common_labels.is_empty() {
+        warn!(
+            node_id = %request.node_id,
+            namespace = %request.namespace,
+            workload_spiffe_id = %spiffe_id,
+            "Mesh slice request matched multiple workloads with the same SPIFFE ID but no shared labels; explicit workload labels are required for selector-scoped policy"
+        );
+    }
+    common_labels
 }
 
 fn normalize_known_destination_host(value: &str) -> Option<String> {
@@ -2058,6 +2086,124 @@ mod tests {
         // The workload-selector policy should match via inherited labels.
         assert_eq!(slice.mesh_policies.len(), 1);
         assert_eq!(slice.mesh_policies[0].name, "selector-policy");
+    }
+
+    #[test]
+    fn from_gateway_config_does_not_inherit_labels_from_ambiguous_spiffe_id() {
+        let td = td();
+        let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
+        let mut web = make_workload(
+            "alpha",
+            "web",
+            HashMap::from([("app".into(), "web".into())]),
+        );
+        let mut api = make_workload(
+            "alpha",
+            "api",
+            HashMap::from([("app".into(), "api".into())]),
+        );
+        web.spiffe_id = spiffe_id.clone();
+        api.spiffe_id = spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![web, api],
+            mesh_policies: vec![make_policy(
+                "web-selector-policy",
+                "alpha",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "web".into())]),
+                        namespace: None,
+                    },
+                },
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: "alpha".into(),
+            workload_spiffe_id: Some(spiffe_id.to_string()),
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+        };
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert!(slice.labels.is_empty());
+        assert!(slice.mesh_policies.is_empty());
+    }
+
+    #[test]
+    fn from_gateway_config_inherits_common_labels_from_replicated_spiffe_id() {
+        let td = td();
+        let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
+        let mut replica_a = make_workload(
+            "alpha",
+            "web",
+            HashMap::from([
+                ("app".into(), "web".into()),
+                ("version".into(), "v1".into()),
+                ("pod-template-hash".into(), "aaa".into()),
+            ]),
+        );
+        let mut replica_b = make_workload(
+            "alpha",
+            "web",
+            HashMap::from([
+                ("app".into(), "web".into()),
+                ("version".into(), "v1".into()),
+                ("pod-template-hash".into(), "bbb".into()),
+            ]),
+        );
+        replica_a.spiffe_id = spiffe_id.clone();
+        replica_b.spiffe_id = spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![replica_a, replica_b],
+            mesh_policies: vec![
+                make_policy(
+                    "common-selector-policy",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([
+                                ("app".into(), "web".into()),
+                                ("version".into(), "v1".into()),
+                            ]),
+                            namespace: None,
+                        },
+                    },
+                ),
+                make_policy(
+                    "replica-specific-policy",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("pod-template-hash".into(), "aaa".into())]),
+                            namespace: None,
+                        },
+                    },
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: "alpha".into(),
+            workload_spiffe_id: Some(spiffe_id.to_string()),
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+        };
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
+        assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
+        assert!(!slice.labels.contains_key("pod-template-hash"));
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "common-selector-policy");
     }
 
     #[test]
