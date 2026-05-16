@@ -73,6 +73,22 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 
+#### MySQL minimum version
+
+MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
+`COLLATE utf8mb4_0900_as_cs` on identifier columns (`id`, `namespace`, `name`,
+`username`, `custom_id`, `plugin_name`, `proxy_id`, `upstream_id`,
+`upstream_subset`, `api_spec_id`, `content_hash`, `spec_version`,
+`backend_host`, `backend_tls_sni`), which is only available on MySQL 8.0 and
+later. This makes uniqueness on `(namespace, name)`, `(namespace, username)`,
+etc. **byte-exact** rather than the case-insensitive default — so `Alpha` and
+`alpha` are distinct identifiers on MySQL just as they are on PostgreSQL and
+SQLite. Operators upgrading a populated 5.x MySQL deployment must run the
+matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
+utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
+compatibility policy of folding schema changes into the V001 baseline rather
+than shipping incremental migrations.
+
 ### Database TLS
 
 | Variable | Required | Default | Description |
