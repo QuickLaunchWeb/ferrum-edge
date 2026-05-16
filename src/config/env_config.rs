@@ -11,6 +11,7 @@
 
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
+use crate::ebpf::NodeAgentProxyMode;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -596,6 +597,19 @@ pub struct EnvConfig {
     /// override channel runs through `RequestContext.route_override_*` and
     /// is applied to dispatch after admission plugins have run.
     pub mesh_vs_header_routing_experimental: bool,
+
+    // Node agent
+    /// Node-agent capture topology between the per-node capture manager and
+    /// proxy. `local_pod` redirects to a co-located pod proxy;
+    /// `node_waypoint` reserves the Phase 2 node-waypoint contract surface.
+    pub node_agent_proxy_mode: NodeAgentProxyMode,
+    /// Opt in to the node-agent read-only admin listener. Default false so
+    /// node-agent upgrades do not expose unauthenticated admin endpoints on
+    /// the global admin bind address by accident.
+    pub node_agent_admin_enabled: bool,
+    /// HBONE redirect/listener port included in the node-agent capture
+    /// contract and BPF config map. Default: 15008.
+    pub node_agent_hbone_redirect_port: u16,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1372,6 +1386,9 @@ impl Default for EnvConfig {
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
             mesh_vs_header_routing_experimental: false,
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            node_agent_admin_enabled: false,
+            node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
             k8s_node_locality_enabled: false,
@@ -1673,6 +1690,9 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
+            node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
+            node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
+            node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
@@ -2046,6 +2066,9 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
             mesh_vs_header_routing_experimental,
+            node_agent_proxy_mode,
+            node_agent_admin_enabled,
+            node_agent_hbone_redirect_port,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
             k8s_node_locality_enabled,
@@ -2629,6 +2652,18 @@ impl EnvConfig {
                         ));
                     }
                 }
+            }
+        }
+
+        if matches!(self.mode, OperatingMode::NodeAgent) {
+            if self.node_agent_hbone_redirect_port == 0 {
+                return Err("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must be non-zero".into());
+            }
+            if self.node_agent_hbone_redirect_port == ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT {
+                return Err(
+                    "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must differ from the outbound capture port"
+                        .into(),
+                );
             }
         }
 

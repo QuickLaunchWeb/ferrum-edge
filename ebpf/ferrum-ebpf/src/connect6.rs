@@ -8,11 +8,12 @@ use aya_ebpf::programs::SockAddrContext;
 use aya_ebpf::EbpfContext;
 
 use crate::maps::{
-    FERRUM_BYPASS_UIDS, FERRUM_CIDR_EXCLUDE6, FERRUM_CIDR_INCLUDE6, FERRUM_ORIG_DST6,
-    FERRUM_PORT_EXCLUDE,
+    FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE6, FERRUM_CIDR_INCLUDE6,
+    FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE,
 };
 use ferrum_ebpf_common::{
-    CidrKey6, OrigDst6, OrigDstKey, IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    CidrKey6, OrigDst6, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO,
+    OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -60,7 +61,16 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
     sock_addr.user_ip6 = IPV6_LOOPBACK_NBO;
-    sock_addr.user_port = (OUTBOUND_CAPTURE_PORT as u32) << 16;
+    sock_addr.user_port = outbound_capture_port() << 16;
 
     Ok(1)
+}
+
+#[inline(always)]
+fn outbound_capture_port() -> u32 {
+    let key = FERRUM_CAPTURE_CONFIG_KEY;
+    match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
+        Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
+        _ => OUTBOUND_CAPTURE_PORT as u32,
+    }
 }

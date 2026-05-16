@@ -26,6 +26,8 @@ use tracing::{debug, info, warn};
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{EbpfBackend, PodInfo};
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use ferrum_ebpf_common::BpfCaptureConfig;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 const DEFAULT_BPF_ELF_PATH: &str = concat!(
@@ -121,6 +123,11 @@ impl EbpfBackend for AyaEbpfBackend {
 
         info!("All BPF programs loaded successfully");
         Ok(())
+    }
+
+    fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
+        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        maps.update_capture_config(config)
     }
 
     fn attach_cgroup(

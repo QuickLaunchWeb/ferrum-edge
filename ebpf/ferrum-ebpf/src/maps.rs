@@ -5,7 +5,9 @@
 
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap};
-use ferrum_ebpf_common::{CidrKey4, CidrKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo};
+use ferrum_ebpf_common::{
+    BpfCaptureConfig, CidrKey4, CidrKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo,
+};
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
 /// The proxy reads this map (via pinned path) to discover the real target.
@@ -47,3 +49,7 @@ pub static FERRUM_CIDR_INCLUDE6: LpmTrie<CidrKey6, u8> = LpmTrie::with_max_entri
 /// Destination ports to exclude from outbound capture.
 #[map]
 pub static FERRUM_PORT_EXCLUDE: HashMap<u16, u8> = HashMap::with_max_entries(256, 0);
+
+/// Singleton node-agent capture settings.
+#[map]
+pub static FERRUM_CAPTURE_CONFIG: HashMap<u32, BpfCaptureConfig> = HashMap::with_max_entries(1, 0);

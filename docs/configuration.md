@@ -274,6 +274,9 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 | `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
 | `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
 | `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |
+| `FERRUM_NODE_AGENT_PROXY_MODE` | No | `local_pod` | Capture topology contract: `local_pod` or `node_waypoint` |
+| `FERRUM_NODE_AGENT_ADMIN_ENABLED` | No | `false` | Enables the node-agent read-only admin listener for metrics/health. When enabled, defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set; JWT does not affect bind because metrics/health are unauthenticated |
+| `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT` | No | `15008` | HBONE redirect/listener port written into the node-agent capture contract and BPF config map. Must match the mesh proxy HBONE listener (`15008` today) |
 | `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | — | Extra namespaces to exclude from capture (comma-separated; `kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated). Per-pod annotation `traffic.sidecar.istio.io/includeOutboundIPRanges` REPLACES this value when present |

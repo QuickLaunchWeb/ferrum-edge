@@ -9,7 +9,8 @@
 //! responsibility.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -18,6 +19,8 @@ use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use tracing::{debug, error, info, warn};
 
+use crate::admin::jwt_auth::create_jwt_manager_from_env;
+use crate::admin::{self, AdminState};
 use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan, XTABLES_LOCK_WAIT_SECONDS};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
@@ -25,7 +28,10 @@ use crate::ebpf::cgroup;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
-use crate::ebpf::{EbpfBackend, FallbackMode, PodAttachmentState, PodInfo};
+use crate::ebpf::{
+    CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, NodeAgentMetrics,
+    PodAttachmentState, PodInfo,
+};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -40,10 +46,11 @@ pub struct NodeAgentConfig {
     pub bpf_fs_path: String,
     pub fallback_mode: FallbackMode,
     pub excluded_namespaces: HashSet<String>,
+    pub capture_contract: CaptureContract,
 }
 
 impl NodeAgentConfig {
-    pub fn from_env_config(_env_config: &EnvConfig) -> Result<Self, String> {
+    pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let node_name = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_NAME").ok_or(
             "FERRUM_NODE_AGENT_NODE_NAME is required in node_agent mode \
              (set via Kubernetes downward API: spec.nodeName)"
@@ -53,7 +60,8 @@ impl NodeAgentConfig {
             return Err("FERRUM_NODE_AGENT_NODE_NAME must not be empty".to_string());
         }
 
-        let capture_config = CaptureConfig::from_env()?;
+        let mut capture_config = CaptureConfig::from_env()?;
+        capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
             .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
         let bpf_fs_path = resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH")
@@ -73,6 +81,12 @@ impl NodeAgentConfig {
                 })
                 .unwrap_or_default();
         let excluded_namespaces = pod_watcher::build_excluded_namespaces(&extra_excluded);
+        let capture_contract = CaptureContract::new(
+            env_config.node_agent_proxy_mode,
+            capture_config.outbound_port,
+            env_config.node_agent_hbone_redirect_port,
+            DEFAULT_NODE_AGENT_SOCKET_PATH,
+        )?;
 
         Ok(Self {
             node_name,
@@ -81,6 +95,7 @@ impl NodeAgentConfig {
             bpf_fs_path,
             fallback_mode,
             excluded_namespaces,
+            capture_contract,
         })
     }
 }
@@ -90,10 +105,18 @@ pub async fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry().set_node_agent_metrics(metrics.clone());
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let admin_handles =
+        start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready.clone()).await?;
 
     info!(
         node_name = %config.node_name,
         capture_mode = ?config.capture_config.mode,
+        proxy_mode = %config.capture_contract.proxy_mode,
+        outbound_capture_port = config.capture_contract.outbound_capture_port,
+        hbone_redirect_port = config.capture_contract.hbone_redirect_port,
         cgroup_root = %config.cgroup_root,
         bpf_fs_path = %config.bpf_fs_path,
         fallback_mode = ?config.fallback_mode,
@@ -109,11 +132,172 @@ pub async fn run(
         "Kernel probe complete"
     );
 
-    if !probe.supports_ebpf() {
-        return handle_fallback(&config, &probe, &shutdown_tx).await;
+    let result = if !probe.supports_ebpf() {
+        handle_fallback(&config, &probe, &shutdown_tx, startup_ready).await
+    } else {
+        run_with_backend(
+            create_backend(),
+            &config,
+            metrics,
+            &shutdown_tx,
+            startup_ready,
+        )
+        .await
+    };
+
+    let _ = shutdown_tx.send(true);
+    for handle in admin_handles {
+        if let Err(err) = handle.await {
+            warn!(error = %err, "Node agent admin listener task failed");
+        }
     }
 
-    run_with_backend(create_backend(), &config, &shutdown_tx).await
+    result
+}
+
+async fn start_node_agent_admin_listeners(
+    env_config: &EnvConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
+    let mut handles = Vec::new();
+    if !env_config.node_agent_admin_enabled {
+        return Ok(handles);
+    }
+    if env_config.admin_http_port == 0 {
+        return Ok(handles);
+    }
+
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
+    let jwt_manager = match create_jwt_manager_from_env() {
+        Ok(manager) => manager,
+        Err(err) => {
+            warn!(
+                "Admin JWT not configured for node_agent mode ({}), authenticated admin endpoints will reject operator tokens",
+                err
+            );
+            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                secret: random_secret,
+                ..Default::default()
+            })
+        }
+    };
+
+    let admin_state = AdminState {
+        db: None,
+        jwt_manager,
+        proxy_state: None,
+        cached_config: None,
+        mode: "node_agent".to_string(),
+        read_only: true,
+        startup_ready: Some(startup_ready),
+        db_available: None,
+        admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
+        reserved_ports: env_config.reserved_gateway_ports(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
+        admin_allowed_cidrs,
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+    };
+
+    // Safe-by-default bind: when the operator opts into the node-agent admin
+    // listener but configures neither an explicit bind nor an allowlist, fall
+    // back to loopback so unauthenticated `/metrics` and `/health` are not
+    // exposed on the network. See `decide_admin_bind_address`.
+    let signals = AdminBindSignals::from_env();
+    let admin_http_addr = decide_admin_bind_address(
+        &env_config.admin_bind_address,
+        env_config.admin_http_port,
+        &signals,
+    )?;
+    let shutdown = shutdown_tx.subscribe();
+    let handle = tokio::spawn(async move {
+        info!(
+            "Starting node_agent admin HTTP listener on {}",
+            admin_http_addr
+        );
+        if let Err(err) = admin::start_admin_listener(admin_http_addr, admin_state, shutdown).await
+        {
+            error!("Node agent admin HTTP listener error: {}", err);
+        }
+    });
+    handles.push(handle);
+
+    Ok(handles)
+}
+
+/// Operator signals that confirm the node-agent admin listener is intentionally
+/// reachable beyond loopback. Captured at startup via `resolve_ferrum_var` so
+/// the env > conf-file precedence chain matches the rest of the gateway.
+#[derive(Debug, Clone)]
+struct AdminBindSignals {
+    /// `FERRUM_ADMIN_BIND_ADDRESS` set explicitly (env or ferrum.conf).
+    bind_address_explicit: bool,
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` set to a non-empty allowlist.
+    allowed_cidrs_set: bool,
+}
+
+impl AdminBindSignals {
+    fn from_env() -> Self {
+        Self {
+            bind_address_explicit: resolve_ferrum_var("FERRUM_ADMIN_BIND_ADDRESS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+            allowed_cidrs_set: resolve_ferrum_var("FERRUM_ADMIN_ALLOWED_CIDRS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Pure helper: pick the admin listener bind address for node-agent mode.
+///
+/// When the operator opts in to the node-agent admin listener but has NOT
+/// configured either network-exposure signal (`FERRUM_ADMIN_BIND_ADDRESS` or
+/// `FERRUM_ADMIN_ALLOWED_CIDRS`) AND the resolved bind address is the
+/// unspecified-default `0.0.0.0`, override it to `127.0.0.1` and emit a
+/// `warn!` pointing operators at the escape hatches. This prevents accidentally
+/// exposing unauthenticated `/metrics` and `/health` to the network when the
+/// operator just flips
+/// `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` without further config.
+fn decide_admin_bind_address(
+    configured_bind: &str,
+    port: u16,
+    signals: &AdminBindSignals,
+) -> Result<std::net::SocketAddr, anyhow::Error> {
+    let configured_ip: std::net::IpAddr = configured_bind.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}' (expected a valid IP address)",
+            configured_bind
+        )
+    })?;
+
+    let any_signal_present = signals.bind_address_explicit || signals.allowed_cidrs_set;
+    let is_default_unspecified = !signals.bind_address_explicit
+        && (configured_ip.is_unspecified() || configured_bind == "0.0.0.0");
+
+    if !any_signal_present && is_default_unspecified {
+        warn!(
+            "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no allowlist or explicit bind address configured; \
+             defaulting node-agent admin listener to 127.0.0.1:{port} so unauthenticated /metrics and /health \
+             are not exposed on the network. To bind elsewhere, set one of: \
+             FERRUM_ADMIN_BIND_ADDRESS=<address> (e.g. 0.0.0.0 if intentional), \
+             or FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>"
+        );
+        let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        return Ok(std::net::SocketAddr::new(loopback, port));
+    }
+
+    Ok(std::net::SocketAddr::new(configured_ip, port))
 }
 
 fn create_backend() -> Box<dyn EbpfBackend> {
@@ -128,32 +312,16 @@ fn create_backend() -> Box<dyn EbpfBackend> {
     }
 }
 
-/// Metrics tracked by the node agent.
-pub struct NodeAgentMetrics {
-    pub pods_enrolled: AtomicU64,
-    pub pods_unenrolled: AtomicU64,
-    pub attach_errors: AtomicU64,
-}
-
-impl Default for NodeAgentMetrics {
-    fn default() -> Self {
-        Self {
-            pods_enrolled: AtomicU64::new(0),
-            pods_unenrolled: AtomicU64::new(0),
-            attach_errors: AtomicU64::new(0),
-        }
-    }
-}
-
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     initialize_backend(backend.as_mut(), config)?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-    let metrics = NodeAgentMetrics::default();
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let client = build_node_agent_kube_client().await?;
@@ -185,13 +353,13 @@ async fn run_with_backend(
                             backend.as_mut(),
                             &pod_states,
                             config,
-                            &metrics,
+                            metrics.as_ref(),
                             &pod,
                         );
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                            handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -202,7 +370,7 @@ async fn run_with_backend(
                             backend.as_mut(),
                             &pod_states,
                             config,
-                            &metrics,
+                            metrics.as_ref(),
                             &pod,
                         ) && let Some(seen) = &mut init_seen {
                             seen.insert(uid);
@@ -216,9 +384,11 @@ async fn run_with_backend(
                                 .map(|entry| entry.key().clone())
                                 .collect();
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                                handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
                             }
                         }
+                        startup_ready.store(true, Ordering::Release);
+                        info!("Node agent initial pod sync complete; /health now reports ready");
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "Pod watcher error; kube-rs will retry");
@@ -505,10 +675,15 @@ async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
-    handle_fallback_with(config, probe, shutdown_tx, |cmds, phase| async move {
-        execute_iptables_commands(&cmds, phase).await
-    })
+    handle_fallback_with(
+        config,
+        probe,
+        shutdown_tx,
+        |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
+        startup_ready,
+    )
     .await
 }
 
@@ -523,6 +698,7 @@ async fn handle_fallback_with<F, Fut>(
     probe: &KernelProbeResult,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     mut execute: F,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error>
 where
     F: FnMut(Vec<String>, &'static str) -> Fut,
@@ -553,6 +729,7 @@ where
                 }
                 return Err(setup_err);
             }
+            startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
 
@@ -698,6 +875,9 @@ fn initialize_backend(
     config: &NodeAgentConfig,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
+    backend
+        .update_capture_config(&config.capture_contract.bpf_capture_config())
+        .map_err(anyhow::Error::msg)?;
 
     if let Some(uid) = config.capture_config.proxy_uid {
         backend.update_bypass_uid(uid).map_err(anyhow::Error::msg)?;
@@ -750,6 +930,71 @@ mod tests {
     use crate::capture::{CaptureMode, Ip6TablesMode};
     use crate::ebpf::MockEbpfBackend;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let result = f();
+
+        for (key, value) in previous {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe {
+                match value {
+                    Some(previous_value) => std::env::set_var(key, previous_value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn from_env_config_auto_excludes_configured_hbone_redirect_port() {
+        let env_config = EnvConfig {
+            node_agent_hbone_redirect_port: 16008,
+            ..EnvConfig::default()
+        };
+
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                (
+                    "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS",
+                    "15001,15006,15008,15020",
+                ),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&env_config)
+                    .expect("node-agent config should parse");
+
+                assert!(
+                    config.capture_config.exclude_ports.contains(&16008),
+                    "custom HBONE redirect port must bypass outbound capture"
+                );
+                assert_eq!(
+                    config
+                        .capture_config
+                        .exclude_ports
+                        .iter()
+                        .filter(|&&port| port == 16008)
+                        .count(),
+                    1,
+                    "auto-added HBONE redirect port should not duplicate"
+                );
+            },
+        );
+    }
+
     #[test]
     fn initialize_backend_populates_maps() {
         let config = NodeAgentConfig {
@@ -772,6 +1017,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
 
         let mut backend = MockEbpfBackend::default();
@@ -782,6 +1028,34 @@ mod tests {
         assert_eq!(backend.cidr_includes, vec!["10.0.0.0/8"]);
         assert_eq!(backend.cidr_excludes, vec!["10.0.0.1/32"]);
         assert_eq!(backend.port_excludes, vec![15020]);
+        assert_eq!(
+            backend.capture_config,
+            Some(config.capture_contract.bpf_capture_config())
+        );
+    }
+
+    #[test]
+    fn initialize_backend_capture_config_failure_is_fatal() {
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let mut backend = MockEbpfBackend {
+            fail_update_capture_config: true,
+            ..MockEbpfBackend::default()
+        };
+
+        let err = initialize_backend(&mut backend, &config)
+            .expect_err("capture-config failure should abort initialization");
+
+        assert!(err.to_string().contains("capture config update failed"));
+        assert!(backend.programs_loaded);
+        assert!(backend.capture_config.is_none());
     }
 
     #[test]
@@ -843,6 +1117,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -854,6 +1129,7 @@ mod tests {
         shutdown_tx
             .send(true)
             .expect("watch channel should be open");
+        let startup_ready = Arc::new(AtomicBool::new(false));
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
@@ -863,7 +1139,65 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            handle_fallback_with(&config, &probe, &shutdown_tx, move |commands, phase| {
+            handle_fallback_with(
+                &config,
+                &probe,
+                &shutdown_tx,
+                move |commands, phase| {
+                    let phases = std::sync::Arc::clone(&phases_for_runner);
+                    let command_counts = std::sync::Arc::clone(&command_counts_for_runner);
+                    async move {
+                        phases.lock().expect("phases mutex").push(phase);
+                        command_counts
+                            .lock()
+                            .expect("command counts mutex")
+                            .push((phase, commands.len()));
+                        Ok(())
+                    }
+                },
+                startup_ready.clone(),
+            ),
+        )
+        .await
+        .expect("handle_fallback should complete within timeout");
+        assert!(result.is_ok());
+        assert!(startup_ready.load(Ordering::Acquire));
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["setup", "cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fallback_iptables_setup_failure_is_not_ready() {
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let probe = kernel_probe::KernelProbeResult {
+            kernel_release: "4.19.0".to_string(),
+            meets_version_requirement: false,
+            cgroup_v2_available: false,
+            bpf_fs_available: false,
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let phases_for_runner = std::sync::Arc::clone(&phases);
+        let command_counts =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let command_counts_for_runner = std::sync::Arc::clone(&command_counts);
+
+        let result = handle_fallback_with(
+            &config,
+            &probe,
+            &shutdown_tx,
+            move |commands, phase| {
                 let phases = std::sync::Arc::clone(&phases_for_runner);
                 let command_counts = std::sync::Arc::clone(&command_counts_for_runner);
                 async move {
@@ -872,13 +1206,15 @@ mod tests {
                         .lock()
                         .expect("command counts mutex")
                         .push((phase, commands.len()));
-                    Ok(())
+                    anyhow::bail!("setup failed")
                 }
-            }),
+            },
+            startup_ready.clone(),
         )
-        .await
-        .expect("handle_fallback should complete within timeout");
-        assert!(result.is_ok());
+        .await;
+
+        assert!(result.is_err());
+        assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
@@ -946,6 +1282,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -954,29 +1291,37 @@ mod tests {
             bpf_fs_available: false,
         };
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
 
-        let result = handle_fallback_with(&config, &probe, &shutdown_tx, move |commands, phase| {
-            let phases = std::sync::Arc::clone(&phases_for_runner);
-            async move {
-                if phase == "setup" {
-                    assert!(
-                        commands.len() > 1,
-                        "setup should pass individual commands, got {commands:?}"
-                    );
-                    assert!(
-                        commands.iter().all(|cmd| !cmd.contains('\n')),
-                        "v4-only setup should not be collapsed into a shell script: {commands:?}"
-                    );
+        let result = handle_fallback_with(
+            &config,
+            &probe,
+            &shutdown_tx,
+            move |commands, phase| {
+                let phases = std::sync::Arc::clone(&phases_for_runner);
+                async move {
+                    if phase == "setup" {
+                        assert!(
+                            commands.len() > 1,
+                            "setup should pass individual commands, got {commands:?}"
+                        );
+                        assert!(
+                            commands.iter().all(|cmd| !cmd.contains('\n')),
+                            "v4-only setup should not be collapsed into a shell script: {commands:?}"
+                        );
+                    }
+                    phases.lock().expect("phases mutex").push(phase);
+                    anyhow::bail!("setup failed")
                 }
-                phases.lock().expect("phases mutex").push(phase);
-                anyhow::bail!("setup failed")
-            }
-        })
+            },
+            startup_ready.clone(),
+        )
         .await;
 
         assert!(result.is_err());
+        assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
@@ -998,6 +1343,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -1035,6 +1381,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -1065,6 +1412,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -1106,6 +1454,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -1137,6 +1486,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: excluded,
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -1215,6 +1565,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -1258,6 +1609,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -1301,6 +1653,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Fail,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -1309,12 +1662,14 @@ mod tests {
             bpf_fs_available: false,
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
 
         assert!(
-            handle_fallback(&config, &probe, &shutdown_tx)
+            handle_fallback(&config, &probe, &shutdown_tx, startup_ready.clone())
                 .await
                 .is_err()
         );
+        assert!(!startup_ready.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1334,5 +1689,146 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), wait)
             .await
             .expect("shutdown wait should resolve after signal");
+    }
+
+    #[tokio::test]
+    async fn admin_listener_http_port_zero_spawns_no_tasks() {
+        let env_config = EnvConfig {
+            node_agent_admin_enabled: true,
+            admin_http_port: 0,
+            ..EnvConfig::default()
+        };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect("port zero should be accepted");
+
+        assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_listener_default_disabled_spawns_no_tasks() {
+        let env_config = EnvConfig::default();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect("disabled admin listener should be accepted");
+
+        assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_listener_invalid_allowed_cidrs_returns_error() {
+        let env_config = EnvConfig {
+            node_agent_admin_enabled: true,
+            admin_http_port: 18081,
+            admin_allowed_cidrs: "not-a-cidr".to_string(),
+            ..EnvConfig::default()
+        };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let err = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect_err("invalid CIDR should fail before spawning");
+
+        assert!(err.to_string().contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
+    }
+
+    fn signals(bind_explicit: bool, cidrs: bool) -> AdminBindSignals {
+        AdminBindSignals {
+            bind_address_explicit: bind_explicit,
+            allowed_cidrs_set: cidrs,
+        }
+    }
+
+    #[test]
+    fn decide_admin_bind_defaults_to_loopback_when_no_signals() {
+        // Default unspecified bind + no auth, no allowlist, no explicit bind →
+        // override to 127.0.0.1 to avoid exposing unauthenticated /metrics.
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false))
+            .expect("default 0.0.0.0 bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_bind_address() {
+        // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 → respected.
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(true, false))
+            .expect("explicit bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_does_not_treat_jwt_secret_as_network_exposure_signal() {
+        // /metrics and /health are unauthenticated, so JWT alone must not make
+        // an unspecified listener network-reachable.
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false))
+            .expect("0.0.0.0 with only JWT should still be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_allowed_cidrs_signal() {
+        // Allowlist configured → operator scoped network exposure, respect 0.0.0.0.
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, true))
+            .expect("0.0.0.0 with allowed cidrs should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_loopback() {
+        // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 → respected.
+        let addr = decide_admin_bind_address("127.0.0.1", 9000, &signals(true, false))
+            .expect("loopback should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_v6_unspecified() {
+        // IPv6 :: with explicit-bind signal → respected (don't override).
+        let addr = decide_admin_bind_address("::", 9000, &signals(true, false))
+            .expect("explicit :: should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_overrides_v6_unspecified_with_no_signals() {
+        // IPv6 :: with NO signals → also unsafe, override to loopback.
+        let addr = decide_admin_bind_address("::", 9000, &signals(false, false))
+            .expect("default :: bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_rejects_invalid_address() {
+        let err = decide_admin_bind_address("not-an-ip", 9000, &signals(true, false))
+            .expect_err("invalid IP should be rejected");
+        assert!(err.to_string().contains("FERRUM_ADMIN_BIND_ADDRESS"));
     }
 }
