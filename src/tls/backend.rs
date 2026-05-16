@@ -118,6 +118,10 @@ pub fn append_backend_tls_pool_key_fields(
 /// TCP+TLS, backend WebSocket, DTLS, and active health probes still use their
 /// protocol-specific server-name plumbing and should route through this helper
 /// when those paths grow backend SNI override support.
+///
+/// Caller invariant: any `tls.sni` value came from resolved configuration that
+/// already passed `validate_backend_tls_sni`; this helper intentionally does
+/// no normalization or validation on the request path.
 pub fn backend_tls_server_name<'a>(tls: &'a BackendTlsConfig, host: &'a str) -> &'a str {
     tls.sni.as_deref().unwrap_or(host)
 }

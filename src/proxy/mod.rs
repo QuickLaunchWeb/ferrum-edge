@@ -363,6 +363,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::ConnectionPoolError
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
+                    | retry::ErrorClass::DispatchPolicyRejected
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -1118,12 +1119,12 @@ fn backend_tls_sni_requires_direct_h2_response(
         status_code: 502,
         body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
         headers,
-        // reqwest cannot apply per-request backend SNI. Status-code retries
-        // may still replay this response, but the retry path repeats this
-        // terminal 502 instead of falling through to reqwest.
+        // reqwest cannot apply per-request backend SNI. Mark this terminal
+        // gateway policy response as non-retryable so a 502 retry policy
+        // cannot amplify it or trip the backend circuit breaker repeatedly.
         connection_error: false,
         backend_resolved_ip: resolved_ip,
-        error_class: Some(retry::ErrorClass::RequestError),
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
     }
 }
 
@@ -9927,6 +9928,15 @@ pub(crate) async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    if proxy.resolved_tls.sni.is_some() {
+        warn!(
+            proxy_id = %proxy.id,
+            backend_tls_sni = ?proxy.resolved_tls.sni,
+            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
+        );
+        return backend_tls_sni_requires_direct_h2_response(None);
+    }
+
     // Resolve backend IP from DNS cache (O(1) cached lookup).
     let resolved_ip = state
         .dns_cache
@@ -9938,15 +9948,6 @@ pub(crate) async fn proxy_to_backend_retry(
         .await
         .ok()
         .map(|ip| ip.to_string());
-
-    if proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %proxy.id,
-            backend_tls_sni = ?proxy.resolved_tls.sni,
-            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
-        );
-        return backend_tls_sni_requires_direct_h2_response(resolved_ip);
-    }
 
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
@@ -13510,7 +13511,10 @@ mod tests {
 
         assert_eq!(resp.status_code, 502);
         assert!(!resp.connection_error);
-        assert_eq!(resp.error_class, Some(retry::ErrorClass::RequestError));
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
         assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(
             resp.headers.get("gateway-error-reason").map(String::as_str),
@@ -13549,7 +13553,11 @@ mod tests {
 
         assert_eq!(resp.status_code, 502);
         assert!(!resp.connection_error);
-        assert_eq!(resp.error_class, Some(retry::ErrorClass::RequestError));
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip, None);
         assert_eq!(
             resp.headers.get("gateway-error-reason").map(String::as_str),
             Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
@@ -14048,6 +14056,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
@@ -14351,6 +14360,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             let bumped = super::record_port_exhaustion_if_class(&overload, class);

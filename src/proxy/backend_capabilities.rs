@@ -237,13 +237,14 @@ impl BackendCapabilityRegistry {
     /// favor of this registry, so without this downgrade every subsequent
     /// request would re-attempt the direct H2 handshake, re-negotiate
     /// HTTP/1.1, and re-pay the fallback cost until the next 24 h refresh.
-    /// Marking the backend Unsupported here makes
-    /// `supports_direct_http2_backend` return false for subsequent
-    /// requests so they go straight to reqwest. The gRPC h2 transport
-    /// bucket is downgraded in lockstep since the same ALPN observation
-    /// is the signal for both. If the target has no cached record yet,
-    /// this creates an initial H1-only record from the observed fallback;
-    /// a later active refresh can overwrite it if the backend changes.
+    /// Marking the backend Unsupported here makes subsequent requests go
+    /// straight to reqwest. The gRPC h2 transport bucket is downgraded in
+    /// lockstep since the same ALPN observation is the signal for both. If
+    /// the target has no cached record yet, this creates an initial H1-only
+    /// record only when a backend SNI override requires direct H2; ordinary
+    /// non-SNI proxies keep the historical occupied-entry-only behavior so
+    /// `mark_h3_unsupported` / `mark_hbone_unsupported` asymmetry does not
+    /// spill into unrelated proxies that share the target key.
     ///
     /// Returns `true` when the registry was mutated (including creation of
     /// that initial H1-only record) and `false` when the key was already
@@ -266,6 +267,9 @@ impl BackendCapabilityRegistry {
                 true
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if proxy.resolved_tls.sni.is_none() {
+                    return false;
+                }
                 let mut new_record = BackendCapabilityRecord::default();
                 mark_record_h2_tls_unsupported(&mut new_record);
                 entry.insert(Arc::new(new_record));
@@ -663,7 +667,8 @@ mod tests {
     #[test]
     fn registry_mark_h2_tls_unsupported_creates_h1_only_entry_when_missing() {
         let registry = BackendCapabilityRegistry::new();
-        let proxy = minimal_proxy();
+        let mut proxy = minimal_proxy();
+        proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
         assert!(registry.mark_h2_tls_unsupported(&proxy, None));
 
         let fetched = registry.get(&proxy, None).unwrap();
@@ -671,6 +676,18 @@ mod tests {
         assert_eq!(fetched.grpc_transport.h2_tls, ProtocolSupport::Unsupported);
         assert_eq!(fetched.plain_http.h1, ProtocolSupport::Supported);
         assert!(fetched.last_probe_error.is_some());
+    }
+
+    #[test]
+    fn registry_mark_h2_tls_unsupported_without_sni_is_noop_when_missing() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+
+        assert!(!registry.mark_h2_tls_unsupported(&proxy, None));
+        assert!(
+            registry.get(&proxy, None).is_none(),
+            "non-SNI vacant downgrades should not create a shared H1-only entry"
+        );
     }
 
     #[test]
