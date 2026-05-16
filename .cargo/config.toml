@@ -8,8 +8,8 @@
 # that matches your platform after installing the required linker.
 #
 # macOS — install lld: `brew install llvm` then add to PATH
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # [target.x86_64-apple-darwin]
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
@@ -29,8 +29,8 @@ rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 # Then uncomment the next two lines, or set RUSTC_WRAPPER=sccache in your
 # shell profile (~/.zshrc / ~/.bashrc).
 #
-[build]
-rustc-wrapper = "sccache"
+# [build]
+# rustc-wrapper = "sccache"
 
 # ── Network settings ────────────────────────────────────────────────────
 [net]
