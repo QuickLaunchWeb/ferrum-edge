@@ -282,10 +282,65 @@ pub struct UpstreamTarget {
     pub weight: u32,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+    /// Optional Istio-style `region/zone/subzone` locality for this target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
     /// Optional path prefix that overrides the proxy's `backend_path` when this
     /// target is selected by the load balancer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+/// Parsed locality preference used by the load balancer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalityPreference {
+    pub region: String,
+    pub zone: Option<String>,
+    pub sub_zone: Option<String>,
+}
+
+impl LocalityPreference {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut parts = trimmed.splitn(3, '/').map(str::trim);
+        let region = parts.next()?.to_string();
+        if region.is_empty() {
+            return None;
+        }
+        let zone = parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string);
+        let sub_zone = parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string);
+
+        Some(Self {
+            region,
+            zone,
+            sub_zone,
+        })
+    }
+
+    #[inline]
+    pub fn exact_matches(&self, target: &Self) -> bool {
+        self.region == target.region && self.zone == target.zone && self.sub_zone == target.sub_zone
+    }
+
+    #[inline]
+    pub fn same_zone(&self, target: &Self) -> bool {
+        self.region == target.region && self.zone.is_some() && self.zone == target.zone
+    }
+
+    #[inline]
+    pub fn same_region(&self, target: &Self) -> bool {
+        self.region == target.region
+    }
 }
 
 fn default_weight() -> u32 {
@@ -644,6 +699,10 @@ pub struct Upstream {
     /// the prior schema when empty (via `skip_serializing_if`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub port_overrides: HashMap<u16, UpstreamPortOverride>,
+    /// Optional source-workload locality used by mesh-mode locality-aware
+    /// balancing. Projected from the selected workload at slice-apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_locality: Option<String>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,

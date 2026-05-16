@@ -1208,6 +1208,7 @@ fn backend_capability_key_uses_target_host_and_port() {
         port: 9443,
         weight: 1,
         tags: Default::default(),
+        locality: None,
         path: None,
     };
 
@@ -1342,6 +1343,7 @@ fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
         port: 7443,
         weight: 1,
         tags: Default::default(),
+        locality: None,
         path: None,
     };
 

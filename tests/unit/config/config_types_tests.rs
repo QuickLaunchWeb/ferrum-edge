@@ -93,6 +93,7 @@ fn make_upstream(id: &str) -> Upstream {
             port: 3000,
             weight: 100,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         }],
         algorithm: Default::default(),
@@ -102,6 +103,7 @@ fn make_upstream(id: &str) -> Upstream {
         service_discovery: None,
         subsets: None,
         port_overrides: HashMap::new(),
+        source_locality: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -146,11 +148,20 @@ fn upstream_backend_tls_new_fields_default_when_absent() {
 
     assert!(upstream.backend_tls_sni.is_none());
     assert!(upstream.backend_tls_san_allow_list.is_empty());
+    assert!(upstream.source_locality.is_none());
+    assert!(upstream.targets[0].locality.is_none());
 
     let json = serde_json::to_value(&upstream).expect("serialize upstream");
     let object = json.as_object().expect("upstream object");
     assert!(!object.contains_key("backend_tls_sni"));
     assert!(!object.contains_key("backend_tls_san_allow_list"));
+    assert!(!object.contains_key("source_locality"));
+    assert!(
+        !object["targets"][0]
+            .as_object()
+            .expect("target object")
+            .contains_key("locality")
+    );
 }
 
 #[test]

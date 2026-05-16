@@ -5522,6 +5522,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // pipeline (`apply_destination_rules`); they are not persisted to SQL
         // backends today, so SQL rows always start with an empty map.
         port_overrides: std::collections::HashMap::new(),
+        source_locality: None,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,

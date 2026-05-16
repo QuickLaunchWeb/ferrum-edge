@@ -2250,6 +2250,7 @@ fn try_next_target(
         weight: 1,
         path: None,
         tags: std::collections::HashMap::new(),
+        locality: None,
     };
     let next = if let Some(subset_name) = params.upstream_subset.as_deref() {
         LoadBalancerCache::select_next_target_subset_from(

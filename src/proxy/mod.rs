@@ -485,6 +485,7 @@ fn target_uses_direct_h2_pool(
         port,
         weight: 1,
         tags: HashMap::new(),
+        locality: None,
         path: None,
     };
     registry
@@ -13301,6 +13302,7 @@ mod tests {
             port: 8080,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         };
         let selected_non_overridden_target = UpstreamTarget {
@@ -13308,6 +13310,7 @@ mod tests {
             port: 9090,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         };
 
@@ -15326,6 +15329,7 @@ mod tests {
                 ("mesh.service".to_string(), "payments".to_string()),
                 ("mesh.trust_domain".to_string(), "cluster.local".to_string()),
             ]),
+            locality: None,
             path: None,
         };
         ctx.metadata.insert(
@@ -16019,6 +16023,7 @@ mod tests {
             port,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         }
     }
@@ -16148,6 +16153,7 @@ mod tests {
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -16200,6 +16206,7 @@ mod tests {
                 service_discovery: None,
                 subsets: None,
                 port_overrides: HashMap::new(),
+                source_locality: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
                 backend_tls_verify_server_cert: true,

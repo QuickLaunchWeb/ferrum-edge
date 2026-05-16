@@ -113,6 +113,7 @@ mod tests {
             port,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         }
     }
@@ -130,6 +131,7 @@ mod tests {
             service_discovery: None,
             subsets: None,
             port_overrides: std::collections::HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,

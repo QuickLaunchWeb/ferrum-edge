@@ -1301,6 +1301,7 @@ pub(crate) fn upstream_for_route(
                 port: backend.port,
                 weight: backend.weight,
                 tags: HashMap::new(),
+                locality: None,
                 path: None,
             })
             .collect(),
@@ -1315,6 +1316,7 @@ pub(crate) fn upstream_for_route(
         service_discovery: None,
         subsets: None,
         port_overrides: HashMap::new(),
+        source_locality: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
