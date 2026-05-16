@@ -2559,6 +2559,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// Body-collection failures must surface a generic 400 with no leaked
+    /// transport details — the underlying error is logged via `tracing::warn`
+    /// instead. Regression guard against an earlier shape that forwarded the
+    /// raw hyper error string into the response body.
+    #[tokio::test]
+    async fn body_collect_error_returns_generic_400() {
+        let resp = error_response(ApiSpecError::BodyCollect);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap();
+        let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();
+        assert!(body.contains("Failed to read request body"));
+    }
+
     #[test]
     fn extract_error_maps_to_400() {
         let resp = error_response(ApiSpecError::Extract(ExtractError::MissingProxyExtension));

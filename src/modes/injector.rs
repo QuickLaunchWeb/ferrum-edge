@@ -649,7 +649,7 @@ async fn handle_injector_request(
 }
 
 fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
-    if max_body_bytes % MIB_BYTES == 0 {
+    if max_body_bytes.is_multiple_of(MIB_BYTES) {
         format!("{} MiB", max_body_bytes / MIB_BYTES)
     } else {
         // Production env parsing is MiB-aligned, but tests and direct
