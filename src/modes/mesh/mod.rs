@@ -15,6 +15,7 @@ pub mod runtime;
 pub mod slice;
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2434,31 +2435,44 @@ async fn serve_mesh_runtime(
         None
     };
 
-    // Resolve mTLS mode from the initial mesh slice. This is evaluated once at
-    // startup — PeerAuthentication changes pushed via CP/xDS update the slice
-    // but do NOT live-rotate the inbound TLS ServerConfig (consistent with the
-    // project's static-TLS-material model). A restart is required.
-    let inbound_mtls_mode =
-        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
-    validate_inbound_mtls_mode_for_topology(&runtime, inbound_mtls_mode)?;
-
-    let mesh_apply_handle = start_mesh_slice_apply_task(
-        mesh_state,
-        proxy_state.clone(),
-        runtime.clone(),
-        initial_applied_mesh_slice,
-        shutdown_tx.subscribe(),
-        dns_proxy_handle,
-    );
-
+    // Resolve mTLS mode from the initial mesh slice. By default this remains a
+    // startup-only decision. When the opt-in live reload flag is enabled, the
+    // mesh accept loops read `proxy_state.mesh_inbound_tls` on every accept and
+    // slice apply may atomically swap the inbound ServerConfig.
+    let inbound_mtls_mode = startup_inbound_mtls_mode(
+        initial_applied_mesh_slice.as_deref(),
+        &runtime,
+        env_config.mesh_peer_auth_live_reload_enabled,
+    )?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
     let frontend_tls = load_mesh_frontend_tls(&env_config, &tls_policy, &crls, inbound_mtls_mode)?;
+    let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
+        proxy_state
+            .mesh_inbound_tls
+            .store(Arc::new(frontend_tls.clone()));
+        Some(mesh_inbound_tls_reload_snapshot(
+            &env_config,
+            inbound_mtls_mode,
+        )?)
+    } else {
+        None
+    };
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
             .set_frontend_tls_config(Some(tls_config.clone()))
             .await;
     }
+
+    let mesh_apply_handle = start_mesh_slice_apply_task(
+        mesh_state,
+        proxy_state.clone(),
+        runtime.clone(),
+        initial_applied_mesh_slice,
+        initial_inbound_tls_snapshot,
+        shutdown_tx.subscribe(),
+        dns_proxy_handle,
+    );
 
     info!(
         listeners = runtime.listener_plan().len(),
@@ -2498,15 +2512,29 @@ async fn serve_mesh_runtime(
                 addr = %addr,
                 "Starting mesh listener"
             );
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-                addr,
-                state,
-                shutdown,
-                tls_config,
-                Some(started_tx),
-            )
-            .await
-            {
+            let listener_result = if state.env_config.mesh_peer_auth_live_reload_enabled
+                && matches!(
+                    kind,
+                    MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+                ) {
+                proxy::start_proxy_listener_with_mesh_inbound_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    Some(started_tx),
+                )
+                .await
+            } else {
+                proxy::start_proxy_listener_with_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
+                    Some(started_tx),
+                )
+                .await
+            };
+            if let Err(e) = listener_result {
                 error!(
                     direction = ?direction,
                     kind = ?kind,
@@ -2654,6 +2682,79 @@ fn validate_inbound_mtls_mode_for_topology(
     }
 }
 
+fn startup_inbound_mtls_mode(
+    initial_slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
+    live_reload_enabled: bool,
+) -> Result<config::MtlsMode, anyhow::Error> {
+    let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
+    match validate_inbound_mtls_mode_for_topology(runtime, resolved) {
+        Ok(()) => Ok(resolved),
+        Err(error) if live_reload_enabled => {
+            warn!(
+                ?resolved,
+                topology = ?runtime.topology,
+                "Initial PeerAuthentication mTLS mode is invalid for this mesh topology: {error}; \
+                 keeping the startup fallback PERMISSIVE mode until a valid slice arrives"
+            );
+            Ok(config::MtlsMode::Permissive)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn live_reload_inbound_mtls_mode(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Option<config::MtlsMode> {
+    let resolved = resolve_inbound_mtls_mode(Some(slice), runtime);
+    if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, resolved) {
+        warn!(
+            mesh_slice_version = %slice.version,
+            ?resolved,
+            topology = ?runtime.topology,
+            "Rejecting mesh slice apply because PeerAuthentication mTLS mode is invalid \
+             for this topology: {error}; keeping the previous mesh config"
+        );
+        return None;
+    }
+    Some(resolved)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshInboundTlsReloadSnapshot {
+    mtls_mode: config::MtlsMode,
+    client_ca_bundle_hash: Option<u64>,
+}
+
+fn mesh_inbound_tls_reload_snapshot(
+    env_config: &EnvConfig,
+    mtls_mode: config::MtlsMode,
+) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
+    let client_ca_bundle_hash =
+        if mtls_mode == config::MtlsMode::Disable {
+            None
+        } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
+            Some(file_content_hash(path).with_context(|| {
+                format!("failed to hash mesh frontend client CA bundle at {path}")
+            })?)
+        } else {
+            None
+        };
+    Ok(MeshInboundTlsReloadSnapshot {
+        mtls_mode,
+        client_ca_bundle_hash,
+    })
+}
+
+fn file_content_hash(path: &str) -> Result<u64, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
 /// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
 ///
 /// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
@@ -2786,11 +2887,92 @@ fn listener_tls_config_for_mtls_mode(
     listener_tls_config(listener, frontend_tls)
 }
 
+enum MeshInboundTlsReloadPlan {
+    Unchanged,
+    Swap {
+        snapshot: MeshInboundTlsReloadSnapshot,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    },
+}
+
+fn plan_mesh_inbound_tls_reload(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+    mtls_mode: config::MtlsMode,
+    last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
+) -> Option<MeshInboundTlsReloadPlan> {
+    let next_snapshot = match mesh_inbound_tls_reload_snapshot(&proxy_state.env_config, mtls_mode) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Unable to inspect mesh inbound TLS reload inputs: {error}; keeping previous TLS config"
+            );
+            return None;
+        }
+    };
+    if last_snapshot == Some(&next_snapshot) {
+        return Some(MeshInboundTlsReloadPlan::Unchanged);
+    }
+    let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+        warn!(
+            mesh_slice_version = %slice.version,
+            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; keeping previous TLS config"
+        );
+        return None;
+    };
+    match load_mesh_frontend_tls(
+        &proxy_state.env_config,
+        tls_policy,
+        &proxy_state.crls,
+        mtls_mode,
+    ) {
+        Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
+            snapshot: next_snapshot,
+            tls_config,
+        }),
+        Err(error) => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; keeping previous TLS config"
+            );
+            None
+        }
+    }
+}
+
+fn apply_mesh_inbound_tls_reload(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+    mtls_mode: config::MtlsMode,
+    plan: MeshInboundTlsReloadPlan,
+    last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
+) {
+    match plan {
+        MeshInboundTlsReloadPlan::Unchanged => {}
+        MeshInboundTlsReloadPlan::Swap {
+            snapshot,
+            tls_config,
+        } => {
+            proxy_state.mesh_inbound_tls.store(Arc::new(tls_config));
+            *last_snapshot = Some(snapshot);
+            info!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Mesh inbound PeerAuthentication TLS config reloaded"
+            );
+        }
+    }
+}
+
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
     runtime: MeshRuntimeConfig,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    mut last_inbound_tls_snapshot: Option<MeshInboundTlsReloadSnapshot>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
@@ -2810,49 +2992,80 @@ fn start_mesh_slice_apply_task(
                         "Skipping no-op mesh slice update"
                     );
                 } else {
-                    match gateway_config_from_mesh_slice(slice, &runtime) {
-                        Ok(config) => {
-                            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
-                            let candidate_loaded_at = config.loaded_at;
-                            let applied = proxy_state.update_config(config);
-                            let current_loaded_at = proxy_state.config.load_full().loaded_at;
-                            let accepted = mesh_proxy_update_was_accepted(
-                                applied,
-                                previous_loaded_at,
-                                current_loaded_at,
-                                candidate_loaded_at,
-                            );
-                            record_mesh_slice_apply_result(
-                                &mut last_applied_slice,
+                    let live_reload_enabled =
+                        proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
+                    let live_reload = if live_reload_enabled {
+                        live_reload_inbound_mtls_mode(slice, &runtime).and_then(|mtls_mode| {
+                            plan_mesh_inbound_tls_reload(
+                                &proxy_state,
                                 slice,
-                                accepted,
-                            );
-                            if accepted && let Some(ref dns_proxy) = dns_proxy {
-                                dns_proxy.update_from_slice(slice);
+                                mtls_mode,
+                                last_inbound_tls_snapshot.as_ref(),
+                            )
+                            .map(|plan| (mtls_mode, plan))
+                        })
+                    } else {
+                        None
+                    };
+                    if live_reload_enabled && live_reload.is_none() {
+                        debug!(
+                            mesh_slice_version = %slice.version,
+                            "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
+                        );
+                    } else {
+                        match gateway_config_from_mesh_slice(slice, &runtime) {
+                            Ok(config) => {
+                                let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+                                let candidate_loaded_at = config.loaded_at;
+                                let applied = proxy_state.update_config(config);
+                                let current_loaded_at = proxy_state.config.load_full().loaded_at;
+                                let accepted = mesh_proxy_update_was_accepted(
+                                    applied,
+                                    previous_loaded_at,
+                                    current_loaded_at,
+                                    candidate_loaded_at,
+                                );
+                                record_mesh_slice_apply_result(
+                                    &mut last_applied_slice,
+                                    slice,
+                                    accepted,
+                                );
+                                if accepted && let Some((mtls_mode, plan)) = live_reload {
+                                    apply_mesh_inbound_tls_reload(
+                                        &proxy_state,
+                                        slice,
+                                        mtls_mode,
+                                        plan,
+                                        &mut last_inbound_tls_snapshot,
+                                    );
+                                }
+                                if accepted && let Some(ref dns_proxy) = dns_proxy {
+                                    dns_proxy.update_from_slice(slice);
+                                }
+                                if applied {
+                                    info!(
+                                        mesh_slice_version = %slice.version,
+                                        "Applied mesh slice to proxy runtime"
+                                    );
+                                } else if accepted {
+                                    debug!(
+                                        mesh_slice_version = %slice.version,
+                                        "Accepted mesh slice with no proxy runtime delta"
+                                    );
+                                } else {
+                                    warn!(
+                                        mesh_slice_version = %slice.version,
+                                        "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
+                                    );
+                                }
                             }
-                            if applied {
-                                info!(
-                                    mesh_slice_version = %slice.version,
-                                    "Applied mesh slice to proxy runtime"
-                                );
-                            } else if accepted {
-                                debug!(
-                                    mesh_slice_version = %slice.version,
-                                    "Accepted mesh slice with no proxy runtime delta"
-                                );
-                            } else {
+                            Err(e) => {
                                 warn!(
                                     mesh_slice_version = %slice.version,
-                                    "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
+                                    error = %e,
+                                    "Ignoring invalid mesh slice update"
                                 );
                             }
-                        }
-                        Err(e) => {
-                            warn!(
-                                mesh_slice_version = %slice.version,
-                                error = %e,
-                                "Ignoring invalid mesh slice update"
-                            );
                         }
                     }
                 }
@@ -3030,6 +3243,10 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 
     fn with_mesh_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -3601,6 +3818,20 @@ mod tests {
                 ..EnvConfig::default()
             },
             None,
+            None,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
+    }
+
+    fn make_test_proxy_state_with_env(initial_config: GatewayConfig, env: EnvConfig) -> ProxyState {
+        ensure_crypto_provider();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("test TLS policy");
+        ProxyState::new(
+            initial_config,
+            DnsCache::new(DnsConfig::default()),
+            env,
+            Some(tls_policy),
             None,
         )
         .expect("ProxyState construction should succeed in tests")
@@ -5130,6 +5361,19 @@ mod tests {
         .unwrap_or_else(|_| panic!("mesh_authz label {key} did not become {expected}"));
     }
 
+    async fn wait_for_mesh_inbound_tls(proxy_state: &ProxyState, expected_present: bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if proxy_state.mesh_inbound_tls.load_full().is_some() == expected_present {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mesh inbound TLS slot should update");
+    }
+
     #[test]
     fn mesh_runtime_listener_plan_uses_sidecar_ports() {
         with_mesh_env(
@@ -5902,6 +6146,7 @@ mod tests {
             proxy_state.clone(),
             runtime,
             None,
+            None,
             shutdown_rx,
             None,
         );
@@ -5919,6 +6164,125 @@ mod tests {
             ..MeshSlice::default()
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_live_reloads_peer_auth_tls_slot() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            Some(initial_snapshot),
+            shutdown_rx,
+            None,
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "strict".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, true).await;
+
+        mesh_state.install_slice(MeshSlice {
+            version: "disable".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, false).await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_rejects_peer_auth_reload_when_tls_rebuild_fails() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("/missing/server.crt".to_string()),
+            frontend_tls_key_path: Some("/missing/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            Some(initial_snapshot),
+            shutdown_rx,
+            None,
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "bad-strict".to_string(),
+            labels: [("app".to_string(), "bad-tls".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            proxy_state.mesh_inbound_tls.load_full().is_none(),
+            "failed TLS rebuild should keep the previous plaintext slot"
+        );
+        let applied_label = proxy_state
+            .current_config()
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .and_then(|plugin| {
+                plugin
+                    .config
+                    .pointer("/mesh_slice/labels/app")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
+        assert!(
+            applied_label.is_none(),
+            "failed TLS rebuild should keep the previous proxy config"
+        );
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
@@ -6546,6 +6910,7 @@ mod tests {
 
     #[test]
     fn permissive_without_ca_bundle_degrades_to_no_client_auth() {
+        ensure_crypto_provider();
         let env = EnvConfig {
             frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
             frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
@@ -6682,6 +7047,100 @@ mod tests {
         let runtime = runtime_with_topology(MeshTopology::Sidecar);
         validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
             .expect("Disable on Sidecar is allowed (plaintext-only inbound)");
+    }
+
+    #[test]
+    fn startup_inbound_mtls_mode_preserves_legacy_disable_rejection_when_live_reload_disabled() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Disable,
+        )]);
+
+        let err = startup_inbound_mtls_mode(Some(&slice), &runtime, false)
+            .expect_err("Disable on Ambient should still fail closed without live reload");
+
+        assert!(err.to_string().contains("Ambient"));
+    }
+
+    #[test]
+    fn startup_inbound_mtls_mode_falls_back_when_live_reload_enabled() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Disable,
+        )]);
+
+        let mode = startup_inbound_mtls_mode(Some(&slice), &runtime, true)
+            .expect("live reload should keep the DP running");
+
+        assert_eq!(mode, config::MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn live_reload_inbound_mtls_mode_rejects_invalid_disable_slice() {
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15090,
+            config::MtlsMode::Disable,
+        )]);
+
+        assert!(
+            live_reload_inbound_mtls_mode(&slice, &runtime).is_none(),
+            "invalid live PeerAuthentication update should be rejected"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_tls_reload_snapshot_tracks_client_ca_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_path, b"first-ca").expect("write first CA");
+        let env = EnvConfig {
+            frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().to_string()),
+            ..EnvConfig::default()
+        };
+
+        let first = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("first snapshot");
+        std::fs::write(&ca_path, b"second-ca").expect("write second CA");
+        let second = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("second snapshot");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn mesh_inbound_tls_slot_swaps_atomically() {
+        ensure_crypto_provider();
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("TLS config builds")
+                .expect("TLS config present");
+        let slot: crate::proxy::SharedMeshInboundTls =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+
+        slot.store(Arc::new(Some(tls_config.clone())));
+        let loaded = slot.load_full();
+        assert!(
+            loaded
+                .as_ref()
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &tls_config)),
+            "load_full should observe the swapped TLS config"
+        );
+
+        slot.store(Arc::new(None));
+        assert!(
+            slot.load_full().is_none(),
+            "load_full should observe the plaintext swap"
+        );
     }
 
     #[test]

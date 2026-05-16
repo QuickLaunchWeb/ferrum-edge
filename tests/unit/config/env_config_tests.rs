@@ -4145,6 +4145,30 @@ fn test_k8s_pod_discovery_default_disabled() {
 }
 
 #[test]
+fn test_mesh_peer_auth_live_reload_default_disabled() {
+    let config = EnvConfig::default();
+    assert!(
+        !config.mesh_peer_auth_live_reload_enabled,
+        "PeerAuthentication live reload is opt-in for the first rollout"
+    );
+}
+
+#[test]
+fn test_mesh_peer_auth_live_reload_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.mesh_peer_auth_live_reload_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_k8s_pod_discovery_parsed_from_env() {
     with_env_vars(
         &[

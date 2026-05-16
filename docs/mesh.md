@@ -423,16 +423,18 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
 
-The resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is **not** re-built — consistent with the project's static-TLS-material rotation model. To change the inbound mTLS mode, restart the data plane.
+By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
+
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply. Frontend cert/key paths remain static operational inputs and still require restart. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
 
 ### Disable-mode topology guard
 
-`PeerAuthentication.mode: disable` resolved against an `Ambient` or `EgressGateway` workload causes startup to fail closed:
+`PeerAuthentication.mode: disable` resolved against an `Ambient` or `EgressGateway` workload is rejected:
 
 - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
 
-`Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
+With live reload disabled, an invalid startup mode still fails closed. With live reload enabled, invalid incoming slices are rejected and the last good config stays active; an invalid initial slice falls back to `permissive` until a valid slice arrives. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
 
 ## Transparent DNS Proxy
 

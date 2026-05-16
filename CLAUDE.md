@@ -115,7 +115,9 @@ Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend
 
 ### TLS Rotation
 
-All file-based TLS materials are **static operational inputs**. Cert changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**.
+All file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**.
+
+Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply. Frontend cert/key paths still require restart.
 
 ### Graceful Shutdown
 
@@ -162,7 +164,7 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **HBONE trust-domain gating** (`hbone.rs`): HTTP/2 CONNECT over mTLS on port 15008. Baggage `source.principal` honored only when its trust domain matches the peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`; mismatches fall back to peer cert identity with audit metadata. Fallback key aliases enumerated in `HboneIdentity::from_headers()`.
 
-**PeerAuthentication inbound mTLS**: resolved once at startup from the initial slice. Live policy changes do NOT re-build the inbound `ServerConfig` — **restart required**, consistent with the static-TLS-material rotation model. `Disable` is rejected for Ambient and EgressGateway. See [docs/mesh.md](docs/mesh.md#peerauthentication).
+**PeerAuthentication inbound mTLS**: by default, resolved once at startup from the initial slice. With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only the resolved mTLS mode and frontend client CA verifier may hot-swap on slice apply; frontend cert/key paths remain static restart-required inputs. `Disable` is rejected for Ambient and EgressGateway slice updates and keeps the last good config. See [docs/mesh.md](docs/mesh.md#peerauthentication).
 
 **Authorization evaluation** (`policy.rs`): DENY rules first (first match wins). Any ALLOW rule + no match → implicit deny (Istio semantics). `RequestMatch` supports Istio-style conjunctive negative-match fields (`not_methods`/`not_paths`/`not_hosts`/`not_ports`) — a rule with `methods=[GET]` AND `not_paths=[/admin]` forms a single AND-block; do NOT split into separate DENY policies.
 
