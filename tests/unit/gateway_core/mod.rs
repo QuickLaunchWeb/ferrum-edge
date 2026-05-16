@@ -16,6 +16,7 @@ mod http3_config_tests;
 mod http3_websocket_tests;
 mod lazy_timeout_tests;
 mod load_balancer_tests;
+mod locality_lb_tests;
 mod metrics_tests;
 mod overload_tests;
 mod per_port_load_balancer_tests;

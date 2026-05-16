@@ -4,8 +4,8 @@
 //! least connections, least latency, consistent hashing, and random.
 
 use crate::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
-    UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
@@ -385,6 +385,7 @@ impl LoadBalancerCache {
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
+                    upstream.source_locality.as_deref(),
                 )),
             );
         }
@@ -441,6 +442,7 @@ impl LoadBalancerCache {
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
+                    upstream.source_locality.as_deref(),
                 )),
             );
         }
@@ -515,6 +517,10 @@ impl LoadBalancerCache {
             .get(upstream_id)
             .map(|upstream| upstream.port_overrides.clone())
             .unwrap_or_default();
+        let existing_source_locality = current
+            .upstreams
+            .get(upstream_id)
+            .and_then(|upstream| upstream.source_locality.clone());
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::with_subsets_and_port_overrides(
@@ -524,6 +530,7 @@ impl LoadBalancerCache {
                 hash_on,
                 existing_subsets.as_deref(),
                 Some(&existing_port_overrides),
+                existing_source_locality.as_deref(),
             )),
         );
 
@@ -881,6 +888,18 @@ pub struct LoadBalancer {
     /// active_connections, latency_ewma, and find_target_key lookups that are
     /// already scoped to this LoadBalancer instance.
     host_port_keys: Vec<String>,
+    /// Pre-computed locality tier rank per target with respect to the
+    /// upstream's `source_locality`. Each value is one of `0` (exact match),
+    /// `1` (same zone), `2` (same region), or `3` (no preference). Index-
+    /// aligned with `targets` when populated. Empty `Vec` when no source
+    /// locality is set — the hot path then skips locality filtering entirely.
+    ///
+    /// Computed at construction so the request path is an O(1) array index
+    /// instead of three `String` comparisons through `LocalityPreference`.
+    /// The source `LocalityPreference` itself is not stored on the balancer
+    /// (it is dropped after construction); diagnostic callers can read it
+    /// from `LoadBalancerCacheInner.upstreams[id].source_locality`.
+    target_locality_ranks: Vec<u8>,
     /// O(1) reverse lookup from "host:port" string to index in `targets`/`host_port_keys`.
     /// Replaces the O(n) linear scan in `find_target_key()`. Keys are the same
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
@@ -977,6 +996,7 @@ impl LoadBalancer {
             hash_on,
             subsets,
             None,
+            None,
         )
     }
 
@@ -989,12 +1009,46 @@ impl LoadBalancer {
         hash_on: Option<String>,
         subsets: Option<&[SubsetDefinition]>,
         port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
+        source_locality: Option<&str>,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
         let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
         // Pre-compute upstream-scoped keys for health check filtering (matches HealthChecker key format)
         let target_keys: Vec<String> = targets.iter().map(|t| target_key(upstream_id, t)).collect();
+        // Pre-compute the locality tier rank for every target against the
+        // source locality so the request path doesn't re-parse / re-compare
+        // strings on every selection. Empty `Vec` when no source locality is
+        // set so callers can cheaply skip the entire locality filter. The
+        // parsed source `LocalityPreference` is dropped after construction —
+        // diagnostic callers can re-parse from `Upstream.source_locality` via
+        // the upstream index.
+        let target_locality_ranks: Vec<u8> =
+            if let Some(source) = source_locality.and_then(LocalityPreference::parse) {
+                targets
+                    .iter()
+                    .map(|target| {
+                        let Some(target_locality) = target
+                            .locality
+                            .as_deref()
+                            .and_then(LocalityPreference::parse)
+                        else {
+                            return 3u8;
+                        };
+                        if source.exact_matches(&target_locality) {
+                            0
+                        } else if source.same_zone(&target_locality) {
+                            1
+                        } else if source.same_region(&target_locality) {
+                            2
+                        } else {
+                            3
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         // Build consistent hash ring with virtual nodes using fx_hash_str
         // (faster than SipHash/DefaultHasher; security irrelevant for ring placement).
@@ -1152,6 +1206,7 @@ impl LoadBalancer {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
             host_port_keys,
+            target_locality_ranks,
             target_index,
             algorithm,
             rr_counter: AtomicU64::new(0),
@@ -1518,6 +1573,77 @@ impl LoadBalancer {
         healthy
     }
 
+    #[inline]
+    fn locality_rank(&self, idx: usize) -> u8 {
+        // Empty `target_locality_ranks` means no source locality is set, in
+        // which case callers short-circuit before reaching this helper.
+        self.target_locality_ranks.get(idx).copied().unwrap_or(3)
+    }
+
+    #[inline]
+    fn preferred_locality_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
+        // No source locality → no tier preference; return the input unchanged.
+        if self.target_locality_ranks.is_empty() {
+            return *candidates;
+        }
+
+        let mut exact = HealthBitset::empty();
+        let mut zone = HealthBitset::empty();
+        let mut region = HealthBitset::empty();
+        for idx in 0..self.targets.len() {
+            if !candidates.contains(idx) {
+                continue;
+            }
+            match self.locality_rank(idx) {
+                0 => exact.set(idx),
+                1 => zone.set(idx),
+                2 => region.set(idx),
+                _ => {}
+            }
+        }
+
+        if !exact.is_empty() {
+            exact
+        } else if !zone.is_empty() {
+            zone
+        } else if !region.is_empty() {
+            region
+        } else {
+            *candidates
+        }
+    }
+
+    fn preferred_locality_candidates<'a>(
+        &self,
+        candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+    ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+        if self.target_locality_ranks.is_empty() {
+            return candidates;
+        }
+
+        let mut best_rank = 3;
+        let mut preferred = Vec::new();
+        for candidate in candidates.iter().copied() {
+            let rank = self.locality_rank(candidate.0);
+            if rank >= 3 {
+                continue;
+            }
+            if rank < best_rank {
+                preferred.clear();
+                best_rank = rank;
+            }
+            if rank == best_rank {
+                preferred.push(candidate);
+            }
+        }
+
+        if preferred.is_empty() {
+            candidates
+        } else {
+            preferred
+        }
+    }
+
     fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
         let mut mask = vec![false; self.targets.len()];
         for &idx in subset_indices {
@@ -1549,6 +1675,7 @@ impl LoadBalancer {
         if healthy.is_empty() {
             // All targets unhealthy — degraded mode fallback using all targets.
             let all = HealthBitset::all(n);
+            let all = self.preferred_locality_bitset(&all);
             return self
                 .select_with_bitset(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -1557,6 +1684,7 @@ impl LoadBalancer {
                 });
         }
 
+        let healthy = self.preferred_locality_bitset(&healthy);
         self.select_with_bitset(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -1611,6 +1739,7 @@ impl LoadBalancer {
             return None;
         }
 
+        let subset_healthy = self.preferred_locality_bitset(&subset_healthy);
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -1650,6 +1779,7 @@ impl LoadBalancer {
 
         if port_healthy.is_empty() {
             let all_port_targets = bitset_for_indices(&port_state.target_indices);
+            let all_port_targets = self.preferred_locality_bitset(&all_port_targets);
             return self
                 .select_with_bitset_using(
                     ctx_key,
@@ -1665,6 +1795,7 @@ impl LoadBalancer {
                 });
         }
 
+        let port_healthy = self.preferred_locality_bitset(&port_healthy);
         self.select_with_bitset_using(
             ctx_key,
             &port_healthy,
@@ -1724,6 +1855,7 @@ impl LoadBalancer {
             return None;
         }
 
+        let port_subset_healthy = self.preferred_locality_bitset(&port_subset_healthy);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -1754,6 +1886,7 @@ impl LoadBalancer {
                 .map(|&idx| (idx, &self.targets[idx]))
                 .collect();
         }
+        let candidates = self.preferred_locality_candidates(candidates);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -1785,6 +1918,7 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
+        let candidates = self.preferred_locality_candidates(candidates);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -1823,6 +1957,7 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
+        let subset_healthy = self.preferred_locality_candidates(subset_healthy);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -1980,6 +2115,7 @@ impl LoadBalancer {
         let healthy = self.healthy_targets_vec(health);
         if healthy.is_empty() {
             let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
+            let all = self.preferred_locality_candidates(all);
             return self
                 .select_from_candidates_vec(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -1987,6 +2123,7 @@ impl LoadBalancer {
                     is_fallback: true,
                 });
         }
+        let healthy = self.preferred_locality_candidates(healthy);
         self.select_from_candidates_vec(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -2084,11 +2221,13 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
+            let fallback = self.preferred_locality_bitset(&fallback);
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = fallback.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
+        let healthy = self.preferred_locality_bitset(&healthy);
         self.select_with_bitset(ctx_key, &healthy)
     }
 
@@ -2135,6 +2274,7 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
+            let fallback = self.preferred_locality_bitset(&fallback);
             return self.select_with_bitset_using(
                 ctx_key,
                 &fallback,
@@ -2145,6 +2285,7 @@ impl LoadBalancer {
             );
         }
 
+        let healthy = self.preferred_locality_bitset(&healthy);
         self.select_with_bitset_using(
             ctx_key,
             &healthy,
@@ -2183,7 +2324,6 @@ impl LoadBalancer {
                 subset_name,
                 subset_target_indices,
                 exclude_idx,
-                exclude,
                 health,
             );
         }
@@ -2204,6 +2344,7 @@ impl LoadBalancer {
             return None;
         }
 
+        let subset_healthy = self.preferred_locality_bitset(&subset_healthy);
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -2268,6 +2409,7 @@ impl LoadBalancer {
             return None;
         }
 
+        let port_subset_healthy = self.preferred_locality_bitset(&port_subset_healthy);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -2301,10 +2443,12 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
+            let fallback = self.preferred_locality_candidates(fallback);
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(fallback[idx % fallback.len()].1));
         }
 
+        let healthy = self.preferred_locality_candidates(healthy);
         self.select_from_candidates_vec(ctx_key, &healthy)
     }
 
@@ -2332,6 +2476,7 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
+        let candidates = self.preferred_locality_candidates(candidates);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2360,6 +2505,7 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
+        let candidates = self.preferred_locality_candidates(candidates);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2377,7 +2523,6 @@ impl LoadBalancer {
         subset_name: &str,
         subset_indices: &[usize],
         exclude_idx: Option<usize>,
-        _exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let all_healthy = self.healthy_targets_vec(health);
@@ -2396,6 +2541,7 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
+        let subset_healthy = self.preferred_locality_candidates(subset_healthy);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2994,6 +3140,7 @@ mod tests {
             port,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         }
     }
@@ -3104,6 +3251,7 @@ mod tests {
             None,
             None,
             Some(&port_overrides),
+            None,
         );
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");
