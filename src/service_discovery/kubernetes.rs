@@ -231,6 +231,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                                         port,
                                         weight: self.default_weight,
                                         tags: HashMap::new(),
+                                        locality: None,
                                         path: None,
                                     });
                                 }
