@@ -32,6 +32,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         frames_client_to_backend: 3,
         frames_backend_to_client: 4,
         direction: Some(Direction::ClientToBackend),
+        io_side: None,
         error_class: None,
         consumer_username: Some("alice".to_string()),
         auth_method: None,

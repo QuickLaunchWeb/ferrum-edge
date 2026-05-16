@@ -38,6 +38,10 @@ impl DbOutageTestHarness {
             // fallback fails quickly when the DB is corrupted, rather than
             // waiting 30s for sqlx's after_connect retry backoff to exhaust.
             .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            // Tight poll interval so the test budget for "wait for poll to
+            // observe DB state" stays small. With 1s polls, every
+            // wait_for_poll() can be ~5s instead of ~8s.
+            .db_poll_interval_seconds(1)
             .spawn()
             .await?;
         // TestGateway's SQLite DbType creates `test.db` in the harness temp
@@ -129,9 +133,12 @@ impl DbOutageTestHarness {
     }
 
     /// Wait for DB poll to pick up changes.
-    /// Budget: poll interval (2s) + pool acquire timeout (3s) + margin = 8s.
+    /// Budget: poll interval (1s, set in `new`) + pool acquire timeout (3s,
+    /// set in `new`) + 1s margin = 5s. Covers both "happy path" pickup
+    /// (poll succeeds in <1s) and "outage detection" (poll connects and
+    /// times out after 3s).
     async fn wait_for_poll(&self) {
-        tokio::time::sleep(Duration::from_secs(8)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 

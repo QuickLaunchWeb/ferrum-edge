@@ -78,6 +78,29 @@ fn mesh_config_round_trips_through_serde() {
 }
 
 #[test]
+fn mesh_config_defaults_istio_root_namespace_for_old_slices() {
+    let mesh: MeshConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(mesh.istio_root_namespace, "istio-system");
+
+    let json = serde_json::to_value(&mesh).unwrap();
+    let obj = json.as_object().expect("mesh object");
+    assert!(
+        !obj.contains_key("istio_root_namespace"),
+        "default root namespace should stay wire-compatible"
+    );
+}
+
+#[test]
+fn mesh_config_round_trips_custom_istio_root_namespace() {
+    let mesh: MeshConfig =
+        serde_json::from_value(serde_json::json!({"istio_root_namespace": "mesh-root"})).unwrap();
+    assert_eq!(mesh.istio_root_namespace, "mesh-root");
+
+    let json = serde_json::to_value(&mesh).unwrap();
+    assert_eq!(json["istio_root_namespace"], "mesh-root");
+}
+
+#[test]
 fn unknown_mesh_fields_are_tolerated() {
     // Forwards-compat: a newer ferrum schema may add fields under a mesh
     // resource. Older binaries must ignore them. Serde's default-on-unknown

@@ -8,7 +8,7 @@
 //! `MeshSlice` is updated, so there are no locks on the query hot path.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -200,8 +200,16 @@ impl DnsResolutionTable {
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
         let mut wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>> = HashMap::new();
 
-        // Index workload addresses by SPIFFE ID for MeshService resolution.
-        let mut workload_ips: HashMap<&str, Vec<IpAddr>> = HashMap::new();
+        // Index workload addresses by SPIFFE ID and namespace, keeping the
+        // workload's service identity alongside its IPs. Multiple Kubernetes
+        // services commonly share a service-account SPIFFE ID; when a matching
+        // service identity exists we prefer it so auto-discovered refs do not
+        // bleed endpoints across services. The fallback below preserves older
+        // explicit MeshService refs whose workload.service_name differs.
+        type WorkloadDnsKey<'a> = (&'a str, &'a str);
+        type WorkloadDnsEntry<'a> = (&'a str, Vec<IpAddr>);
+        let mut workload_ips: HashMap<WorkloadDnsKey<'_>, Vec<WorkloadDnsEntry<'_>>> =
+            HashMap::new();
         for wl in &slice.workloads {
             let ips: Vec<IpAddr> = wl
                 .addresses
@@ -210,11 +218,20 @@ impl DnsResolutionTable {
                 .filter(is_routable_mesh_dns_ip)
                 .collect();
             if !ips.is_empty() {
-                let entry = workload_ips.entry(wl.spiffe_id.as_str()).or_default();
-                for ip in ips {
-                    if !entry.contains(&ip) {
-                        entry.push(ip);
+                let entries = workload_ips
+                    .entry((wl.spiffe_id.as_str(), wl.namespace.as_str()))
+                    .or_default();
+                if let Some((_, existing_ips)) = entries
+                    .iter_mut()
+                    .find(|(service_name, _)| *service_name == wl.service_name.as_str())
+                {
+                    for ip in ips {
+                        if !existing_ips.contains(&ip) {
+                            existing_ips.push(ip);
+                        }
                     }
+                } else {
+                    entries.push((wl.service_name.as_str(), ips));
                 }
             }
         }
@@ -258,9 +275,35 @@ impl DnsResolutionTable {
         // workload addresses through SPIFFE ID references.
         for svc in &slice.services {
             let mut svc_ips: Vec<IpAddr> = Vec::new();
+            let mut seen_workload_refs = HashSet::new();
             for wl_ref in &svc.workloads {
-                if let Some(ips) = workload_ips.get(wl_ref.spiffe_id.as_str()) {
-                    svc_ips.extend(ips.iter());
+                if !seen_workload_refs.insert(wl_ref.spiffe_id.as_str()) {
+                    continue;
+                }
+                if let Some(entries) =
+                    workload_ips.get(&(wl_ref.spiffe_id.as_str(), svc.namespace.as_str()))
+                {
+                    let mut found_matching_service = false;
+                    for (service_name, ips) in entries {
+                        if *service_name == svc.name.as_str() {
+                            found_matching_service = true;
+                            svc_ips.extend(ips.iter());
+                        }
+                    }
+                    if !found_matching_service {
+                        if entries.len() == 1 {
+                            let (_, ips) = &entries[0];
+                            svc_ips.extend(ips.iter());
+                        } else {
+                            warn!(
+                                service = %svc.name,
+                                namespace = %svc.namespace,
+                                spiffe_id = %wl_ref.spiffe_id,
+                                service_identities = entries.len(),
+                                "Skipping ambiguous mesh DNS workload fallback"
+                            );
+                        }
+                    }
                 }
             }
             if svc_ips.is_empty() {
@@ -2195,6 +2238,19 @@ mod tests {
         }
     }
 
+    fn test_workload_for_service(
+        spiffe_id: &str,
+        service_name: &str,
+        namespace: &str,
+        addresses: Vec<&str>,
+    ) -> Workload {
+        let mut workload = test_workload(spiffe_id, addresses);
+        workload.service_name = service_name.to_string();
+        workload.namespace = namespace.to_string();
+        workload.selector.namespace = Some(namespace.to_string());
+        workload
+    }
+
     fn test_mesh_service(name: &str, namespace: &str, workload_refs: Vec<&str>) -> MeshService {
         MeshService {
             name: name.to_string(),
@@ -2275,6 +2331,72 @@ mod tests {
         assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"10.1.0.3".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_dedups_duplicate_service_workload_refs() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.1.0.1", "10.1.0.2"])],
+            services: vec![test_mesh_service(
+                "my-api",
+                "default",
+                vec![spiffe, spiffe, spiffe],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table.resolve("my-api.default.svc.cluster.local").unwrap();
+
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_does_not_cross_match_same_spiffe_other_services() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
+        let api = test_workload(spiffe, vec!["10.1.0.1"]);
+        let mut metrics = test_workload(spiffe, vec!["10.1.0.2"]);
+        metrics.service_name = "metrics".to_string();
+
+        let slice = MeshSlice {
+            workloads: vec![api, metrics],
+            services: vec![
+                test_mesh_service("test-svc", "default", vec![spiffe]),
+                test_mesh_service("metrics", "default", vec![spiffe]),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let api_ips = table.resolve("test-svc.default.svc.cluster.local").unwrap();
+        let metrics_ips = table.resolve("metrics.default.svc.cluster.local").unwrap();
+
+        assert_eq!(api_ips.len(), 1);
+        assert!(api_ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(metrics_ips.len(), 1);
+        assert!(metrics_ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_skips_ambiguous_mismatched_service_fallback() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
+        let api = test_workload_for_service(spiffe, "api", "default", vec!["10.1.0.1"]);
+        let metrics = test_workload_for_service(spiffe, "metrics", "default", vec!["10.1.0.2"]);
+        let slice = MeshSlice {
+            workloads: vec![api, metrics],
+            services: vec![test_mesh_service("reviews", "default", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+
+        assert!(
+            table.resolve("reviews.default.svc.cluster.local").is_none(),
+            "ambiguous fallback must not include every service sharing the SPIFFE ID"
+        );
     }
 
     #[test]
@@ -2512,7 +2634,12 @@ mod tests {
     fn resolution_table_mesh_service_produces_fqdn_and_short_name() {
         let spiffe = "spiffe://cluster.local/ns/production/sa/web";
         let slice = MeshSlice {
-            workloads: vec![test_workload(spiffe, vec!["10.2.0.1"])],
+            workloads: vec![test_workload_for_service(
+                spiffe,
+                "web-frontend",
+                "production",
+                vec!["10.2.0.1"],
+            )],
             services: vec![test_mesh_service(
                 "web-frontend",
                 "production",
@@ -2545,7 +2672,12 @@ mod tests {
     fn resolution_table_custom_cluster_domain_fqdn_format() {
         let spiffe = "spiffe://corp.local/ns/staging/sa/api";
         let slice = MeshSlice {
-            workloads: vec![test_workload(spiffe, vec!["10.3.0.1"])],
+            workloads: vec![test_workload_for_service(
+                spiffe,
+                "payments",
+                "staging",
+                vec!["10.3.0.1"],
+            )],
             services: vec![test_mesh_service("payments", "staging", vec![spiffe])],
             ..MeshSlice::default()
         };
@@ -3107,8 +3239,8 @@ mod tests {
         let spiffe_b = "spiffe://cluster.local/ns/ns-b/sa/api";
         let slice = MeshSlice {
             workloads: vec![
-                test_workload(spiffe_a, vec!["10.1.0.1"]),
-                test_workload(spiffe_b, vec!["10.2.0.1"]),
+                test_workload_for_service(spiffe_a, "api", "ns-a", vec!["10.1.0.1"]),
+                test_workload_for_service(spiffe_b, "api", "ns-b", vec!["10.2.0.1"]),
             ],
             services: vec![
                 test_mesh_service("api", "ns-a", vec![spiffe_a]),

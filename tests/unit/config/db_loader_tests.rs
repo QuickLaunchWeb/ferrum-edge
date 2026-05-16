@@ -2,8 +2,42 @@ use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
     statement_timeout_sql,
 };
-use ferrum_edge::config::types::{AuthMode, BackendScheme};
+use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
+};
 use std::collections::HashSet;
+
+fn make_upstream(id: &str) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: Some("tls-upstream".to_string()),
+        targets: vec![UpstreamTarget {
+            host: "reviews.default.svc.cluster.local".to_string(),
+            port: 8080,
+            weight: 100,
+            tags: Default::default(),
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: Default::default(),
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
 
 // ── append_connect_timeout ───────────────────────────────────────────────────
 
@@ -207,4 +241,46 @@ fn test_statement_timeout_sql_mysql() {
 fn test_statement_timeout_sql_sqlite_returns_none() {
     // SQLite does not support statement timeouts.
     assert_eq!(statement_timeout_sql(30, false, false), None);
+}
+
+#[tokio::test]
+async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("upstream_tls_identity.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut upstream = make_upstream("tls-u1");
+    upstream.backend_tls_sni = Some("reviews.mesh.internal".to_string());
+    upstream.backend_tls_san_allow_list = vec![
+        "reviews.mesh.internal".to_string(),
+        "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+    ];
+
+    store.create_upstream(&upstream).await.unwrap();
+    let loaded = store.get_upstream("tls-u1").await.unwrap().unwrap();
+    assert_eq!(
+        loaded.backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+    assert_eq!(
+        loaded.backend_tls_san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+        ]
+    );
+
+    upstream.backend_tls_sni = Some("ratings.mesh.internal".to_string());
+    upstream.backend_tls_san_allow_list = vec!["10.0.0.8".to_string()];
+    store.update_upstream(&upstream).await.unwrap();
+
+    let loaded = store.get_upstream("tls-u1").await.unwrap().unwrap();
+    assert_eq!(
+        loaded.backend_tls_sni.as_deref(),
+        Some("ratings.mesh.internal")
+    );
+    assert_eq!(loaded.backend_tls_san_allow_list, vec!["10.0.0.8"]);
 }

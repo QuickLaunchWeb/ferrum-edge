@@ -64,6 +64,27 @@ fn start_gateway(
     start_gateway_with_dtls(config_path, http_port, None)
 }
 
+fn start_gateway_with_extra_env(
+    config_path: &str,
+    http_port: u16,
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    let admin_port = http_port + 1000;
+    let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.env("FERRUM_MODE", "file")
+        .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_LOG_LEVEL", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    Ok(cmd.spawn()?)
+}
+
 fn start_gateway_with_dtls(
     config_path: &str,
     http_port: u16,
@@ -270,7 +291,7 @@ proxies:
     backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
-    udp_idle_timeout_seconds: 5
+    udp_idle_timeout_seconds: 2
 
 consumers: []
 plugin_configs: []
@@ -278,8 +299,17 @@ plugin_configs: []
         ),
     );
 
-    let mut gateway =
-        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    // Drop the cleanup interval from its 10s default so the test can verify
+    // session expiry + reclaim in single-digit seconds instead of 18s. The
+    // gateway's cleanup task fires every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`
+    // and prunes any session idle longer than `udp_idle_timeout_seconds`; with
+    // idle=2 + cleanup=3 the worst case is 5s, so a 7s wait has 2s margin.
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[("FERRUM_UDP_CLEANUP_INTERVAL_SECONDS", "3")],
+    )
+    .expect("Failed to start");
     sleep(Duration::from_secs(3)).await;
 
     // Send initial datagram to create a session
@@ -299,9 +329,9 @@ plugin_configs: []
         .expect("First recv error");
     assert_eq!(&buf[..n], msg1);
 
-    // Wait for session timeout + cleanup interval (idle_timeout=5s + cleanup_interval=10s)
-    // Give some margin
-    sleep(Duration::from_secs(18)).await;
+    // Wait for session timeout + cleanup interval (idle_timeout=2s +
+    // cleanup_interval=3s = 5s worst case) plus a 2s margin.
+    sleep(Duration::from_secs(7)).await;
 
     // Send another datagram — should create a new session (old one was cleaned up)
     // This should still work since a new session will be created

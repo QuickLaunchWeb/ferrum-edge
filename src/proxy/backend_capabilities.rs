@@ -318,7 +318,7 @@ pub fn capability_key(proxy: &Proxy) -> String {
 /// they're reusing one (see `BackendCapabilityRegistry::get`).
 ///
 /// Key shape:
-/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify|hbone_port`.
+/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|hbone_port`.
 /// `|` delimiter matches the pool-key conventions in the rest of the code.
 /// The HBONE port field is populated only when the upstream target opts into
 /// HBONE; direct backend capability observations remain shared for ordinary
@@ -340,35 +340,13 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
         port,
         proxy.dns_override.as_deref().unwrap_or_default(),
     );
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default(),
+    crate::tls::backend::append_backend_tls_pool_key_fields(
+        buf,
+        &proxy.resolved_tls,
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        proxy.resolved_tls.client_key_path.as_deref(),
+        proxy.resolved_tls.verify_server_cert,
     );
-    buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .unwrap_or_default(),
-    );
-    buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .client_key_path
-            .as_deref()
-            .unwrap_or_default(),
-    );
-    buf.push('|');
-    buf.push(if proxy.resolved_tls.verify_server_cert {
-        '1'
-    } else {
-        '0'
-    });
     buf.push('|');
     if let Some(port) = hbone_port {
         let _ = write!(buf, "{port}");

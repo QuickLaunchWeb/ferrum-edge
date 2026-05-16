@@ -24,7 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
 use crate::capture::{
-    CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, IptablesPlan, validate_cidr_list,
+    CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, Ip6TablesMode, IptablesPlan, validate_cidr_list,
 };
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
@@ -117,6 +117,7 @@ pub struct InjectorConfig {
     /// CIDRs excluded from outbound iptables capture. Per Istio semantics,
     /// pod annotation `excludeOutboundIPRanges` APPENDS to this value.
     pub exclude_outbound_cidrs: Vec<String>,
+    pub ip6tables_mode: Ip6TablesMode,
     pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -164,6 +165,10 @@ impl InjectorConfig {
             validate_cidr_list(&exclude_outbound_cidrs)
                 .map_err(|e| format!("Invalid FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS: {e}"))?;
         }
+        let ip6tables_mode = Ip6TablesMode::parse(
+            &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED")
+                .unwrap_or_else(|| "auto".to_string()),
+        )?;
         let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
@@ -201,6 +206,7 @@ impl InjectorConfig {
             exclude_inbound_ports,
             include_outbound_cidrs,
             exclude_outbound_cidrs,
+            ip6tables_mode,
             trust_domain,
             tls_cert_path,
             tls_key_path,
@@ -834,6 +840,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
 
 fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String> {
     let plan = IptablesPlan::for_config(&capture_config(config, pod)?);
+    let script = plan.script();
     Ok(json!({
         "name": "ferrum-edge-init",
         "image": config.sidecar_image,
@@ -860,10 +867,11 @@ fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String>
         },
         "env": [
             {"name": "FERRUM_MESH_CAPTURE_MODE", "value": "iptables"},
-            {"name": "FERRUM_MESH_PROXY_UID", "value": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID).to_string()}
+            {"name": "FERRUM_MESH_PROXY_UID", "value": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID).to_string()},
+            {"name": "FERRUM_MESH_IP6TABLES_ENABLED", "value": config.ip6tables_mode.as_env_value()}
         ],
         "command": ["/bin/sh", "-c"],
-        "args": [plan.commands.join("\n")]
+        "args": [script]
     }))
 }
 
@@ -880,6 +888,7 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.include_outbound_ports = include_outbound_ports.ports;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
+    capture.ip6tables_mode = config.ip6tables_mode;
 
     // CIDR resolution layered on top of injector-level defaults:
     //   - `includeOutboundIPRanges` REPLACES the env-derived include list when
@@ -1092,6 +1101,7 @@ mod tests {
             exclude_inbound_ports: Vec::new(),
             include_outbound_cidrs: Vec::new(),
             exclude_outbound_cidrs: Vec::new(),
+            ip6tables_mode: Ip6TablesMode::Auto,
             trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
@@ -1692,6 +1702,7 @@ mod tests {
         let config = InjectorConfig::from_env_config(&env).expect("injector config");
         assert_eq!(config.listen_addr.port(), 9443);
         assert_eq!(config.capture_mode, CaptureMode::Explicit);
+        assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
         assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
         assert!(config.tls_cert_path.is_none());
     }
@@ -2266,14 +2277,9 @@ mod tests {
         );
     }
 
-    // IPv6 CIDR in the annotation passes admission today (the validator only
-    // checks shape, not address family) and survives into `CaptureConfig` so
-    // operators can observe the configured intent. The init container only
-    // invokes IPv4 `iptables`, so feeding `-d fd00::/8` directly to it would
-    // fail the rule append at runtime and leave the capture chain partially
-    // populated. To prevent that, `IptablesPlan::for_config` strips non-IPv4
-    // CIDRs before emitting commands — admission acceptance is purely for
-    // forward compatibility with a future `ip6tables` fan-out.
+    // IPv6 CIDR annotations pass admission (the validator checks shape and
+    // prefix range, not a single address family) and survive into
+    // `CaptureConfig` so the plan can fan them out to `ip6tables`.
     #[test]
     fn capture_config_accepts_ipv6_cidr_in_exclude_annotation_today() {
         let pod = json!({
@@ -2291,13 +2297,8 @@ mod tests {
         assert!(capture.exclude_cidrs.iter().any(|c| c == "fd00::/8"));
     }
 
-    // The full webhook patch must never ship an IPv6 CIDR into the iptables
-    // init script. Otherwise the init container exits non-zero on rule append
-    // and the pod fails to start (or, with the current best-effort error
-    // handling, starts with a half-populated capture chain). This is the
-    // end-to-end regression guard for the `IptablesPlan` filter.
     #[test]
-    fn patch_strips_ipv6_cidr_from_init_container_iptables_script() {
+    fn patch_fans_out_ipv6_cidr_to_ip6tables_script() {
         let pod = json!({
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
@@ -2329,9 +2330,77 @@ mod tests {
         }
         for ipv6 in ["fd00::/8", "2001:db8::/32"] {
             assert!(
-                !commands.contains(ipv6),
-                "IPv6 CIDR {ipv6} must NOT appear in the iptables init script (would fail at -A): {commands}"
+                commands.contains(ipv6),
+                "IPv6 CIDR {ipv6} must appear in the ip6tables init script: {commands}"
             );
         }
+        assert!(commands.contains("command -v ip6tables"));
+        assert!(commands.contains("ip6tables -t nat"));
+        assert!(commands.contains("skipping IPv6 mesh capture rules"));
+    }
+
+    #[test]
+    fn patch_requires_ip6tables_when_configured_true() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "fd00::/8"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.ip6tables_mode = Ip6TablesMode::Required;
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        assert!(commands.contains("ip6tables is required for IPv6 mesh capture"));
+        assert!(commands.contains("ip6tables nat table is required for IPv6 mesh capture"));
+        assert!(commands.contains("ip6tables -t nat -w 5 -L"));
+        assert!(commands.contains("exit 1"));
+        assert!(commands.contains("ip6tables -t nat"));
+    }
+
+    #[test]
+    fn patch_omits_ipv6_cidr_when_ip6tables_disabled() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "10.0.0.0/8, fd00::/8",
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": "172.16.0.0/12, 2001:db8::/32"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.ip6tables_mode = Ip6TablesMode::Disabled;
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        assert!(commands.contains("10.0.0.0/8"));
+        assert!(commands.contains("172.16.0.0/12"));
+        assert!(!commands.contains("fd00::/8"));
+        assert!(!commands.contains("2001:db8::/32"));
+        assert!(!commands.contains("ip6tables -t nat"));
     }
 }
