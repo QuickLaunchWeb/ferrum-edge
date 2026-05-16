@@ -4151,6 +4151,10 @@ fn test_mesh_peer_auth_live_reload_default_disabled() {
         !config.mesh_peer_auth_live_reload_enabled,
         "PeerAuthentication live reload is opt-in for the first rollout"
     );
+    assert_eq!(
+        config.mesh_svid_rotation_drain_seconds, 0,
+        "Backend SVID rotation force-drain is disabled by default"
+    );
 }
 
 #[test]
@@ -4164,6 +4168,21 @@ fn test_mesh_peer_auth_live_reload_parsed_from_env() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.mesh_peer_auth_live_reload_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_mesh_svid_rotation_drain_seconds_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS", "15"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mesh_svid_rotation_drain_seconds, 15);
         },
     );
 }

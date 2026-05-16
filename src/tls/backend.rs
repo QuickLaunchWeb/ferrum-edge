@@ -4,6 +4,7 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use reqwest::ClientBuilder;
 use rustls::client::WebPkiServerVerifier;
@@ -44,20 +45,54 @@ pub enum TlsError {
 /// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
 /// in-memory session resumption state across new backend connections instead
 /// of resetting it on every reconnect.
+///
+/// Cache keys MUST be tagged with the backend SVID generation marker (or the
+/// `static` sentinel for operator-supplied certs) via
+/// [`append_backend_svid_generation_key_field`] before calling
+/// [`get_or_try_build`]. Drain operations rely on this contract to scope
+/// invalidation to the rotated generation only.
 #[derive(Clone, Default)]
 pub struct BackendTlsConfigCache {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
 }
 
 impl BackendTlsConfigCache {
+    #[allow(dead_code)] // Used by focused tests with default shard sizing.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Build a cache sized to the pool's shard count.
+    ///
+    /// The SVID generation is intentionally NOT held on the cache: cache keys
+    /// are pre-tagged by callers via `append_backend_svid_generation_key_field`,
+    /// and a stale `|svidg=N` entry is evicted by `drain_svid_generation(N)`
+    /// when the rotation consumer task observes a revision bump. The cache
+    /// itself stays generation-agnostic — see the `BackendTlsConfigCache`
+    /// rustdoc for the full contract.
+    pub fn with_shards(shards: usize) -> Self {
+        Self {
+            configs: Arc::new(DashMap::with_shard_amount(shards)),
+        }
+    }
+
+    pub fn drain_svid_generation(&self, generation: u64) {
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.configs.retain(|key, _| !matcher.matches(key));
+    }
+
+    /// Build or retrieve a cached `ClientConfig` for `key`. Callers MUST have
+    /// already appended the SVID generation marker to `key` — see the
+    /// rustdoc on [`BackendTlsConfigCache`]. A `debug_assert` catches drift
+    /// in tests; release builds skip the check.
     pub fn get_or_try_build<E, F>(&self, key: String, build: F) -> Result<Arc<ClientConfig>, E>
     where
         F: FnOnce() -> Result<ClientConfig, E>,
     {
+        debug_assert!(
+            backend_tls_pool_key_has_svid_field(&key),
+            "BackendTlsConfigCache::get_or_try_build requires the key to be tagged with `|svidg=...`; call append_backend_svid_generation_key_field before this entry point"
+        );
         if let Some(existing) = self.configs.get(&key) {
             return Ok(existing.clone());
         }
@@ -74,6 +109,88 @@ impl BackendTlsConfigCache {
     }
 }
 
+/// Pre-built matcher for SVID generation pool-key drain checks.
+///
+/// Building the matcher once and reusing it across every key in
+/// `force_drain_svid_generation` / `drain_svid_generation` avoids per-key
+/// `format!` allocations during a rotation drain pass.
+#[derive(Debug, Clone)]
+pub struct SvidGenerationMatcher {
+    /// `"|svidg=<generation>"` — matches keys whose generation segment is the
+    /// final field of the pool key.
+    end_segment: String,
+    /// `"|svidg=<generation>#"` — matches keys whose generation segment is
+    /// followed by a shard separator (`#shard`) at the end.
+    mid_segment: String,
+}
+
+impl SvidGenerationMatcher {
+    pub fn new(generation: u64) -> Self {
+        let end_segment = format!("|svidg={generation}");
+        let mid_segment = format!("{end_segment}#");
+        Self {
+            end_segment,
+            mid_segment,
+        }
+    }
+
+    pub fn matches(&self, key: &str) -> bool {
+        key.ends_with(&self.end_segment) || key.contains(&self.mid_segment)
+    }
+}
+
+pub type BackendSvidGeneration = Arc<AtomicU64>;
+
+/// Discriminate workload-SVID-driven client certs from operator-supplied ones.
+///
+/// Returns `Some(current_generation)` only when the effective backend client
+/// cert path is byte-equal to the configured workload SVID cert path
+/// (`FERRUM_GATEWAY_SVID_CERT_PATH`). For operator-supplied static material
+/// or when no SVID is configured, returns `None` so the caller emits the
+/// stable `svidg=static` segment and the pool key never partitions on
+/// rotation. The comparison is intentionally byte-equality, not filesystem
+/// canonicalization: callers (DestinationRule ISTIO_MUTUAL projection and the
+/// `ReqwestPoolManager` / H2 / gRPC / H3 pool managers) copy paths from
+/// `EnvConfig` without canonicalization, so both sides see the same string.
+/// Operators who symlink the gateway SVID path under a different name on the
+/// proxy's `resolved_tls.client_cert_path` will get `svidg=static` and miss
+/// the rotation drain — keep both sides pointing at the same path string.
+pub fn backend_svid_generation_for_client_cert(
+    effective_client_cert_path: Option<&str>,
+    workload_svid_cert_path: Option<&str>,
+    current_generation: u64,
+) -> Option<u64> {
+    match (effective_client_cert_path, workload_svid_cert_path) {
+        (Some(client_cert_path), Some(svid_cert_path)) if client_cert_path == svid_cert_path => {
+            Some(current_generation)
+        }
+        _ => None,
+    }
+}
+
+pub fn append_backend_svid_generation_key_field(buf: &mut String, svid_generation: Option<u64>) {
+    use std::fmt::Write;
+    buf.push_str("|svidg=");
+    if let Some(svid_generation) = svid_generation {
+        let _ = write!(buf, "{svid_generation}");
+    } else {
+        buf.push_str("static");
+    }
+}
+
+pub fn backend_tls_pool_key_has_svid_field(key: &str) -> bool {
+    key.contains("|svidg=")
+}
+
+/// Convenience wrapper around [`SvidGenerationMatcher`] for one-off matches
+/// (tests and ad-hoc inspection). Production hot paths build a single
+/// `SvidGenerationMatcher::new(generation)` and pass it into
+/// `pool.invalidate_matching` to avoid per-key segment allocation.
+#[allow(dead_code)]
+pub fn backend_tls_pool_key_has_svid_generation(key: &str, svid_generation: u64) -> bool {
+    SvidGenerationMatcher::new(svid_generation).matches(key)
+}
+
 /// Append the backend TLS identity fields that partition runtime client caches.
 ///
 /// Keep this in one place so HTTP, H2, H3, gRPC, and backend capability probes
@@ -84,6 +201,7 @@ pub fn append_backend_tls_pool_key_fields(
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
     verify_server_cert: bool,
+    svid_generation: Option<u64>,
 ) {
     // The SAN digest is precomputed (see BackendTlsConfig::compute_san_digest) so
     // pool-key emission stays allocation-free. If a caller mutates san_allow_list
@@ -106,6 +224,7 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push(if verify_server_cert { '1' } else { '0' });
+    append_backend_svid_generation_key_field(buf, svid_generation);
 }
 
 /// Return the TLS server name used for backend handshakes.
@@ -899,20 +1018,27 @@ mod tests {
         }
     }
 
+    fn tagged_test_key(base: &str, generation: Option<u64>) -> String {
+        let mut key = base.to_string();
+        append_backend_svid_generation_key_field(&mut key, generation);
+        key
+    }
+
     #[test]
     fn backend_tls_config_cache_reuses_built_configs() {
         ensure_crypto_provider();
         let cache = BackendTlsConfigCache::new();
         let builds = AtomicUsize::new(0);
+        let key = tagged_test_key("backend-a", None);
 
         let first = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(key.clone(), || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
             .expect("first config");
         let second = cache
-            .get_or_try_build("backend-a".to_string(), || {
+            .get_or_try_build(key, || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, TlsError>(new_test_client_config())
             })
@@ -920,6 +1046,87 @@ mod tests {
 
         assert_eq!(builds.load(Ordering::Relaxed), 1);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn backend_tls_config_cache_rebuilds_after_svid_generation_changes() {
+        ensure_crypto_provider();
+        let cache = BackendTlsConfigCache::with_shards(64);
+        let builds = AtomicUsize::new(0);
+
+        let first = cache
+            .get_or_try_build(tagged_test_key("backend-a", Some(0)), || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, TlsError>(new_test_client_config())
+            })
+            .expect("first config");
+        let same_generation = cache
+            .get_or_try_build(tagged_test_key("backend-a", Some(0)), || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, TlsError>(new_test_client_config())
+            })
+            .expect("same generation config");
+
+        let rotated = cache
+            .get_or_try_build(tagged_test_key("backend-a", Some(1)), || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, TlsError>(new_test_client_config())
+            })
+            .expect("rotated config");
+
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        assert!(Arc::ptr_eq(&first, &same_generation));
+        assert!(!Arc::ptr_eq(&first, &rotated));
+    }
+
+    #[test]
+    fn svid_generation_matcher_anchors_segment_to_end_or_shard() {
+        let matcher = SvidGenerationMatcher::new(42);
+
+        assert!(matcher.matches("backend|443|some|fields|svidg=42"));
+        assert!(matcher.matches("backend|443|some|fields|svidg=42#0"));
+        assert!(matcher.matches("backend|443|some|fields|svidg=42#7"));
+
+        // Different generation: no false positive.
+        assert!(!matcher.matches("backend|443|some|fields|svidg=4"));
+        assert!(!matcher.matches("backend|443|some|fields|svidg=420"));
+        assert!(!matcher.matches("backend|443|some|fields|svidg=static"));
+
+        // Embedded but not anchored at end-or-shard: no false positive.
+        assert!(!matcher.matches("backend|443|svidg=42|some|fields|svidg=static"));
+    }
+
+    #[test]
+    fn backend_tls_pool_key_fields_include_svid_generation() {
+        let mut key = String::from("backend|443|");
+        append_backend_tls_pool_key_fields(
+            &mut key,
+            &BackendTlsConfig::default(),
+            None,
+            None,
+            true,
+            Some(42),
+        );
+
+        assert!(key.ends_with("|svidg=42"));
+        assert!(backend_tls_pool_key_has_svid_generation(&key, 42));
+        assert!(!backend_tls_pool_key_has_svid_generation(&key, 41));
+    }
+
+    #[test]
+    fn backend_tls_pool_key_fields_keep_static_client_material_static() {
+        let mut key = String::from("backend|443|");
+        append_backend_tls_pool_key_fields(
+            &mut key,
+            &BackendTlsConfig::default(),
+            Some("/operator/client.pem"),
+            Some("/operator/client.key"),
+            true,
+            None,
+        );
+
+        assert!(key.ends_with("|svidg=static"));
+        assert!(!backend_tls_pool_key_has_svid_generation(&key, 0));
     }
 
     #[test]

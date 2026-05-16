@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use x509_parser::prelude::*;
@@ -43,17 +44,50 @@ pub struct RotationConfig {
     /// Trigger rotation once the current SVID has aged past this fraction
     /// (0.0..=1.0) of its validity window. Default 0.5.
     pub rotate_at_fraction: f64,
+    /// Monotonic revision channel bumped after each successful post-initial
+    /// rotation. Backend TLS pools subscribe to this to rebuild client identity
+    /// configs without restarting.
+    ///
+    /// Production callers should hand in `ProxyState.backend_svid_rotation_tx`
+    /// so the consumer side (`spawn_backend_svid_rotation_task`) observes the
+    /// same channel; otherwise the producer/consumer pair drift and the
+    /// drain plumbing stays dormant. Construct a fresh channel only for unit
+    /// tests that don't have a ProxyState.
+    pub revision_tx: watch::Sender<u64>,
 }
 
 impl RotationConfig {
-    pub fn new(ca: SharedCa, spiffe_id: SpiffeId, svid_ttl_secs: u64) -> Self {
+    /// Construct a rotation config with an explicit revision sender.
+    ///
+    /// `revision_tx` is the producer side of the channel
+    /// `ProxyState.backend_svid_rotation_tx` is the consumer of. Pass a
+    /// `.clone()` of the gateway's sender so revision bumps flow into the
+    /// backend pool drain task.
+    pub fn new(
+        ca: SharedCa,
+        spiffe_id: SpiffeId,
+        svid_ttl_secs: u64,
+        revision_tx: watch::Sender<u64>,
+    ) -> Self {
         Self {
             ca,
             spiffe_id,
             svid_ttl_secs,
             current: Arc::new(ArcSwap::new(Arc::new(None))),
             rotate_at_fraction: 0.5,
+            revision_tx,
         }
+    }
+
+    /// Test-only constructor that synthesizes a private channel.
+    #[cfg(test)]
+    pub fn new_isolated(ca: SharedCa, spiffe_id: SpiffeId, svid_ttl_secs: u64) -> Self {
+        let (revision_tx, _) = watch::channel(0u64);
+        Self::new(ca, spiffe_id, svid_ttl_secs, revision_tx)
+    }
+
+    pub fn revision_receiver(&self) -> watch::Receiver<u64> {
+        self.revision_tx.subscribe()
     }
 }
 
@@ -85,10 +119,22 @@ async fn rotation_main(config: RotationConfig) {
             continue;
         }
         match mint_and_install(&config).await {
-            Ok(()) => info!(spiffe_id = %config.spiffe_id, "SVID rotated"),
+            Ok(()) => {
+                let revision = bump_revision(&config.revision_tx);
+                info!(
+                    spiffe_id = %config.spiffe_id,
+                    svid_revision = revision,
+                    "SVID rotated"
+                );
+            }
             Err(e) => warn!(error = %e, spiffe_id = %config.spiffe_id, "SVID rotation failed"),
         }
     }
+}
+
+fn bump_revision(revision_tx: &watch::Sender<u64>) -> u64 {
+    revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
+    *revision_tx.borrow()
 }
 
 async fn mint_and_install(config: &RotationConfig) -> Result<(), String> {
@@ -165,4 +211,23 @@ fn leaf_validity(bundle: &SvidBundle) -> Option<(DateTime<Utc>, DateTime<Utc>)> 
     let not_before = DateTime::<Utc>::from_timestamp(validity.not_before.timestamp(), 0)?;
     let not_after = DateTime::<Utc>::from_timestamp(validity.not_after.timestamp(), 0)?;
     Some((not_before, not_after))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_revision_notifies_watch_subscribers() {
+        let (revision_tx, mut revision_rx) = watch::channel(0u64);
+
+        assert_eq!(*revision_rx.borrow(), 0);
+        assert_eq!(bump_revision(&revision_tx), 1);
+        assert!(revision_rx.has_changed().expect("watch sender is alive"));
+        assert_eq!(*revision_rx.borrow_and_update(), 1);
+
+        assert_eq!(bump_revision(&revision_tx), 2);
+        assert!(revision_rx.has_changed().expect("watch sender is alive"));
+        assert_eq!(*revision_rx.borrow_and_update(), 2);
+    }
 }
