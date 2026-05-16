@@ -336,12 +336,27 @@ impl SpecExpose {
     }
 }
 
+/// Build a 502 rejection for an oversized upstream spec body.
+///
+/// **Security:** `/specz` is intentionally unauthenticated, so the public error
+/// body intentionally omits the configured `max_response_body_bytes` value to
+/// avoid leaking operator config to anonymous probes. Operator-facing detail
+/// (the configured cap and how many bytes were observed) stays in the
+/// structured `tracing::warn!` at the call site. Do not "improve" the message
+/// by adding the limit back — the tests at
+/// `tests/unit/plugins/spec_expose_tests.rs` explicitly assert the public body
+/// does NOT contain `max_response_body_bytes`.
 fn body_too_large_reject() -> PluginResult {
-    // /specz is unauthenticated, so the public error intentionally omits the
-    // configured limit while structured logs retain the operator-facing detail.
     reject_502_json("API specification response too large")
 }
 
+/// Build a 502 `Reject` with a JSON `{"error": message}` body.
+///
+/// Uses `serde_json::json!` to escape the message safely — never inline
+/// user-controlled or upstream-derived strings into the response with raw
+/// `format!`. Callers should keep operator-facing detail (URL, cap value,
+/// upstream status) in structured `tracing::warn!` logs rather than the
+/// response body, since `/specz` is unauthenticated.
 fn reject_502_json(message: impl Into<String>) -> PluginResult {
     let mut headers = HashMap::with_capacity(1);
     headers.insert("content-type".to_string(), "application/json".to_string());

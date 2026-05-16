@@ -66,6 +66,30 @@ impl std::fmt::Display for BoundedReadError {
 impl std::error::Error for BoundedReadError {}
 
 /// Parse a common `max_response_body_bytes`-style plugin config field.
+///
+/// Used by `spec_expose`, `serverless_function`, and `request_mirror` so the
+/// validation matrix and error wording stay consistent across plugins.
+///
+/// # Contract
+///
+/// * Missing key or `null` → `Ok(default)`.
+/// * Positive integer that fits `usize` → `Ok(raw as usize)`.
+/// * Non-integer JSON (strings, arrays, objects, booleans) → `Err("must be a
+///   non-negative integer")`. Floating-point JSON numbers — including
+///   whole-number forms like `1024.0` — fall into this branch because
+///   `serde_json::Number::as_u64()` returns `None` for any `Float` variant.
+///   Operators must supply an integer literal.
+/// * Negative integer → same `Err("must be a non-negative integer")` (because
+///   `as_u64()` rejects it).
+/// * `0` → `Err("must be greater than zero")` (a zero cap would reject every
+///   response).
+/// * Positive integer that overflows `usize` on the target platform (only
+///   reachable on 32-bit builds) → `Err("is too large for this platform")`.
+///
+/// The error messages intentionally do not echo the offending value to avoid
+/// blowing up logs / admin-API responses when an operator pastes a large
+/// JSON blob into the field. The structured config is still attached at the
+/// plugin construction call site via the surrounding error.
 pub fn parse_max_response_body_bytes(
     config: &Value,
     plugin_name: &str,
