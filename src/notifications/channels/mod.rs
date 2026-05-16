@@ -27,7 +27,8 @@ pub mod webhook;
 /// body just to keep the keep-alive connection reusable. The drain path counts
 /// and discards chunks instead of buffering them, so memory tracks the current
 /// response chunk and transport buffers rather than this full cap.
-const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = 1024 * 1024;
+const RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64: u64 = 1024 * 1024;
+const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64 as usize;
 
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
@@ -250,9 +251,8 @@ async fn drain_response_body_redacted(
     channel: &str,
     redacted_url: &str,
 ) -> Result<(), String> {
-    let drain_limit_bytes_u64 = RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64;
     if let Some(content_length) = resp.content_length()
-        && content_length > drain_limit_bytes_u64
+        && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64
     {
         // Keep this wording distinct from the streaming abort below; tests use
         // "before reading" vs. "after reading" to pin the intended path.
