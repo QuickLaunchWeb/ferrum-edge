@@ -462,7 +462,7 @@ impl MeshSlice {
             .collect();
         let workloads =
             if request.enforce_sidecar_identity_narrowing && applicable_sidecar.is_some() {
-                narrow_workload_identities(workloads, &services)
+                narrow_workload_identities(workloads, &services, &request)
             } else {
                 workloads
             };
@@ -503,6 +503,7 @@ impl MeshSlice {
 fn narrow_workload_identities(
     workloads: Vec<Workload>,
     admitted_services: &[MeshService],
+    request: &MeshSliceRequest,
 ) -> Vec<Workload> {
     let reachable_identities: HashSet<_> = admitted_services
         .iter()
@@ -510,11 +511,17 @@ fn narrow_workload_identities(
         .collect();
     if !admitted_services.is_empty() && reachable_identities.is_empty() {
         warn!(
+            node_id = request.node_id.as_str(),
+            namespace = request.namespace.as_str(),
+            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
             admitted_services = admitted_services.len(),
             "Sidecar workload identity narrowing found no reachable identities; admitted MeshService.workloads lists are empty"
         );
     } else if admitted_services.is_empty() {
         debug!(
+            node_id = request.node_id.as_str(),
+            namespace = request.namespace.as_str(),
+            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
             "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
@@ -3850,6 +3857,79 @@ mod tests {
             slice.workloads.len(),
             2,
             "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true is a no-op until FERRUM_MESH_SIDECAR_ENFORCED=true"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_drops_workloads_when_no_services_admitted() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar("default-sc", "alpha", None, vec![vec!["~/*"]])],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert!(
+            slice.services.is_empty(),
+            "the Sidecar egress scope admits no services"
+        );
+        assert!(
+            slice.workloads.is_empty(),
+            "identity narrowing follows the empty admitted-service set"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_drops_workloads_when_services_have_no_refs() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        assert!(
+            slice.workloads.is_empty(),
+            "admitted services without workload refs yield an empty reachable identity set"
         );
     }
 
