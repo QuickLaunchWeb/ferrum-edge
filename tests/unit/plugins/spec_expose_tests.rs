@@ -471,8 +471,8 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        // One uncached /specz call performs one upstream GET. If that ever gains
-        // retry behavior, the timeout below fails fast instead of hanging CI.
+        // The timeout below guards against this raw fixture hanging if the
+        // request/response plumbing changes.
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 1024];
         let _ = socket.read(&mut buf).await.unwrap();

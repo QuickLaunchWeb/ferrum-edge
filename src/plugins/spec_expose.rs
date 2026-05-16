@@ -322,10 +322,11 @@ impl SpecExpose {
         let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
             .map_err(|e| match e {
-                BoundedReadError::LimitExceeded { .. } => {
+                BoundedReadError::LimitExceeded { read_so_far, .. } => {
                     tracing::warn!(
                         spec_url = %self.spec_url,
                         max_response_body_bytes = self.max_response_body_bytes,
+                        read_so_far,
                         "spec_expose: upstream spec response body exceeded configured limit while streaming"
                     );
                     self.body_too_large_reject()
