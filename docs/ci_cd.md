@@ -74,13 +74,23 @@ cargo fmt --all -- --check
 
 **Runs**: `ubuntu-latest`
 
-Runs the PR test matrix in parallel:
+Runs the PR test matrix in parallel. The commands below are grouped by job,
+not run as one sequential shell script:
 
 ```bash
+# test-unit
 cargo test --test unit_tests
+
+# test-lib
 cargo test --lib
+
+# test-integration
 cargo test --test integration_tests
+
+# build-gateway-binary
 cargo build --bin ferrum-edge
+
+# test-functional-{harness,admin-routing,data-plane,plugins,protocols,resilience}
 cargo nextest run --test functional_tests \
   --run-ignored=all \
   --no-fail-fast \
@@ -153,7 +163,7 @@ Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, m
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `latest-release` job and Docker publishing jobs both depend on the completed build matrix and then run in parallel. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
+On pushes to `main`, the `latest-release` job and the per-platform Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
 
 ## Release Pipeline (release.yml)
 
@@ -266,11 +276,11 @@ FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 
 ```toml
 [package]
 name = "ferrum-edge"
-version = "0.9.0" # Bump for each release
+version = "<version>"
 ```
 
 **Release Process**:
-1. Update `Cargo.toml` version before tagging
+1. Update `Cargo.toml` version to the intended release version before tagging
 2. Tag: `git tag v<version>` (matching the new version)
 3. Release: GitHub Actions automatically builds and publishes
 
@@ -583,6 +593,10 @@ strategy:
         artifact_name: ferrum-edge
         asset_name: ferrum-edge-linux-x86_64-musl
 ```
+
+Musl targets need their own toolchain setup. Add `musl-tools` before a native
+`cargo build`, or route the target through `cross build` and install `cross`
+in the workflow the same way the ARM64 Linux target does.
 
 ### Skipping Steps
 
