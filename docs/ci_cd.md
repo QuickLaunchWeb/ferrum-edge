@@ -151,7 +151,7 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. All CI binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build uses the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin`, so it is a cross-compile target.
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. All CI binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build runs on the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain; it does not use `cross`.
 
 #### 7. Latest Release and Docker Jobs
 
@@ -198,7 +198,7 @@ Builds optimized release binaries for all target platforms:
 
 **Cross-Compilation**:
 - Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
-- Other targets use standard `cargo build`; macOS x86_64 is cross-compiled on the ARM64 `macos-latest` runner.
+- Other targets use standard `cargo build`; macOS x86_64 is built on the ARM64 `macos-latest` runner with the standard Apple/Rust target tooling.
 
 **Output**:
 - Binary: `ferrum-edge-{platform}`
@@ -350,14 +350,20 @@ If automatic release fails:
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
 # MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`)
 # with Docker or Podman running.
-# Run macOS targets on a macOS host and the Windows MSVC target on Windows.
+# On a Linux host:
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
 cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
+
+# On a macOS host:
 cargo build --features cloud-secrets --release --target x86_64-apple-darwin
 cargo build --features cloud-secrets --release --target aarch64-apple-darwin
+
+# On a Windows host:
 cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
 # Stage platform-suffixed assets before checksums/upload, matching CI asset names.
+# Collect the built target artifacts from the Linux, macOS, and Windows hosts
+# into this checkout before running these staging commands.
 mkdir -p dist
 cp target/x86_64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-x86_64
 cp target/aarch64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-aarch64
@@ -538,7 +544,7 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 ### Adding New Targets
 
-Edit `.github/workflows/release.yml`:
+Edit both `.github/workflows/ci.yml` (`build-binaries`) and `.github/workflows/release.yml` (`build-release-binaries`):
 
 ```yaml
 strategy:
@@ -553,13 +559,13 @@ strategy:
 
 ### Skipping Steps
 
-Skip specific jobs per commit:
+Skip the entire workflow run for a commit:
 
 ```bash
 # Skip CI for documentation changes
 git commit -m "docs: update README [skip ci]"
 
-# Automatically skips test/lint/build jobs
+# Skips the whole GitHub Actions workflow run for this commit
 ```
 
 ### Custom Build Flags
