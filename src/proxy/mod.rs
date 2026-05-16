@@ -1563,7 +1563,8 @@ pub struct ProxyState {
     /// Mesh-mode startup is responsible for binding the producer; non-mesh
     /// modes (database / file / cp / dp) leave the channel dormant by design,
     /// since they do not run a rotation task.
-    #[allow(dead_code)] // Producer hookup lands in mesh-mode startup; tests exercise the channel.
+    // Producer hookup lands in mesh-mode startup; tests exercise the channel.
+    #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
     #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
