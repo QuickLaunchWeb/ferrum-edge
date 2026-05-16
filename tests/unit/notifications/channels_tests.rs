@@ -522,6 +522,39 @@ async fn webhook_oversized_content_length_response_body_is_rejected_and_redacted
 }
 
 #[tokio::test]
+async fn webhook_response_body_at_drain_limit_is_allowed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let body = vec![b'x'; 1024 * 1024];
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn webhook_oversized_chunked_response_body_is_rejected_and_redacted() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

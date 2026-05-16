@@ -252,7 +252,7 @@ pub(super) async fn drain_response_body_redacted(
         && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64
     {
         return Err(format!(
-            "{channel} dispatch response body length {content_length} exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes reading response from {redacted_url}"
+            "{channel} dispatch response body exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes before reading advertised {content_length} byte response from {redacted_url}"
         ));
     }
 
