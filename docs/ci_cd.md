@@ -18,19 +18,21 @@ Two main workflows handle different aspects of the development lifecycle:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Push to `main`, Pull Requests | Test and lint |
-| **Release** (`release.yml`) | Push tag matching `v*` | Build platform-specific binaries, create GitHub release |
+| **CI** (`ci.yml`) | Pull Requests, push to `main` | PR validation; latest binaries and Docker images on `main` |
+| **Release** (`release.yml`) | Push tag matching `v*` | Versioned binaries, GitHub release, and Docker tags |
 
 ### CI Pipeline Flow
 
 ```
 Push to main / Pull Request
         │
-        ├─► Test (cargo test)
-        └─► Lint (clippy, fmt)
+        ├─► Format
+        ├─► Unit / inline-lib / integration tests
+        ├─► Functional test shards
+        ├─► Lint + performance regression check
+        ├─► Five target release builds
+        └─► Push to main only: latest GitHub release + Docker images
 ```
-
-> **Note**: Build Release and Docker Build jobs are currently disabled (commented out in ci.yml) while the project is in early development. They will be enabled when the project is mature. See the release pipeline for producing binaries on version tags.
 
 ### Release Pipeline Flow
 
@@ -41,8 +43,9 @@ Push tag v* (e.g., v0.2.0)
         ├─► Build linux-aarch64 (ARM)
         ├─► Build macos-x86_64
         ├─► Build macos-aarch64 (Apple Silicon)
-        │
-        └─► Create GitHub Release with binaries and checksums
+        ├─► Build windows-x86_64
+        ├─► Create GitHub Release with binaries and checksums
+        └─► Push versioned Docker images to Docker Hub and GHCR
 ```
 
 ## CI Pipeline (ci.yml)
@@ -51,62 +54,75 @@ The CI pipeline runs on every push to `main` and all pull requests.
 
 ### Jobs
 
-#### 1. Test Job
+#### 1. Format Job
 
 **Runs**: `ubuntu-latest`
 
-Tests all code changes and dependencies:
+Checks Rust formatting on pull requests:
 
 ```bash
-# Executed
-cargo test --verbose --all-features
+cargo fmt --all -- --check
+```
+
+**Failures**:
+- Indicate formatting drift
+- Must be fixed before merging
+
+#### 2. Test Jobs
+
+**Runs**: `ubuntu-latest`
+
+Runs the PR test matrix in parallel:
+
+```bash
+cargo test --test unit_tests
+cargo test --lib
+cargo test --test integration_tests
+cargo build --bin ferrum-edge
+cargo test --test functional_tests -- --ignored
 ```
 
 **What it tests**:
-- All unit tests in `src/`
-- All integration tests in `tests/`
-- Feature combinations
-- Build dependencies
+- Unit tests in `tests/unit_tests.rs`
+- Inline `#[cfg(test)]` modules in `src/`
+- Integration tests
+- Functional tests split across harness, admin/routing, data-plane, plugins, protocols, and resilience shards
 
 **Output**:
 - Test pass/fail status
 - Failures block PR merges (if branch protection enabled)
 
-#### 2. Lint Job
+#### 3. Lint, eBPF, and Performance Jobs
 
 **Runs**: `ubuntu-latest`
 
-Enforces code quality standards:
+Enforces code quality, optional eBPF build coverage, and the self-relative performance gate:
 
 ```bash
-# Clippy (warnings as errors)
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Format check
-cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build --profile ci-release --bin ferrum-edge
 ```
 
 **What it checks**:
 - Code style and idioms (clippy)
-- Code formatting (rustfmt)
-- Unsafe code warnings
-- Performance issues
+- eBPF programs when `ebpf/` changes
+- Performance regressions against the benchmark backend
 
 **Failures**:
-- Indicate code quality issues
+- Indicate quality, build, or regression issues
 - Must be fixed before merging
 
-#### 3. Build Release Job (Currently Disabled)
+#### 4. Cross-Platform Build Jobs
 
-> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-When enabled, builds optimized release binaries for multiple platforms (Linux x86_64, macOS x86_64, macOS aarch64). Gated on test and lint jobs passing, and only runs on push to `main` (not on PRs).
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`.
 
-#### 4. Docker Build Job (Currently Disabled)
+#### 5. Latest Release and Docker Jobs
 
-> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
+**Runs**: `ubuntu-latest`
 
-When enabled, builds and optionally pushes a Docker image. Gated on test and lint jobs passing, and only runs on push to `main`. Requires `DOCKER_USERNAME` and `DOCKER_PASSWORD` GitHub Secrets for pushing to a registry.
+On pushes to `main`, creates or replaces the `latest` prerelease, then builds and pushes multi-arch Docker images to Docker Hub and GHCR. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and requires workflow package write permission.
 
 ## Release Pipeline (release.yml)
 
@@ -124,7 +140,7 @@ git push origin v0.2.0
 
 ### Release Build Job
 
-**Runs**: `ubuntu-latest`, `macos-latest` (matrix)
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (matrix)
 
 Builds optimized release binaries for all target platforms:
 
@@ -133,6 +149,7 @@ Builds optimized release binaries for all target platforms:
 - `aarch64-unknown-linux-gnu` - Linux ARM64
 - `x86_64-apple-darwin` - macOS x86_64
 - `aarch64-apple-darwin` - macOS ARM64 (Apple Silicon)
+- `x86_64-pc-windows-msvc` - Windows x86_64
 
 **Build Process**:
 1. Checkout code at tag commit
@@ -174,6 +191,7 @@ Creates a GitHub Release with all binaries and checksums:
 - ferrum-edge-linux-aarch64
 - ferrum-edge-macos-x86_64
 - ferrum-edge-macos-aarch64
+- ferrum-edge-windows-x86_64.exe
 
 ## Checksums
 
@@ -191,7 +209,7 @@ def456... ferrum-edge-linux-aarch64
 ```toml
 [package]
 name = "ferrum-edge"
-version = "0.1.0"
+version = "0.9.0"
 ```
 
 **Release Process**:
@@ -381,15 +399,18 @@ sha256sum -c *.sha256
 # ferrum-edge-linux-aarch64: OK
 # ferrum-edge-macos-x86_64: OK
 # ferrum-edge-macos-aarch64: OK
+# ferrum-edge-windows-x86_64.exe: OK
 ```
 
-### Docker Hub Images
+### Docker Images
 
-Pre-built Docker images also available (if Docker Hub credentials configured):
+Pre-built Docker images are published to Docker Hub and GitHub Container Registry when credentials and workflow permissions are configured:
 
 ```bash
-docker pull your-registry/ferrum-edge:v0.2.0
-docker pull your-registry/ferrum-edge:latest
+docker pull ferrumedge/ferrum-edge:v0.2.0
+docker pull ferrumedge/ferrum-edge:latest
+docker pull ghcr.io/ferrum-edge/ferrum-edge:v0.2.0
+docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
 ```
 
 ## GitHub Actions Secrets
@@ -406,37 +427,39 @@ Configure secrets for Docker image publishing and releases.
 
 #### Docker Registry (Optional)
 
-For pushing Docker images to registry:
+For pushing Docker Hub images:
 
-- `DOCKER_USERNAME` - Docker Hub username
-- `DOCKER_PASSWORD` - Docker Hub access token or password
+- `DOCKERHUB_USERNAME` - Docker Hub username
+- `DOCKERHUB_TOKEN` - Docker Hub access token
 
 **Generate Docker Token**:
 1. Log in to Docker Hub
 2. Account Settings → Security
 3. Create new access token
-4. Copy token to `DOCKER_PASSWORD`
+4. Copy token to `DOCKERHUB_TOKEN`
 
-### Environment Variables in Workflows
+For GHCR publishing, the workflows use `GITHUB_TOKEN`. Repository settings must allow Actions read/write workflow permissions and package write access.
 
-Access secrets in workflows:
+### Secret Usage in Workflows
+
+The Docker Hub login steps use:
 
 ```yaml
-env:
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+with:
+  username: ${{ secrets.DOCKERHUB_USERNAME }}
+  password: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
 
 ### Setting Secrets
 
 ```bash
 # Using GitHub CLI
-gh secret set DOCKER_USERNAME --body "your-username"
-gh secret set DOCKER_PASSWORD --body "your-token"
+gh secret set DOCKERHUB_USERNAME --body "your-username"
+gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 # Via web UI
 1. Settings → Secrets → New repository secret
-2. Name: DOCKER_USERNAME
+2. Name: DOCKERHUB_USERNAME
 3. Value: your-username
 4. Click "Add secret"
 ```
@@ -525,7 +548,7 @@ git show v0.2.0
 **Verify secrets**:
 ```bash
 gh secret list
-# Should show DOCKER_USERNAME and DOCKER_PASSWORD
+# Should show DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
 ```
 
 **Test credentials**:
@@ -534,7 +557,7 @@ gh secret list
 docker login -u $USERNAME -p $PASSWORD
 
 # Update secrets if needed
-gh secret set DOCKER_PASSWORD --body "new-token"
+gh secret set DOCKERHUB_TOKEN --body "new-token"
 ```
 
 ## See Also
