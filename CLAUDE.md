@@ -348,10 +348,39 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 ### Code Quality Rules
 
-- **No `.unwrap()` or `.expect()` in production code** — use `?`, `.unwrap_or()`, `.unwrap_or_else()`, match/if-let. OK in tests.
-- **No panics on hot path** — proxy request path must never panic. Return errors.
-- Don't silently swallow errors — log warnings before `.unwrap_or_default()` when appropriate.
-- **Always `validation.validate_exp = true`** on JWT verification.
+**Production Rust:**
+- No `.unwrap()` / `.expect()` in production code. Tests are exempt. Prefer `?`, explicit error handling, or documented invariants.
+- Avoid `unwrap_or`-style fallbacks when they could hide real configuration, parsing, or I/O failures — log a `warn!` before `.unwrap_or_default()` when a fallback is genuinely desired.
+- No panics on the proxy request path. Return errors.
+
+**Hot path:**
+- No `format!()` or avoidable allocation in hot loops.
+- No global `Mutex` / `RwLock` on the proxy hot path.
+- Prefer `ArcSwap` snapshots for read-mostly state.
+- Use `DashMap` only for concurrent mutable maps.
+- New hot-path `DashMap` construction must go through `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`.
+
+**Schemas:**
+- Backward-compatible optional field additions must use `#[serde(default, skip_serializing_if = "<pred>")]`.
+- Required new fields need a migration/versioning plan.
+- Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
+
+**Configuration:**
+- New `FERRUM_*` env vars require updates to `docs/configuration.md` and `ferrum.conf`.
+- Update config tests/examples where applicable.
+
+**Pool keys:**
+- Use `|` as the delimiter, never `:`.
+- Ensure key components cannot contain `|`, or escape/encode them before joining.
+
+**Admin API / OpenAPI parity:**
+- Admin API request/response changes (new endpoints, fields, status codes) and any new plugin must be reflected in `openapi.yaml`. UI integrations consume that spec — drift silently breaks downstream tooling.
+
+**Injector / Kubernetes admission:**
+- Changes touching `src/modes/injector.rs` require review for webhook body-size limits, SSRF exposure, Kubernetes `AdmissionReview` shape, UID echoing, `status` / `allowed` behavior, and JSONPatch correctness.
+
+**Security:**
+- Always set `validation.validate_exp = true` on JWT verification.
 - Escape user input when interpolating into JSON/XML response bodies.
 
 ### TLS Architecture
@@ -489,7 +518,7 @@ Tests in `tests/performance/multi_protocol/`. Build once with `cargo build --rel
 3. Override `supported_protocols()` (default HTTP only). Constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, `UDP_ONLY_PROTOCOLS`
 4. Register in `create_plugin_with_http_client()` match arm (use `?` on `new()`) + add name to `available_plugins()`
 5. Unit tests in `tests/unit/plugins/my_plugin_tests.rs` (valid AND invalid configs) + add to `tests/unit/plugins/mod.rs`
-6. Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`
+6. Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, and `openapi.yaml` (plugin schema for UI parity)
 
 ### Plugin Config Validation
 
