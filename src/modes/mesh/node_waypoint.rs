@@ -144,6 +144,97 @@ impl NodeWaypointIdentityResolver {
         self.policy_scopes_by_pod_uid.load().get(pod_uid).cloned()
     }
 
+    /// Build an operator-facing snapshot of the currently enrolled identities.
+    ///
+    /// Returned entries are sorted by pod UID so admin polling produces a
+    /// deterministic order across calls. The shape carries:
+    ///   - canonical hyphenated UUID for the pod UID
+    ///   - the workload's SPIFFE ID string
+    ///   - the workload SPIFFE hash (matches the value the eBPF map stores;
+    ///     useful when correlating with node-agent telemetry)
+    ///   - the cookie counts (IPv4 + IPv6) currently mapped to that pod via
+    ///     `OrigDst{4,6}` records, so operators can see "is this identity
+    ///     actually receiving traffic right now?" without joining datasets.
+    ///   - whether a per-pod `PolicyScopeCache` is installed.
+    ///
+    /// This is a cold-path snapshot — it iterates every entry of each
+    /// `DashMap` once. Not safe to call on a hot accept path.
+    pub fn identities_snapshot(&self) -> Vec<NodeWaypointIdentitySummary> {
+        let mut cookie_counts: HashMap<[u8; 16], (usize, usize)> = HashMap::new();
+        for entry in self.orig_dst4_by_cookie.iter() {
+            cookie_counts
+                .entry(entry.value().pod_uid)
+                .or_insert((0, 0))
+                .0 += 1;
+        }
+        for entry in self.orig_dst6_by_cookie.iter() {
+            cookie_counts
+                .entry(entry.value().pod_uid)
+                .or_insert((0, 0))
+                .1 += 1;
+        }
+
+        let policy_scopes = self.policy_scopes_by_pod_uid.load();
+        let mut out: Vec<NodeWaypointIdentitySummary> = self
+            .identities_by_pod_uid
+            .iter()
+            .map(|entry| {
+                let identity = entry.value();
+                let (orig_dst4_cookies, orig_dst6_cookies) = cookie_counts
+                    .get(&identity.pod_uid)
+                    .copied()
+                    .unwrap_or((0, 0));
+                NodeWaypointIdentitySummary {
+                    pod_uid: identity.pod_uid,
+                    spiffe_id: identity.spiffe_id.as_str().to_string(),
+                    workload_spiffe_hash: identity.workload_spiffe_hash,
+                    orig_dst4_cookies,
+                    orig_dst6_cookies,
+                    has_policy_scope: policy_scopes.contains_key(&identity.pod_uid),
+                }
+            })
+            .collect();
+        out.sort_by_key(|summary| summary.pod_uid);
+        out
+    }
+
+    /// Number of currently enrolled identities. Cheap-ish; uses DashMap's
+    /// `len()` which iterates per-shard counters.
+    pub fn identity_count(&self) -> usize {
+        self.identities_by_pod_uid.len()
+    }
+
+    /// Total cookie records (IPv4 + IPv6) currently tracked. Useful for the
+    /// admin endpoint summary so operators see "1k cookies / 10 identities"
+    /// without scanning per-identity entries.
+    pub fn cookie_count(&self) -> (usize, usize) {
+        (
+            self.orig_dst4_by_cookie.len(),
+            self.orig_dst6_by_cookie.len(),
+        )
+    }
+}
+
+/// One enrolled identity as exposed via `GET /node-waypoint/identities`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeWaypointIdentitySummary {
+    pub pod_uid: [u8; 16],
+    pub spiffe_id: String,
+    pub workload_spiffe_hash: u64,
+    pub orig_dst4_cookies: usize,
+    pub orig_dst6_cookies: usize,
+    pub has_policy_scope: bool,
+}
+
+impl NodeWaypointIdentitySummary {
+    /// Hyphenated lowercase UUID rendering of the pod UID. Matches the
+    /// Kubernetes `metadata.uid` format operators see in `kubectl` output.
+    pub fn pod_uid_string(&self) -> String {
+        pod_uid_label(&self.pod_uid)
+    }
+}
+
+impl NodeWaypointIdentityResolver {
     pub fn resolve_stream(
         &self,
         stream: &TcpStream,
@@ -367,6 +458,76 @@ mod tests {
         assert_eq!(
             from_cache.policy_applies(&policy),
             policy_scope_applies_to_workload(&policy, "default", &from_cache.labels)
+        );
+    }
+
+    #[test]
+    fn identities_snapshot_lists_enrolled_pods_sorted_by_uid() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_a = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let pod_b = parse_pod_uid("22222222-2222-2222-2222-222222222222").unwrap();
+        let identity_b =
+            NodeWaypointIdentity::new(pod_b, spiffe("spiffe://td/ns/default/sa/billing"));
+        let identity_a = NodeWaypointIdentity::new(pod_a, spiffe("spiffe://td/ns/default/sa/api"));
+        let hash_a = identity_a.workload_spiffe_hash;
+        let hash_b = identity_b.workload_spiffe_hash;
+
+        // Insert b first so the snapshot has to sort.
+        resolver.upsert_identity(identity_b);
+        resolver.upsert_identity(identity_a);
+        // Two cookies for pod_a, one for pod_b.
+        resolver.record_orig_dst4(11, orig_dst4(pod_a, hash_a));
+        resolver.record_orig_dst4(12, orig_dst4(pod_a, hash_a));
+        resolver.record_orig_dst6(21, orig_dst6(pod_b, hash_b));
+
+        let snapshot = resolver.identities_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].pod_uid, pod_a);
+        assert_eq!(snapshot[1].pod_uid, pod_b);
+        assert_eq!(snapshot[0].spiffe_id, "spiffe://td/ns/default/sa/api");
+        assert_eq!(snapshot[0].orig_dst4_cookies, 2);
+        assert_eq!(snapshot[0].orig_dst6_cookies, 0);
+        assert!(!snapshot[0].has_policy_scope);
+        assert_eq!(snapshot[1].orig_dst4_cookies, 0);
+        assert_eq!(snapshot[1].orig_dst6_cookies, 1);
+        assert_eq!(resolver.identity_count(), 2);
+        assert_eq!(resolver.cookie_count(), (2, 1));
+    }
+
+    #[test]
+    fn identities_snapshot_reports_policy_scope_presence() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
+        resolver.upsert_identity(identity);
+
+        let snapshot_pre = resolver.identities_snapshot();
+        assert!(!snapshot_pre[0].has_policy_scope);
+
+        let cache = Arc::new(PolicyScopeCache::new(
+            spiffe("spiffe://td/ns/default/sa/api"),
+            "default",
+            HashMap::new(),
+        ));
+        resolver.install_policy_scopes(HashMap::from([(pod_uid, cache)]));
+
+        let snapshot_post = resolver.identities_snapshot();
+        assert!(snapshot_post[0].has_policy_scope);
+    }
+
+    #[test]
+    fn identities_snapshot_summary_renders_canonical_uuid() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let snapshot = resolver.identities_snapshot();
+        assert_eq!(
+            snapshot[0].pod_uid_string(),
+            "11111111-1111-1111-1111-111111111111"
         );
     }
 
