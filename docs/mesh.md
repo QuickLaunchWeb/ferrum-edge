@@ -1071,7 +1071,7 @@ Ferrum's ADS server honors explicit SotW (State-of-the-World) resource subscript
 
 Delta-xDS subscriptions across the same type URLs are additive: `resource_names_subscribe` appends to the per-stream subscription set and `resource_names_unsubscribe` removes from it, with empty lists treated as no-ops. Subscriptions persist across requests on the same stream, and updates only mutate the explicit subscription state without broadcasting unrelated resources.
 
-Delta xDS wire-byte optimization and ECDS `TypedExtensionConfig` resources remain staged follow-ups in the GAP-2L track; the current support is the explicit-resource subscription state machine.
+ECDS (Extension Config Discovery Service) — `type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig` — is served alongside the standard xDS resource types. Operators populate `MeshSlice.extension_configs` with `MeshExtensionConfig { name, type_url, value }` entries; the translator emits one ECDS resource per entry whose payload is the encoded `TypedExtensionConfig` (with the inner `Any` carrying the operator-defined `type_url` and bytes). The GAP-2K DestinationRule-carrier path uses inner `type_url == type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier` to ship the original DR JSON across xDS when full DR semantics are required. Delta wire-byte reduction (GAP-2L.2) extends to ECDS naturally because per-resource versions are content-derived.
 
 ## Istio Compatibility Gaps
 

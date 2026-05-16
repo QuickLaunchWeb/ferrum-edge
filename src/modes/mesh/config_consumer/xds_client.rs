@@ -19,15 +19,22 @@ use crate::modes::mesh::slice::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::translator::{
-    CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
+    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
+    XDS_TYPE_URLS,
 };
 
-const INITIAL_TYPE_URL_ORDER: [&str; 5] = [
+const INITIAL_TYPE_URL_ORDER: [&str; 6] = [
     CDS_TYPE_URL,
     EDS_TYPE_URL,
     LDS_TYPE_URL,
     RDS_TYPE_URL,
     SDS_TYPE_URL,
+    // ECDS rides the same ADS stream as the standard xDS resources so the
+    // GAP-2K DR-carrier path piggybacks on existing subscription lifecycles.
+    // Kept last in the initial subscription order so DPs request the
+    // baseline resources first and treat ECDS as a "richer-semantics"
+    // overlay rather than a hard dependency.
+    ECDS_TYPE_URL,
 ];
 const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
     [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
@@ -852,6 +859,11 @@ fn reverse_translate(
         // fallback until MeshConfig translation is wired.
         outbound_traffic_policy: None,
         sidecar_egress_scope: None,
+        // GAP-2L.3: xDS-only deployments don't round-trip ECDS resources back
+        // into the slice today. The DR-carrier path (GAP-2K) lands them
+        // alongside CDS via the same wire so this stays None unless future
+        // ADS-side recovery wires it.
+        extension_configs: Vec::new(),
     })
 }
 
@@ -1092,7 +1104,8 @@ mod tests {
                 EDS_TYPE_URL,
                 LDS_TYPE_URL,
                 RDS_TYPE_URL,
-                SDS_TYPE_URL
+                SDS_TYPE_URL,
+                ECDS_TYPE_URL,
             ]
         );
         assert!(requests.iter().all(|request| request.node.is_some()));
