@@ -425,7 +425,7 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 
 By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
 
-Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply. Frontend cert/key paths remain static operational inputs and still require restart. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply for mesh HTTP/HBONE termination listeners. Frontend cert/key paths remain static operational inputs and still require restart. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config and require restart for PeerAuthentication changes. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
 
 ### Disable-mode topology guard
 

@@ -117,7 +117,7 @@ Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend
 
 All file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**.
 
-Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply. Frontend cert/key paths still require restart.
+Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply for mesh HTTP/HBONE termination listeners. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config. Frontend cert/key paths still require restart.
 
 ### Graceful Shutdown
 

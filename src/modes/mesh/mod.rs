@@ -2691,7 +2691,7 @@ fn startup_inbound_mtls_mode(
     match validate_inbound_mtls_mode_for_topology(runtime, resolved) {
         Ok(()) => Ok(resolved),
         Err(error) if live_reload_enabled => {
-            warn!(
+            error!(
                 ?resolved,
                 topology = ?runtime.topology,
                 "Initial PeerAuthentication mTLS mode is invalid for this mesh topology: {error}; \
@@ -2750,6 +2750,8 @@ fn mesh_inbound_tls_reload_snapshot(
 fn file_content_hash(path: &str) -> Result<u64, std::io::Error> {
     let bytes = std::fs::read(path)?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Non-cryptographic change detection only; collisions can miss a reload
+    // but do not form a security boundary.
     path.hash(&mut hasher);
     bytes.hash(&mut hasher);
     Ok(hasher.finish())
@@ -3017,6 +3019,11 @@ fn start_mesh_slice_apply_task(
                             Ok(config) => {
                                 let previous_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let candidate_loaded_at = config.loaded_at;
+                                // The TLS reload plan is validated before config apply, but the
+                                // live slot is swapped only after proxy config acceptance. That
+                                // creates a tiny accept window where listeners may still see the
+                                // previous TLS config, and avoids pre-swapping TLS for a proxy
+                                // config that the runtime rejects.
                                 let applied = proxy_state.update_config(config);
                                 let current_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let accepted = mesh_proxy_update_was_accepted(
@@ -6208,6 +6215,22 @@ mod tests {
             )])
         });
         wait_for_mesh_inbound_tls(&proxy_state, true).await;
+        let strict_tls_slot = proxy_state.mesh_inbound_tls.load_full();
+
+        mesh_state.install_slice(MeshSlice {
+            version: "strict-label-only".to_string(),
+            labels: [("app".to_string(), "same-peer-auth".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "same-peer-auth").await;
+        let unchanged_tls_slot = proxy_state.mesh_inbound_tls.load_full();
+        assert!(
+            Arc::ptr_eq(&strict_tls_slot, &unchanged_tls_slot),
+            "unchanged PeerAuthentication inputs should not rebuild the TLS slot"
+        );
 
         mesh_state.install_slice(MeshSlice {
             version: "disable".to_string(),

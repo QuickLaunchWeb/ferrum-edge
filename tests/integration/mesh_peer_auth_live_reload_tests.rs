@@ -45,6 +45,8 @@ fn strict_mesh_tls_config() -> Arc<rustls::ServerConfig> {
     load_mesh_tls_config(
         "tests/certs/server.crt",
         "tests/certs/server.key",
+        // Test fixture certificate is self-signed, so it doubles as the CA
+        // anchor for client-certificate verification in this narrow test.
         Some("tests/certs/server.crt"),
         MeshClientAuth::Required,
         &tls_policy,
@@ -107,6 +109,11 @@ async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap
         !rejected_response.starts_with(b"HTTP/"),
         "strict mesh TLS slot must reject plaintext before HTTP routing; response was {}",
         String::from_utf8_lossy(&rejected_response)
+    );
+    assert!(
+        rejected_response.is_empty() || rejected_response.len() < 64,
+        "plaintext rejection should close during TLS admission, not return a routed response; got {} bytes",
+        rejected_response.len()
     );
 
     let _ = shutdown_tx.send(true);

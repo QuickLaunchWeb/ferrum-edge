@@ -5977,6 +5977,17 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     .await
 }
 
+/// Start a proxy listener whose TLS config is loaded dynamically from
+/// `ProxyState::mesh_inbound_tls` on every accepted connection.
+///
+/// Mesh-mode mTLS / HBONE termination listeners use this when
+/// `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. The mesh slice apply task
+/// swaps the underlying `ArcSwap` when PeerAuthentication changes; subsequent
+/// accepts pick up the new config without restarting the listener. Existing
+/// in-flight connections keep their original TLS state.
+///
+/// Each accept performs one `ArcSwap::load_full()` plus one inner `Arc` clone,
+/// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
 pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
@@ -5995,11 +6006,21 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
 
 #[derive(Clone)]
 enum ListenerTlsSource {
+    /// Static listener TLS captured at startup; loading clones only the inner
+    /// `Option<Arc<_>>` and performs no atomic read.
     Static(Option<Arc<rustls::ServerConfig>>),
+    /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
+    /// every accept so PeerAuthentication changes can hot-swap future
+    /// handshakes without restarting the listener.
     MeshInbound,
 }
 
 impl ListenerTlsSource {
+    /// Load the TLS config for a single accepted connection.
+    ///
+    /// `Static` is the ordinary startup-captured path. `MeshInbound` performs
+    /// one `ArcSwap::load_full()` and one inner `Arc` clone per accept; this is
+    /// the narrow mesh live-reload carve-out and is not on the request path.
     fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
         match self {
             Self::Static(tls_config) => tls_config.clone(),
