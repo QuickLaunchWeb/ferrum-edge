@@ -354,30 +354,30 @@ fn test_creation_accepts_zero_cache_ttl() {
 }
 
 #[test]
-fn test_creation_rejects_non_integer_max_body_bytes() {
+fn test_creation_rejects_non_integer_max_response_body_bytes() {
     let err = SpecExpose::new(
         &json!({
             "spec_url": "https://example.com/openapi.yaml",
-            "max_body_bytes": "large"
+            "max_response_body_bytes": "large"
         }),
         PluginHttpClient::default(),
     )
     .err()
-    .expect("non-integer max_body_bytes must be rejected");
-    assert!(err.contains("max_body_bytes"), "got: {err}");
+    .expect("non-integer max_response_body_bytes must be rejected");
+    assert!(err.contains("max_response_body_bytes"), "got: {err}");
 }
 
 #[test]
-fn test_creation_rejects_zero_max_body_bytes() {
+fn test_creation_rejects_zero_max_response_body_bytes() {
     let err = SpecExpose::new(
         &json!({
             "spec_url": "https://example.com/openapi.yaml",
-            "max_body_bytes": 0
+            "max_response_body_bytes": 0
         }),
         PluginHttpClient::default(),
     )
     .err()
-    .expect("zero max_body_bytes must be rejected");
+    .expect("zero max_response_body_bytes must be rejected");
     assert!(err.contains("greater than zero"), "got: {err}");
 }
 
@@ -424,7 +424,7 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
 }
 
 #[tokio::test]
-async fn test_specz_request_rejects_oversized_spec_body() {
+async fn test_specz_request_rejects_oversized_content_length_spec_body() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -443,7 +443,7 @@ async fn test_specz_request_rejects_oversized_spec_body() {
     let plugin = SpecExpose::new(
         &json!({
             "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
-            "max_body_bytes": 8
+            "max_response_body_bytes": 8
         }),
         PluginHttpClient::default(),
     )
@@ -456,7 +456,52 @@ async fn test_specz_request_rejects_oversized_spec_body() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 502);
-            assert!(body.contains("max_body_bytes"), "got: {body}");
+            assert!(body.contains("max_response_body_bytes"), "got: {body}");
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_specz_request_rejects_oversized_chunked_spec_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let body = b"openapi: 3.0.0\ninfo: too large\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    });
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("http://{addr}/openapi.yaml"),
+            "max_response_body_bytes": 8
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    server.await.unwrap();
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("max_response_body_bytes"), "got: {body}");
         }
         other => panic!("expected Reject, got {other:?}"),
     }

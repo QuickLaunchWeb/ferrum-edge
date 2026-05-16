@@ -2104,7 +2104,7 @@ Useful for providing a common, discoverable pattern for API specifications acros
 | `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
 | `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
 | `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
-| `max_body_bytes` | usize | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `max_response_body_bytes` | usize | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -2130,7 +2130,7 @@ config:
 
 **Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
