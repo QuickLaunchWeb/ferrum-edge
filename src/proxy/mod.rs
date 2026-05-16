@@ -84,6 +84,9 @@ use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::modes::mesh::node_waypoint::{
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
@@ -113,6 +116,33 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+fn record_node_waypoint_identity_drop(
+    overload: &crate::overload::OverloadState,
+    error: &NodeWaypointIdentityError,
+) {
+    let reason = match error {
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => {
+            crate::overload::NodeWaypointDropReason::CookieUnavailable
+        }
+        NodeWaypointIdentityError::UnknownCookie(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownCookie
+        }
+        NodeWaypointIdentityError::MissingPodUid(_) => {
+            crate::overload::NodeWaypointDropReason::MissingPodUid
+        }
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => {
+            crate::overload::NodeWaypointDropReason::MissingWorkloadHash
+        }
+        NodeWaypointIdentityError::UnknownPod(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownPod
+        }
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
+    };
+    overload.record_node_waypoint_drop(reason);
+}
 
 /// Validate that every `mesh_route_dispatch` rule's
 /// `destination.upstream_id` points at a real upstream in the config.
@@ -333,6 +363,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::ConnectionPoolError
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
+                    | retry::ErrorClass::DispatchPolicyRejected
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -1016,18 +1047,6 @@ fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
 
-fn supports_direct_http2_backend(
-    state: &ProxyState,
-    proxy: &Proxy,
-    upstream_target: Option<&UpstreamTarget>,
-) -> bool {
-    proxy.dispatch_kind == DispatchKind::HttpsPool
-        && state
-            .backend_capabilities
-            .get(proxy, upstream_target)
-            .is_some_and(|record| record.plain_http.h2_tls.is_supported())
-}
-
 fn can_use_hbone_pool(
     retain_request_body: bool,
     requires_request_body_buffering: bool,
@@ -1087,6 +1106,30 @@ fn http2_pool_sender_error_response(
         error_class: Some(h2_error_class),
     }
 }
+
+fn backend_tls_sni_requires_direct_h2_response(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert(
+        "gateway-error-reason".to_string(),
+        BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON.to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+        headers,
+        // reqwest cannot apply per-request backend SNI. Mark this terminal
+        // gateway policy response as non-retryable so a 502 retry policy
+        // cannot amplify it or trip the backend circuit breaker repeatedly.
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
+    "backend_tls_sni_requires_direct_h2";
 
 enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
@@ -1486,6 +1529,10 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Node-waypoint source identity resolver. When present, accepted sockets
+    /// must carry a node-agent/eBPF cookie record or the connection is dropped
+    /// fail-closed before TLS/HBONE processing.
+    pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
     /// The slot shape matches mesh SVID rotation so later trust-bundle updates
     /// can hot-swap without blocking proxy readers.
@@ -1497,6 +1544,10 @@ pub struct ProxyState {
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
+    /// Dynamic mesh inbound TLS config. Mesh mode updates this slot when
+    /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
+    /// listeners continue using their static startup TLS config.
+    pub mesh_inbound_tls: SharedMeshInboundTls,
 }
 
 #[inline]
@@ -1523,6 +1574,12 @@ fn via_header_for_backend_response_body<'a>(
     }
 }
 
+#[derive(Clone, Default)]
+struct RequestConnectionMetadata {
+    frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
+}
+
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
@@ -1532,8 +1589,13 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 }
 
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
+pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
 fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn empty_mesh_inbound_tls_slot() -> SharedMeshInboundTls {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
 
@@ -1715,6 +1777,7 @@ impl ProxyState {
         );
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
+        let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
             global_pool_config.clone(),
             dns_cache.clone(),
@@ -2036,11 +2099,23 @@ impl ProxyState {
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
+            node_waypoint_identity_resolver: None,
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
+            mesh_inbound_tls,
         };
         Ok((state, health_check_handles))
+    }
+
+    /// Return a copy of this state with node-waypoint identity resolution
+    /// installed before listeners start accepting traffic.
+    pub fn with_node_waypoint_identity_resolver(
+        mut self,
+        resolver: Arc<NodeWaypointIdentityResolver>,
+    ) -> Self {
+        self.node_waypoint_identity_resolver = Some(resolver);
+        self
     }
 
     /// Start a background task that periodically removes stale zero-count
@@ -3972,6 +4047,7 @@ async fn handle_connection(
     state: ProxyState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -4021,6 +4097,10 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
+        let connection_metadata = RequestConnectionMetadata {
+            frontend_listen_port,
+            node_waypoint_identity: node_waypoint_identity.clone(),
+        };
         async move {
             handle_proxy_request_on_frontend_port(
                 req,
@@ -4029,7 +4109,7 @@ async fn handle_connection(
                 false,
                 None,
                 None,
-                frontend_listen_port,
+                connection_metadata,
             )
             .await
         }
@@ -5872,7 +5952,15 @@ pub async fn start_proxy_listener_with_bound_listener(
         info!("Proxy listener (in-process) started on bound TCP socket");
     }
 
-    run_accept_loop(listener, state, tls_config, conn_semaphore, shutdown, 0).await;
+    run_accept_loop(
+        listener,
+        state,
+        ListenerTlsSource::Static(tls_config),
+        conn_semaphore,
+        shutdown,
+        0,
+    )
+    .await;
     Ok(())
 }
 
@@ -5948,6 +6036,75 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Static(tls_config),
+        started_tx,
+    )
+    .await
+}
+
+/// Start a proxy listener whose TLS config is loaded dynamically from
+/// `ProxyState::mesh_inbound_tls` on every accepted connection.
+///
+/// Mesh-mode mTLS / HBONE termination listeners use this when
+/// `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. The mesh slice apply task
+/// swaps the underlying `ArcSwap` when PeerAuthentication changes; subsequent
+/// accepts pick up the new config without restarting the listener. Existing
+/// in-flight connections keep their original TLS state.
+///
+/// Each accept performs one `ArcSwap::load()` plus one inner `Arc` clone,
+/// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
+pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::MeshInbound,
+        started_tx,
+    )
+    .await
+}
+
+#[derive(Clone)]
+enum ListenerTlsSource {
+    /// Static listener TLS captured at startup; loading clones only the inner
+    /// `Option<Arc<_>>` and performs no atomic read.
+    Static(Option<Arc<rustls::ServerConfig>>),
+    /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
+    /// every accept so PeerAuthentication changes can hot-swap future
+    /// handshakes without restarting the listener.
+    MeshInbound,
+}
+
+impl ListenerTlsSource {
+    /// Load the TLS config for a single accepted connection.
+    ///
+    /// `Static` is the ordinary startup-captured path. `MeshInbound` performs
+    /// one `ArcSwap::load()` and one inner `Arc` clone per accept; this is
+    /// the narrow mesh live-reload carve-out and is not on the request path.
+    fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
+        match self {
+            Self::Static(tls_config) => tls_config.clone(),
+            Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
+        }
+    }
+}
+
+async fn start_proxy_listener_with_tls_source_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_source: ListenerTlsSource,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let configured_accept_threads = state.env_config.accept_threads.max(1);
     #[cfg(unix)]
@@ -6001,12 +6158,12 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         for i in 1..accept_threads {
             let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
             let state = state.clone();
-            let tls_config = tls_config.clone();
+            let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
 
             handles.push(tokio::spawn(async move {
-                run_accept_loop(listener, state, tls_config, semaphore, shutdown_rx, i).await;
+                run_accept_loop(listener, state, tls_source, semaphore, shutdown_rx, i).await;
             }));
         }
 
@@ -6022,7 +6179,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         run_accept_loop(
             first_listener,
             state,
-            tls_config,
+            tls_source,
             conn_semaphore,
             shutdown,
             0,
@@ -6043,7 +6200,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         run_accept_loop(
             first_listener,
             state,
-            tls_config,
+            tls_source,
             conn_semaphore,
             shutdown,
             0,
@@ -6059,7 +6216,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 async fn run_accept_loop(
     listener: TcpListener,
     state: ProxyState,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     _thread_id: usize,
@@ -6099,7 +6256,25 @@ async fn run_accept_loop(
                         };
 
                         let state = state.clone();
-                        let tls_config = tls_config.clone();
+                        let node_waypoint_identity =
+                            if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
+                                match resolver.resolve_stream(&stream) {
+                                    Ok(identity) => Some(identity),
+                                    Err(error) => {
+                                        record_node_waypoint_identity_drop(&state.overload, &error);
+                                        debug!(
+                                            remote_addr = %remote_addr,
+                                            error = %error,
+                                            "Dropping node-waypoint connection without a resolved pod identity"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                        let tls_config = tls_source.load(&state);
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -6124,6 +6299,7 @@ async fn run_accept_loop(
                                     tls_config,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    node_waypoint_identity,
                                 )
                                 .await
                             } else {
@@ -6133,6 +6309,7 @@ async fn run_accept_loop(
                                     state,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    node_waypoint_identity,
                                 )
                                     .await
                             };
@@ -6167,6 +6344,7 @@ async fn handle_tls_connection(
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -6243,6 +6421,10 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
+        let connection_metadata = RequestConnectionMetadata {
+            frontend_listen_port,
+            node_waypoint_identity: node_waypoint_identity.clone(),
+        };
         async move {
             handle_proxy_request_on_frontend_port(
                 req,
@@ -6251,7 +6433,7 @@ async fn handle_tls_connection(
                 true,
                 cert,
                 chain,
-                frontend_listen_port,
+                connection_metadata,
             )
             .await
         }
@@ -6744,7 +6926,7 @@ pub async fn handle_proxy_request(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
-        None,
+        RequestConnectionMetadata::default(),
     )
     .await
 }
@@ -6756,7 +6938,7 @@ async fn handle_proxy_request_on_frontend_port(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    frontend_listen_port: Option<u16>,
+    connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
@@ -6796,7 +6978,7 @@ async fn handle_proxy_request_on_frontend_port(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
-        frontend_listen_port,
+        connection_metadata,
     )
     .await;
 
@@ -6818,7 +7000,7 @@ async fn handle_proxy_request_inner(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    frontend_listen_port: Option<u16>,
+    connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -6839,13 +7021,23 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
-    ctx.frontend_listen_port = Some(frontend_listen_port.unwrap_or(if is_tls {
-        state.env_config.proxy_https_port
-    } else {
-        state.env_config.proxy_http_port
-    }));
+    ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
+        if is_tls {
+            state.env_config.proxy_https_port
+        } else {
+            state.env_config.proxy_http_port
+        },
+    ));
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
+    if let Some(identity) = connection_metadata.node_waypoint_identity {
+        // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
+        // identity is the authenticated source workload for policy. It
+        // intentionally pre-populates `peer_spiffe_id` so mesh authz and the
+        // SPIFFE identity plugin consume the pod identity instead of baggage or
+        // future TLS-peer derivation on this listener.
+        ctx.peer_spiffe_id = Some(identity.spiffe_id.clone());
+    }
     // Store raw query string on ctx for lazy parsing. The local `query_string`
     // is kept for validation + URL building; the ctx copy is consumed by
     // materialize_query_params() when plugins need the parsed HashMap.
@@ -9824,6 +10016,15 @@ pub(crate) async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    if proxy.resolved_tls.sni.is_some() {
+        warn!(
+            proxy_id = %proxy.id,
+            backend_tls_sni = ?proxy.resolved_tls.sni,
+            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
+        );
+        return backend_tls_sni_requires_direct_h2_response(None);
+    }
+
     // Resolve backend IP from DNS cache (O(1) cached lookup).
     let resolved_ip = state
         .dns_cache
@@ -10300,31 +10501,72 @@ async fn proxy_to_backend(
         let direct_h2_effective_proxy =
             resolve_backend_connection_proxy_for_target(proxy, upstream_target);
         let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
-        if can_use_direct_http2_pool(
+        let requires_direct_h2_for_sni = direct_h2_proxy.resolved_tls.sni.is_some();
+        let direct_h2_capability = state.backend_capabilities.get(proxy, upstream_target);
+        let direct_h2_known_unsupported = direct_h2_capability
+            .as_ref()
+            .is_some_and(|record| matches!(record.plain_http.h2_tls, ProtocolSupport::Unsupported));
+        let direct_h2_supports = direct_h2_capability
+            .as_ref()
+            .is_some_and(|record| record.plain_http.h2_tls.is_supported());
+        let direct_h2_compatible = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) && supports_direct_http2_backend(state, proxy, upstream_target)
-        {
+        );
+        if requires_direct_h2_for_sni && direct_h2_known_unsupported {
+            debug!(
+                proxy_id = %proxy.id,
+                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                "H2 pool required for backend TLS SNI override but capability registry already marks this backend target H2/TLS unsupported"
+            );
+            return (
+                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
+            );
+        }
+        if direct_h2_compatible && (direct_h2_supports || requires_direct_h2_for_sni) {
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
                     if should_fallback_to_reqwest_after_http2_pool_error(&e) {
-                        debug!(
-                            proxy_id = %proxy.id,
-                            error = %e,
-                            "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
-                        );
                         // The per-pool-key ALPN learning cache was removed
                         // when the capability registry took over classification,
                         // so without this the next request would repeat the
                         // direct-H2 handshake + ALPN-fallback cost until the
                         // 24 h refresh re-probes. Downgrade here so subsequent
                         // requests go straight to reqwest.
-                        state
+                        let downgraded = state
                             .backend_capabilities
                             .mark_h2_tls_unsupported(proxy, upstream_target);
-                        None
+                        if requires_direct_h2_for_sni {
+                            if downgraded {
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    error = %e,
+                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest; marking backend H2/TLS unsupported and returning 502"
+                                );
+                            } else {
+                                debug!(
+                                    proxy_id = %proxy.id,
+                                    error = %e,
+                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
+                                );
+                            }
+                            return (
+                                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                                None,
+                            );
+                        } else {
+                            debug!(
+                                proxy_id = %proxy.id,
+                                error = %e,
+                                "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
+                            );
+                            None
+                        }
                     } else {
                         return (
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
@@ -10377,6 +10619,20 @@ async fn proxy_to_backend(
                     None,
                 );
             }
+        }
+        if requires_direct_h2_for_sni {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                retain_request_body = retain_request_body,
+                requires_request_body_buffering = requires_request_body_buffering,
+                enable_http2 = pool_config.enable_http2,
+                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
+            );
+            return (
+                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
+            );
         }
         if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
@@ -13338,6 +13594,65 @@ mod tests {
     }
 
     #[test]
+    fn backend_tls_sni_direct_h2_required_response_is_final() {
+        let resp = backend_tls_sni_requires_direct_h2_response(Some("127.0.0.1".to_string()));
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            resp.headers.get("gateway-error-reason").map(String::as_str),
+            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("SNI direct-H2 rejection should be buffered");
+        };
+        assert_eq!(body.as_slice(), br#"{"error":"Bad Gateway"}"#);
+    }
+
+    #[tokio::test]
+    async fn backend_tls_sni_retry_path_fails_closed_before_reqwest() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.1".to_string());
+        proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+        let resp = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            "https://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_2,
+        )
+        .await;
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip, None);
+        assert_eq!(
+            resp.headers.get("gateway-error-reason").map(String::as_str),
+            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+        );
+    }
+
+    #[test]
     fn websocket_backend_url_strips_exact_listen_path_literal() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
@@ -13829,6 +14144,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
@@ -14132,6 +14448,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             let bumped = super::record_port_exhaustion_if_class(&overload, class);

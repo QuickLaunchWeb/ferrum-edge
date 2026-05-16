@@ -704,17 +704,19 @@ impl GrpcPoolManager {
         connect_started: Instant,
         connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
-        let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-            GrpcProxyError::backend_unavailable(
-                GrpcBackendUnavailableKind::InvalidServerName,
-                format!("Invalid server name: {}", e),
-            )
-        })?;
+        let server_name =
+            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
+                |e| {
+                    GrpcProxyError::backend_unavailable(
+                        GrpcBackendUnavailableKind::InvalidServerName,
+                        format!("Invalid server name: {}", e),
+                    )
+                },
+            )?;
 
         let Some(remaining) =
             crate::pool::remaining_connect_timeout(connect_started, connect_timeout)

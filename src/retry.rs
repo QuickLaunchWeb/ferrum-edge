@@ -60,6 +60,14 @@ pub enum ErrorClass {
     /// spec-legal teardown signal (RFC 9114 §8.1), not a transport-level
     /// capability failure. See [`crate::http3::client::is_h3_graceful_close`].
     GracefulRemoteClose,
+    /// Gateway dispatch policy rejected the request before any backend dial.
+    ///
+    /// Used for terminal gateway decisions where replaying would produce the
+    /// same policy response (for example a backend TLS SNI override on a path
+    /// that cannot honor per-request SNI). Classified as non-connection-error
+    /// so `retry_on_connect_failure` does not fire, and `should_retry` rejects
+    /// it before status-code retry checks.
+    DispatchPolicyRejected,
     /// Catch-all for unclassified request errors.
     RequestError,
 }
@@ -82,6 +90,7 @@ impl ErrorClass {
             Self::ConnectionPoolError => "connection_pool_error",
             Self::PortExhaustion => "port_exhaustion",
             Self::GracefulRemoteClose => "graceful_remote_close",
+            Self::DispatchPolicyRejected => "dispatch_policy_rejected",
             Self::RequestError => "request_error",
         }
     }
@@ -116,6 +125,11 @@ impl std::fmt::Display for ErrorClass {
 ///   rejections; not connect failures. Classified as "reached wire" so the
 ///   connect-failure retry does NOT fire (the request can't be salvaged by
 ///   replaying it on a different backend).
+/// - `DispatchPolicyRejected` — gateway-side dispatch policy failed before a
+///   backend dial. It did not literally reach the backend wire, but it is
+///   intentionally grouped with post-wire/gateway-policy classes so retries
+///   do not amplify a terminal 502 or trip backend circuit breakers multiple
+///   times.
 /// - `ClientDisconnect` — the request reached the gateway but the client
 ///   gave up. Classified as "reached wire"; if a caller knows the body was
 ///   not committed yet (e.g. H3 streaming-body request when the client
@@ -160,6 +174,7 @@ pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
         ErrorClass::RequestBodyTooLarge => "request_body_too_large",
         ErrorClass::ResponseBodyTooLarge => "response_body_too_large",
         ErrorClass::GracefulRemoteClose => "graceful_remote_close",
+        ErrorClass::DispatchPolicyRejected => "dispatch_policy_rejected",
         ErrorClass::RequestError => "request_error",
     }
 }
@@ -892,6 +907,10 @@ pub fn should_retry(
         return false;
     }
 
+    if response.error_class == Some(ErrorClass::DispatchPolicyRejected) {
+        return false;
+    }
+
     // Connection-level failures (TCP refused, DNS, TLS, timeout) are retried
     // regardless of HTTP method — the request never reached the backend so
     // idempotency is not a concern.
@@ -1020,6 +1039,7 @@ mod tests {
             ErrorClass::ResponseBodyTooLarge,
             ErrorClass::ClientDisconnect,
             ErrorClass::GracefulRemoteClose,
+            ErrorClass::DispatchPolicyRejected,
             ErrorClass::RequestError,
         ] {
             assert!(
@@ -1051,6 +1071,7 @@ mod tests {
             ErrorClass::RequestBodyTooLarge,
             ErrorClass::ResponseBodyTooLarge,
             ErrorClass::GracefulRemoteClose,
+            ErrorClass::DispatchPolicyRejected,
             ErrorClass::RequestError,
         ]
         .into_iter()

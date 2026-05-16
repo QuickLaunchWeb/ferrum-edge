@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
 use http_body_util::Full;
@@ -16,8 +16,10 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
 
 // ============================================================================
 // Helpers
@@ -90,13 +92,61 @@ fn create_dns_cache() -> DnsCache {
     DnsCache::new(DnsConfig::default())
 }
 
+struct GeneratedCa {
+    cert_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+fn generate_ca(cn: &str) -> GeneratedCa {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    let cert = params.self_signed(&key_pair).expect("self-sign CA");
+    GeneratedCa {
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, key_pair),
+    }
+}
+
+struct GeneratedCert {
+    cert_pem: String,
+    key_pem: String,
+}
+
+fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedCert {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let san_strings: Vec<String> = sans.iter().map(|san| san.to_string()).collect();
+    let mut params = CertificateParams::new(san_strings).expect("leaf params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+    GeneratedCert {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    }
+}
+
 /// Start a TLS + HTTP/2 echo backend on an ephemeral port.
 /// Returns (join_handle, port).
 async fn start_h2_tls_backend()
 -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
+    start_h2_tls_backend_with_cert(cert_pem, key_pem).await
+}
 
+/// Start a TLS + HTTP/2 echo backend with caller-provided certificate material.
+/// Returns (join_handle, port).
+async fn start_h2_tls_backend_with_cert(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let mut cert_reader = cert_pem.as_bytes();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .filter_map(|cert| cert.ok())
@@ -302,6 +352,55 @@ async fn test_http2_pool_get_sender_connects() {
     assert!(
         pool.pool_size() > 0,
         "Pool should have at least one entry after get_sender"
+    );
+}
+
+#[tokio::test]
+async fn test_http2_pool_uses_backend_tls_sni_override_for_handshake() {
+    let ca = generate_ca("backend-test-ca");
+    let backend = generate_signed_cert(&ca, "backend.mesh.internal", &["backend.mesh.internal"]);
+    let (_handle, port) = start_h2_tls_backend_with_cert(&backend.cert_pem, &backend.key_pem)
+        .await
+        .expect("Failed to start SNI H2 backend");
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let ca_path = temp_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca.cert_pem).expect("write CA");
+
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+
+    let mut without_override = create_test_proxy();
+    without_override.backend_host = "connect.mesh.internal".to_string();
+    without_override.backend_port = port;
+    without_override.backend_tls_verify_server_cert = true;
+    without_override.resolved_tls = BackendTlsConfig::default_verify();
+    without_override.resolved_tls.server_ca_cert_path = Some(ca_path.display().to_string());
+    without_override.dns_override = Some("127.0.0.1".to_string());
+
+    let err = pool
+        .get_sender(&without_override)
+        .await
+        .expect_err("cert name mismatch should fail without backend_tls_sni");
+    assert!(
+        matches!(err, Http2PoolError::BackendUnavailable { .. }),
+        "expected TLS backend unavailable error, got {err:?}"
+    );
+
+    let mut with_override = without_override.clone();
+    with_override.id = "h2-test-sni".to_string();
+    with_override.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+    let sender = pool.get_sender(&with_override).await;
+    assert!(
+        sender.is_ok(),
+        "backend_tls_sni should be used as rustls ServerName: {:?}",
+        sender.err()
     );
 }
 

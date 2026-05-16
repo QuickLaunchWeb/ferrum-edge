@@ -283,6 +283,11 @@ pub struct MetricsRegistry {
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
     /// Mesh outbound registry decisions keyed by mesh namespace and host.
+    ///
+    /// Cardinality contract: caller must never pass attacker-controllable
+    /// values as `host`. The admit path uses the actual destination (bounded
+    /// by the configured registry); the deny path always passes the constant
+    /// `<denied>` bucket so /metrics stays bounded under hostile traffic.
     pub mesh_outbound_registry_decisions:
         DashMap<Arc<str>, DashMap<Arc<str>, MeshOutboundRegistryDecisionCounters>>,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.

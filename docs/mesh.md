@@ -2,11 +2,11 @@
 
 Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this mode the gateway consumes mesh configuration from a Ferrum Control Plane (native `MeshSubscribe` gRPC) or a standard xDS ADS server, materializes SPIFFE-identity-aware proxies and authorization policies, and serves traffic with automatic mTLS, identity propagation, and Istio-compatible observability. The mesh subsystem deliberately reuses the existing proxy/plugin chain so all 58+ gateway plugins work unchanged in mesh context.
 
-Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
+Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
 
 ## Topologies
 
-Mesh mode supports four topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
+Mesh mode supports five topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
 
 ### Sidecar
 
@@ -29,6 +29,16 @@ Ztunnel-style ambient mesh proxy that terminates HBONE (HTTP/2 CONNECT over mTLS
 | HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
 
 The HBONE listener accepts HTTP/2 CONNECT streams over mTLS on port 15008. Source identity is extracted from the mTLS peer certificate and optionally from W3C Baggage headers. See [HBONE Protocol](#hbone-protocol) below.
+
+### Node Waypoint
+
+Node-scoped sidecarless waypoint for pods captured by the node agent. This topology uses the same HBONE listener as ambient mode, but source pod identity is resolved from the node-agent/eBPF socket-cookie record instead of assuming one proxy per workload.
+
+| Listener | Address | Direction | Kind |
+|---|---|---|---|
+| HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
+
+At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
 
 ### East-West Gateway
 
@@ -269,12 +279,14 @@ subsets:
 | `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
-| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify + projects the workload SVID paths from `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` onto the upstream client cert/key fields, failing slice apply if either path is missing so stale/global client material is not used. `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` projects to `Upstream.backend_tls_sni`; `subjectAltNames` project to `Upstream.backend_tls_san_allow_list` and onto `Proxy.resolved_tls` during config resolution. Backend handshake SNI consumption and SAN allow-list enforcement are tracked by GAP-1B / GAP-1C. When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
+| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify + projects the workload SVID paths from `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` onto the upstream client cert/key fields, failing slice apply if either path is missing so stale/global client material is not used. `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` projects to `Upstream.backend_tls_sni`, onto `Proxy.resolved_tls`, into backend H2/gRPC/H3 TLS handshakes, and into the backend pool key so different SNI values never share connections. Plain HTTPS requests with an SNI override use the direct H2 backend pool instead of reqwest because reqwest cannot express per-request backend SNI overrides. `subjectAltNames` projects to `Upstream.backend_tls_san_allow_list`, onto `Proxy.resolved_tls`, into backend TLS verifier enforcement, and into the backend pool key so different allow-lists never share connections. If per-proxy or global no-verify is enabled, SAN allow-lists are not enforced and Ferrum logs a warning. When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
 | `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool.tcp.connectTimeout` | Supported | Top-level policy applies first; per-port `connectTimeout` lands on `Upstream.port_overrides[port].connect_timeout_ms` at apply time, then `GatewayConfig::resolve_dispatch_port_overrides()` projects it onto `Proxy.dispatch_port_overrides` for O(1) hot-path lookup. All four dispatch families consult it: HTTP/H2/H3 via `resolve_effective_proxy_for_target` (`src/proxy/mod.rs`), gRPC via the same helper threaded through `proxy_grpc_request*` (`src/proxy/grpc_proxy.rs`), TCP via `effective_backend_connect_timeout_ms` in `TcpConnParams` (`src/proxy/tcp_proxy.rs`), and HBONE via `effective_connect_timeout_ms` in `connect_backend` (`src/proxy/hbone_proxy.rs`). Ports outside 1-65535 rejected; duplicate port entries rejected; phantom ports (DR entry references a port unused by any `Upstream.target`) skipped with a warning at apply time. The admin API rejects POST/PUT setting `Upstream.port_overrides` directly — express per-port policy as a DestinationRule (SQL/MongoDB schemas don't persist the field) |
 | `trafficPolicy.portLevelSettings[].loadBalancer` / `outlierDetection` | Supported for HTTP-family / gRPC / WebSocket / HBONE dispatch | Per-port load-balancer algorithm/hash settings and passive outlier thresholds land on `Upstream.port_overrides[port]`; the runtime builds isolated per-port LB counters/hash rings and consults per-port passive health before the upstream default. TCP/UDP/DTLS stream proxies currently enforce only per-port `connectTimeout` and continue to use the upstream-level LB/passive policy. Phantom ports are skipped with a warning at apply time. Migration note: operators who previously set these fields expecting warning-only behavior should audit them before upgrade because they now affect HTTP-family/gRPC/WebSocket/HBONE routing and ejection decisions. Example: a top-level `ROUND_ROBIN` policy with `portLevelSettings[8080].loadBalancer.simple=RANDOM` keeps non-8080 traffic on round-robin while 8080 dispatch uses its own random counter/ring. |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
 Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.
+
+DestinationRule `trafficPolicy.tls.sni` is enforced only on backend paths where Ferrum owns the TLS handshake: direct HTTP/2 for plain HTTPS, gRPC over H2, and native H3. Because reqwest cannot express a per-request backend SNI override, Ferrum rejects SNI-overridden plain HTTPS requests that cannot use the direct H2 backend pool (request-body replay for retries, request-body-buffering plugins, `pool_enable_http2: false`, or an H1-only backend) with `502` and a `gateway-error-reason: backend_tls_sni_requires_direct_h2` header instead of silently dropping the override. H3 frontend requests bridged to a non-H3 backend now fail closed with the same 502/header policy; use an H2/H3-capable backend for those routes until the bridge grows a direct-H2 fallback. Active HTTP/H2/H3/gRPC health probes still use the target host as the TLS server name, so a backend certificate that only matches the override name can be marked unhealthy even though request traffic succeeds. Prefer TCP/passive health checks or a certificate that covers both names until active probes grow the same SNI override path. As a last-resort operational escape hatch, `backend_tls_verify_server_cert=false` avoids the certificate-name check for active probes, but it also disables backend certificate verification for request traffic.
 
 ## MeshSlice
 
@@ -420,19 +432,23 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 |---|---|---|
 | `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
 | `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
+| `NodeWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
 
-The resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is **not** re-built — consistent with the project's static-TLS-material rotation model. To change the inbound mTLS mode, restart the data plane.
+By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
+
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply for mesh HTTP/HBONE termination listeners. Frontend cert/key paths are read and cached at startup, remain static operational inputs, and still require restart. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config and require restart for PeerAuthentication changes. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
 
 ### Disable-mode topology guard
 
-`PeerAuthentication.mode: disable` resolved against an `Ambient` or `EgressGateway` workload causes startup to fail closed:
+`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, or `EgressGateway` workload is rejected. Startup fails closed on an invalid initial slice; with `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, later invalid slices are rejected and the last good inbound TLS config remains active.
 
 - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
+- **NodeWaypoint**: the shared node listener must resolve pod identity from the node-agent/eBPF socket-cookie record before admitting HBONE traffic. Use `permissive` or `strict`.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
 
-`Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
+Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
 
 ## Transparent DNS Proxy
 
@@ -593,9 +609,15 @@ When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default o
 
 When multiple `Sidecar` resources apply at the same scope tier (two namespace-defaults, two root-namespace defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
 
-### Known Limitations
+### Workload Identity Narrowing
 
-- Slice narrowing today filters `services`, `service_entries`, and `destination_rules`. **Workload identity entries are not filtered** by Sidecar scope — every workload in the workload's own namespace continues to appear in the slice even when the applicable Sidecar only allows egress to a subset of services. This avoids breaking introspection and mTLS peer-identity lookups; workload-identity narrowing is tracked as a follow-up.
+`FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true` adds a second, default-off narrowing pass after Sidecar egress scope has admitted services. The slice builder collects `MeshService.workloads[].spiffe_id` references from the admitted services and filters `workloads` to that reachable identity set. The flag only takes effect when `FERRUM_MESH_SIDECAR_ENFORCED=true`; with either flag disabled, workload identity lists keep the legacy namespace-wide behavior.
+
+The local workload identity is still preserved separately on `MeshSlice::workload_spiffe_id`. It is often not listed under any admitted service's `workloads[]`, so it can be absent from the narrowed `slice.workloads` output; operators should treat `workload_spiffe_id` as the canonical local identity field.
+
+Before enabling identity narrowing, confirm admitted `MeshService.workloads[]` lists are populated in a few representative slices. Empty workload refs on admitted services cause the second pass to remove every workload identity from `slice.workloads`; this usually indicates EndpointSlice reconciliation lag in Kubernetes-derived config or a file-mode service typo.
+
+Inbound mTLS peer validation continues to use the trust bundle carried in the slice, not the `workloads` list. HBONE `source.principal` baggage continues to be accepted or rejected by peer-cert trust-domain matching plus `FERRUM_MESH_TRUST_DOMAIN_ALIASES`, not by checking whether the source identity appears in the narrowed workload list.
 
 ### Migration Notes
 
@@ -605,16 +627,17 @@ The flag defaults `false` so existing deployments see zero behavior change on up
 2. Set `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN=true` and inspect `GET /mesh/egress-scope` on a data plane to confirm the expected narrowing would apply without denying traffic.
 3. Use `POST /mesh/egress-scope/test` to dry-run important destinations by host and port.
 4. Set `FERRUM_MESH_SIDECAR_ENFORCED=true` on the CP and roll. DPs receive the already-narrowed slice - no DP-side configuration is required.
+5. After egress narrowing is trusted, set `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true` and roll the CP again to trim `slice.workloads` to reachable service identities.
 
 ### Egress Scope Operations
 
-`GET /mesh/egress-scope` is a JWT-authenticated admin endpoint that returns the current workload's resolved egress scope: admitted services, admitted service-entries, known outbound registry destinations, dry-run status, and admitted/denied service counts.
+`GET /mesh/egress-scope` is a JWT-authenticated admin endpoint that returns the current workload's resolved egress scope: admitted services, admitted service-entries, known outbound registry destinations, dry-run status, and admitted/denied service counts. It returns 404 when no mesh slice has been installed yet rather than fabricating counts from raw config.
 
-`POST /mesh/egress-scope/test` accepts JSON like `{"host":"ratings.default.svc.cluster.local","port":9080}` and returns whether the destination is currently admitted by the resolved scope. The endpoint is a dry-run check only; it never mutates slice state.
+`POST /mesh/egress-scope/test` accepts JSON like `{"host":"ratings.default.svc.cluster.local","port":9080}` and returns whether the destination is currently admitted by the resolved scope. The endpoint is a dry-run check only; it never mutates slice state. It also returns 404 when no mesh slice has been installed.
 
 When dry-run mode computes denied services, the data plane emits one transition warning when would-denies become active and one recovery info line when the next installed slice has no would-denies. It does not log per request. The `/health` response includes `mesh.egress_scope.sidecar_admitted_services` and `mesh.egress_scope.sidecar_denied_services` for readiness dashboards.
 
-The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels so operators can compare admitted and denied outbound destinations during rollout.
+The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels so operators can compare admitted and denied outbound destinations during rollout. To keep label cardinality bounded, the `host` label uses the actual destination only for `admit` decisions (constrained by the configured registry) — `deny` decisions always bucket under `host="<denied>"` since the Host header is attacker-controlled on that path. Operators triaging denied traffic should consult application logs for the requested host; the metric only signals the rate of denied egress per namespace.
 
 ## DestinationRule
 
@@ -646,7 +669,7 @@ DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream.
 
 ### Deferred Fields
 
-Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields at slice-apply time. Backend handshake SNI consumption and SAN allow-list verification are follow-up enforcement steps, tracked separately from translation. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset. Port-level `connectionPool.tcp.connectTimeout` is enforced; port-level load balancer and outlier detection overrides are parsed and warned but not enforced per port.
+Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields at slice-apply time. Backend handshake SNI consumption and SAN allow-list verification are enforced on the backend TLS paths; both settings are included in backend pool keys so distinct TLS identities never share connections. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset. Port-level `connectionPool.tcp.connectTimeout` is enforced; port-level load balancer and outlier detection overrides are parsed and warned but not enforced per port.
 
 ## Observability
 
@@ -1057,12 +1080,13 @@ Mesh-specific environment variables are listed below. For the full reference of 
 |---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native` or `xds` |
 | `FERRUM_MESH_NODE_ID` | `$HOSTNAME` or `ferrum-mesh-node` | Node identifier sent to the CP |
-| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `east_west_gateway`, `egress_gateway` |
+| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `east_west_gateway`, `egress_gateway` |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
 | `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
+| `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` | `false` | Enables Istio `VirtualService` method/header/queryParam predicate capture through proxy-scoped `mesh_route_dispatch` plugins; unsupported predicate-only candidates fail closed through proxy-scoped `request_termination`, and destination-only collapse rejects route-local policy that cannot be carried per rule |
 
 ### Listeners

@@ -118,6 +118,9 @@ pub struct AdminState {
     pub mesh_registry: Option<Arc<MeshNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    /// Live mesh runtime state (mesh mode only). Carries the per-runtime egress
+    /// scope snapshot/counters powering `/mesh/egress-scope` and `/health`.
+    pub mesh_runtime_state: Option<crate::modes::mesh::runtime::MeshRuntimeState>,
     /// Admin HTTP header read timeout (seconds). 0 disables.
     pub admin_http_header_read_timeout_seconds: u64,
     /// Admin TLS handshake timeout (seconds). 0 disables.
@@ -537,8 +540,13 @@ pub async fn handle_admin_request(
             .is_some_and(|ps| ps.config.load_full().mesh.is_some())
             || state.mode == "mesh"
         {
+            let egress_health = state
+                .mesh_runtime_state
+                .as_ref()
+                .map(|rt| rt.egress_scope_state().health())
+                .unwrap_or_default();
             health_status["mesh"] = json!({
-                "egress_scope": crate::modes::mesh::runtime::mesh_egress_scope_state().health()
+                "egress_scope": egress_health
             });
         }
 
@@ -885,7 +893,14 @@ async fn handle_mesh_egress_scope_get(
             &json!({"error": "No proxy state available"}),
         ));
     };
-    let Some(scope) = current_mesh_egress_scope(proxy_state) else {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    let egress = mesh_runtime.egress_scope_state();
+    let Some(scope) = egress.snapshot() else {
         return Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "No active mesh egress scope"}),
@@ -896,7 +911,7 @@ async fn handle_mesh_egress_scope_get(
         &json!({
             "namespace": proxy_state.env_config.namespace,
             "scope": scope,
-            "health": crate::modes::mesh::runtime::mesh_egress_scope_state().health(),
+            "health": egress.health(),
         }),
     ))
 }
@@ -905,13 +920,20 @@ async fn handle_mesh_egress_scope_test(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let Some(proxy_state) = state.proxy_state.as_ref() else {
+    if state.proxy_state.as_ref().is_none() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No proxy state available"}),
         ));
+    }
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
     };
-    let Some(scope) = current_mesh_egress_scope(proxy_state) else {
+    let egress = mesh_runtime.egress_scope_state();
+    let Some(scope) = egress.snapshot() else {
         return Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "No active mesh egress scope"}),
@@ -942,12 +964,13 @@ async fn handle_mesh_egress_scope_test(
             &json!({"error": "port must be between 1 and 65535"}),
         ));
     }
-    let registry = match crate::plugins::mesh::outbound_registry::OutboundRegistry::new(&json!({
-        "registry": &scope.known_destinations,
-    })) {
-        Ok(registry) => registry,
-        Err(e) => {
-            tracing::error!("failed to build mesh egress-scope test registry: {}", e);
+    // Memoized — rebuilt only on slice install. Repeated admin calls reuse the
+    // same `Arc<OutboundRegistry>` so we don't re-parse / re-normalise the
+    // full registry on every request.
+    let registry = match egress.test_registry() {
+        Some(registry) => registry,
+        None => {
+            tracing::error!("mesh egress-scope test registry unavailable");
             return Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Failed to build mesh egress-scope registry"}),
@@ -965,97 +988,6 @@ async fn handle_mesh_egress_scope_test(
             "dry_run": scope.dry_run,
         }),
     ))
-}
-
-fn current_mesh_egress_scope(
-    proxy_state: &ProxyState,
-) -> Option<crate::modes::mesh::slice::MeshEgressScopeSnapshot> {
-    let config = proxy_state.config.load_full();
-    let mesh = config.mesh.as_ref()?;
-    if let Some(scope) = crate::modes::mesh::runtime::mesh_egress_scope_state().snapshot() {
-        return Some(scope);
-    }
-    Some(mesh_config_egress_scope_snapshot(
-        mesh,
-        &proxy_state.env_config.namespace,
-        &proxy_state.env_config.k8s_cluster_domain,
-        proxy_state.env_config.mesh_sidecar_enforced,
-        proxy_state.env_config.mesh_sidecar_enforced_dry_run,
-    ))
-}
-
-fn mesh_config_egress_scope_snapshot(
-    mesh: &crate::modes::mesh::config::MeshConfig,
-    namespace: &str,
-    cluster_domain: &str,
-    sidecar_enforced: bool,
-    dry_run: bool,
-) -> crate::modes::mesh::slice::MeshEgressScopeSnapshot {
-    use crate::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot, MeshSlice};
-
-    let scope_slice = MeshSlice {
-        namespace: namespace.to_string(),
-        workloads: mesh.workloads.clone(),
-        services: mesh.services.clone(),
-        service_entries: mesh.service_entries.clone(),
-        outbound_traffic_policy: mesh.outbound_traffic_policy,
-        ..MeshSlice::default()
-    };
-    let services = mesh
-        .services
-        .iter()
-        .map(|service| {
-            let mut hosts = vec![
-                service.name.clone(),
-                format!("{}.{}", service.name, service.namespace),
-                format!("{}.{}.svc", service.name, service.namespace),
-                format!(
-                    "{}.{}.svc.{}",
-                    service.name, service.namespace, cluster_domain
-                ),
-            ];
-            hosts.sort();
-            hosts.dedup();
-            let mut ports: Vec<u16> = service.ports.iter().map(|port| port.port).collect();
-            ports.sort_unstable();
-            ports.dedup();
-            MeshEgressScopeResource {
-                namespace: service.namespace.clone(),
-                name: service.name.clone(),
-                hosts,
-                ports,
-            }
-        })
-        .collect();
-    let service_entries = mesh
-        .service_entries
-        .iter()
-        .map(|entry| {
-            let mut hosts = entry.hosts.clone();
-            hosts.sort();
-            hosts.dedup();
-            let mut ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
-            ports.sort_unstable();
-            ports.dedup();
-            MeshEgressScopeResource {
-                namespace: entry.namespace.clone(),
-                name: entry.name.clone(),
-                hosts,
-                ports,
-            }
-        })
-        .collect();
-
-    MeshEgressScopeSnapshot {
-        sidecar_enforced,
-        dry_run,
-        sidecar_applied: sidecar_enforced && !dry_run,
-        sidecar_admitted_services: mesh.services.len(),
-        sidecar_denied_services: 0,
-        services,
-        service_entries,
-        known_destinations: scope_slice.build_known_destinations(cluster_domain),
-    }
 }
 
 // ---- Consumer CRUD ----

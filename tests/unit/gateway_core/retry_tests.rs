@@ -35,6 +35,17 @@ fn connection_failure() -> BackendResponse {
     }
 }
 
+fn dispatch_policy_rejection() -> BackendResponse {
+    BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(Vec::new()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: None,
+        error_class: Some(ErrorClass::DispatchPolicyRejected),
+    }
+}
+
 #[test]
 fn test_should_retry_on_retryable_status() {
     let config = RetryConfig {
@@ -215,6 +226,23 @@ fn test_connection_failure_still_respects_max_retries() {
     };
     assert!(should_retry(&config, "GET", &connection_failure(), 0));
     assert!(!should_retry(&config, "GET", &connection_failure(), 1));
+}
+
+#[test]
+fn test_dispatch_policy_rejection_is_never_retried() {
+    let config = RetryConfig {
+        max_retries: 3,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
+
+    assert!(!should_retry(
+        &config,
+        "GET",
+        &dispatch_policy_rejection(),
+        0
+    ));
 }
 
 // --- classify_grpc_proxy_error tests ---

@@ -82,6 +82,9 @@ pub struct XdsAdsServer {
     sidecar_enforced: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
     sidecar_enforced_dry_run: bool,
+    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing`. Only takes
+    /// effect when `sidecar_enforced` is also true.
+    sidecar_identity_narrowing: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
     cluster_domain: String,
@@ -214,12 +217,18 @@ impl XdsAdsServer {
             active_streams: Arc::new(XdsStreamRegistry::default()),
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
+            sidecar_identity_narrowing: false,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 
     pub fn with_sidecar_enforcement_dry_run(mut self, dry_run: bool) -> Self {
         self.sidecar_enforced_dry_run = dry_run;
+        self
+    }
+
+    pub fn with_sidecar_identity_narrowing(mut self, sidecar_identity_narrowing: bool) -> Self {
+        self.sidecar_identity_narrowing = sidecar_identity_narrowing;
         self
     }
 
@@ -254,7 +263,8 @@ impl XdsAdsServer {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
             .with_cluster_domain(self.cluster_domain.clone())
             .with_enforce_sidecar_egress(self.sidecar_enforced)
-            .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run);
+            .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
+            .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();

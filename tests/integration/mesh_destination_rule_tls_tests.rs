@@ -91,6 +91,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         outbound_registry_reject_status: 502,
         sidecar_enforced: false,
         sidecar_enforced_dry_run: false,
+        sidecar_identity_narrowing: false,
     }
 }
 

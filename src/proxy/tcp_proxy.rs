@@ -309,13 +309,16 @@ fn pre_copy_disconnect_cause(
         // route it. A graceful remote close is backend-initiated, so
         // semantically this matches the `ConnectionClosed` branch above.
         ErrorClass::GracefulRemoteClose => DisconnectCause::BackendError,
-        // `RequestError` is a semantic catch-all. The typed `StreamSetupError`
-        // path above already attributes plugin/ACL/throttle/policy rejects
-        // (client-side) and `NoHealthyTargets` (backend-side); reaching here
-        // means the chain has no typed kind, so defer to a conservative
-        // recv-side fallback rather than substring-matching. Migrate
-        // remaining untyped sites to `StreamSetupError` to remove this fallback.
-        ErrorClass::RequestError => DisconnectCause::RecvError,
+        // `DispatchPolicyRejected` and `RequestError` are semantic gateway
+        // policy/catch-all classes. The typed `StreamSetupError` path above
+        // already attributes plugin/ACL/throttle/policy rejects (client-side)
+        // and `NoHealthyTargets` (backend-side); reaching here means the chain
+        // has no typed kind, so defer to a conservative recv-side fallback
+        // rather than substring-matching. Migrate remaining untyped sites to
+        // `StreamSetupError` to remove this fallback.
+        ErrorClass::DispatchPolicyRejected | ErrorClass::RequestError => {
+            DisconnectCause::RecvError
+        }
     }
 }
 
@@ -354,7 +357,9 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
         }
         // Unknown side — leave it ambiguous so log consumers know the proxy
         // could not attribute the failure.
-        ErrorClass::TlsError | ErrorClass::RequestError => Direction::Unknown,
+        ErrorClass::TlsError | ErrorClass::DispatchPolicyRejected | ErrorClass::RequestError => {
+            Direction::Unknown
+        }
     }
 }
 

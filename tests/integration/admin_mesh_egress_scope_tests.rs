@@ -9,7 +9,7 @@ use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
-use ferrum_edge::modes::mesh::runtime::mesh_egress_scope_state;
+use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{
     MeshEgressScopeResource, MeshEgressScopeSnapshot, MeshSlice,
 };
@@ -74,7 +74,7 @@ fn mesh_service(name: &str) -> MeshService {
     }
 }
 
-fn admin_state(jwt: JwtManager) -> AdminState {
+fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeState>) -> AdminState {
     let mesh = MeshConfig {
         services: vec![mesh_service("reviews")],
         ..MeshConfig::default()
@@ -100,26 +100,6 @@ fn admin_state(jwt: JwtManager) -> AdminState {
     )
     .expect("proxy state");
 
-    mesh_egress_scope_state().install_from_slice(&MeshSlice {
-        namespace: "alpha".to_string(),
-        sidecar_egress_scope: Some(MeshEgressScopeSnapshot {
-            sidecar_enforced: false,
-            dry_run: true,
-            sidecar_applied: false,
-            sidecar_admitted_services: 1,
-            sidecar_denied_services: 1,
-            services: vec![MeshEgressScopeResource {
-                namespace: "alpha".to_string(),
-                name: "reviews".to_string(),
-                hosts: vec!["reviews.alpha.svc.cluster.local".to_string()],
-                ports: vec![8080],
-            }],
-            known_destinations: vec!["reviews.alpha.svc.cluster.local:8080".to_string()],
-            ..MeshEgressScopeSnapshot::default()
-        }),
-        ..MeshSlice::default()
-    });
-
     AdminState {
         db: None,
         jwt_manager: jwt,
@@ -139,8 +119,41 @@ fn admin_state(jwt: JwtManager) -> AdminState {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state,
         admin_tls_handshake_timeout_seconds: 10,
     }
+}
+
+fn install_default_egress_slice(runtime: &MeshRuntimeState) {
+    runtime.install_slice(MeshSlice {
+        namespace: "alpha".to_string(),
+        sidecar_egress_scope: Some(MeshEgressScopeSnapshot {
+            sidecar_enforced: false,
+            dry_run: true,
+            sidecar_applied: false,
+            sidecar_admitted_services: 1,
+            sidecar_denied_services: 1,
+            services: vec![MeshEgressScopeResource {
+                namespace: "alpha".to_string(),
+                name: "reviews".to_string(),
+                hosts: vec!["reviews.alpha.svc.cluster.local".to_string()],
+                ports: vec![8080],
+            }],
+            known_destinations: vec!["reviews.alpha.svc.cluster.local:8080".to_string()],
+            ..MeshEgressScopeSnapshot::default()
+        }),
+        ..MeshSlice::default()
+    });
+}
+
+fn admin_state(jwt: JwtManager) -> AdminState {
+    let mesh_runtime = MeshRuntimeState::new();
+    install_default_egress_slice(&mesh_runtime);
+    build_admin_state(jwt, Some(mesh_runtime))
+}
+
+fn admin_state_without_mesh_runtime(jwt: JwtManager) -> AdminState {
+    build_admin_state(jwt, None)
 }
 
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -216,4 +229,105 @@ async fn mesh_egress_scope_test_endpoint_admits_and_denies_candidates() {
         .unwrap();
     assert_eq!(denied["allowed"], false);
     assert_eq!(denied["decision"], "deny");
+}
+
+#[tokio::test]
+async fn mesh_egress_scope_endpoint_requires_jwt() {
+    let tc = TestConfig::default();
+    let state = admin_state(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base_url}/mesh/egress-scope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .json(&json!({"host": "reviews.alpha.svc.cluster.local"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn mesh_egress_scope_returns_404_without_installed_slice() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    // No MeshRuntimeState is wired into AdminState — handler should report
+    // "no active scope" instead of synthesising counts from raw config.
+    let state = admin_state_without_mesh_runtime(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base_url}/mesh/egress-scope"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"host": "reviews.alpha.svc.cluster.local"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn mesh_egress_scope_test_endpoint_rejects_bad_request_bodies() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let state = admin_state(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    // Non-JSON body.
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+
+    // Missing host.
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"port": 8080}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+
+    // Empty host.
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"host": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+
+    // Port 0.
+    let response = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"host": "reviews.alpha.svc.cluster.local", "port": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
 }

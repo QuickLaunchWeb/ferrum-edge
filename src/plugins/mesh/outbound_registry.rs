@@ -267,7 +267,22 @@ impl OutboundRegistry {
                 .record_mesh_outbound_registry_decision(&self.namespace, buf.as_str(), decision);
         });
     }
+
+    /// Record a deny decision into the metrics registry under a fixed-
+    /// cardinality `host` bucket. The Host header is attacker-controllable on
+    /// the deny path; using the actual value as a Prometheus label exposes
+    /// `/metrics` to memory-exhaustion / cardinality-DoS via curl loops with
+    /// distinct synthetic Host values. Operators that need the actual host of
+    /// denied traffic should consult application logs.
+    fn record_deny_decision(&self) {
+        crate::plugins::prometheus_metrics::global_registry()
+            .record_mesh_outbound_registry_decision(&self.namespace, DENIED_HOST_BUCKET, "deny");
+    }
 }
+
+/// Constant Prometheus `host` label value used for every deny decision; see
+/// [`OutboundRegistry::record_deny_decision`].
+pub(crate) const DENIED_HOST_BUCKET: &str = "<denied>";
 
 fn normalise_registry_entry(entry: &str) -> Option<String> {
     let entry = entry.trim().to_ascii_lowercase();
@@ -411,14 +426,18 @@ impl Plugin for OutboundRegistry {
         // into `host` before plugin execution, so one lookup covers all
         // HTTP-family frontends.
         let Some(host_header) = ctx.headers.get("host") else {
-            self.record_decision("<missing>", "deny");
+            // Use the fixed-cardinality bucket — see `record_deny_decision`.
+            self.record_deny_decision();
             return reject(self.reject_status, "host header required");
         };
         let (host, port) = split_host_header(host_header);
         if self.contains(host, port) {
             self.record_decision(host, "admit");
         } else {
-            self.record_decision(host, "deny");
+            // Deny path uses a constant bucket label so the Prometheus
+            // `host` label remains bounded (the request Host header is
+            // attacker-controlled).
+            self.record_deny_decision();
             return reject(
                 self.reject_status,
                 "destination not in mesh registry (REGISTRY_ONLY policy)",
@@ -747,9 +766,13 @@ mod tests {
         assert!(rendered.contains(
             "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"reviews.svc\",decision=\"admit\""
         ));
+        // Deny decisions always bucket under the fixed `<denied>` label to
+        // keep Prometheus cardinality bounded against attacker-supplied Host
+        // headers. The actual rejected host never appears as a label value.
         assert!(rendered.contains(
-            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"unknown.svc\",decision=\"deny\""
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"<denied>\",decision=\"deny\""
         ));
+        assert!(!rendered.contains("host=\"unknown.svc\",decision=\"deny\""));
     }
 
     #[tokio::test]
