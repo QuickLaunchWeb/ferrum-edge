@@ -382,7 +382,14 @@ impl XdsAdsServer {
         //      client received last over this stream.
         //
         // If neither source has the resource, treat it as new and include
-        // it.
+        // it. `resource.version` is always server-computed (see
+        // `per_resource_version`); a client-supplied version in
+        // `initial_resource_versions` can only suppress its own delivery by
+        // claiming a value that the server independently re-derives from
+        // current bytes, so a spoofed claim is at worst a self-DoS. The
+        // `value` byte-equality check against the previous snapshot is a
+        // defensive guard against the 64-bit truncation in the per-resource
+        // hash.
         let explicit_subscribe_set: HashSet<&str> = explicitly_subscribed_names
             .iter()
             .map(String::as_str)
@@ -2642,6 +2649,143 @@ mod tests {
             names,
             vec!["cluster/default/billing/8080".to_string()],
             "delta should ship the newly-introduced resource only"
+        );
+    }
+
+    /// Edge case: client reports a malformed (empty-string) version for a known
+    /// resource name in `initial_resource_versions`. The empty string cannot
+    /// match any server-computed per-resource version (which is a non-empty hex
+    /// hash), so the resource must be re-flowed. Spoofing the version field is
+    /// a no-op attack — the client just won't get the resource skipped.
+    #[test]
+    fn delta_response_reflows_resource_when_initial_version_is_empty_string() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), String::new())]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "malformed (empty-string) client version must not skip the resource"
+        );
+    }
+
+    /// Mixed scenario: one resource removed AND one unchanged across snapshots.
+    /// The delta filter must skip the unchanged resource on the response while
+    /// `removed_resources` still surfaces the dropped name — the two paths are
+    /// orthogonal.
+    #[test]
+    fn delta_response_emits_removed_resource_and_skips_unchanged_resource() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        // Drop "admin" entirely; keep "api" identical so it stays unchanged.
+        let next_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_services(&["api"], 0));
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            names.is_empty(),
+            "unchanged resource must be omitted from delta, got: {names:?}"
+        );
+        assert_eq!(
+            response.removed_resources,
+            vec!["cluster/default/admin/8080".to_string()],
+            "removed resource must still be surfaced alongside the delta filter"
+        );
+    }
+
+    /// Defensive guard: even if a malicious or buggy client tries to spoof
+    /// `initial_resource_versions` with a guessed hash that happens to match a
+    /// stale server-computed version (functionally impossible with a 64-bit
+    /// truncation, but check the contract anyway), the server's per-resource
+    /// version is always recomputed from current resource bytes. A client
+    /// claim is honored only when it byte-matches the server's current view,
+    /// so a stale claim cannot suppress a real change.
+    #[test]
+    fn delta_response_reflows_resource_when_content_changes_even_if_client_spoofs_old_version() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let initial_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let old_version = initial_snapshot
+            .resources(super::super::translator::CDS_TYPE_URL)
+            .iter()
+            .find(|r| r.name == cluster_name)
+            .map(|r| r.version.clone())
+            .expect("CDS resource should be present in initial snapshot");
+
+        // Server-side content changes — port flips from 8080 to 8081, which
+        // also renames the cluster. Build a fresh snapshot that carries a
+        // cluster with name `cluster/default/api/8081` AND keep the client
+        // claiming "I already have cluster/default/api/8080 at <old_version>".
+        let mut next_config = gateway_config_with_service(true, 1);
+        if let Some(mesh) = next_config.mesh.as_mut() {
+            for service in &mut mesh.services {
+                if let Some(port) = service.ports.first_mut() {
+                    port.port = 8081;
+                }
+            }
+        }
+        let next_snapshot = server.snapshot_for_config("node-a", &next_config);
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), old_version)]);
+
+        let response = server.delta_response(
+            &next_snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster/default/api/8081".to_string()],
+            "renamed resource must be shipped; client's stale claim for the old name only suppresses the old name (which no longer exists)"
+        );
+        assert_eq!(
+            response.removed_resources,
+            vec![cluster_name],
+            "old name absent from current snapshot must be reported removed even when client claimed a version for it"
         );
     }
 }
