@@ -837,13 +837,8 @@ pub struct MeshSidecarEgress {
     ///   - `namespace/host` — `host` in the specified namespace
     ///   - `namespace/*`   — anything in the specified namespace
     pub hosts: Vec<String>,
-    /// Optional Istio Port object; when set, narrows by listener port too.
-    ///
-    /// TODO: this field is parsed from `spec.egress[].port.number` and round-
-    /// trips through the slice, but `sidecar_egress_includes_service` does
-    /// NOT yet consult it — slice narrowing today is host-only. Setting
-    /// `port` on a Sidecar egress entry does not constrain traffic; the
-    /// follow-up is tracked in `docs/mesh.md`.
+    /// Optional Istio Port object; when set, narrows MeshService and
+    /// ServiceEntry port lists during Sidecar egress slice projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }
@@ -1024,11 +1019,10 @@ pub struct MeshTrafficPolicyTls {
     /// defaulting semantics treat it as `SIMPLE`.
     #[serde(default = "default_client_tls_mode")]
     pub mode: MtlsMode,
-    /// Optional Server Name Indication value sent on the backend handshake.
-    /// Today this is a schema-compatibility field — `Upstream` does not yet
-    /// have a per-upstream SNI override (Ferrum's reqwest path derives SNI
-    /// from the host header / target address). Captured here so cold-path
-    /// apply can warn when set and future work can wire it through.
+    /// Optional Server Name Indication value for backend TLS origination.
+    /// Cold-path DestinationRule application projects this onto
+    /// `Upstream.backend_tls_sni` and then into `Proxy.resolved_tls` so the
+    /// backend handshake layer can consume the cached value when wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
     /// Optional path to a PEM CA bundle for verifying the backend server's
@@ -1046,10 +1040,11 @@ pub struct MeshTrafficPolicyTls {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
     /// Optional list of acceptable Subject Alternative Names for the
-    /// backend's server certificate (Istio `subjectAltNames`). Today this
-    /// is a schema-compatibility field — Ferrum's `backend_tls_*` surface
-    /// does not yet expose a per-upstream SAN allow-list. Captured here
-    /// so cold-path apply can warn when set.
+    /// backend's server certificate (Istio `subjectAltNames`). Cold-path
+    /// DestinationRule application projects this onto
+    /// `Upstream.backend_tls_san_allow_list` and then into
+    /// `Proxy.resolved_tls` so certificate-verifier enforcement can consume
+    /// the cached value when wired.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_alt_names: Vec<String>,
     /// When true, suppress server-cert verification on the backend handshake
@@ -1152,8 +1147,16 @@ pub struct MeshSubset {
 /// core `GatewayConfig` struct stays lean for non-mesh deployments.
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
 /// the operator has no mesh resources, zero cost in that case.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshConfig {
+    /// Istio root namespace used for mesh-wide policy resources and
+    /// cluster-wide Sidecar defaults. Native mesh YAML can override it;
+    /// Kubernetes translation fills it from `K8sTranslationOptions`.
+    #[serde(
+        default = "default_istio_root_namespace",
+        skip_serializing_if = "is_default_istio_root_namespace"
+    )]
+    pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1191,6 +1194,35 @@ pub struct MeshConfig {
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
+pub fn default_istio_root_namespace() -> String {
+    "istio-system".to_string()
+}
+
+fn is_default_istio_root_namespace(value: &str) -> bool {
+    value == default_istio_root_namespace()
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            istio_root_namespace: default_istio_root_namespace(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            mesh_policies: Vec::new(),
+            peer_authentications: Vec::new(),
+            service_entries: Vec::new(),
+            request_authentications: Vec::new(),
+            telemetry_resources: Vec::new(),
+            destination_rules: Vec::new(),
+            proxy_configs: Vec::new(),
+            sidecars: Vec::new(),
+            trust_bundles: None,
+            multi_cluster: None,
+            outbound_traffic_policy: None,
+        }
+    }
+}
+
 /// Istio mesh-wide outbound traffic policy. Mirrors
 /// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1226,6 +1258,12 @@ impl MeshConfig {
     }
 
     pub fn normalize(&mut self) {
+        let trimmed_root_namespace = self.istio_root_namespace.trim();
+        if trimmed_root_namespace.is_empty() {
+            self.istio_root_namespace = default_istio_root_namespace();
+        } else if trimmed_root_namespace.len() != self.istio_root_namespace.len() {
+            self.istio_root_namespace = trimmed_root_namespace.to_string();
+        }
         normalize_mesh_fields_internal(
             &mut self.service_entries,
             &mut self.workloads,
@@ -1469,24 +1507,6 @@ fn validate_mesh_config_internal(
             if rule.jwks_uri.is_none() && rule.jwks.is_none() {
                 errors.push(format!(
                     "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
-                    ra.name, i
-                ));
-            }
-            if rule.jwks_uri.is_none() && rule.jwks.is_some() {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: inline jwks is not supported yet; use jwks_uri",
-                    ra.name, i
-                ));
-            }
-            if rule.audiences.len() > 1 {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: multiple audiences are not supported yet",
-                    ra.name, i
-                ));
-            }
-            if !rule.from_headers.is_empty() || !rule.from_params.is_empty() {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: custom token locations are not supported yet",
                     ra.name, i
                 ));
             }

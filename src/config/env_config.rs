@@ -141,6 +141,43 @@ impl std::fmt::Display for DbTlsMode {
     }
 }
 
+fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
+    if ns.is_empty() {
+        return Err("namespace must not be empty".to_string());
+    }
+    if ns.len() > 63 {
+        return Err(format!(
+            "namespace must be at most 63 characters, got {}",
+            ns.len()
+        ));
+    }
+    let bytes = ns.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must start with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !last.is_ascii_lowercase() && !last.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must end with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "namespace '{}' is invalid: use lowercase alphanumeric characters or '-'",
+            ns
+        ));
+    }
+    Ok(())
+}
+
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
@@ -565,6 +602,14 @@ pub struct EnvConfig {
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
     /// config via `translate_k8s_objects()`. Default: false.
     pub k8s_controller_enabled: bool,
+    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Default:
+    /// false for one release; when true, CP also watches core resources and
+    /// derives mesh services/workloads from ready pods.
+    pub k8s_pod_discovery_enabled: bool,
+    /// Enable cluster-scoped Node watching to enrich auto-discovered pod
+    /// workloads with topology.kubernetes.io/{region,zone}. Requires
+    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. Default: false.
+    pub k8s_node_locality_enabled: bool,
     /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
     /// (requires ClusterRole). Default: "" (all).
     pub k8s_watch_namespaces: Vec<String>,
@@ -592,6 +637,10 @@ pub struct EnvConfig {
     /// translator. Hosts like `<svc>.<ns>.svc.<cluster_domain>` are accepted.
     /// Default: "cluster.local".
     pub k8s_cluster_domain: String,
+    /// Istio root namespace used by the K8s translator when resolving
+    /// mesh-wide Istio resources such as root-namespace Sidecar defaults.
+    /// Default: "istio-system".
+    pub k8s_istio_root_namespace: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1115,6 +1164,20 @@ pub struct EnvConfig {
     /// growth from adversarial backends returning many distinct status codes.
     /// Default: 200.
     pub status_counts_max_entries: usize,
+    /// Interval for the `/metrics/runtime` process/system sampler. Default: 1000.
+    pub runtime_metrics_system_sample_interval_ms: u64,
+    /// Runtime metrics status-rate window. Default: 60.
+    pub runtime_metrics_window_1m_seconds: u64,
+    /// Runtime metrics status-rate window. Default: 300.
+    pub runtime_metrics_window_5m_seconds: u64,
+    /// Count Ferrum tracing warn/error/etc. events by bounded category. Default: true.
+    pub runtime_metrics_log_counter_enabled: bool,
+    /// Admin `/metrics/runtime` JSON response cache TTL. Default: 1000.
+    pub runtime_metrics_cache_ttl_ms: u64,
+    /// Count backend pool creation/failure/eviction churn. Default: true.
+    pub runtime_metrics_pool_tracking_enabled: bool,
+    /// Count extra `/metrics/runtime` HTTP status windows. Default: true.
+    pub runtime_metrics_status_tracking_enabled: bool,
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
@@ -1310,6 +1373,8 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_vs_header_routing_experimental: false,
             k8s_controller_enabled: false,
+            k8s_pod_discovery_enabled: false,
+            k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
             k8s_reconcile_debounce_ms: 500,
@@ -1318,6 +1383,7 @@ impl Default for EnvConfig {
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
+            k8s_istio_root_namespace: "istio-system".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1440,6 +1506,13 @@ impl Default for EnvConfig {
             circuit_breaker_cache_max_entries: 10_000,
             pool_shard_amount: 0,
             status_counts_max_entries: 200,
+            runtime_metrics_system_sample_interval_ms: 1000,
+            runtime_metrics_window_1m_seconds: 60,
+            runtime_metrics_window_5m_seconds: 300,
+            runtime_metrics_log_counter_enabled: true,
+            runtime_metrics_cache_ttl_ms: 1000,
+            runtime_metrics_pool_tracking_enabled: true,
+            runtime_metrics_status_tracking_enabled: true,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
             server_http2_max_concurrent_streams: 1000,
@@ -1601,6 +1674,8 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
+            k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
+            k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
@@ -1609,6 +1684,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
+            k8s_istio_root_namespace: String = "FERRUM_K8S_ISTIO_ROOT_NAMESPACE" => "istio-system".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1750,6 +1826,13 @@ impl EnvConfig {
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
             pool_shard_amount: usize = "FERRUM_POOL_SHARD_AMOUNT" => 0usize;
             status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
+            runtime_metrics_system_sample_interval_ms: u64 = "FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS" => 1000u64, max(100u64);
+            runtime_metrics_window_1m_seconds: u64 = "FERRUM_METRICS_WINDOW_1M_SECONDS" => 60u64, max(1u64);
+            runtime_metrics_window_5m_seconds: u64 = "FERRUM_METRICS_WINDOW_5M_SECONDS" => 300u64, max(1u64);
+            runtime_metrics_log_counter_enabled: bool = "FERRUM_METRICS_LOG_COUNTER_ENABLED" => true;
+            runtime_metrics_cache_ttl_ms: u64 = "FERRUM_METRICS_RUNTIME_CACHE_MS" => 1000u64;
+            runtime_metrics_pool_tracking_enabled: bool = "FERRUM_METRICS_POOL_TRACKING_ENABLED" => true;
+            runtime_metrics_status_tracking_enabled: bool = "FERRUM_METRICS_STATUS_TRACKING_ENABLED" => true;
             tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
             server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
             server_http2_max_pending_accept_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS" => 64usize, max(1usize);
@@ -1964,6 +2047,8 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_vs_header_routing_experimental,
             k8s_controller_enabled,
+            k8s_pod_discovery_enabled,
+            k8s_node_locality_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,
             k8s_reconcile_debounce_ms,
@@ -1972,6 +2057,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
             k8s_cluster_domain,
+            k8s_istio_root_namespace,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2094,6 +2180,13 @@ impl EnvConfig {
             circuit_breaker_cache_max_entries,
             pool_shard_amount,
             status_counts_max_entries,
+            runtime_metrics_system_sample_interval_ms,
+            runtime_metrics_window_1m_seconds,
+            runtime_metrics_window_5m_seconds,
+            runtime_metrics_log_counter_enabled,
+            runtime_metrics_cache_ttl_ms,
+            runtime_metrics_pool_tracking_enabled,
+            runtime_metrics_status_tracking_enabled,
             tcp_listen_backlog,
             accept_threads,
             server_http2_max_concurrent_streams,
@@ -2544,6 +2637,8 @@ impl EnvConfig {
         // Validate namespace
         crate::config::types::validate_namespace(&self.namespace)
             .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
+        validate_k8s_namespace(&self.k8s_istio_root_namespace)
+            .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

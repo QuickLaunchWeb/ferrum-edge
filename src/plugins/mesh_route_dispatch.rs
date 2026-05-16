@@ -43,7 +43,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::types::{BackendTlsConfig, MAX_BACKEND_HOST_LENGTH};
+use crate::config::types::{
+    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
+    validate_backend_tls_sni,
+};
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
@@ -156,25 +160,58 @@ impl MeshRouteDispatchConfig {
                      backend_host and backend_port so TLS overrides only apply to a direct backend"
                 ));
             }
-            if let Some(tls) = rule.destination.backend_tls.as_ref() {
-                let has_client_cert = tls
-                    .client_cert_path
-                    .as_deref()
-                    .is_some_and(|path| !path.is_empty());
-                let has_client_key = tls
-                    .client_key_path
-                    .as_deref()
-                    .is_some_and(|path| !path.is_empty());
-                if has_client_cert != has_client_key {
-                    return Err(format!(
-                        "mesh_route_dispatch.rules[{idx}].destination.backend_tls.client_cert_path \
-                         and client_key_path must be set together"
-                    ));
-                }
+            if let Some(tls) = rule.destination.backend_tls.as_mut() {
+                normalize_and_validate_backend_tls(idx, tls)?;
             }
         }
         Ok(())
     }
+}
+
+fn normalize_and_validate_backend_tls(
+    rule_idx: usize,
+    tls: &mut BackendTlsConfig,
+) -> Result<(), String> {
+    let has_client_cert = tls
+        .client_cert_path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty());
+    let has_client_key = tls
+        .client_key_path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty());
+    if has_client_cert != has_client_key {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.client_cert_path \
+             and client_key_path must be set together"
+        ));
+    }
+
+    if let Some(sni) = tls.sni.as_mut() {
+        validate_backend_tls_sni(sni).map_err(|e| {
+            format!("mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.sni: {e}")
+        })?;
+        *sni = sni.to_ascii_lowercase();
+    }
+
+    if tls.san_allow_list.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list \
+             must not have more than {MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES} entries (got {})",
+            tls.san_allow_list.len()
+        ));
+    }
+    for (san_idx, san) in tls.san_allow_list.iter_mut().enumerate() {
+        validate_backend_tls_san_allow_list_entry(san).map_err(|e| {
+            format!(
+                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list[{san_idx}]: {e}"
+            )
+        })?;
+        normalize_backend_tls_san_allow_list_entry(san);
+    }
+    tls.recompute_san_digest();
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -569,6 +606,80 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("must be set together"), "got: {err}");
+    }
+
+    #[test]
+    fn normalizes_backend_tls_identity_fields_and_recomputes_san_digest() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "canary.svc",
+                    "backend_port": 443,
+                    "backend_tls": {
+                        "sni": "Reviews.Mesh.Internal",
+                        "san_allow_list": [
+                            "Ratings.Mesh.Internal",
+                            "spiffe://cluster.local/ns/default/sa/reviews",
+                            "10.0.0.8"
+                        ]
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+
+        let tls = plugin.rules()[0]
+            .destination
+            .backend_tls
+            .as_ref()
+            .expect("backend_tls override");
+        assert_eq!(tls.sni.as_deref(), Some("reviews.mesh.internal"));
+        assert_eq!(
+            tls.san_allow_list,
+            vec![
+                "ratings.mesh.internal".to_string(),
+                "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+                "10.0.0.8".to_string(),
+            ]
+        );
+        assert_eq!(
+            tls.san_allow_list_key_digest,
+            BackendTlsConfig::compute_san_digest(&tls.san_allow_list),
+            "route-local backend_tls must be ready for pool-key emission"
+        );
+    }
+
+    #[test]
+    fn rejects_backend_tls_invalid_sni_and_san_allow_list() {
+        let sni_err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "canary.svc",
+                    "backend_port": 443,
+                    "backend_tls": {"sni": "10.0.0.8"}
+                }
+            }]
+        }))
+        .unwrap_err();
+        assert!(sni_err.contains("backend_tls.sni"), "got: {sni_err}");
+
+        let san_err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "canary.svc",
+                    "backend_port": 443,
+                    "backend_tls": {"san_allow_list": ["https://not-spiffe.example"]}
+                }
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            san_err.contains("backend_tls.san_allow_list[0]"),
+            "got: {san_err}"
+        );
     }
 
     #[test]
