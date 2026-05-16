@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
@@ -1053,8 +1053,7 @@ pub async fn proxy_grpc_request(
         match BodyExt::collect(limited).await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("length limit exceeded") {
+                if e.downcast_ref::<LengthLimitError>().is_some() {
                     return (
                         Err(GrpcProxyError::ResourceExhausted(format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
@@ -1358,8 +1357,7 @@ pub async fn collect_grpc_request_body(
         match BodyExt::collect(limited).await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("length limit exceeded") {
+                if e.downcast_ref::<LengthLimitError>().is_some() {
                     return Err(GrpcProxyError::ResourceExhausted(format!(
                         "gRPC request payload size exceeds maximum of {} bytes",
                         max_grpc_recv_size_bytes

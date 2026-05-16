@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -713,11 +713,10 @@ async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>,
     match Limited::new(req.into_body(), max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes().to_vec()),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("length limit exceeded") {
+            if e.downcast_ref::<LengthLimitError>().is_some() {
                 Err(ApiSpecError::PayloadTooLarge(max_mib))
             } else {
-                Err(ApiSpecError::BodyCollect(msg))
+                Err(ApiSpecError::BodyCollect(e.to_string()))
             }
         }
     }

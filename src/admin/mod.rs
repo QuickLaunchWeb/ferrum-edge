@@ -8,7 +8,7 @@ pub mod spec_codec;
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -711,8 +711,7 @@ pub async fn handle_admin_request(
     let body_bytes = match Limited::new(req.into_body(), max_body_size).collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("length limit exceeded") {
+            if e.downcast_ref::<LengthLimitError>().is_some() {
                 return Ok(json_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),

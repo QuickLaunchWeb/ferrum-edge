@@ -175,9 +175,10 @@ impl InjectorConfig {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
         validate_injector_trust_domain(&trust_domain)?;
-        let admission_review_max_body_bytes = parse_injector_admission_review_max_body_size_mib(
-            resolve_ferrum_var("FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB").as_deref(),
-        )?;
+        let admission_review_max_body_bytes =
+            parse_injector_admission_review_max_body_bytes_from_mib(
+                resolve_ferrum_var("FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB").as_deref(),
+            )?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
         match (&tls_cert_path, &tls_key_path) {
@@ -221,7 +222,9 @@ impl InjectorConfig {
     }
 }
 
-fn parse_injector_admission_review_max_body_size_mib(value: Option<&str>) -> Result<usize, String> {
+fn parse_injector_admission_review_max_body_bytes_from_mib(
+    value: Option<&str>,
+) -> Result<usize, String> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024);
     };
@@ -614,9 +617,10 @@ async fn handle_injector_request(
                     max_body_bytes,
                     "Injector AdmissionReview body exceeded configured limit"
                 );
+                let max_body_limit = admission_review_body_limit_display(max_body_bytes);
                 return Ok(response(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("AdmissionReview body too large (max {max_body_bytes} bytes)"),
+                    format!("AdmissionReview body too large (max {max_body_limit})"),
                 ));
             }
             warn!(
@@ -634,6 +638,15 @@ async fn handle_injector_request(
     match admission_response(&body, &config) {
         Ok(value) => Ok(json_response(StatusCode::OK, value)),
         Err(e) => Ok(response(StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if max_body_bytes % MIB == 0 {
+        format!("{max_body_bytes} bytes / {} MiB", max_body_bytes / MIB)
+    } else {
+        format!("{max_body_bytes} bytes")
     }
 }
 
@@ -1723,30 +1736,30 @@ mod tests {
     #[test]
     fn injector_admission_review_max_body_size_mib_defaults_and_validates() {
         assert_eq!(
-            parse_injector_admission_review_max_body_size_mib(None).unwrap(),
+            parse_injector_admission_review_max_body_bytes_from_mib(None).unwrap(),
             DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
         );
         assert_eq!(
-            parse_injector_admission_review_max_body_size_mib(Some("")).unwrap(),
+            parse_injector_admission_review_max_body_bytes_from_mib(Some("")).unwrap(),
             DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
         );
         assert_eq!(
-            parse_injector_admission_review_max_body_size_mib(Some("1")).unwrap(),
+            parse_injector_admission_review_max_body_bytes_from_mib(Some("1")).unwrap(),
             1024 * 1024
         );
         assert!(
-            parse_injector_admission_review_max_body_size_mib(Some("0"))
+            parse_injector_admission_review_max_body_bytes_from_mib(Some("0"))
                 .unwrap_err()
                 .contains("greater than zero")
         );
         assert!(
-            parse_injector_admission_review_max_body_size_mib(Some("-1"))
+            parse_injector_admission_review_max_body_bytes_from_mib(Some("-1"))
                 .unwrap_err()
                 .contains("unsigned integer")
         );
         let overflow_mib = usize::MAX.to_string();
         assert!(
-            parse_injector_admission_review_max_body_size_mib(Some(&overflow_mib))
+            parse_injector_admission_review_max_body_bytes_from_mib(Some(&overflow_mib))
                 .unwrap_err()
                 .contains("value too large")
         );
