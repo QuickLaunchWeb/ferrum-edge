@@ -1173,6 +1173,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | `0.0.0.0:9443` | Webhook listen address |
+| `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | `4` | Maximum AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrum-edge:latest` | Sidecar container image |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | `true` | Require opt-in annotation |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | (none) | Webhook TLS certificate |
