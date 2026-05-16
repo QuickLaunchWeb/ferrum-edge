@@ -363,6 +363,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::ConnectionPoolError
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
+                    | retry::ErrorClass::DispatchPolicyRejected
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -1046,18 +1047,6 @@ fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
 
-fn supports_direct_http2_backend(
-    state: &ProxyState,
-    proxy: &Proxy,
-    upstream_target: Option<&UpstreamTarget>,
-) -> bool {
-    proxy.dispatch_kind == DispatchKind::HttpsPool
-        && state
-            .backend_capabilities
-            .get(proxy, upstream_target)
-            .is_some_and(|record| record.plain_http.h2_tls.is_supported())
-}
-
 fn can_use_hbone_pool(
     retain_request_body: bool,
     requires_request_body_buffering: bool,
@@ -1117,6 +1106,30 @@ fn http2_pool_sender_error_response(
         error_class: Some(h2_error_class),
     }
 }
+
+fn backend_tls_sni_requires_direct_h2_response(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert(
+        "gateway-error-reason".to_string(),
+        BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON.to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+        headers,
+        // reqwest cannot apply per-request backend SNI. Mark this terminal
+        // gateway policy response as non-retryable so a 502 retry policy
+        // cannot amplify it or trip the backend circuit breaker repeatedly.
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
+    "backend_tls_sni_requires_direct_h2";
 
 enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
@@ -9915,6 +9928,15 @@ pub(crate) async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    if proxy.resolved_tls.sni.is_some() {
+        warn!(
+            proxy_id = %proxy.id,
+            backend_tls_sni = ?proxy.resolved_tls.sni,
+            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
+        );
+        return backend_tls_sni_requires_direct_h2_response(None);
+    }
+
     // Resolve backend IP from DNS cache (O(1) cached lookup).
     let resolved_ip = state
         .dns_cache
@@ -10391,31 +10413,72 @@ async fn proxy_to_backend(
         let direct_h2_effective_proxy =
             resolve_backend_connection_proxy_for_target(proxy, upstream_target);
         let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
-        if can_use_direct_http2_pool(
+        let requires_direct_h2_for_sni = direct_h2_proxy.resolved_tls.sni.is_some();
+        let direct_h2_capability = state.backend_capabilities.get(proxy, upstream_target);
+        let direct_h2_known_unsupported = direct_h2_capability
+            .as_ref()
+            .is_some_and(|record| matches!(record.plain_http.h2_tls, ProtocolSupport::Unsupported));
+        let direct_h2_supports = direct_h2_capability
+            .as_ref()
+            .is_some_and(|record| record.plain_http.h2_tls.is_supported());
+        let direct_h2_compatible = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) && supports_direct_http2_backend(state, proxy, upstream_target)
-        {
+        );
+        if requires_direct_h2_for_sni && direct_h2_known_unsupported {
+            debug!(
+                proxy_id = %proxy.id,
+                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                "H2 pool required for backend TLS SNI override but capability registry already marks this backend target H2/TLS unsupported"
+            );
+            return (
+                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
+            );
+        }
+        if direct_h2_compatible && (direct_h2_supports || requires_direct_h2_for_sni) {
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
                     if should_fallback_to_reqwest_after_http2_pool_error(&e) {
-                        debug!(
-                            proxy_id = %proxy.id,
-                            error = %e,
-                            "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
-                        );
                         // The per-pool-key ALPN learning cache was removed
                         // when the capability registry took over classification,
                         // so without this the next request would repeat the
                         // direct-H2 handshake + ALPN-fallback cost until the
                         // 24 h refresh re-probes. Downgrade here so subsequent
                         // requests go straight to reqwest.
-                        state
+                        let downgraded = state
                             .backend_capabilities
                             .mark_h2_tls_unsupported(proxy, upstream_target);
-                        None
+                        if requires_direct_h2_for_sni {
+                            if downgraded {
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    error = %e,
+                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest; marking backend H2/TLS unsupported and returning 502"
+                                );
+                            } else {
+                                debug!(
+                                    proxy_id = %proxy.id,
+                                    error = %e,
+                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
+                                );
+                            }
+                            return (
+                                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                                None,
+                            );
+                        } else {
+                            debug!(
+                                proxy_id = %proxy.id,
+                                error = %e,
+                                "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
+                            );
+                            None
+                        }
                     } else {
                         return (
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
@@ -10468,6 +10531,20 @@ async fn proxy_to_backend(
                     None,
                 );
             }
+        }
+        if requires_direct_h2_for_sni {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                retain_request_body = retain_request_body,
+                requires_request_body_buffering = requires_request_body_buffering,
+                enable_http2 = pool_config.enable_http2,
+                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
+            );
+            return (
+                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
+            );
         }
         if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
@@ -13429,6 +13506,65 @@ mod tests {
     }
 
     #[test]
+    fn backend_tls_sni_direct_h2_required_response_is_final() {
+        let resp = backend_tls_sni_requires_direct_h2_response(Some("127.0.0.1".to_string()));
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            resp.headers.get("gateway-error-reason").map(String::as_str),
+            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("SNI direct-H2 rejection should be buffered");
+        };
+        assert_eq!(body.as_slice(), br#"{"error":"Bad Gateway"}"#);
+    }
+
+    #[tokio::test]
+    async fn backend_tls_sni_retry_path_fails_closed_before_reqwest() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.1".to_string());
+        proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+        let resp = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            "https://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_2,
+        )
+        .await;
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip, None);
+        assert_eq!(
+            resp.headers.get("gateway-error-reason").map(String::as_str),
+            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+        );
+    }
+
+    #[test]
     fn websocket_backend_url_strips_exact_listen_path_literal() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
@@ -13920,6 +14056,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
@@ -14223,6 +14360,7 @@ mod tests {
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
             let bumped = super::record_port_exhaustion_if_class(&overload, class);

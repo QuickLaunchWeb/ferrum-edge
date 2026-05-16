@@ -108,6 +108,33 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push(if verify_server_cert { '1' } else { '0' });
 }
 
+/// Return the TLS server name used for backend handshakes.
+///
+/// `backend_tls_sni` intentionally affects the SNI extension and rustls'
+/// certificate-name verification while the TCP/QUIC dial target remains the
+/// selected backend host.
+///
+/// GAP-1B wires this helper into H2, gRPC, and native H3 backend dispatch.
+/// TCP+TLS, backend WebSocket, DTLS, and active health probes still use their
+/// protocol-specific server-name plumbing and should route through this helper
+/// when those paths grow backend SNI override support.
+///
+/// Caller invariant: any `tls.sni` value came from resolved configuration that
+/// already passed `validate_backend_tls_sni`; this helper intentionally does
+/// no normalization or validation on the request path.
+pub fn backend_tls_server_name<'a>(tls: &'a BackendTlsConfig, host: &'a str) -> &'a str {
+    tls.sni.as_deref().unwrap_or(host)
+}
+
+/// Return an owned rustls backend server name for pool-backed TLS handshakes.
+pub fn backend_tls_server_name_owned(
+    tls: &BackendTlsConfig,
+    host: &str,
+) -> Result<rustls::pki_types::ServerName<'static>, rustls::pki_types::InvalidDnsNameError> {
+    rustls::pki_types::ServerName::try_from(backend_tls_server_name(tls, host))
+        .map(|server_name| server_name.to_owned())
+}
+
 #[derive(Debug)]
 enum BackendServerVerifier {
     WebPki(Arc<WebPkiServerVerifier>),
@@ -798,6 +825,34 @@ mod tests {
             global_client_key,
             crls,
         }
+    }
+
+    #[test]
+    fn backend_tls_server_name_defaults_to_connect_host() {
+        let tls = BackendTlsConfig::default_verify();
+        assert_eq!(
+            backend_tls_server_name(&tls, "connect.mesh.internal"),
+            "connect.mesh.internal"
+        );
+    }
+
+    #[test]
+    fn backend_tls_server_name_honors_sni_override() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("service.mesh.internal".to_string());
+        assert_eq!(
+            backend_tls_server_name(&tls, "connect.mesh.internal"),
+            "service.mesh.internal"
+        );
+    }
+
+    #[test]
+    fn backend_tls_server_name_owned_honors_sni_override() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("service.mesh.internal".to_string());
+        let server_name = backend_tls_server_name_owned(&tls, "connect.mesh.internal").unwrap();
+
+        assert_eq!(server_name.to_str(), "service.mesh.internal");
     }
 
     fn verify_backend_server_cert(

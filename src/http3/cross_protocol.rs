@@ -611,6 +611,42 @@ async fn dispatch_plain<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    if proxy.resolved_tls.sni.is_some() {
+        warn!(
+            proxy_id = %proxy.id,
+            backend_tls_sni = ?proxy.resolved_tls.sni,
+            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
+        );
+        record_backend_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            upstream_target,
+            cb_target_key,
+            502,
+            false,
+            cb_is_half_open_probe,
+            backend_start.elapsed(),
+        );
+        let mut outcome = write_error_with_header(
+            stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway"}"#,
+            Some((
+                "gateway-error-reason",
+                crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+            )),
+            backend_start,
+            raw_prebuffered_body_bytes,
+        )
+        .await?;
+        outcome.backend_target_url = Some(strip_query_from_backend_url(backend_url));
+        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+        return Ok(outcome);
+    }
+
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(c) => c,
         Err(e) => {
@@ -2501,9 +2537,27 @@ async fn write_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let resp = Response::builder()
+    write_error_with_header(stream, status, body, None, backend_start, request_bytes).await
+}
+
+async fn write_error_with_header<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &'static str,
+    extra_header: Option<(&'static str, &'static str)>,
+    backend_start: Instant,
+    request_bytes: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some((name, value)) = extra_header {
+        builder = builder.header(name, value);
+    }
+    let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 error response: {}", e))?;
     stream.send_response(resp).await?;
