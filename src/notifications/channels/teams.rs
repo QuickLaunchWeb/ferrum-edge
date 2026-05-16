@@ -11,7 +11,7 @@ use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
 use super::{
-    drain_response_body_redacted, redacted_endpoint_url, resolve_optional_string,
+    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
     validate_webhook_url,
 };
 
@@ -82,13 +82,6 @@ impl TeamsChannel {
             .execute_redacted(req, "notification_teams", &redacted_url)
             .await
             .map_err(|e| format!("teams dispatch failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!(
-                "teams dispatch returned non-success status {status} from {redacted_url}"
-            ));
-        }
-        drain_response_body_redacted(resp, "teams", &redacted_url).await?;
-        Ok(())
+        finalize_dispatch_response(resp, "teams", &redacted_url).await
     }
 }

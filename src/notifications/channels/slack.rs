@@ -12,7 +12,7 @@ use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
 use super::{
-    drain_response_body_redacted, redacted_endpoint_url, resolve_optional_string,
+    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
     validate_webhook_url,
 };
 
@@ -98,14 +98,7 @@ impl SlackChannel {
             .execute_redacted(req, "notification_slack", &redacted_url)
             .await
             .map_err(|e| format!("slack dispatch failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!(
-                "slack dispatch returned non-success status {status} from {redacted_url}"
-            ));
-        }
-        drain_response_body_redacted(resp, "slack", &redacted_url).await?;
-        Ok(())
+        finalize_dispatch_response(resp, "slack", &redacted_url).await
     }
 }
 

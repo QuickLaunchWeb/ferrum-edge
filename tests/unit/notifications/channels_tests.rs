@@ -5,6 +5,7 @@
 //! HTTP server to assert wire format.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{
@@ -15,6 +16,7 @@ use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 fn fixed_notification() -> Notification {
     Notification {
@@ -38,6 +40,30 @@ fn parse_one(name: &str, def: Value) -> NotificationChannel {
     let map = parse_channels(&json!({ name: def })).unwrap();
     let arc = map.get(name).expect("channel parsed").clone();
     (*arc).clone()
+}
+
+async fn spawn_raw_notification_response_server(
+    response: &'static [u8],
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+                break;
+            }
+        }
+        socket.write_all(response).await.unwrap();
+    });
+    (addr, server)
 }
 
 // ---------------------------------------------------------------- parse_channels
@@ -516,6 +542,7 @@ async fn webhook_oversized_content_length_response_body_is_rejected_and_redacted
     server.await.unwrap();
 
     assert!(err.contains("exceeds drain limit"), "got: {err}");
+    assert!(err.contains("before reading"), "got: {err}");
     assert!(err.contains("redacted"), "got: {err}");
     assert!(!err.contains("TOKEN123"), "got: {err}");
     assert!(!err.contains("abc123"), "got: {err}");
@@ -678,6 +705,66 @@ async fn webhook_non_success_status_short_circuits_oversized_body_drain() {
     assert!(!err.contains("exceeds drain limit"), "got: {err}");
     assert!(!err.contains("TOKEN123"), "got: {err}");
     assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn non_success_status_errors_include_redacted_url_for_all_channels() {
+    let configs = [
+        (
+            "slack",
+            json!({
+                "type": "slack",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "teams",
+            json!({
+                "type": "teams",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "discord",
+            json!({
+                "type": "discord",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "webhook",
+            json!({
+                "type": "webhook",
+                "url": null,
+                "body_template": "x",
+            }),
+        ),
+    ];
+
+    for (name, mut config) in configs {
+        let (addr, server) = spawn_raw_notification_response_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let url = format!("http://{addr}/hooks/TOKEN123?routing_key=abc123");
+        if name == "webhook" {
+            config["url"] = json!(url);
+        } else {
+            config["webhook_url"] = json!(url);
+        }
+
+        let channel = parse_one(name, config);
+        let err = channel
+            .dispatch(&fixed_notification(), &PluginHttpClient::default())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(err.contains("non-success status 500"), "got: {err}");
+        assert!(err.contains("redacted"), "got: {err}");
+        assert!(!err.contains("TOKEN123"), "got: {err}");
+        assert!(!err.contains("abc123"), "got: {err}");
+    }
 }
 
 // -------------------------------------------------- env-var resolution helper

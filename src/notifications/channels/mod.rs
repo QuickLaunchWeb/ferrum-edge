@@ -277,6 +277,20 @@ pub(super) async fn drain_response_body_redacted(
         })
 }
 
+pub(super) async fn finalize_dispatch_response(
+    resp: reqwest::Response,
+    channel: &'static str,
+    redacted_url: &str,
+) -> Result<(), String> {
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{channel} dispatch returned non-success status {status} from {redacted_url}"
+        ));
+    }
+    drain_response_body_redacted(resp, channel, redacted_url).await
+}
+
 fn reqwest_error_class(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "timeout"
