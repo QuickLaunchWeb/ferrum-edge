@@ -2400,15 +2400,20 @@ fn telemetry_tracing_provider(
             TracingProvider::OpenTelemetry { endpoint }
         }
         other => {
+            let warning = format!(
+                "Telemetry {}/{} tracing.providers[] name '{}' is not a recognised inline \
+                 provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
+                 meshConfig.extensionProviders lookup only resolves entries shaped as \
+                 `{{name: \"...\"}}` (no extra fields) — provider skipped",
+                object.metadata.namespace, object.metadata.name, other
+            );
             tracing::warn!(
                 resource = %object.metadata.name,
                 namespace = %object.metadata.namespace,
                 provider_name = other,
-                "Telemetry tracing.providers[] name '{other}' is not a recognised \
-                 inline provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
-                 if this references a meshConfig.extensionProviders entry, that lookup \
-                 is not yet supported — provider skipped"
+                "{warning}"
             );
+            acc.warnings.push(warning);
             return Ok(None);
         }
     };
@@ -2435,10 +2440,19 @@ fn default_telemetry_tracing_providers(
 }
 
 fn warn_missing_mesh_config_provider(acc: &mut K8sAccumulator, object: &K8sObject, name: &str) {
-    let warning = format!(
-        "Telemetry {}/{} references unknown meshConfig extensionProvider '{}'; provider skipped",
-        object.metadata.namespace, object.metadata.name, name
-    );
+    let warning = if acc.mesh_config_registry.is_known_non_tracing_provider(name) {
+        format!(
+            "Telemetry {}/{} references meshConfig extensionProvider '{}' which is declared but \
+             not a tracing provider type Ferrum supports (zipkin/datadog/lightstep/opentelemetry); \
+             provider skipped",
+            object.metadata.namespace, object.metadata.name, name
+        )
+    } else {
+        format!(
+            "Telemetry {}/{} references unknown meshConfig extensionProvider '{}'; provider skipped",
+            object.metadata.namespace, object.metadata.name, name
+        )
+    };
     tracing::warn!(
         resource = %object.metadata.name,
         namespace = %object.metadata.namespace,

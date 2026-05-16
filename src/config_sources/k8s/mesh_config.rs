@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -12,6 +12,13 @@ use super::{
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MeshConfigProviderRegistry {
     tracing_providers: HashMap<String, TracingProvider>,
+    /// extensionProvider names declared in meshConfig that Ferrum does not
+    /// translate to a tracing provider — either non-tracing types
+    /// (`envoyExtAuthzHttp`, `prometheus`, future Istio additions) or a
+    /// recognised tracing key Ferrum can't yet emit. Tracked so Telemetry
+    /// resolution can distinguish "name not in meshConfig" from
+    /// "name in meshConfig but not a tracing type Ferrum supports".
+    non_tracing_provider_names: HashSet<String>,
     default_tracing_provider_names: Vec<String>,
 }
 
@@ -20,20 +27,22 @@ impl MeshConfigProviderRegistry {
         self.tracing_providers.get(name)
     }
 
+    pub(crate) fn is_known_non_tracing_provider(&self, name: &str) -> bool {
+        self.non_tracing_provider_names.contains(name)
+    }
+
     pub(crate) fn default_tracing_provider_names(&self) -> &[String] {
         &self.default_tracing_provider_names
     }
 
     fn merge_from(&mut self, parsed: ParsedMeshConfig, warnings: &mut Vec<String>) {
         for (name, provider) in parsed.registry.tracing_providers {
-            if self
-                .tracing_providers
-                .insert(name.clone(), provider)
-                .is_some()
-            {
-                warnings.push(format!(
-                    "meshConfig.extensionProviders duplicate tracing provider '{name}' replaced by later definition"
-                ));
+            self.non_tracing_provider_names.remove(&name);
+            self.tracing_providers.insert(name, provider);
+        }
+        for name in parsed.registry.non_tracing_provider_names {
+            if !self.tracing_providers.contains_key(&name) {
+                self.non_tracing_provider_names.insert(name);
             }
         }
         if !parsed.registry.default_tracing_provider_names.is_empty() {
@@ -116,18 +125,25 @@ fn collect_extension_providers(value: &Value, parsed: &mut ParsedMeshConfig) -> 
             );
             continue;
         };
-        let Some(provider) = tracing_provider_from_extension(&name, entry)? else {
-            continue;
-        };
-        if parsed
-            .registry
-            .tracing_providers
-            .insert(name.clone(), provider)
-            .is_some()
-        {
-            parsed.warnings.push(format!(
-                "meshConfig.extensionProviders duplicate tracing provider '{name}' replaced by later definition"
-            ));
+        match tracing_provider_from_extension(&name, entry)? {
+            ExtensionProviderKind::Tracing(provider) => {
+                parsed.registry.non_tracing_provider_names.remove(&name);
+                if parsed
+                    .registry
+                    .tracing_providers
+                    .insert(name.clone(), provider)
+                    .is_some()
+                {
+                    parsed.warnings.push(format!(
+                        "meshConfig.extensionProviders duplicate tracing provider '{name}' replaced by later definition"
+                    ));
+                }
+            }
+            ExtensionProviderKind::NonTracing => {
+                if !parsed.registry.tracing_providers.contains_key(&name) {
+                    parsed.registry.non_tracing_provider_names.insert(name);
+                }
+            }
         }
     }
     Ok(())
@@ -153,23 +169,43 @@ fn collect_default_providers(value: &Value, parsed: &mut ParsedMeshConfig) -> Re
     Ok(())
 }
 
+/// Outcome of classifying a single `meshConfig.extensionProviders[]` entry.
+/// `Tracing` carries a translated provider; `NonTracing` means the entry has a
+/// recognisable shape (e.g., `envoyExtAuthzHttp`, `prometheus`, `stackdriver`,
+/// a future Istio tracing key Ferrum doesn't translate, or a typo'd block
+/// name) so the registry can still remember the *name* and let Telemetry
+/// resolution distinguish "name not declared" from "name declared but Ferrum
+/// can't translate it as tracing".
+enum ExtensionProviderKind {
+    Tracing(TracingProvider),
+    NonTracing,
+}
+
 fn tracing_provider_from_extension(
     name: &str,
     entry: &Value,
-) -> Result<Option<TracingProvider>, String> {
+) -> Result<ExtensionProviderKind, String> {
     if let Some(config) = object_field(entry, "zipkin")? {
-        return Ok(Some(zipkin_provider(name, config)?));
+        return Ok(ExtensionProviderKind::Tracing(zipkin_provider(
+            name, config,
+        )?));
     }
     if let Some(config) = object_field(entry, "datadog")? {
-        return Ok(Some(datadog_provider(name, config)?));
+        return Ok(ExtensionProviderKind::Tracing(datadog_provider(
+            name, config,
+        )?));
     }
     if let Some(config) = object_field(entry, "lightstep")? {
-        return Ok(Some(lightstep_provider(name, config)?));
+        return Ok(ExtensionProviderKind::Tracing(lightstep_provider(
+            name, config,
+        )?));
     }
     if let Some(config) = object_field(entry, "opentelemetry")? {
-        return Ok(Some(opentelemetry_provider(name, config)?));
+        return Ok(ExtensionProviderKind::Tracing(opentelemetry_provider(
+            name, config,
+        )?));
     }
-    Ok(None)
+    Ok(ExtensionProviderKind::NonTracing)
 }
 
 fn zipkin_provider(name: &str, config: &Value) -> Result<TracingProvider, String> {
@@ -352,6 +388,74 @@ extensionProviders:
             parsed.registry.tracing_providers.is_empty(),
             "non-tracing providers must not enter tracing registry"
         );
+        assert!(
+            parsed.registry.is_known_non_tracing_provider("ext-authz"),
+            "non-tracing provider name must be remembered so Telemetry resolution \
+             can distinguish 'name not declared' from 'declared but not tracing'"
+        );
+        assert!(
+            parsed.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn tracing_entry_overrides_non_tracing_classification_when_same_name() {
+        // Operator typo'd a zipkin block on the first entry, fixed it on the
+        // second with the same name. The fixed tracing entry must win, and the
+        // name must no longer be tracked as non-tracing.
+        let parsed = parse(
+            r#"
+extensionProviders:
+- name: my-zipkin
+  zipkinn:
+    service: zipkin.istio-system.svc.cluster.local
+    port: 9411
+- name: my-zipkin
+  zipkin:
+    service: zipkin.istio-system.svc.cluster.local
+    port: 9411
+"#,
+        );
+        assert!(
+            parsed.registry.tracing_provider("my-zipkin").is_some(),
+            "later tracing entry must override earlier non-tracing classification"
+        );
+        assert!(
+            !parsed.registry.is_known_non_tracing_provider("my-zipkin"),
+            "name must not remain in non-tracing set after a tracing entry promotes it"
+        );
+    }
+
+    #[test]
+    fn duplicate_tracing_provider_in_same_config_map_warns_once() {
+        // Two entries with the same name in one ConfigMap. Only the
+        // pre-merge dup detector should fire; the cross-ConfigMap merge_from
+        // path must not emit a second identical warning.
+        let parsed = parse(
+            r#"
+extensionProviders:
+- name: zipkin-prod
+  zipkin:
+    service: zipkin-a.istio-system.svc.cluster.local
+    port: 9411
+- name: zipkin-prod
+  zipkin:
+    service: zipkin-b.istio-system.svc.cluster.local
+    port: 9411
+"#,
+        );
+        let dup_count = parsed
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("duplicate tracing provider 'zipkin-prod'"))
+            .count();
+        assert_eq!(
+            dup_count, 1,
+            "exactly one dup warning expected, got {dup_count}: {:?}",
+            parsed.warnings
+        );
     }
 
     #[test]
@@ -365,5 +469,18 @@ defaultProviders:
         .expect_err("invalid default provider shape fails closed");
 
         assert!(err.contains("defaultProviders.tracing"));
+    }
+
+    #[test]
+    fn rejects_invalid_yaml_with_actionable_message() {
+        // Operator types a stray tab / mis-indents the file — surface a
+        // message that names the field so the reconciler skip-retries log
+        // points at the right spot.
+        let err = parse_mesh_config("not: valid: yaml")
+            .expect_err("invalid YAML must fail closed instead of silently emptying the registry");
+        assert!(
+            err.contains("ConfigMap data.mesh"),
+            "error must name data.mesh so operators know where to look, got: {err}"
+        );
     }
 }

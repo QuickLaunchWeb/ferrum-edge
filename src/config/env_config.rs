@@ -640,6 +640,13 @@ pub struct EnvConfig {
     /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
     /// telemetry.istio.io). Default: true.
     pub k8s_watch_istio_crds: bool,
+    /// Enable watching the root-namespace `istio` ConfigMap for
+    /// `meshConfig.extensionProviders` / `defaultProviders.tracing` lookup.
+    /// Requires `configmaps` `get/list/watch` RBAC in the istio root
+    /// namespace. When `false`, Telemetry name-only provider references
+    /// resolve as unknown and inline-provider Telemetry continues to work.
+    /// Default: true (only effective when `FERRUM_K8S_WATCH_ISTIO_CRDS=true`).
+    pub k8s_watch_mesh_config: bool,
     /// Enable watching Gateway API CRDs (gateway.networking.k8s.io).
     /// Default: true.
     pub k8s_watch_gateway_api_crds: bool,
@@ -1397,6 +1404,7 @@ impl Default for EnvConfig {
             k8s_reconcile_debounce_ms: 500,
             k8s_full_sync_interval_secs: 300,
             k8s_watch_istio_crds: true,
+            k8s_watch_mesh_config: true,
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
@@ -1701,6 +1709,7 @@ impl EnvConfig {
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
             k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
             k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
+            k8s_watch_mesh_config: bool = "FERRUM_K8S_WATCH_MESH_CONFIG" => true;
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
@@ -2077,6 +2086,7 @@ impl EnvConfig {
             k8s_reconcile_debounce_ms,
             k8s_full_sync_interval_secs,
             k8s_watch_istio_crds,
+            k8s_watch_mesh_config,
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
             k8s_cluster_domain,

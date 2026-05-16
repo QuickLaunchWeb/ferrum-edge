@@ -187,3 +187,94 @@ fn k8s_telemetry_inline_provider_still_translates_without_mesh_config() {
     }
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 }
+
+#[test]
+fn k8s_telemetry_non_tracing_extension_provider_lookup_distinguishes_from_unknown() {
+    // Operator declared an `envoyExtAuthzHttp` extensionProvider and then
+    // mistakenly referenced it from Telemetry tracing. The warning must
+    // distinguish "declared but not tracing" from "name not declared at all"
+    // so the operator can locate the misconfiguration.
+    let (tracing, warnings) = translated_tracing(&[
+        istio_mesh_config(
+            r#"
+extensionProviders:
+- name: ext-authz
+  envoyExtAuthzHttp:
+    service: authz.default.svc.cluster.local
+    port: 9000
+"#,
+        ),
+        telemetry(json!({
+            "tracing": [{
+                "providers": [{
+                    "name": "ext-authz"
+                }]
+            }]
+        })),
+    ]);
+
+    assert!(
+        tracing.providers.is_empty(),
+        "non-tracing extensionProvider must not surface a tracing provider"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains(
+            "Telemetry default/sample references meshConfig extensionProvider 'ext-authz' which is declared but not a tracing provider type"
+        )),
+        "warning should distinguish declared-but-not-tracing from unknown: {warnings:?}"
+    );
+}
+
+#[test]
+fn k8s_telemetry_malformed_mesh_config_does_not_block_sibling_telemetry() {
+    // A stray invalid-YAML edit in the istio ConfigMap must not silently
+    // empty the registry and drop all Telemetry; the reconciler's
+    // skip-retries fallback drops the bad ConfigMap and continues. An
+    // inline-provider Telemetry resource still translates so the mesh
+    // keeps emitting spans.
+    use ferrum_edge::config_sources::k8s::{K8sTranslateError, translate_k8s_objects};
+
+    let objects = vec![
+        istio_mesh_config("not: valid: yaml"),
+        telemetry(json!({
+            "tracing": [{
+                "providers": [{
+                    "name": "datadog",
+                    "agentUrl": "http://datadog-agent:8126",
+                    "service": "reviews"
+                }]
+            }]
+        })),
+    ];
+
+    // First pass surfaces the malformed ConfigMap as an InvalidResource
+    // error so the reconciler can drop it on retry.
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("invalid mesh ConfigMap must surface as an error");
+    match err {
+        K8sTranslateError::InvalidResource { kind, name, .. } => {
+            assert_eq!(kind, "ConfigMap");
+            assert_eq!(name, "istio");
+        }
+        other => panic!("expected InvalidResource error, got {other:?}"),
+    }
+
+    // After the reconciler drops the bad ConfigMap, the Telemetry resource
+    // still resolves through inline-provider translation — no provider
+    // requires meshConfig because the spec carries its own config.
+    let healthy = vec![objects[1].clone()];
+    let translation = translate_k8s_objects(&healthy, options())
+        .expect("sibling Telemetry must still translate after malformed ConfigMap is skipped");
+    let mesh = translation.config.mesh.expect("mesh config emitted");
+    let tracing = mesh.telemetry_resources[0]
+        .config
+        .tracing
+        .clone()
+        .expect("tracing config emitted");
+    match tracing.providers.first().expect("inline provider emitted") {
+        TracingProvider::Datadog { agent_url, .. } => {
+            assert_eq!(agent_url, "http://datadog-agent:8126");
+        }
+        other => panic!("expected Datadog inline provider, got {other:?}"),
+    }
+}

@@ -25,6 +25,11 @@ pub struct CoreResourceSpec {
     pub kind: &'static str,
     pub plural: &'static str,
     pub namespaced: bool,
+    /// Optional Kubernetes field selector applied to the watcher. Used to
+    /// scope a namespaced watcher to a single named object (e.g.,
+    /// `metadata.name=istio`) so unrelated objects in that namespace don't
+    /// trigger no-op reconciliations. `None` watches every object in scope.
+    pub field_selector: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +144,7 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
         kind: "Pod",
         plural: "pods",
         namespaced: true,
+        field_selector: None,
     },
     CoreResourceSpec {
         group: "",
@@ -146,6 +152,7 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
         kind: "Service",
         plural: "services",
         namespaced: true,
+        field_selector: None,
     },
     CoreResourceSpec {
         group: "discovery.k8s.io",
@@ -153,6 +160,7 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
         kind: "EndpointSlice",
         plural: "endpointslices",
         namespaced: true,
+        field_selector: None,
     },
 ];
 
@@ -162,14 +170,20 @@ pub const K8S_NODE_LOCALITY_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec 
     kind: "Node",
     plural: "nodes",
     namespaced: false,
+    field_selector: None,
 }];
 
+// The only ConfigMap Ferrum consumes from the istio root namespace is the
+// `istio` MeshConfig. Scoping the watch with a name field selector means
+// unrelated ConfigMap churn (CA root cert, sidecar injector, dashboards, ...)
+// does not trigger no-op reconciliations.
 pub const ISTIO_MESH_CONFIG_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     group: "",
     version: "v1",
     kind: "ConfigMap",
     plural: "configmaps",
     namespaced: true,
+    field_selector: Some("metadata.name=istio"),
 }];
 
 // Node labels can enrich workloads with topology.kubernetes.io/{region,zone},
@@ -481,7 +495,10 @@ pub async fn start_crd_watchers(
                 let task_kind = kind.clone();
                 let task_api_version = api_version.clone();
                 let task_store_set = store_set.clone();
-                let watcher_config = watcher::Config::default();
+                let watcher_config = match resource.field_selector {
+                    Some(selector) => watcher::Config::default().fields(selector),
+                    None => watcher::Config::default(),
+                };
 
                 let handle = tokio::spawn(async move {
                     let stream = reflector::reflector(writer, watcher(api, watcher_config));
@@ -663,5 +680,29 @@ mod tests {
             resource.namespaced,
             "Istio meshConfig lives in the root namespace ConfigMap"
         );
+        assert_eq!(
+            resource.field_selector,
+            Some("metadata.name=istio"),
+            "mesh-config watcher must be name-scoped so unrelated ConfigMaps in \
+             the istio root namespace do not trigger no-op reconciliations"
+        );
+    }
+
+    #[test]
+    fn k8s_core_resources_have_no_field_selector() {
+        for resource in K8S_CORE_RESOURCES {
+            assert!(
+                resource.field_selector.is_none(),
+                "core resource {} should match every object in scope",
+                resource.kind
+            );
+        }
+        for resource in K8S_NODE_LOCALITY_RESOURCES {
+            assert!(
+                resource.field_selector.is_none(),
+                "node-locality resource {} should match every object in scope",
+                resource.kind
+            );
+        }
     }
 }
