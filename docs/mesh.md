@@ -436,17 +436,19 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
 
-The resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is **not** re-built — consistent with the project's static-TLS-material rotation model. To change the inbound mTLS mode, restart the data plane.
+By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
+
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply for mesh HTTP/HBONE termination listeners. Frontend cert/key paths are read and cached at startup, remain static operational inputs, and still require restart. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config and require restart for PeerAuthentication changes. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
 
 ### Disable-mode topology guard
 
-`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, or `EgressGateway` workload causes startup to fail closed:
+`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, or `EgressGateway` workload is rejected. Startup fails closed on an invalid initial slice; with `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, later invalid slices are rejected and the last good inbound TLS config remains active.
 
 - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
 - **NodeWaypoint**: the shared node listener must resolve pod identity from the node-agent/eBPF socket-cookie record before admitting HBONE traffic. Use `permissive` or `strict`.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
 
-`Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
+Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
 
 ## Transparent DNS Proxy
 

@@ -601,6 +601,10 @@ pub struct EnvConfig {
     /// override channel runs through `RequestContext.route_override_*` and
     /// is applied to dispatch after admission plugins have run.
     pub mesh_vs_header_routing_experimental: bool,
+    /// Opt-in live reload for PeerAuthentication-derived inbound mTLS mode
+    /// and client CA verifier. Cert/key paths remain static operational
+    /// inputs.
+    pub mesh_peer_auth_live_reload_enabled: bool,
 
     // Node agent
     /// Node-agent capture topology between the per-node capture manager and
@@ -1391,6 +1395,7 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_identity_narrowing: false,
             mesh_vs_header_routing_experimental: false,
+            mesh_peer_auth_live_reload_enabled: false,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
@@ -1696,6 +1701,7 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
+            mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
@@ -2073,6 +2079,7 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_identity_narrowing,
             mesh_vs_header_routing_experimental,
+            mesh_peer_auth_live_reload_enabled,
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,

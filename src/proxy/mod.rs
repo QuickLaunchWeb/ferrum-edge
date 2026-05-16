@@ -1544,6 +1544,10 @@ pub struct ProxyState {
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
+    /// Dynamic mesh inbound TLS config. Mesh mode updates this slot when
+    /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
+    /// listeners continue using their static startup TLS config.
+    pub mesh_inbound_tls: SharedMeshInboundTls,
 }
 
 #[inline]
@@ -1585,8 +1589,13 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 }
 
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
+pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
 fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn empty_mesh_inbound_tls_slot() -> SharedMeshInboundTls {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
 
@@ -1768,6 +1777,7 @@ impl ProxyState {
         );
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
+        let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
             global_pool_config.clone(),
             dns_cache.clone(),
@@ -2093,6 +2103,7 @@ impl ProxyState {
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
+            mesh_inbound_tls,
         };
         Ok((state, health_check_handles))
     }
@@ -5941,7 +5952,15 @@ pub async fn start_proxy_listener_with_bound_listener(
         info!("Proxy listener (in-process) started on bound TCP socket");
     }
 
-    run_accept_loop(listener, state, tls_config, conn_semaphore, shutdown, 0).await;
+    run_accept_loop(
+        listener,
+        state,
+        ListenerTlsSource::Static(tls_config),
+        conn_semaphore,
+        shutdown,
+        0,
+    )
+    .await;
     Ok(())
 }
 
@@ -6017,6 +6036,75 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Static(tls_config),
+        started_tx,
+    )
+    .await
+}
+
+/// Start a proxy listener whose TLS config is loaded dynamically from
+/// `ProxyState::mesh_inbound_tls` on every accepted connection.
+///
+/// Mesh-mode mTLS / HBONE termination listeners use this when
+/// `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. The mesh slice apply task
+/// swaps the underlying `ArcSwap` when PeerAuthentication changes; subsequent
+/// accepts pick up the new config without restarting the listener. Existing
+/// in-flight connections keep their original TLS state.
+///
+/// Each accept performs one `ArcSwap::load()` plus one inner `Arc` clone,
+/// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
+pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::MeshInbound,
+        started_tx,
+    )
+    .await
+}
+
+#[derive(Clone)]
+enum ListenerTlsSource {
+    /// Static listener TLS captured at startup; loading clones only the inner
+    /// `Option<Arc<_>>` and performs no atomic read.
+    Static(Option<Arc<rustls::ServerConfig>>),
+    /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
+    /// every accept so PeerAuthentication changes can hot-swap future
+    /// handshakes without restarting the listener.
+    MeshInbound,
+}
+
+impl ListenerTlsSource {
+    /// Load the TLS config for a single accepted connection.
+    ///
+    /// `Static` is the ordinary startup-captured path. `MeshInbound` performs
+    /// one `ArcSwap::load()` and one inner `Arc` clone per accept; this is
+    /// the narrow mesh live-reload carve-out and is not on the request path.
+    fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
+        match self {
+            Self::Static(tls_config) => tls_config.clone(),
+            Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
+        }
+    }
+}
+
+async fn start_proxy_listener_with_tls_source_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_source: ListenerTlsSource,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let configured_accept_threads = state.env_config.accept_threads.max(1);
     #[cfg(unix)]
@@ -6070,12 +6158,12 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         for i in 1..accept_threads {
             let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
             let state = state.clone();
-            let tls_config = tls_config.clone();
+            let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
 
             handles.push(tokio::spawn(async move {
-                run_accept_loop(listener, state, tls_config, semaphore, shutdown_rx, i).await;
+                run_accept_loop(listener, state, tls_source, semaphore, shutdown_rx, i).await;
             }));
         }
 
@@ -6091,7 +6179,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         run_accept_loop(
             first_listener,
             state,
-            tls_config,
+            tls_source,
             conn_semaphore,
             shutdown,
             0,
@@ -6112,7 +6200,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         run_accept_loop(
             first_listener,
             state,
-            tls_config,
+            tls_source,
             conn_semaphore,
             shutdown,
             0,
@@ -6128,7 +6216,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 async fn run_accept_loop(
     listener: TcpListener,
     state: ProxyState,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     _thread_id: usize,
@@ -6168,7 +6256,6 @@ async fn run_accept_loop(
                         };
 
                         let state = state.clone();
-                        let tls_config = tls_config.clone();
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
@@ -6187,6 +6274,7 @@ async fn run_accept_loop(
                             } else {
                                 None
                             };
+                        let tls_config = tls_source.load(&state);
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
