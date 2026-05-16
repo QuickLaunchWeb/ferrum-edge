@@ -42,6 +42,7 @@ fn runtime() -> MeshRuntimeConfig {
         outbound_traffic_policy: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
         outbound_registry_reject_status: 502,
         sidecar_enforced: false,
+        sidecar_identity_narrowing: false,
         workload_svid_cert_path: None,
         workload_svid_key_path: None,
         workload_svid_trust_bundle_path: None,
