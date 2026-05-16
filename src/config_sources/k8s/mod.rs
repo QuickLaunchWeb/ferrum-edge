@@ -7,6 +7,7 @@
 mod core;
 mod gateway_api;
 mod istio;
+mod mesh_config;
 
 use std::collections::{HashMap, HashSet};
 
@@ -216,6 +217,7 @@ pub(crate) struct K8sAccumulator {
     /// The nested shape lets `lookup_service_port` borrow `&str` arguments
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
+    pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
@@ -236,6 +238,7 @@ impl K8sAccumulator {
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
+            mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
@@ -419,6 +422,8 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
+        } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
+            mesh_config::collect(&mut acc, object)?;
         } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
             collect_explicit_workload_service(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
@@ -449,6 +454,13 @@ where
             continue;
         }
 
+        // The root-namespace `istio` ConfigMap feeds the translation-time
+        // MeshConfig registry during the pre-pass. Other ConfigMaps watched
+        // from that namespace are not Ferrum resources.
+        if object.kind == "ConfigMap" {
+            continue;
+        }
+
         if core::is_core_resource_kind(&object.kind) {
             continue;
         }
@@ -472,6 +484,7 @@ where
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
     options.includes_namespace(&object.metadata.namespace)
+        || mesh_config::is_root_namespace_config_map(options, object)
         || (options.pod_discovery_enabled
             && core::is_cluster_scoped_core_resource_kind(&object.kind))
 }

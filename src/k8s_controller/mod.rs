@@ -34,6 +34,12 @@ pub struct K8sControllerConfig {
     pub istio_root_namespace: String,
     pub watch_namespaces: Vec<String>,
     pub watch_istio: bool,
+    /// `FERRUM_K8S_WATCH_MESH_CONFIG` — opt-out for clusters where the
+    /// gateway runs in a different trust boundary from `istio-system` and
+    /// cannot easily grant cross-namespace `configmaps` RBAC. Only
+    /// effective when `watch_istio` is true (without Istio CRDs there is
+    /// no Telemetry resource that would consume meshConfig providers).
+    pub watch_mesh_config: bool,
     pub watch_gateway_api: bool,
     pub pod_discovery_enabled: bool,
     pub watch_node_locality: bool,
@@ -78,6 +84,7 @@ pub async fn start_k8s_controller(
         watch_gateway_api = controller_config.watch_gateway_api,
         pod_discovery_enabled = controller_config.pod_discovery_enabled,
         watch_node_locality = controller_config.watch_node_locality,
+        istio_root_namespace = %controller_config.istio_root_namespace,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
         "Starting Kubernetes controller"
@@ -92,13 +99,19 @@ pub async fn start_k8s_controller(
         watch_gateway_api: controller_config.watch_gateway_api,
         watch_core: controller_config.pod_discovery_enabled,
         watch_node_locality: controller_config.watch_node_locality,
+        // Without Istio CRDs there is no Telemetry resource that would
+        // consume meshConfig providers, so the configmaps watch and its
+        // associated RBAC requirement are skipped automatically.
+        watch_mesh_config: controller_config.watch_istio && controller_config.watch_mesh_config,
     };
+    let istio_root_namespace = controller_config.istio_root_namespace.clone();
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
         store_set.clone(),
         watcher_selection,
         controller_config.watch_namespaces.clone(),
+        istio_root_namespace.clone(),
         shutdown.clone(),
     )
     .await;
@@ -136,6 +149,7 @@ pub async fn start_k8s_controller(
         store_set,
         watcher_selection,
         controller_config.watch_namespaces,
+        istio_root_namespace,
         shutdown,
         Duration::from_secs(300),
     );

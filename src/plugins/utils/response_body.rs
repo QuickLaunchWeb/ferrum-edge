@@ -11,13 +11,23 @@
 //!
 //! [`read_response_body_bounded`] streams chunks from the network, enforces
 //! the limit byte-by-byte, and aborts the read as soon as the running total
-//! crosses the threshold — capping memory usage at roughly `max_bytes` plus
-//! one chunk. This mirrors the approach in
+//! crosses the threshold. Successful reads can still return up to `max_bytes`,
+//! but the initial allocation is capped even when an upstream advertises a
+//! huge `Content-Length`. This mirrors the approach in
 //! `proxy::collect_response_with_limit` so plugin-side reads share the same
 //! hardened pattern.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use serde_json::Value;
+
+// Bound only the upfront allocation for every caller of
+// `read_response_body_bounded`. One MiB covers common API specs and
+// serverless-function responses without repeated tiny reallocations, while
+// larger in-limit bodies still grow one chunk at a time up to the configured
+// cap. This avoids letting Content-Length force a large allocation before the
+// first byte streams in.
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 1024 * 1024;
 
 /// Error returned by [`read_response_body_bounded`].
 #[derive(Debug)]
@@ -44,7 +54,7 @@ impl std::fmt::Display for BoundedReadError {
             } => {
                 write!(
                     f,
-                    "response body size {} exceeds max_response_body_bytes {}",
+                    "response body size {} exceeds configured max_response_body_bytes limit {}",
                     read_so_far, max_bytes
                 )
             }
@@ -55,7 +65,54 @@ impl std::fmt::Display for BoundedReadError {
 
 impl std::error::Error for BoundedReadError {}
 
-/// Stream a `reqwest::Response` body and accumulate chunks into a `Vec<u8>`,
+/// Parse a common `max_response_body_bytes`-style plugin config field.
+///
+/// Used by `spec_expose`, `serverless_function`, and `request_mirror` so the
+/// validation matrix and error wording stay consistent across plugins.
+///
+/// # Contract
+///
+/// * Missing key or `null` → `Ok(default)`.
+/// * Positive integer that fits `usize` → `Ok(raw as usize)`.
+/// * Non-integer JSON (strings, arrays, objects, booleans) → `Err("must be a
+///   non-negative integer")`. Floating-point JSON numbers — including
+///   whole-number forms like `1024.0` — fall into this branch because
+///   `serde_json::Number::as_u64()` returns `None` for any `Float` variant.
+///   Operators must supply an integer literal.
+/// * Negative integer → same `Err("must be a non-negative integer")` (because
+///   `as_u64()` rejects it).
+/// * `0` → `Err("must be greater than zero")` (a zero cap would reject every
+///   response).
+/// * Positive integer that overflows `usize` on the target platform (only
+///   reachable on 32-bit builds) → `Err("is too large for this platform")`.
+///
+/// The error messages intentionally do not echo the offending value to avoid
+/// blowing up logs / admin-API responses when an operator pastes a large
+/// JSON blob into the field. The structured config is still attached at the
+/// plugin construction call site via the surrounding error.
+pub fn parse_max_response_body_bytes(
+    config: &Value,
+    plugin_name: &str,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let raw = v
+                .as_u64()
+                .ok_or_else(|| format!("{plugin_name}: '{key}' must be a non-negative integer"))?;
+            if raw == 0 {
+                return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
+            }
+            usize::try_from(raw).map_err(|_| {
+                format!("{plugin_name}: '{key}' is too large for this platform: {raw}")
+            })
+        }
+    }
+}
+
+/// Stream a `reqwest::Response` body and accumulate chunks into `Bytes`,
 /// aborting as soon as the running total exceeds `max_bytes`.
 ///
 /// Returns `Ok(body)` when the full body fits inside the limit, or
@@ -63,22 +120,28 @@ impl std::error::Error for BoundedReadError {}
 /// (without finishing the stream). Transport errors are surfaced as
 /// `Err(BoundedReadError::Stream)`.
 ///
-/// The `content-length` hint, when present, is used to pre-size the buffer
-/// (clamped to `max_bytes`) — a single allocation for typical small/medium
-/// responses, no growth churn for larger but bounded ones. When absent, the
-/// buffer grows organically.
+/// The `content-length` hint, when present, is used to pre-size the buffer up
+/// to a small ceiling. This avoids a huge upfront allocation when an operator
+/// configures a high `max_bytes` and the upstream advertises a very large but
+/// still-in-limit body. When absent, the buffer grows organically.
 pub async fn read_response_body_bounded(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Vec<u8>, BoundedReadError> {
-    // Pre-size from Content-Length when available, but never larger than the
-    // allowed maximum — a misbehaving sink can advertise CL=10GB.
+) -> Result<Bytes, BoundedReadError> {
+    // Pre-size from Content-Length when available, but never larger than a
+    // modest ceiling. A misbehaving sink or oversized operator setting should
+    // not be able to force a huge allocation before streaming starts.
     let initial_capacity = response
         .content_length()
-        .map(|cl| (cl as usize).min(max_bytes))
+        .map(|cl| {
+            usize::try_from(cl)
+                .unwrap_or(usize::MAX)
+                .min(max_bytes)
+                .min(MAX_INITIAL_RESPONSE_BODY_CAPACITY)
+        })
         .unwrap_or(0);
 
-    let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
+    let mut buf = BytesMut::with_capacity(initial_capacity);
     let mut total = 0usize;
     let mut stream = response.bytes_stream();
 
@@ -94,7 +157,7 @@ pub async fn read_response_body_bounded(
         buf.extend_from_slice(&chunk);
     }
 
-    Ok(buf)
+    Ok(buf.freeze())
 }
 
 /// Stream a `reqwest::Response` body to determine its total length without

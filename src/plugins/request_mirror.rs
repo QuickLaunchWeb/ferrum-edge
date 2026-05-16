@@ -63,7 +63,9 @@ use std::time::Duration;
 use tracing::warn;
 use url::form_urlencoded;
 
-use super::utils::response_body::{BoundedReadError, measure_response_body_bounded};
+use super::utils::response_body::{
+    BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
+};
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Default cap on the size of mirror response bodies the gateway is willing
@@ -147,30 +149,12 @@ impl RequestMirror {
 
         let mirror_request_body = optional_bool(config, "mirror_request_body")?.unwrap_or(true);
 
-        let max_response_body_bytes = match config.get("max_response_body_bytes") {
-            Some(Value::Number(n)) => match n.as_u64() {
-                Some(0) => {
-                    return Err("request_mirror: 'max_response_body_bytes' must be > 0".to_string());
-                }
-                Some(v) => usize::try_from(v).map_err(|_| {
-                    "request_mirror: 'max_response_body_bytes' is too large for this platform"
-                        .to_string()
-                })?,
-                None => {
-                    return Err(
-                        "request_mirror: 'max_response_body_bytes' must be a non-negative integer"
-                            .to_string(),
-                    );
-                }
-            },
-            Some(Value::Null) | None => DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
-            Some(_) => {
-                return Err(
-                    "request_mirror: 'max_response_body_bytes' must be a non-negative integer"
-                        .to_string(),
-                );
-            }
-        };
+        let max_response_body_bytes = parse_max_response_body_bytes(
+            config,
+            "request_mirror",
+            "max_response_body_bytes",
+            DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
+        )?;
 
         let mirror_hostname = mirror_host.clone();
 
