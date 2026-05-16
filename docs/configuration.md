@@ -252,6 +252,7 @@ Service / namespace names embedded in destination hosts are matched case-sensiti
 | `FERRUM_K8S_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used by the source translator for FQDN host matching. VirtualService destinations of the form `<svc>.<ns>.svc.<cluster_domain>` (and bare/short forms) resolve port names against the matching `Service` |
 | `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` | No | `istio-system` | Istio root namespace used by the K8s source translator for mesh-wide resources, including root-namespace `Sidecar` defaults/selectors and root-scoped `PeerAuthentication`, `RequestAuthentication`, `Telemetry`, and `ProxyConfig` resources |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
+| `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES` | No | `4194304` | Maximum `POST /mutate` AdmissionReview request body size accepted before JSON parsing |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
