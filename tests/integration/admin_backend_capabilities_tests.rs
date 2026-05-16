@@ -122,6 +122,7 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
 }

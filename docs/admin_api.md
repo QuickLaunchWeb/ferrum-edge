@@ -572,3 +572,84 @@ The registry stores only protocol classifications and probe timestamps — never
 - `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` — periodic refresh cadence (default `86400`).
 - `FERRUM_POOL_WARMUP_ENABLED` — when `true`, the initial classification runs synchronously during startup; when `false`, the gateway issues the first refresh in the background and reports ready before it completes (DP mode always gates readiness on first-refresh completion regardless).
 - `FERRUM_POOL_WARMUP_CONCURRENCY` — parallelism cap for both startup and refresh probe passes.
+
+## Mesh Egress Scope (mesh mode)
+
+Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).
+
+### `GET /mesh/egress-scope`
+
+Returns the current workload's resolved egress scope: namespace, admitted services, admitted service-entries, admitted destination-rules, the deduplicated `known_destinations` host list used by the outbound registry, dry-run status, and admit/deny service and DestinationRule counts.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/egress-scope
+```
+
+Response (truncated):
+
+```json
+{
+  "namespace": "alpha",
+  "scope": {
+    "sidecar_enforced": false,
+    "dry_run": true,
+    "sidecar_applied": false,
+    "sidecar_admitted_services": 1,
+    "sidecar_denied_services": 1,
+    "sidecar_admitted_destination_rules": 1,
+    "sidecar_denied_destination_rules": 0,
+    "services": [
+      {
+        "namespace": "alpha",
+        "name": "reviews",
+        "hosts": ["reviews.alpha.svc.cluster.local"],
+        "ports": [8080]
+      }
+    ],
+    "destination_rules": [
+      {"namespace": "alpha", "name": "reviews", "hosts": ["reviews.alpha.svc.cluster.local"], "ports": []}
+    ],
+    "known_destinations": ["reviews.alpha.svc.cluster.local:8080"]
+  },
+  "health": {
+    "sidecar_admitted_services": 1,
+    "sidecar_denied_services": 1
+  }
+}
+```
+
+**Disclosure surface**: the payload reveals the mesh topology shape the current workload can reach — service names, namespaces, hosts, ports, FQDN aliases. This is not secret traffic data (no bodies, headers, or credentials), but operators wiring this into long-running scrapers should still scope JWT issuance accordingly.
+
+Returns `503 Service Unavailable` when proxy state is not yet available, `404 Not Found` when no active mesh egress scope has been installed.
+
+### `POST /mesh/egress-scope/test`
+
+Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"host":"reviews.alpha.svc.cluster.local","port":8080}' \
+  http://localhost:9000/mesh/egress-scope/test
+```
+
+Response:
+
+```json
+{
+  "allowed": true,
+  "decision": "admit",
+  "host": "reviews.alpha.svc.cluster.local",
+  "port": 8080,
+  "dry_run": true
+}
+```
+
+The handler memoises the resolved `OutboundRegistry` against the installed snapshot, so repeated calls do not re-parse `known_destinations` on every request.
+
+Returns `503` when proxy state is unavailable, `404` when no active mesh egress scope, `400` when the body is not valid JSON / `host` is missing or empty / `port` is `0`.
+
+### Related environment variables
+
+- `FERRUM_MESH_SIDECAR_ENFORCED` — gates the slice-narrowing pass (default `false`).
+- `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` — computes the scope and exposes it through these endpoints while leaving the slice unenforced.

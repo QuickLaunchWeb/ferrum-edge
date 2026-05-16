@@ -201,6 +201,7 @@ pub async fn run(
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
             .sidecar_enforced(env_config.mesh_sidecar_enforced)
+            .sidecar_enforced_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .cluster_domain(env_config.k8s_cluster_domain.clone())
             .build();
@@ -216,6 +217,7 @@ pub async fn run(
                 env_config.xds_stream_channel_capacity,
                 env_config.mesh_sidecar_enforced,
             )
+            .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone()),
         )
@@ -262,6 +264,7 @@ pub async fn run(
         mesh_registry: Some(mesh_registry.clone()),
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse

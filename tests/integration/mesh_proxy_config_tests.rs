@@ -59,6 +59,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         outbound_traffic_policy: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
         outbound_registry_reject_status: 502,
         sidecar_enforced: false,
+        sidecar_enforced_dry_run: false,
         sidecar_identity_narrowing: false,
     }
 }

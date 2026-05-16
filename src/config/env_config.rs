@@ -589,6 +589,9 @@ pub struct EnvConfig {
     /// happens unconditionally; this flag only gates the slice-narrowing
     /// pass.
     pub mesh_sidecar_enforced: bool,
+    /// When true, compute and expose the Sidecar egress scope but keep the
+    /// unenforced slice so traffic remains admitted.
+    pub mesh_sidecar_enforced_dry_run: bool,
     /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
     /// by admitted services. Default `false` for a one-release rollout window.
@@ -1400,6 +1403,7 @@ impl Default for EnvConfig {
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
+            mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
             mesh_vs_header_routing_experimental: false,
             mesh_peer_auth_live_reload_enabled: false,
@@ -1707,6 +1711,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
+            mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
@@ -2086,6 +2091,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
+            mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
             mesh_vs_header_routing_experimental,
             mesh_peer_auth_live_reload_enabled,
