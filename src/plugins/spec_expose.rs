@@ -154,7 +154,7 @@ impl SpecExpose {
             Some(v) => {
                 let raw = v.as_u64().ok_or_else(|| {
                     format!(
-                        "spec_expose: 'max_response_body_bytes' must be a positive integer, got: {v}"
+                        "spec_expose: 'max_response_body_bytes' must be an unsigned integer, got: {v}"
                     )
                 })?;
                 if raw == 0 {

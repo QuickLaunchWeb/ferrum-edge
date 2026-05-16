@@ -473,20 +473,35 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 1024];
         let _ = socket.read(&mut buf).await.unwrap();
-        let body = b"openapi: 3.0.0\ninfo: too large\n";
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
-            body.len()
-        );
-        socket.write_all(head.as_bytes()).await.unwrap();
-        socket.write_all(body).await.unwrap();
-        socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for chunk in [
+            b"openapi: ".as_slice(),
+            b"3.0.0\n".as_slice(),
+            b"info: too large\n".as_slice(),
+        ] {
+            let head = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(chunk).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
     });
 
     let plugin = SpecExpose::new(
         &json!({
             "spec_url": format!("http://{addr}/openapi.yaml"),
-            "max_response_body_bytes": 8
+            "max_response_body_bytes": 16
         }),
         PluginHttpClient::default(),
     )
