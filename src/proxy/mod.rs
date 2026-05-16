@@ -84,6 +84,9 @@ use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::modes::mesh::node_waypoint::{
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
@@ -113,6 +116,33 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+fn record_node_waypoint_identity_drop(
+    overload: &crate::overload::OverloadState,
+    error: &NodeWaypointIdentityError,
+) {
+    let reason = match error {
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => {
+            crate::overload::NodeWaypointDropReason::CookieUnavailable
+        }
+        NodeWaypointIdentityError::UnknownCookie(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownCookie
+        }
+        NodeWaypointIdentityError::MissingPodUid(_) => {
+            crate::overload::NodeWaypointDropReason::MissingPodUid
+        }
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => {
+            crate::overload::NodeWaypointDropReason::MissingWorkloadHash
+        }
+        NodeWaypointIdentityError::UnknownPod(_) => {
+            crate::overload::NodeWaypointDropReason::UnknownPod
+        }
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
+    };
+    overload.record_node_waypoint_drop(reason);
+}
 
 /// Validate that every `mesh_route_dispatch` rule's
 /// `destination.upstream_id` points at a real upstream in the config.
@@ -1498,6 +1528,10 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Node-waypoint source identity resolver. When present, accepted sockets
+    /// must carry a node-agent/eBPF cookie record or the connection is dropped
+    /// fail-closed before TLS/HBONE processing.
+    pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
     /// The slot shape matches mesh SVID rotation so later trust-bundle updates
     /// can hot-swap without blocking proxy readers.
@@ -1533,6 +1567,12 @@ fn via_header_for_backend_response_body<'a>(
         ResponseBody::StreamingH3(_) => &state.via_header_http3,
         ResponseBody::Buffered(_) => &state.via_header_http11,
     }
+}
+
+#[derive(Clone, Default)]
+struct RequestConnectionMetadata {
+    frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -2048,11 +2088,22 @@ impl ProxyState {
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
+            node_waypoint_identity_resolver: None,
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
         };
         Ok((state, health_check_handles))
+    }
+
+    /// Return a copy of this state with node-waypoint identity resolution
+    /// installed before listeners start accepting traffic.
+    pub fn with_node_waypoint_identity_resolver(
+        mut self,
+        resolver: Arc<NodeWaypointIdentityResolver>,
+    ) -> Self {
+        self.node_waypoint_identity_resolver = Some(resolver);
+        self
     }
 
     /// Start a background task that periodically removes stale zero-count
@@ -3984,6 +4035,7 @@ async fn handle_connection(
     state: ProxyState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -4033,6 +4085,10 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
+        let connection_metadata = RequestConnectionMetadata {
+            frontend_listen_port,
+            node_waypoint_identity: node_waypoint_identity.clone(),
+        };
         async move {
             handle_proxy_request_on_frontend_port(
                 req,
@@ -4041,7 +4097,7 @@ async fn handle_connection(
                 false,
                 None,
                 None,
-                frontend_listen_port,
+                connection_metadata,
             )
             .await
         }
@@ -6112,6 +6168,24 @@ async fn run_accept_loop(
 
                         let state = state.clone();
                         let tls_config = tls_config.clone();
+                        let node_waypoint_identity =
+                            if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
+                                match resolver.resolve_stream(&stream) {
+                                    Ok(identity) => Some(identity),
+                                    Err(error) => {
+                                        record_node_waypoint_identity_drop(&state.overload, &error);
+                                        debug!(
+                                            remote_addr = %remote_addr,
+                                            error = %error,
+                                            "Dropping node-waypoint connection without a resolved pod identity"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -6136,6 +6210,7 @@ async fn run_accept_loop(
                                     tls_config,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    node_waypoint_identity,
                                 )
                                 .await
                             } else {
@@ -6145,6 +6220,7 @@ async fn run_accept_loop(
                                     state,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    node_waypoint_identity,
                                 )
                                     .await
                             };
@@ -6179,6 +6255,7 @@ async fn handle_tls_connection(
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -6255,6 +6332,10 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
+        let connection_metadata = RequestConnectionMetadata {
+            frontend_listen_port,
+            node_waypoint_identity: node_waypoint_identity.clone(),
+        };
         async move {
             handle_proxy_request_on_frontend_port(
                 req,
@@ -6263,7 +6344,7 @@ async fn handle_tls_connection(
                 true,
                 cert,
                 chain,
-                frontend_listen_port,
+                connection_metadata,
             )
             .await
         }
@@ -6756,7 +6837,7 @@ pub async fn handle_proxy_request(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
-        None,
+        RequestConnectionMetadata::default(),
     )
     .await
 }
@@ -6768,7 +6849,7 @@ async fn handle_proxy_request_on_frontend_port(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    frontend_listen_port: Option<u16>,
+    connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
@@ -6808,7 +6889,7 @@ async fn handle_proxy_request_on_frontend_port(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
-        frontend_listen_port,
+        connection_metadata,
     )
     .await;
 
@@ -6830,7 +6911,7 @@ async fn handle_proxy_request_inner(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    frontend_listen_port: Option<u16>,
+    connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -6851,13 +6932,23 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
-    ctx.frontend_listen_port = Some(frontend_listen_port.unwrap_or(if is_tls {
-        state.env_config.proxy_https_port
-    } else {
-        state.env_config.proxy_http_port
-    }));
+    ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
+        if is_tls {
+            state.env_config.proxy_https_port
+        } else {
+            state.env_config.proxy_http_port
+        },
+    ));
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
+    if let Some(identity) = connection_metadata.node_waypoint_identity {
+        // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
+        // identity is the authenticated source workload for policy. It
+        // intentionally pre-populates `peer_spiffe_id` so mesh authz and the
+        // SPIFFE identity plugin consume the pod identity instead of baggage or
+        // future TLS-peer derivation on this listener.
+        ctx.peer_spiffe_id = Some(identity.spiffe_id.clone());
+    }
     // Store raw query string on ctx for lazy parsing. The local `query_string`
     // is kept for validation + URL building; the ctx copy is consumed by
     // materialize_query_params() when plugins need the parsed HashMap.

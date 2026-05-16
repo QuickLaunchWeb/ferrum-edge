@@ -2,11 +2,11 @@
 
 Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this mode the gateway consumes mesh configuration from a Ferrum Control Plane (native `MeshSubscribe` gRPC) or a standard xDS ADS server, materializes SPIFFE-identity-aware proxies and authorization policies, and serves traffic with automatic mTLS, identity propagation, and Istio-compatible observability. The mesh subsystem deliberately reuses the existing proxy/plugin chain so all 58+ gateway plugins work unchanged in mesh context.
 
-Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
+Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
 
 ## Topologies
 
-Mesh mode supports four topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
+Mesh mode supports five topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
 
 ### Sidecar
 
@@ -29,6 +29,16 @@ Ztunnel-style ambient mesh proxy that terminates HBONE (HTTP/2 CONNECT over mTLS
 | HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
 
 The HBONE listener accepts HTTP/2 CONNECT streams over mTLS on port 15008. Source identity is extracted from the mTLS peer certificate and optionally from W3C Baggage headers. See [HBONE Protocol](#hbone-protocol) below.
+
+### Node Waypoint
+
+Node-scoped sidecarless waypoint for pods captured by the node agent. This topology uses the same HBONE listener as ambient mode, but source pod identity is resolved from the node-agent/eBPF socket-cookie record instead of assuming one proxy per workload.
+
+| Listener | Address | Direction | Kind |
+|---|---|---|---|
+| HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
+
+At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
 
 ### East-West Gateway
 
@@ -422,6 +432,7 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 |---|---|---|
 | `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
 | `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
+| `NodeWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
 
@@ -429,9 +440,10 @@ The resolved mode is captured **once at startup** from the first valid slice. Su
 
 ### Disable-mode topology guard
 
-`PeerAuthentication.mode: disable` resolved against an `Ambient` or `EgressGateway` workload causes startup to fail closed:
+`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, or `EgressGateway` workload causes startup to fail closed:
 
 - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
+- **NodeWaypoint**: the shared node listener must resolve pod identity from the node-agent/eBPF socket-cookie record before admitting HBONE traffic. Use `permissive` or `strict`.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
 
 `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
@@ -1053,7 +1065,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 |---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native` or `xds` |
 | `FERRUM_MESH_NODE_ID` | `$HOSTNAME` or `ferrum-mesh-node` | Node identifier sent to the CP |
-| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `east_west_gateway`, `egress_gateway` |
+| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `east_west_gateway`, `egress_gateway` |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
