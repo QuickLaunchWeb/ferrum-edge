@@ -52,7 +52,7 @@ Push tag v* (e.g., v0.2.0)
 
 The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Format, test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
 
-CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation; rerun the latest workflow if a publish was canceled mid-flight.
+CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
 ### Jobs
 
@@ -101,7 +101,7 @@ cargo nextest run --test functional_tests \
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Integration tests
-- Functional tests split across harness, admin-routing, data-plane, plugins, protocols, and resilience shards. CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
+- Functional tests split across six shards (harness, admin-routing, data-plane, plugins, protocols, and resilience). CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
 
 **Output**:
 - Test pass/fail status
@@ -159,13 +159,13 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. These cross-platform binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build runs on the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain; it does not use `cross`.
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. The job installs the same prerequisites as the Release pipeline matrix — `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 #### 7. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
+On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
@@ -206,7 +206,7 @@ Builds optimized release binaries for all target platforms:
 
 **Cross-Compilation**:
 - Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
-- Other targets use standard `cargo build`; macOS x86_64 is built on the ARM64 `macos-latest` runner with the standard Apple/Rust target tooling.
+- Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
 - Binary: `ferrum-edge-{platform}`
@@ -513,21 +513,21 @@ Pre-built Docker images are published to Docker Hub and GitHub Container Registr
 
 ```bash
 docker pull ferrumedge/ferrum-edge:latest
-docker pull ferrumedge/ferrum-edge:main-<git-sha>
+docker pull ferrumedge/ferrum-edge:main-<sha>
 docker pull ferrumedge/ferrum-edge:v1.2.3
 docker pull ferrumedge/ferrum-edge:1.2.3
 docker pull ferrumedge/ferrum-edge:1.2
 
 docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
-docker pull ghcr.io/ferrum-edge/ferrum-edge:main-<git-sha>
+docker pull ghcr.io/ferrum-edge/ferrum-edge:main-<sha>
 docker pull ghcr.io/ferrum-edge/ferrum-edge:v1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
-The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<git-sha>` tag uses the full commit SHA from `github.sha`.
+The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<sha>` tag uses the full commit SHA from `github.sha`.
 
-The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it tracks the GitHub repository owner/name if the repository is moved or forked.
+The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in both `ci.yml` and `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
 ## GitHub Actions Secrets
 
