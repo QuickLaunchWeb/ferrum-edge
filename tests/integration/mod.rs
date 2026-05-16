@@ -6,6 +6,7 @@ mod admin_db_api_specs_tests;
 mod admin_runtime_metrics_tests;
 mod apply_incremental_outcome_tests;
 mod backend_mtls_tests;
+mod backend_tls_san_allow_list_tests;
 mod connection_pool_tests;
 mod cp_dp_grpc_tests;
 mod db_incremental_poll_tests;

@@ -1,14 +1,19 @@
 use dashmap::DashMap;
 use std::fs;
 use std::io::Cursor;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reqwest::ClientBuilder;
 use rustls::client::WebPkiServerVerifier;
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore};
 use thiserror::Error;
+use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 use crate::config::types::{BackendTlsConfig, Proxy};
 use crate::tls::{
@@ -101,6 +106,250 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push(if verify_server_cert { '1' } else { '0' });
+}
+
+#[derive(Debug)]
+enum BackendServerVerifier {
+    WebPki(Arc<WebPkiServerVerifier>),
+    SanAllowList(Arc<SanAllowListVerifier>),
+}
+
+impl ServerCertVerifier for BackendServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        match self {
+            Self::WebPki(verifier) => verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
+            Self::SanAllowList(verifier) => verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        match self {
+            Self::WebPki(verifier) => verifier.verify_tls12_signature(message, cert, dss),
+            Self::SanAllowList(verifier) => verifier.verify_tls12_signature(message, cert, dss),
+        }
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        match self {
+            Self::WebPki(verifier) => verifier.verify_tls13_signature(message, cert, dss),
+            Self::SanAllowList(verifier) => verifier.verify_tls13_signature(message, cert, dss),
+        }
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        match self {
+            Self::WebPki(verifier) => verifier.supported_verify_schemes(),
+            Self::SanAllowList(verifier) => verifier.supported_verify_schemes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SanAllowListEntry {
+    Dns(String),
+    Uri(String),
+    Ip(IpAddr),
+}
+
+impl SanAllowListEntry {
+    fn parse(value: &str) -> Result<Self, TlsError> {
+        if value.trim().is_empty() || value.trim() != value {
+            return Err(TlsError::Rustls(
+                "backend TLS SAN allow-list entry must be non-empty and trimmed".to_string(),
+            ));
+        }
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Ok(Self::Ip(ip));
+        }
+        if value
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("spiffe://"))
+        {
+            return Ok(Self::Uri(value.to_string()));
+        }
+        if value.contains("://") {
+            return Err(TlsError::Rustls(
+                "backend TLS URI SAN allow-list entries must be SPIFFE URIs".to_string(),
+            ));
+        }
+        Ok(Self::Dns(value.to_ascii_lowercase()))
+    }
+}
+
+/// A backend server verifier that delegates normal chain/name verification to
+/// webpki, then requires at least one certificate SAN to match an explicit
+/// allow-list entry.
+#[derive(Debug)]
+pub struct SanAllowListVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    allowed_sans: Arc<Vec<SanAllowListEntry>>,
+}
+
+impl SanAllowListVerifier {
+    pub fn new(
+        inner: Arc<WebPkiServerVerifier>,
+        allowed_sans: Vec<String>,
+    ) -> Result<Self, TlsError> {
+        let allowed_sans = allowed_sans
+            .iter()
+            .map(|san| SanAllowListEntry::parse(san))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            inner,
+            allowed_sans: Arc::new(allowed_sans),
+        })
+    }
+
+    fn verify_allowed_sans(&self, end_entity: &CertificateDer<'_>) -> Result<(), RustlsError> {
+        if self.allowed_sans.is_empty() {
+            return Ok(());
+        }
+        certificate_matches_allowed_sans(end_entity, &self.allowed_sans)
+    }
+}
+
+impl ServerCertVerifier for SanAllowListVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let verified = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        self.verify_allowed_sans(end_entity)?;
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn certificate_matches_allowed_sans(
+    end_entity: &CertificateDer<'_>,
+    allowed_sans: &[SanAllowListEntry],
+) -> Result<(), RustlsError> {
+    let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref()).map_err(|e| {
+        RustlsError::General(format!(
+            "backend certificate SAN allow-list: failed to parse end-entity certificate: {e}"
+        ))
+    })?;
+
+    let mut saw_subject_alt_name = false;
+    for extension in cert.extensions() {
+        let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() else {
+            continue;
+        };
+        saw_subject_alt_name = true;
+        for name in &san.general_names {
+            if general_name_matches_any_allowed(name, allowed_sans) {
+                return Ok(());
+            }
+        }
+    }
+
+    if saw_subject_alt_name {
+        Err(RustlsError::General(
+            "backend certificate SAN allow-list rejected certificate: no SAN matched".into(),
+        ))
+    } else {
+        Err(RustlsError::General(
+            "backend certificate SAN allow-list rejected certificate: no SAN extension".into(),
+        ))
+    }
+}
+
+fn general_name_matches_any_allowed(
+    name: &GeneralName<'_>,
+    allowed_sans: &[SanAllowListEntry],
+) -> bool {
+    allowed_sans
+        .iter()
+        .any(|allowed| general_name_matches_allowed(name, allowed))
+}
+
+fn general_name_matches_allowed(name: &GeneralName<'_>, allowed: &SanAllowListEntry) -> bool {
+    match (name, allowed) {
+        (GeneralName::DNSName(actual), SanAllowListEntry::Dns(expected)) => {
+            actual.eq_ignore_ascii_case(expected)
+        }
+        (GeneralName::URI(actual), SanAllowListEntry::Uri(expected)) => *actual == expected,
+        (GeneralName::IPAddress(actual), SanAllowListEntry::Ip(expected)) => {
+            ip_addr_from_san_bytes(actual).is_some_and(|actual| actual == *expected)
+        }
+        _ => false,
+    }
+}
+
+fn ip_addr_from_san_bytes(bytes: &[u8]) -> Option<IpAddr> {
+    match bytes.len() {
+        4 => {
+            let mut octets = [0_u8; 4];
+            octets.copy_from_slice(bytes);
+            Some(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        16 => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(bytes);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
 }
 
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:
@@ -205,13 +454,37 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             }
         } else {
             let verifier = self.build_server_verifier()?;
-            let builder = builder.with_webpki_verifier(verifier);
-
-            match client_auth {
-                Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
-                    TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
-                }),
-                None => Ok(builder.with_no_client_auth()),
+            match verifier {
+                BackendServerVerifier::WebPki(verifier) => {
+                    let builder = builder.with_webpki_verifier(verifier);
+                    match client_auth {
+                        Some((certs, key)) => {
+                            builder.with_client_auth_cert(certs, key).map_err(|e| {
+                                TlsError::Rustls(format!(
+                                    "Invalid client certificate/key pair: {}",
+                                    e
+                                ))
+                            })
+                        }
+                        None => Ok(builder.with_no_client_auth()),
+                    }
+                }
+                BackendServerVerifier::SanAllowList(verifier) => {
+                    let dangerous = builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier);
+                    match client_auth {
+                        Some((certs, key)) => {
+                            dangerous.with_client_auth_cert(certs, key).map_err(|e| {
+                                TlsError::Rustls(format!(
+                                    "Invalid client certificate/key pair: {}",
+                                    e
+                                ))
+                            })
+                        }
+                        None => Ok(dangerous.with_no_client_auth()),
+                    }
+                }
             }
         }?;
 
@@ -231,10 +504,17 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         Ok(builder.use_preconfigured_tls(self.build_rustls()?))
     }
 
-    fn build_server_verifier(&self) -> Result<Arc<WebPkiServerVerifier>, TlsError> {
+    fn build_server_verifier(&self) -> Result<BackendServerVerifier, TlsError> {
         let root_store = build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
-        build_server_verifier_with_crls(root_store, self.crls)
-            .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))
+        let inner = build_server_verifier_with_crls(root_store, self.crls)
+            .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
+        if self.proxy.resolved_tls.san_allow_list.is_empty() {
+            Ok(BackendServerVerifier::WebPki(inner))
+        } else {
+            Ok(BackendServerVerifier::SanAllowList(Arc::new(
+                SanAllowListVerifier::new(inner, self.proxy.resolved_tls.san_allow_list.clone())?,
+            )))
+        }
     }
 
     fn skip_verification(&self) -> bool {
@@ -771,6 +1051,31 @@ mod tests {
                 rustls::pki_types::UnixTime::now(),
             )
             .expect("unrelated CRL should not reject trusted cert");
+    }
+
+    #[test]
+    fn build_server_verifier_uses_plain_webpki_when_san_allow_list_empty() {
+        ensure_crypto_provider();
+        let proxy = test_proxy();
+        let verifier = builder_for(&proxy, None, false, None, None, &[])
+            .build_server_verifier()
+            .expect("verifier");
+
+        assert!(matches!(verifier, BackendServerVerifier::WebPki(_)));
+    }
+
+    #[test]
+    fn build_server_verifier_wraps_when_san_allow_list_configured() {
+        ensure_crypto_provider();
+        let mut proxy = test_proxy();
+        proxy.resolved_tls.san_allow_list = vec!["localhost".to_string()];
+        proxy.resolved_tls.recompute_san_digest();
+
+        let verifier = builder_for(&proxy, None, false, None, None, &[])
+            .build_server_verifier()
+            .expect("verifier");
+
+        assert!(matches!(verifier, BackendServerVerifier::SanAllowList(_)));
     }
 
     #[test]
