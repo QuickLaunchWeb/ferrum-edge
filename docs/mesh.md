@@ -40,6 +40,17 @@ Node-scoped sidecarless waypoint for pods captured by the node agent. This topol
 
 At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
 
+#### BPF SOCK_OPS observability (GAP-SC3)
+
+The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces the TCP-layer counters published by the `BPF_PROG_TYPE_SOCK_OPS` program. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState` that the plugin reads on each `/metrics` scrape. Metrics emitted (Prometheus text format):
+
+- `ferrum_mesh_bpf_tcp_events_total{event="connect"|"accept_established"|"rst_sent"|"rst_received"|"fin_sent"|"fin_received"}` — per-TCP-event counts. Operators correlate `accept` vs `connect` rates to spot stuck pods or pre-handshake drops.
+- `ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|"exclude_cidr_hit"|"not_in_include_cidr"|"exclude_port_hit"}` — how often each BPF drop reason fired. Previously invisible.
+- `ferrum_mesh_bpf_srtt_microseconds_{sum,count}`, `ferrum_mesh_bpf_syn_to_ack_microseconds_{sum,count}`, `ferrum_mesh_bpf_accept_to_first_byte_microseconds_{sum,count}` — TCP-layer latency aggregates. Operators derive averages from `sum / count`. App-layer latency stays in `workload_metrics`.
+- `ferrum_mesh_bpf_ringbuf_overruns_total` + companion `ferrum_mesh_bpf_ringbuf_in_overrun_regime` gauge — ringbuf health. Non-zero overrun count means userspace fell behind and the kernel dropped events; raise `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` or reduce event rate. The consumer also logs one `warn!` per regime entry and one `info!` on recovery — no per-event spam.
+
+The kernel-side BPF program and the `aya::maps::RingBuf::poll_async` wiring land as separate follow-up PRs; this PR ships the userspace contract (event-decoder enum, consumer state machine, plugin Prometheus surface, auto-injection on `NodeWaypoint`) so dashboards, alerting rules, and tests can be authored against a stable shape.
+
 ### East-West Gateway
 
 Multi-cluster SNI-routed passthrough gateway. Does not create listeners directly; instead materializes passthrough TCP proxies from `MultiClusterConfig.east_west_gateways` entries.

@@ -1318,6 +1318,13 @@ pub mod priority {
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WORKLOAD_METRICS: u16 = 9360;
+    /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
+    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
+    /// SOCK_OPS event consumer. Auto-injected only when topology is
+    /// `NodeWaypoint`. Lives in the observability band alongside other
+    /// metric-emitter plugins so its `log` hook runs after all
+    /// transaction-summary serialization.
+    pub const MESH_BPF_METRICS: u16 = 9365;
     pub const ACCESS_LOG: u16 = 9375;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
@@ -1946,6 +1953,16 @@ pub fn create_plugin_with_http_client(
         "workload_metrics" => Ok(Some(Arc::new(
             mesh::workload_metrics::WorkloadMetrics::new_with_http_client(config, http_client)?,
         ))),
+        // GAP-SC3: `__mesh_bpf_metrics` is auto-injected on `NodeWaypoint`
+        // topology. Until a `ProxyState` plumbed Arc<BpfMetricsState> is
+        // threaded through create_plugin_with_http_client, the factory
+        // path builds a plugin with a fresh, unattached metrics state.
+        // This keeps the chain valid; the production wiring (passing the
+        // SockOpsConsumer's shared state) lands when the BPF program is
+        // wired in.
+        "__mesh_bpf_metrics" => Ok(Some(Arc::new(mesh::bpf_metrics::MeshBpfMetrics::new(
+            config,
+        )?))),
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
@@ -2062,6 +2079,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "spec_expose",
         "api_chargeback",
         "workload_metrics",
+        "__mesh_bpf_metrics",
         "fault_injection",
         "access_log",
     ];
