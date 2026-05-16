@@ -489,6 +489,17 @@ impl MeshSlice {
     }
 }
 
+/// Filter `workloads` down to the SPIFFE identities referenced by admitted
+/// services.
+///
+/// The local workload running this sidecar is usually not in any admitted
+/// service's `workloads[]` and can therefore be removed from `slice.workloads`.
+/// Consumers that need the local identity must read `MeshSlice::workload_spiffe_id`
+/// or use `inferred_workload_labels_for_request`, which runs before narrowing.
+///
+/// Inbound mTLS peer validation uses `slice.trust_bundles`, and HBONE
+/// `source.principal` baggage uses peer-cert trust-domain matching plus
+/// `FERRUM_MESH_TRUST_DOMAIN_ALIASES`, so neither depends on this list.
 fn narrow_workload_identities(
     workloads: Vec<Workload>,
     admitted_services: &[MeshService],
@@ -497,6 +508,12 @@ fn narrow_workload_identities(
         .iter()
         .flat_map(|service| service.workloads.iter().map(|workload| &workload.spiffe_id))
         .collect();
+    if !admitted_services.is_empty() && reachable_identities.is_empty() {
+        warn!(
+            admitted_services = admitted_services.len(),
+            "Sidecar workload identity narrowing found no reachable identities; admitted MeshService.workloads lists are empty"
+        );
+    }
     workloads
         .into_iter()
         .filter(|workload| reachable_identities.contains(&workload.spiffe_id))
@@ -3439,6 +3456,14 @@ mod tests {
         }
     }
 
+    fn slice_request_identity_narrowing_only(namespace: &str) -> MeshSliceRequest {
+        MeshSliceRequest {
+            enforce_sidecar_egress: false,
+            enforce_sidecar_identity_narrowing: true,
+            ..slice_request_enforced(namespace)
+        }
+    }
+
     fn port_numbers(ports: &[ServicePort]) -> Vec<u16> {
         ports.iter().map(|port| port.port).collect()
     }
@@ -3779,6 +3804,48 @@ mod tests {
             slice.workloads.len(),
             2,
             "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false keeps the legacy workload list"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_requires_sidecar_egress_enforcement() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice =
+            MeshSlice::from_gateway_config(&config, slice_request_identity_narrowing_only("alpha"));
+
+        assert_eq!(
+            slice.services.len(),
+            2,
+            "identity narrowing alone must not enable sidecar egress narrowing"
+        );
+        assert_eq!(
+            slice.workloads.len(),
+            2,
+            "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true is a no-op until FERRUM_MESH_SIDECAR_ENFORCED=true"
         );
     }
 
