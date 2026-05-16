@@ -396,7 +396,10 @@ fn peer_authentication(
 /// are deliberately not translated yet — egress scoping is the immediate
 /// compatibility gap; the other surfaces stay in the documented "deferred"
 /// table until separate PRs land them.
-fn sidecar(_acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+fn sidecar(
+    _acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = selector_from_istio(Some(selector_value));
