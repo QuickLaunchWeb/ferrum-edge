@@ -5,6 +5,7 @@
 //! HTTP server to assert wire format.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{
@@ -15,6 +16,8 @@ use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 
 fn fixed_notification() -> Notification {
     Notification {
@@ -38,6 +41,35 @@ fn parse_one(name: &str, def: Value) -> NotificationChannel {
     let map = parse_channels(&json!({ name: def })).unwrap();
     let arc = map.get(name).expect("channel parsed").clone();
     (*arc).clone()
+}
+
+async fn spawn_raw_notification_response_server(response: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
+    // Currently used by the all-channel non-success test. It fully reads the
+    // request headers before responding so future raw fixtures can reuse it
+    // without depending on partial-read timing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        socket.write_all(&response).await.unwrap();
+    });
+    (addr, server)
+}
+
+async fn read_request_headers(socket: &mut TcpStream) {
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    loop {
+        let n = socket.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- parse_channels
@@ -457,8 +489,7 @@ async fn webhook_body_read_error_redacts_secret_url() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\nshort")
             .await
@@ -484,6 +515,266 @@ async fn webhook_body_read_error_redacts_secret_url() {
     assert!(err.contains("redacted"), "got: {err}");
     assert!(!err.contains("TOKEN123"), "got: {err}");
     assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn webhook_oversized_content_length_response_body_is_rejected_and_redacted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(err.contains("exceeds drain limit"), "got: {err}");
+    assert!(err.contains("before reading"), "got: {err}");
+    assert!(err.contains("redacted"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn webhook_response_body_at_drain_limit_is_allowed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        let body = vec![b'x'; 1024 * 1024];
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn webhook_oversized_chunked_response_body_is_rejected_and_redacted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..5 {
+            let head = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(&chunk).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(err.contains("exceeds drain limit"), "got: {err}");
+    assert!(err.contains("after reading"), "got: {err}");
+    assert!(err.contains("redacted"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn webhook_chunked_response_body_at_drain_limit_is_allowed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..4 {
+            let head = format!("{:x}\r\n", chunk.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&chunk).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn webhook_non_success_status_short_circuits_oversized_body_drain() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_headers(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(err.contains("non-success status 500"), "got: {err}");
+    assert!(!err.contains("exceeds drain limit"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn non_success_status_errors_include_redacted_url_for_all_channels() {
+    // This covers the non-success short-circuit for every channel. Oversized
+    // response-body paths share `finalize_dispatch_response`, so the webhook
+    // tests above pin the shared drain-limit behavior once; this loop pins
+    // each channel's status-first dispatch ordering and URL redaction.
+    let configs = [
+        (
+            "slack",
+            json!({
+                "type": "slack",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "teams",
+            json!({
+                "type": "teams",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "discord",
+            json!({
+                "type": "discord",
+                "webhook_url": null,
+            }),
+        ),
+        (
+            "webhook",
+            json!({
+                "type": "webhook",
+                "url": null,
+                "body_template": "x",
+            }),
+        ),
+    ];
+
+    for (name, mut config) in configs {
+        let (addr, server) = spawn_raw_notification_response_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let url = format!("http://{addr}/hooks/TOKEN123?routing_key=abc123");
+        if name == "webhook" {
+            config["url"] = json!(url);
+        } else {
+            config["webhook_url"] = json!(url);
+        }
+
+        let channel = parse_one(name, config);
+        let err = channel
+            .dispatch(&fixed_notification(), &PluginHttpClient::default())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(err.contains("non-success status 500"), "got: {err}");
+        assert!(err.contains("redacted"), "got: {err}");
+        assert!(!err.contains("TOKEN123"), "got: {err}");
+        assert!(!err.contains("abc123"), "got: {err}");
+    }
 }
 
 // -------------------------------------------------- env-var resolution helper
