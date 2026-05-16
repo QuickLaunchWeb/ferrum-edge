@@ -73,7 +73,7 @@ The Ferrum-native protocol uses the `MeshConfigSync.MeshSubscribe` gRPC streamin
 
 ### xDS ADS
 
-Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, RDS, and SDS resource types via state-of-the-world mode with incremental version tracking.
+Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, RDS, SDS, and ECDS resource types via state-of-the-world mode with incremental version tracking. ECDS is subscribed last as a richer-semantics overlay (see the DR-carrier bullet below); the slice still applies if no ECDS resources are returned.
 
 - **25ms debounce** on slice application to batch rapid resource updates.
 - **Multi-CP failover**: same URL list and backoff as native mode.

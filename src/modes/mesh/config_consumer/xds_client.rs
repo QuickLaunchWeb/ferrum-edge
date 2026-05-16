@@ -1856,6 +1856,7 @@ mod tests {
 
     #[test]
     fn ecds_dr_carrier_payload_recovers_destination_rule() {
+        use crate::modes::mesh::config::{MeshLoadBalancer, MeshSimpleLb};
         let dr_json = r#"{
             "name": "api-dr",
             "namespace": "default",
@@ -1878,12 +1879,22 @@ mod tests {
             .expect("reverse translate")
             .expect("all required types present");
         assert_eq!(slice.destination_rules.len(), 1);
-        assert_eq!(slice.destination_rules[0].name, "api-dr");
-        assert_eq!(slice.destination_rules[0].namespace, "default");
-        assert_eq!(
-            slice.destination_rules[0].host,
-            "api.default.svc.cluster.local"
-        );
+        let dr = &slice.destination_rules[0];
+        assert_eq!(dr.name, "api-dr");
+        assert_eq!(dr.namespace, "default");
+        assert_eq!(dr.host, "api.default.svc.cluster.local");
+        // Pin nested DR semantics round-trip — the whole point of the carrier
+        // path is that fields baked out of CDS/EDS (LB algorithm, etc.) come
+        // back intact. Without this assertion the test would pass even if the
+        // inner JSON were silently truncated to {name, namespace, host}.
+        let policy = dr
+            .traffic_policy
+            .as_ref()
+            .expect("traffic_policy should round-trip from ECDS DR-carrier");
+        match policy.load_balancer.as_ref() {
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)) => {}
+            other => panic!("expected Simple(RoundRobin) load balancer, got {other:?}"),
+        }
     }
 
     #[test]
