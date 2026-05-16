@@ -290,6 +290,9 @@ impl SpecExpose {
             });
         }
 
+        // The plugin HTTP client is built without reqwest auto-decompression
+        // features. If that changes, content_length() can become None for
+        // encoded responses and the streaming guard below remains authoritative.
         if let Some(content_length) = response.content_length()
             && content_length > self.max_response_body_bytes as u64
         {
@@ -299,7 +302,7 @@ impl SpecExpose {
                 max_response_body_bytes = self.max_response_body_bytes,
                 "spec_expose: upstream spec response body exceeds configured limit"
             );
-            return Err(Self::body_too_large_reject(self.max_response_body_bytes));
+            return Err(self.body_too_large_reject());
         }
 
         // Determine content-type: plugin override > upstream response > default.
@@ -325,7 +328,7 @@ impl SpecExpose {
                         max_response_body_bytes = self.max_response_body_bytes,
                         "spec_expose: upstream spec response body exceeded configured limit while streaming"
                     );
-                    Self::body_too_large_reject(self.max_response_body_bytes)
+                    self.body_too_large_reject()
                 }
                 BoundedReadError::Stream(e) => {
                     tracing::warn!(
@@ -356,13 +359,14 @@ impl SpecExpose {
         Ok(entry)
     }
 
-    fn body_too_large_reject(max_response_body_bytes: usize) -> PluginResult {
+    fn body_too_large_reject(&self) -> PluginResult {
         let mut headers = HashMap::with_capacity(1);
         headers.insert("content-type".to_string(), "application/json".to_string());
         PluginResult::Reject {
             status_code: 502,
             body: format!(
-                r#"{{"error":"API specification response exceeds max_response_body_bytes ({max_response_body_bytes})"}}"#
+                r#"{{"error":"API specification response exceeds max_response_body_bytes ({})"}}"#,
+                self.max_response_body_bytes
             ),
             headers,
         }

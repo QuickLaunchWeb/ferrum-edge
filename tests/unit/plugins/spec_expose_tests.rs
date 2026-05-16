@@ -466,10 +466,13 @@ async fn test_specz_request_rejects_oversized_content_length_spec_body() {
 async fn test_specz_request_rejects_oversized_chunked_spec_body() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
+        // One uncached /specz call performs one upstream GET. If that ever gains
+        // retry behavior, the timeout below fails fast instead of hanging CI.
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 1024];
         let _ = socket.read(&mut buf).await.unwrap();
@@ -509,7 +512,10 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
 
     let mut ctx = make_ctx("GET", "/api/specz", "/api");
     let result = plugin.on_request_received(&mut ctx).await;
-    server.await.unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .expect("raw spec server timed out")
+        .expect("raw spec server panicked");
 
     match result {
         PluginResult::Reject {
