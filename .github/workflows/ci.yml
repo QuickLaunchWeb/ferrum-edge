@@ -170,6 +170,9 @@ jobs:
               scripted_backend_tests
               scripted_backend_udp_tests
           - shard: data-plane
+            # Serialized because DP functional tests bind exclusive ports and
+            # race when nextest runs this shard in parallel.
+            nextest_jobs: 1
             filters: |
               functional_capability_registry_test
               functional_cp_dp_resilience_test
@@ -271,13 +274,19 @@ jobs:
             [ -z "$filter" ] && continue
             filters+=("$filter")
           done <<< "$FUNCTIONAL_FILTERS"
+          nextest_args=()
+          if [ -n "${NEXTEST_JOBS:-}" ]; then
+            nextest_args+=("-j" "$NEXTEST_JOBS")
+          fi
           cargo nextest run --test functional_tests \
             --run-ignored=all \
             --no-fail-fast \
             -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
+            "${nextest_args[@]}" \
             "${filters[@]}"
         env:
           FUNCTIONAL_FILTERS: ${{ matrix.filters }}
+          NEXTEST_JOBS: ${{ matrix.nextest_jobs }}
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
         timeout-minutes: 30

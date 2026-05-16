@@ -67,7 +67,11 @@ impl MeshServiceDiscoverer {
         })
     }
 
-    fn workload_matches_service(service: &MeshService, workload: &Workload) -> bool {
+    fn workload_matches_service(
+        service: &MeshService,
+        workload: &Workload,
+        matching_service_spiffe_ids: &HashSet<&str>,
+    ) -> bool {
         if workload.namespace != service.namespace {
             return false;
         }
@@ -76,10 +80,24 @@ impl MeshServiceDiscoverer {
             return workload.service_name == service.name;
         }
 
-        service
+        if !service
             .workloads
             .iter()
             .any(|reference| reference.spiffe_id == workload.spiffe_id)
+        {
+            return false;
+        }
+
+        if workload.service_name == service.name {
+            return true;
+        }
+
+        // Legacy and hand-authored mesh snapshots can carry authoritative
+        // MeshService.workloads refs while workload.service_name metadata still
+        // points at another logical service. Prefer a matching service_name when
+        // duplicate SPIFFE entries exist, but do not blackhole explicit refs when
+        // the metadata is stale or absent.
+        !matching_service_spiffe_ids.contains(workload.spiffe_id.as_str())
     }
 
     fn target_port_for_workload(
@@ -170,11 +188,17 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
-        for workload in mesh
+        let matching_service_spiffe_ids: HashSet<&str> = mesh
             .workloads
             .iter()
-            .filter(|workload| Self::workload_matches_service(service, workload))
-        {
+            .filter(|workload| {
+                workload.namespace == service.namespace && workload.service_name == service.name
+            })
+            .map(|workload| workload.spiffe_id.as_str())
+            .collect();
+        for workload in mesh.workloads.iter().filter(|workload| {
+            Self::workload_matches_service(service, workload, &matching_service_spiffe_ids)
+        }) {
             let Some(selected_port) =
                 Self::target_port_for_workload(selected_service_port.as_ref(), workload)
             else {
@@ -372,6 +396,58 @@ mod tests {
             workloads: vec![workload(
                 "spiffe://cluster.local/ns/ferrum/sa/api",
                 "api",
+                vec!["10.0.0.1"],
+                vec![8080],
+            )],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn service_workload_refs_do_not_cross_match_same_spiffe_other_services() {
+        let shared_id = "spiffe://cluster.local/ns/ferrum/sa/shared";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![shared_id], vec![8080])],
+            workloads: vec![
+                workload(shared_id, "api", vec!["10.0.0.1"], vec![8080]),
+                workload(shared_id, "metrics", vec!["10.0.0.2"], vec![8080]),
+            ],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn service_workload_refs_allow_legacy_mismatched_service_metadata() {
+        let shared_id = "spiffe://cluster.local/ns/ferrum/sa/shared";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![shared_id], vec![8080])],
+            workloads: vec![workload(
+                shared_id,
+                "legacy-api",
                 vec!["10.0.0.1"],
                 vec![8080],
             )],

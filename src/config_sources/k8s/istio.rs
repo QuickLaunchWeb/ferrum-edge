@@ -23,6 +23,7 @@ use super::{
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -1187,6 +1188,32 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
+    let service_raw = object
+        .spec
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or(&object.metadata.name);
+    let service_key = workload_entry_service_key_from_host(
+        service_raw,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    );
+    match service_key.as_ref() {
+        Some(key) if key.namespace != object.metadata.namespace => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "WorkloadEntry.service '{service_raw}' references Service namespace '{}' but WorkloadEntry namespace is '{}'; cross-namespace WorkloadEntry service hosts are not supported",
+                    key.namespace, object.metadata.namespace
+                ),
+            ));
+        }
+        _ => {}
+    }
+    let service_name = service_key
+        .map(|key| key.name)
+        .unwrap_or_else(|| service_raw.to_string());
+
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
         selector: WorkloadSelector {
@@ -1197,12 +1224,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
                 .unwrap_or_default(),
             namespace: Some(object.metadata.namespace.clone()),
         },
-        service_name: object
-            .spec
-            .get("service")
-            .and_then(Value::as_str)
-            .unwrap_or(&object.metadata.name)
-            .to_string(),
+        service_name,
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),
@@ -2592,8 +2614,10 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec,
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -3155,6 +3179,93 @@ mod tests {
             "spiffe://cluster.local/ns/default/sa/api"
         );
         assert_eq!(workload.service_account.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_host_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "service": "reviews.prod.svc.cluster.local"
+                }),
+            )],
+            options(),
+        )
+        .expect_err("cross-namespace WorkloadEntry service host must fail closed");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("WorkloadEntry.service"),
+            "error should mention WorkloadEntry.service: {err}"
+        );
+        assert!(
+            err.contains("reviews.prod.svc.cluster.local"),
+            "error should include the offending host: {err}"
+        );
+        assert!(
+            err.contains("cross-namespace"),
+            "error should identify the unsupported cross-namespace reference: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_two_label_cross_namespace_service_host_is_preserved() {
+        let mut prod_service = object(
+            "Service",
+            serde_json::json!({
+                "ports": [{"port": 80}]
+            }),
+        );
+        prod_service.metadata.name = "reviews".to_string();
+        prod_service.metadata.namespace = "prod".to_string();
+        let result = translate_k8s_objects(
+            &[
+                prod_service,
+                object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "service": "reviews.prod"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect("two-label cross-namespace WorkloadEntry service host should stay literal");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].service_name, "reviews.prod");
+    }
+
+    #[test]
+    fn workload_entry_two_label_dns_service_name_is_preserved() {
+        let mut com_service = object(
+            "Service",
+            serde_json::json!({
+                "ports": [{"port": 80}]
+            }),
+        );
+        com_service.metadata.name = "placeholder".to_string();
+        com_service.metadata.namespace = "com".to_string();
+        let result = translate_k8s_objects(
+            &[
+                com_service,
+                object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "service": "example.com"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect("two-label DNS WorkloadEntry service should remain valid");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].service_name, "example.com");
     }
 
     #[test]
@@ -7901,8 +8012,10 @@ mod tests {
                     name: "mesh-default".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -7935,11 +8048,13 @@ mod tests {
                     name: "mesh-api".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({
                     "selector": {"matchLabels": {"app": "api"}},
                     "tracing": {"sampling": 50.0}
                 }),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -8062,11 +8177,13 @@ mod tests {
                         name: "api-overrides".to_string(),
                         namespace: "default".to_string(),
                         labels: HashMap::new(),
+                        deletion_timestamp: None,
                     },
                     spec: serde_json::json!({
                         "selector": {"matchLabels": {"app": "api"}},
                         "tracing": {"sampling": 99.0}
                     }),
+                    status: Value::Object(serde_json::Map::new()),
                 },
             ],
             options(),
@@ -8614,8 +8731,10 @@ mod tests {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({ "ports": ports_json }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8627,6 +8746,7 @@ mod tests {
                 name: name.to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "hosts": ["api.example.com"],
@@ -8635,6 +8755,7 @@ mod tests {
                     "route": [{"destination": destination}]
                 }]
             }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8816,6 +8937,7 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "ports": [
@@ -8823,6 +8945,7 @@ mod tests {
                     {"name": "grpc", "port": 9090}            // named entry survives
                 ]
             }),
+            status: Value::Object(serde_json::Map::new()),
         };
         let vs_missing = virtual_service_with_destination(
             "vs-missing",
@@ -8862,8 +8985,10 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({}),
+            status: Value::Object(serde_json::Map::new()),
         };
         let result =
             translate_k8s_objects(&[svc], options()).expect("Service with no ports must not panic");
