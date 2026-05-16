@@ -16,6 +16,7 @@ use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 fn fixed_notification() -> Notification {
@@ -52,21 +53,25 @@ async fn spawn_raw_notification_response_server(
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut buf = [0; 1024];
-        loop {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            request.extend_from_slice(&buf[..n]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
-                break;
-            }
-        }
+        read_request_headers(&mut socket).await;
         socket.write_all(response).await.unwrap();
     });
     (addr, server)
+}
+
+async fn read_request_headers(socket: &mut TcpStream) {
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    loop {
+        let n = socket.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- parse_channels
@@ -486,8 +491,7 @@ async fn webhook_body_read_error_redacts_secret_url() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\nshort")
             .await
@@ -521,8 +525,7 @@ async fn webhook_oversized_content_length_response_body_is_rejected_and_redacted
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n")
             .await
@@ -557,8 +560,7 @@ async fn webhook_response_body_at_drain_limit_is_allowed() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         let body = vec![b'x'; 1024 * 1024];
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -590,8 +592,7 @@ async fn webhook_oversized_chunked_response_body_is_rejected_and_redacted() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -643,8 +644,7 @@ async fn webhook_chunked_response_body_at_drain_limit_is_allowed() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -681,8 +681,7 @@ async fn webhook_non_success_status_short_circuits_oversized_body_drain() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await.unwrap();
+        read_request_headers(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
@@ -716,7 +715,8 @@ async fn webhook_non_success_status_short_circuits_oversized_body_drain() {
 async fn non_success_status_errors_include_redacted_url_for_all_channels() {
     // This covers the non-success short-circuit for every channel. Oversized
     // response-body paths share `finalize_dispatch_response`, so the webhook
-    // tests above exercise those branches once through the shared helper.
+    // tests above pin the shared drain-limit behavior once; this loop pins
+    // each channel's status-first dispatch ordering and URL redaction.
     let configs = [
         (
             "slack",

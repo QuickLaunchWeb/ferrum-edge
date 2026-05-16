@@ -28,7 +28,6 @@ pub mod webhook;
 /// and discards chunks instead of buffering them, so memory tracks the current
 /// response chunk and transport buffers rather than this full cap.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = 1024 * 1024;
-const RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64: u64 = RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64;
 
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
@@ -251,13 +250,14 @@ async fn drain_response_body_redacted(
     channel: &str,
     redacted_url: &str,
 ) -> Result<(), String> {
+    let drain_limit_bytes_u64 = RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64;
     if let Some(content_length) = resp.content_length()
-        && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64
+        && content_length > drain_limit_bytes_u64
     {
         // Keep this wording distinct from the streaming abort below; tests use
         // "before reading" vs. "after reading" to pin the intended path.
         return Err(format!(
-            "{channel} dispatch response body exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes before reading advertised {content_length}-byte response from {redacted_url}"
+            "{channel} dispatch response body exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes before reading response advertising Content-Length {content_length} from {redacted_url}"
         ));
     }
 
@@ -289,6 +289,9 @@ pub(super) async fn finalize_dispatch_response(
 ) -> Result<(), String> {
     let status = resp.status();
     if !status.is_success() {
+        // Keep non-success diagnostics status-only. Notification endpoint URLs
+        // often contain credentials, and response bodies are untrusted and not
+        // needed to identify a failed send.
         return Err(format!(
             "{channel} dispatch returned non-success status {status} from {redacted_url}"
         ));
