@@ -4,6 +4,7 @@
 //! We use `serial_test` via a simple mutex to enforce this.
 
 use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
+use ferrum_edge::ebpf::NodeAgentProxyMode;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -3711,6 +3712,85 @@ fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
     );
 }
 
+#[test]
+fn test_env_config_node_agent_contract_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "node_agent"),
+            ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+        ],
+        || {
+            remove_var("FERRUM_NODE_AGENT_PROXY_MODE");
+            remove_var("FERRUM_NODE_AGENT_ADMIN_ENABLED");
+            remove_var("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.node_agent_proxy_mode, NodeAgentProxyMode::LocalPod);
+            assert!(!config.node_agent_admin_enabled);
+            assert_eq!(
+                config.node_agent_hbone_redirect_port,
+                ferrum_ebpf_common::INBOUND_HBONE_PORT
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_node_agent_contract_custom_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "node_agent"),
+            ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+            ("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint"),
+            ("FERRUM_NODE_AGENT_ADMIN_ENABLED", "true"),
+            ("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.node_agent_proxy_mode,
+                NodeAgentProxyMode::NodeWaypoint
+            );
+            assert!(config.node_agent_admin_enabled);
+            assert_eq!(config.node_agent_hbone_redirect_port, 16008);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_node_agent_rejects_invalid_proxy_mode() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "node_agent"),
+            ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+            ("FERRUM_NODE_AGENT_PROXY_MODE", "bad"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_NODE_AGENT_PROXY_MODE"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_node_agent_rejects_hbone_port_equal_to_outbound_capture() {
+    let outbound_capture_port = ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT.to_string();
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "node_agent"),
+            ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+            (
+                "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT",
+                outbound_capture_port.as_str(),
+            ),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT"));
+            assert!(err.contains("outbound capture port"));
+        },
+    );
+}
+
 // --- DP CP failover URL tests ---
 
 #[test]
@@ -4115,6 +4195,51 @@ fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
                 "FERRUM_POOL_SHARD_AMOUNT=0 must remain 0 (auto sentinel) — \
                  the helper resolves it later, not the parser",
             );
+        },
+    );
+}
+
+#[test]
+fn test_k8s_istio_root_namespace_defaults_to_istio_system() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_K8S_ISTIO_ROOT_NAMESPACE");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.k8s_istio_root_namespace, "istio-system");
+        },
+    );
+}
+
+#[test]
+fn test_k8s_istio_root_namespace_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_ISTIO_ROOT_NAMESPACE", "istio-config"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.k8s_istio_root_namespace, "istio-config");
+        },
+    );
+}
+
+#[test]
+fn test_k8s_istio_root_namespace_rejects_invalid_k8s_namespace() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_ISTIO_ROOT_NAMESPACE", "Istio_System"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_K8S_ISTIO_ROOT_NAMESPACE"));
         },
     );
 }

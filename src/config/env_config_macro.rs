@@ -151,6 +151,13 @@ impl EnvValue for DbTlsMode {
     }
 }
 
+impl EnvValue for crate::ebpf::NodeAgentProxyMode {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        crate::ebpf::NodeAgentProxyMode::parse(raw)
+            .map_err(|_| invalid_env_value(key, raw, "local_pod or node_waypoint"))
+    }
+}
+
 impl EnvValue for Vec<String> {
     fn parse_env(raw: &str, _key: &str) -> Result<Self, String> {
         Ok(raw

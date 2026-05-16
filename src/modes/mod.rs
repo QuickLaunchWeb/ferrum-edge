@@ -10,7 +10,7 @@
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
 //! | `mesh`     | Yes   | Read-only   | xDS or native MeshSubscribe      |
 //! | `injector`   | No    | No          | Kubernetes admission webhook     |
-//! | `node_agent` | No    | No          | Per-node eBPF/iptables capture   |
+//! | `node_agent` | No    | Metrics     | Per-node eBPF/iptables capture   |
 //! | `migrate`    | No    | No          | Runs DB migrations then exits    |
 //!
 //! All modes share the same `ProxyState` and atomic config swap mechanism.

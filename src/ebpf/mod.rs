@@ -20,11 +20,184 @@ pub use loader::AyaEbpfBackend;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
+
+pub const DEFAULT_NODE_AGENT_SOCKET_PATH: &str = "/run/ferrum/node-agent.sock";
+pub const BPF_MAP_ORIG_DST4: &str = "FERRUM_ORIG_DST4";
+pub const BPF_MAP_ORIG_DST6: &str = "FERRUM_ORIG_DST6";
+pub const BPF_MAP_POD_IPS: &str = "FERRUM_POD_IPS";
+pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
+pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
+pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
+pub const BPF_MAP_CIDR_INCLUDE4: &str = "FERRUM_CIDR_INCLUDE4";
+pub const BPF_MAP_CIDR_INCLUDE6: &str = "FERRUM_CIDR_INCLUDE6";
+pub const BPF_MAP_PORT_EXCLUDE: &str = "FERRUM_PORT_EXCLUDE";
+pub const BPF_MAP_CAPTURE_CONFIG: &str = "FERRUM_CAPTURE_CONFIG";
+
+/// Node-agent proxy topology for the capture contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAgentProxyMode {
+    LocalPod,
+    NodeWaypoint,
+}
+
+impl NodeAgentProxyMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local_pod" => Ok(Self::LocalPod),
+            "node_waypoint" => Ok(Self::NodeWaypoint),
+            other => Err(format!(
+                "Invalid FERRUM_NODE_AGENT_PROXY_MODE '{other}'. Expected: local_pod or node_waypoint"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPod => "local_pod",
+            Self::NodeWaypoint => "node_waypoint",
+        }
+    }
+}
+
+impl std::fmt::Display for NodeAgentProxyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// BPF map names that form the node-agent/proxy capture ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureBpfMaps {
+    pub orig_dst4: &'static str,
+    pub orig_dst6: &'static str,
+    pub pod_ips: &'static str,
+    pub bypass_uids: &'static str,
+    pub cidr_exclude4: &'static str,
+    pub cidr_exclude6: &'static str,
+    pub cidr_include4: &'static str,
+    pub cidr_include6: &'static str,
+    pub port_exclude: &'static str,
+    pub capture_config: &'static str,
+}
+
+impl Default for CaptureBpfMaps {
+    fn default() -> Self {
+        Self {
+            orig_dst4: BPF_MAP_ORIG_DST4,
+            orig_dst6: BPF_MAP_ORIG_DST6,
+            pod_ips: BPF_MAP_POD_IPS,
+            bypass_uids: BPF_MAP_BYPASS_UIDS,
+            cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
+            cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
+            cidr_include4: BPF_MAP_CIDR_INCLUDE4,
+            cidr_include6: BPF_MAP_CIDR_INCLUDE6,
+            port_exclude: BPF_MAP_PORT_EXCLUDE,
+            capture_config: BPF_MAP_CAPTURE_CONFIG,
+        }
+    }
+}
+
+/// Formal node-agent/proxy capture surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureContract {
+    pub proxy_mode: NodeAgentProxyMode,
+    pub outbound_capture_port: u16,
+    pub hbone_redirect_port: u16,
+    pub unix_socket_path: String,
+    pub bpf_maps: CaptureBpfMaps,
+}
+
+impl CaptureContract {
+    pub fn new(
+        proxy_mode: NodeAgentProxyMode,
+        outbound_capture_port: u16,
+        hbone_redirect_port: u16,
+        unix_socket_path: impl Into<String>,
+    ) -> Result<Self, String> {
+        if outbound_capture_port == 0 {
+            return Err("CaptureContract outbound_capture_port must be non-zero".to_string());
+        }
+        if hbone_redirect_port == 0 {
+            return Err("CaptureContract hbone_redirect_port must be non-zero".to_string());
+        }
+        if outbound_capture_port == hbone_redirect_port {
+            return Err(
+                "CaptureContract outbound_capture_port and hbone_redirect_port must differ"
+                    .to_string(),
+            );
+        }
+        let unix_socket_path = unix_socket_path.into();
+        if unix_socket_path.trim().is_empty() {
+            return Err("CaptureContract unix_socket_path must not be empty".to_string());
+        }
+
+        Ok(Self {
+            proxy_mode,
+            outbound_capture_port,
+            hbone_redirect_port,
+            unix_socket_path,
+            bpf_maps: CaptureBpfMaps::default(),
+        })
+    }
+
+    pub fn local_pod_defaults() -> Self {
+        Self {
+            proxy_mode: NodeAgentProxyMode::LocalPod,
+            outbound_capture_port: OUTBOUND_CAPTURE_PORT,
+            hbone_redirect_port: INBOUND_HBONE_PORT,
+            unix_socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+            bpf_maps: CaptureBpfMaps::default(),
+        }
+    }
+
+    pub fn bpf_capture_config(&self) -> BpfCaptureConfig {
+        BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
+    }
+}
+
+/// Metrics tracked by the node agent.
+pub struct NodeAgentMetrics {
+    pub pods_enrolled: AtomicU64,
+    pub pods_unenrolled: AtomicU64,
+    pub attach_errors: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAgentMetricsSnapshot {
+    pub pods_enrolled: u64,
+    pub pods_unenrolled: u64,
+    pub attach_errors: u64,
+}
+
+impl NodeAgentMetrics {
+    pub fn snapshot(&self) -> NodeAgentMetricsSnapshot {
+        NodeAgentMetricsSnapshot {
+            pods_enrolled: self.pods_enrolled.load(Ordering::Relaxed),
+            pods_unenrolled: self.pods_unenrolled.load(Ordering::Relaxed),
+            attach_errors: self.attach_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for NodeAgentMetrics {
+    fn default() -> Self {
+        Self {
+            pods_enrolled: AtomicU64::new(0),
+            pods_unenrolled: AtomicU64::new(0),
+            attach_errors: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Metadata tracked per enrolled pod IP in the BPF `FERRUM_POD_IPS` map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodInfo {
     pub proxy_port: u16,
+    /// Reserved for future cgroup-aware BPF policy; current node-agent
+    /// enrollment writes `0` because IP-to-proxy-port capture is sufficient.
     pub cgroup_id: u64,
 }
 
@@ -66,6 +239,7 @@ impl FallbackMode {
 /// substitute.
 pub trait EbpfBackend: Send + Sync {
     fn load_programs(&mut self) -> Result<(), String>;
+    fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String>;
     fn attach_cgroup(
         &mut self,
         pod_uid: &str,
@@ -94,13 +268,23 @@ pub struct MockEbpfBackend {
     pub cidr_excludes: Vec<String>,
     pub cidr_includes: Vec<String>,
     pub port_excludes: Vec<u16>,
+    pub capture_config: Option<BpfCaptureConfig>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
+    pub fail_update_capture_config: bool,
 }
 
 impl EbpfBackend for MockEbpfBackend {
     fn load_programs(&mut self) -> Result<(), String> {
         self.programs_loaded = true;
+        Ok(())
+    }
+
+    fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
+        if self.fail_update_capture_config {
+            return Err("capture config update failed".to_string());
+        }
+        self.capture_config = Some(*config);
         Ok(())
     }
 
@@ -188,10 +372,74 @@ mod tests {
     }
 
     #[test]
+    fn node_agent_proxy_mode_parse_valid() {
+        assert_eq!(
+            NodeAgentProxyMode::parse("local_pod").unwrap(),
+            NodeAgentProxyMode::LocalPod
+        );
+        assert_eq!(
+            NodeAgentProxyMode::parse("node_waypoint").unwrap(),
+            NodeAgentProxyMode::NodeWaypoint
+        );
+        assert_eq!(
+            NodeAgentProxyMode::parse("LOCAL_POD").unwrap(),
+            NodeAgentProxyMode::LocalPod
+        );
+    }
+
+    #[test]
+    fn capture_contract_projects_bpf_config() {
+        let contract = CaptureContract::new(
+            NodeAgentProxyMode::NodeWaypoint,
+            16001,
+            16008,
+            "/tmp/ferrum.sock",
+        )
+        .unwrap();
+
+        assert_eq!(contract.proxy_mode, NodeAgentProxyMode::NodeWaypoint);
+        assert_eq!(contract.bpf_maps.capture_config, BPF_MAP_CAPTURE_CONFIG);
+        assert_eq!(
+            contract.bpf_capture_config(),
+            BpfCaptureConfig::new(16001, 16008)
+        );
+    }
+
+    #[test]
+    fn capture_contract_rejects_invalid_surface() {
+        assert!(
+            CaptureContract::new(NodeAgentProxyMode::LocalPod, 0, 15008, "/tmp/ferrum.sock")
+                .is_err()
+        );
+        assert!(
+            CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 0, "/tmp/ferrum.sock")
+                .is_err()
+        );
+        assert!(
+            CaptureContract::new(
+                NodeAgentProxyMode::LocalPod,
+                15001,
+                15001,
+                "/tmp/ferrum.sock"
+            )
+            .is_err()
+        );
+        assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 15008, "").is_err());
+    }
+
+    #[test]
     fn mock_backend_load_and_attach() {
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         assert!(backend.programs_loaded);
+
+        backend
+            .update_capture_config(&BpfCaptureConfig::new(16001, 16008))
+            .unwrap();
+        assert_eq!(
+            backend.capture_config,
+            Some(BpfCaptureConfig::new(16001, 16008))
+        );
 
         backend
             .attach_cgroup(

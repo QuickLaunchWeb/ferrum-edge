@@ -8,6 +8,17 @@
 //!   `Any` driver does not round-trip MySQL `DATETIME` values into the
 //!   string-based config layer.  RFC 3339 nano-precision timestamps are at most
 //!   35 chars; `VARCHAR(64)` provides comfortable headroom
+//! - identifier / hostname VARCHAR columns use `COLLATE utf8mb4_0900_as_cs`
+//!   (MySQL 8.0+) so uniqueness and ordering on `(namespace, name)` etc. is
+//!   byte-exact rather than the table-default case-insensitive collation.
+//!   Hostnames are pre-normalized to ASCII-lowercase by `normalize_fields()`,
+//!   so case-sensitivity is moot for those, but other identifiers benefit.
+//!   Floor is MySQL 8.0+; the project test infra runs MySQL 8.
+//! - columns whose code-side cap exceeds MySQL's `TEXT` (65,535 bytes) use
+//!   `MEDIUMTEXT` (16 MiB): `plugin_configs.config` (1 MiB cap),
+//!   `consumers.credentials` (64 KiB cap — off-by-one over `TEXT`),
+//!   `consumers.acl_groups` (≈130 KiB worst case), `upstreams.targets`
+//!   (1000 targets ≈ 200 KiB), `upstreams.backend_tls_san_allow_list`.
 //!
 //! The proxy schema also intentionally omits a unique index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
@@ -109,16 +120,24 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_consumers_updated_at ON consumers (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_updated_at ON plugin_configs (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
-            "CREATE INDEX IF NOT EXISTS idx_proxies_namespace ON proxies (namespace)",
-            "CREATE INDEX IF NOT EXISTS idx_consumers_namespace ON consumers (namespace)",
-            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_namespace ON plugin_configs (namespace)",
-            "CREATE INDEX IF NOT EXISTS idx_upstreams_namespace ON upstreams (namespace)",
+            // No standalone `(namespace)` indexes — fully covered by the
+            // `(namespace, updated_at)` compounds below via the leading-column
+            // rule. Keeping both would only add write amplification.
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
+            // Cold-path index for cross-namespace mesh_route_dispatch lookups in
+            // `mesh_route_dispatch_plugin_configs_tx`. Upstream IDs are globally
+            // unique PKs, so the cleanup helpers intentionally scan across
+            // namespaces (a cross-namespace reference is real and must be
+            // caught). MongoDB has a matching `{plugin_name, enabled}` partial
+            // index with `partialFilterExpression: {enabled: true}`; the
+            // SQL helper applies the same `WHERE enabled = 1` filter on
+            // Postgres/SQLite (MySQL has no partial-index equivalent).
+            self.mesh_route_dispatch_index_sql(),
             // Note: no standalone namespace index on api_specs — the compound
             // indexes below (namespace + updated_at / spec_version / etc.) all
             // have namespace as the leading column and serve namespace-only lookups.
@@ -198,14 +217,31 @@ impl V001SqlBuilder {
         }
     }
 
+    fn mesh_route_dispatch_index_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            // MySQL lacks SQL-standard partial indexes; index every row.
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_plugin_name_enabled \
+             ON plugin_configs (plugin_name, enabled)"
+        } else {
+            // Postgres and SQLite both support partial indexes. The
+            // `mesh_route_dispatch_plugin_configs_tx` helper only ever asks
+            // for `enabled != 0`, so filtering disabled rows out of the index
+            // halves index size and write amplification in deployments with
+            // many disabled plugin_configs — matching the MongoDB
+            // `partialFilterExpression: {enabled: true}` companion index.
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_plugin_name_enabled \
+             ON plugin_configs (plugin_name) WHERE enabled = 1"
+        }
+    }
+
     fn create_upstreams_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
-                id VARCHAR(255) PRIMARY KEY,
-                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
-                name VARCHAR(255),
-                targets TEXT NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                targets MEDIUMTEXT NOT NULL,
                 algorithm VARCHAR(50) NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
                 hash_on_cookie_config TEXT,
@@ -216,9 +252,9 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path VARCHAR(2048),
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
-                backend_tls_sni VARCHAR(255),
+                backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 backend_tls_san_allow_list MEDIUMTEXT,
-                api_spec_id VARCHAR(255),
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL
             )
@@ -254,12 +290,12 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
-                id VARCHAR(255) PRIMARY KEY,
-                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
-                username VARCHAR(255) NOT NULL,
-                custom_id VARCHAR(255),
-                credentials TEXT NOT NULL,
-                acl_groups VARCHAR(8192) NOT NULL DEFAULT '[]',
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                username VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                custom_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                credentials MEDIUMTEXT NOT NULL,
+                acl_groups MEDIUMTEXT NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL
             )
@@ -284,13 +320,13 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
-                id VARCHAR(255) PRIMARY KEY,
-                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
-                name VARCHAR(255),
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 hosts TEXT NOT NULL,
-                listen_path VARCHAR(500),
+                listen_path VARCHAR(512),
                 backend_scheme VARCHAR(16) NOT NULL DEFAULT 'https',
-                backend_host VARCHAR(255) NOT NULL,
+                backend_host VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
                 backend_path TEXT,
                 strip_listen_path INTEGER NOT NULL DEFAULT 1,
@@ -305,8 +341,8 @@ impl V001SqlBuilder {
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode VARCHAR(20) NOT NULL DEFAULT 'single',
-                upstream_id VARCHAR(255),
-                upstream_subset VARCHAR(255),
+                upstream_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                upstream_subset VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 circuit_breaker TEXT,
                 retry TEXT,
                 response_body_mode VARCHAR(50) NOT NULL DEFAULT 'stream',
@@ -332,7 +368,7 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
-                api_spec_id VARCHAR(255),
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
@@ -411,15 +447,15 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
-                id VARCHAR(255) PRIMARY KEY,
-                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
-                plugin_name VARCHAR(255) NOT NULL,
-                config TEXT NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                plugin_name VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                config MEDIUMTEXT NOT NULL,
                 scope VARCHAR(50) NOT NULL DEFAULT 'global',
-                proxy_id VARCHAR(255),
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
-                api_spec_id VARCHAR(255),
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -448,8 +484,8 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxy_plugins (
-                proxy_id VARCHAR(255) NOT NULL,
-                plugin_config_id VARCHAR(255) NOT NULL,
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                plugin_config_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 PRIMARY KEY (proxy_id, plugin_config_id),
                 CONSTRAINT fk_proxy_plugins_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE,
                 CONSTRAINT fk_proxy_plugins_plugin FOREIGN KEY (plugin_config_id) REFERENCES plugin_configs(id) ON DELETE CASCADE
@@ -487,15 +523,15 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
-                id VARCHAR(255) PRIMARY KEY,
-                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
-                proxy_id VARCHAR(255) NOT NULL,
-                spec_version VARCHAR(50) NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                spec_version VARCHAR(50) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 spec_format VARCHAR(10) NOT NULL,
                 spec_content LONGBLOB NOT NULL,
                 content_encoding VARCHAR(50) NOT NULL DEFAULT 'gzip',
                 uncompressed_size BIGINT NOT NULL,
-                content_hash VARCHAR(64) NOT NULL,
+                content_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 title TEXT,
                 info_version VARCHAR(255),
                 description LONGTEXT,
@@ -610,7 +646,7 @@ mod tests {
         assert!(
             builder
                 .create_upstreams_sql()
-                .contains("id VARCHAR(255) PRIMARY KEY")
+                .contains("id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY")
         );
         assert!(
             builder
@@ -650,6 +686,253 @@ mod tests {
             sql.contains("backend_tls_san_allow_list MEDIUMTEXT"),
             "SAN allow-list JSON can exceed MySQL TEXT when every allowed entry is near the per-entry cap"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // mesh_route_dispatch index — partial on Postgres/SQLite (matches
+    // MongoDB's `partialFilterExpression: {enabled: true}`), full on
+    // MySQL which lacks SQL-standard partial indexes.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_mysql_mesh_route_dispatch_index_is_full() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "MySQL must still create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name, enabled)"),
+            "MySQL has no partial-index support; the index must include enabled as a regular column"
+        );
+        assert!(
+            !sql.contains("WHERE"),
+            "MySQL cannot use a partial WHERE clause on a regular CREATE INDEX"
+        );
+    }
+
+    #[test]
+    fn test_postgres_mesh_route_dispatch_index_is_partial() {
+        let builder = V001SqlBuilder::new("postgres");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "Postgres must create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name)") && sql.contains("WHERE enabled = 1"),
+            "Postgres should use a partial index keyed on plugin_name filtered by enabled = 1"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_mesh_route_dispatch_index_is_partial() {
+        let builder = V001SqlBuilder::new("sqlite");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "SQLite must create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name)") && sql.contains("WHERE enabled = 1"),
+            "SQLite should use a partial index keyed on plugin_name filtered by enabled = 1"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Column-sizing regression tests for the V001 baseline.
+    //
+    // Code in `src/config/types.rs` enforces hard caps that exceed MySQL's
+    // `TEXT` (65,535 bytes). The matching columns must be `MEDIUMTEXT` or
+    // larger, otherwise valid payloads round-trip-fail with a truncation
+    // error on MySQL.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_mysql_plugin_configs_config_holds_one_mib_cap() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_plugin_configs_sql();
+        assert!(
+            sql.contains("config MEDIUMTEXT NOT NULL"),
+            "MAX_PLUGIN_CONFIG_SIZE = 1 MiB exceeds MySQL TEXT (65,535 bytes); plugin_configs.config must be MEDIUMTEXT"
+        );
+    }
+
+    #[test]
+    fn test_mysql_consumers_credentials_holds_64kib_cap() {
+        // MAX_CREDENTIALS_SIZE = 65_536 is exactly 1 byte over MySQL TEXT's
+        // 65,535-byte ceiling. MEDIUMTEXT removes the off-by-one risk.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_consumers_sql();
+        assert!(
+            sql.contains("credentials MEDIUMTEXT NOT NULL"),
+            "MAX_CREDENTIALS_SIZE = 65,536 is over MySQL TEXT (65,535); credentials must be MEDIUMTEXT"
+        );
+    }
+
+    #[test]
+    fn test_mysql_consumers_acl_groups_holds_worst_case_payload() {
+        // 500 groups × 255 chars + JSON quoting ≈ 130 KiB worst case.
+        // The previous VARCHAR(8192) silently truncated at scale.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_consumers_sql();
+        assert!(
+            sql.contains("acl_groups MEDIUMTEXT NOT NULL"),
+            "ACL groups JSON worst case (~130 KiB) exceeds VARCHAR(8192) and MySQL TEXT; must be MEDIUMTEXT"
+        );
+        assert!(
+            !sql.contains("VARCHAR(8192)"),
+            "acl_groups must no longer use VARCHAR(8192)"
+        );
+    }
+
+    #[test]
+    fn test_mysql_upstreams_targets_holds_max_targets_payload() {
+        // MAX_TARGETS_PER_UPSTREAM = 1000 with full TLS/SAN metadata exceeds
+        // MySQL TEXT (65,535 bytes) at the upper bound.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        assert!(
+            sql.contains("targets MEDIUMTEXT NOT NULL"),
+            "upstreams.targets with MAX_TARGETS_PER_UPSTREAM = 1000 can exceed MySQL TEXT; must be MEDIUMTEXT"
+        );
+    }
+
+    #[test]
+    fn test_mysql_proxies_listen_path_has_headroom() {
+        // MAX_LISTEN_PATH_LENGTH = 500; VARCHAR(512) gives headroom matching
+        // the project's elsewhere-applied "1+ char buffer" convention.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxies_sql();
+        assert!(
+            sql.contains("listen_path VARCHAR(512)"),
+            "listen_path should be VARCHAR(512) (MAX_LISTEN_PATH_LENGTH + headroom)"
+        );
+        assert!(
+            !sql.contains("listen_path VARCHAR(500)"),
+            "listen_path VARCHAR(500) has zero headroom over the code cap"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Collation regression tests
+    //
+    // MySQL identifier and hostname VARCHAR columns must use explicit
+    // `COLLATE utf8mb4_0900_as_cs` so uniqueness on `(namespace, name)` and
+    // similar is byte-exact rather than relying on the table-default
+    // case-insensitive collation. MySQL 8.0+ floor; the project test infra
+    // already runs MySQL 8 (tests/scripts/setup_db_tls.sh).
+    // ------------------------------------------------------------------
+
+    fn assert_columns_have_collation(sql: &str, table_label: &str, columns: &[&str]) {
+        for col in columns {
+            let needles = [
+                format!("{col} VARCHAR(255) COLLATE utf8mb4_0900_as_cs"),
+                format!("{col} VARCHAR(50) COLLATE utf8mb4_0900_as_cs"),
+                format!("{col} VARCHAR(64) COLLATE utf8mb4_0900_as_cs"),
+            ];
+            assert!(
+                needles.iter().any(|n| sql.contains(n)),
+                "{table_label}.{col} must have an explicit COLLATE utf8mb4_0900_as_cs clause"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mysql_proxies_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxies_sql();
+        assert_columns_have_collation(
+            sql,
+            "proxies",
+            &[
+                "id",
+                "namespace",
+                "name",
+                "backend_host",
+                "upstream_id",
+                "upstream_subset",
+                "api_spec_id",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_mysql_upstreams_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        assert_columns_have_collation(
+            sql,
+            "upstreams",
+            &["id", "namespace", "name", "backend_tls_sni", "api_spec_id"],
+        );
+    }
+
+    #[test]
+    fn test_mysql_consumers_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_consumers_sql();
+        assert_columns_have_collation(
+            sql,
+            "consumers",
+            &["id", "namespace", "username", "custom_id"],
+        );
+    }
+
+    #[test]
+    fn test_mysql_plugin_configs_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_plugin_configs_sql();
+        assert_columns_have_collation(
+            sql,
+            "plugin_configs",
+            &["id", "namespace", "plugin_name", "proxy_id", "api_spec_id"],
+        );
+    }
+
+    #[test]
+    fn test_mysql_api_specs_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_api_specs_sql();
+        assert_columns_have_collation(
+            sql,
+            "api_specs",
+            &[
+                "id",
+                "namespace",
+                "proxy_id",
+                "content_hash",
+                "spec_version",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_mysql_proxy_plugins_collation_on_fk_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxy_plugins_sql();
+        assert_columns_have_collation(sql, "proxy_plugins", &["proxy_id", "plugin_config_id"]);
+    }
+
+    #[test]
+    fn test_non_mysql_dialects_have_no_mysql_collation_clause() {
+        for dialect in ["postgres", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            for sql in [
+                builder.create_upstreams_sql(),
+                builder.create_consumers_sql(),
+                builder.create_proxies_sql(),
+                builder.create_plugin_configs_sql(),
+                builder.create_proxy_plugins_sql(),
+                builder.create_api_specs_sql(),
+            ] {
+                assert!(
+                    !sql.contains("utf8mb4_0900_as_cs"),
+                    "{dialect} dialect must not carry MySQL-specific COLLATE clauses"
+                );
+            }
+        }
     }
 
     #[test]

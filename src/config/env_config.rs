@@ -11,6 +11,7 @@
 
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
+use crate::ebpf::NodeAgentProxyMode;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -139,6 +140,43 @@ impl std::fmt::Display for DbTlsMode {
             Self::VerifyFull => "verify-full",
         })
     }
+}
+
+fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
+    if ns.is_empty() {
+        return Err("namespace must not be empty".to_string());
+    }
+    if ns.len() > 63 {
+        return Err(format!(
+            "namespace must be at most 63 characters, got {}",
+            ns.len()
+        ));
+    }
+    let bytes = ns.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must start with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !last.is_ascii_lowercase() && !last.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must end with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "namespace '{}' is invalid: use lowercase alphanumeric characters or '-'",
+            ns
+        ));
+    }
+    Ok(())
 }
 
 /// Check whether an IP address falls within private/reserved ranges.
@@ -560,6 +598,19 @@ pub struct EnvConfig {
     /// is applied to dispatch after admission plugins have run.
     pub mesh_vs_header_routing_experimental: bool,
 
+    // Node agent
+    /// Node-agent capture topology between the per-node capture manager and
+    /// proxy. `local_pod` redirects to a co-located pod proxy;
+    /// `node_waypoint` reserves the Phase 2 node-waypoint contract surface.
+    pub node_agent_proxy_mode: NodeAgentProxyMode,
+    /// Opt in to the node-agent read-only admin listener. Default false so
+    /// node-agent upgrades do not expose unauthenticated admin endpoints on
+    /// the global admin bind address by accident.
+    pub node_agent_admin_enabled: bool,
+    /// HBONE redirect/listener port included in the node-agent capture
+    /// contract and BPF config map. Default: 15008.
+    pub node_agent_hbone_redirect_port: u16,
+
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
@@ -600,6 +651,10 @@ pub struct EnvConfig {
     /// translator. Hosts like `<svc>.<ns>.svc.<cluster_domain>` are accepted.
     /// Default: "cluster.local".
     pub k8s_cluster_domain: String,
+    /// Istio root namespace used by the K8s translator when resolving
+    /// mesh-wide Istio resources such as root-namespace Sidecar defaults.
+    /// Default: "istio-system".
+    pub k8s_istio_root_namespace: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1331,6 +1386,9 @@ impl Default for EnvConfig {
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
             mesh_vs_header_routing_experimental: false,
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            node_agent_admin_enabled: false,
+            node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
             k8s_node_locality_enabled: false,
@@ -1342,6 +1400,7 @@ impl Default for EnvConfig {
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
+            k8s_istio_root_namespace: "istio-system".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1631,6 +1690,9 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
+            node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
+            node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
+            node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
@@ -1642,6 +1704,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
+            k8s_istio_root_namespace: String = "FERRUM_K8S_ISTIO_ROOT_NAMESPACE" => "istio-system".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -2003,6 +2066,9 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
             mesh_vs_header_routing_experimental,
+            node_agent_proxy_mode,
+            node_agent_admin_enabled,
+            node_agent_hbone_redirect_port,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
             k8s_node_locality_enabled,
@@ -2014,6 +2080,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
             k8s_cluster_domain,
+            k8s_istio_root_namespace,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2588,11 +2655,25 @@ impl EnvConfig {
             }
         }
 
+        if matches!(self.mode, OperatingMode::NodeAgent) {
+            if self.node_agent_hbone_redirect_port == 0 {
+                return Err("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must be non-zero".into());
+            }
+            if self.node_agent_hbone_redirect_port == ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT {
+                return Err(
+                    "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must differ from the outbound capture port"
+                        .into(),
+                );
+            }
+        }
+
         self.validate_db_tls_config()?;
 
         // Validate namespace
         crate::config::types::validate_namespace(&self.namespace)
             .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
+        validate_k8s_namespace(&self.k8s_istio_root_namespace)
+            .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

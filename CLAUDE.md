@@ -84,6 +84,7 @@ PRs: format → tests (parallel) → lint → perf regression → build 5 target
 - `dp` (Data Plane) — R/O admin + proxy; gRPC from CP (multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`)
 - `mesh` — R/O admin + proxy; service-mesh data plane consuming xDS or native MeshSubscribe
 - `injector` — Kubernetes admission webhook; emits JSON patches that add Ferrum mesh sidecars/init capture
+- `node_agent` — per-node eBPF capture manager for ambient mesh; no proxy listeners
 - `migrate` — runs DB migrations, exits
 
 **TLS-only listeners**: port `0` on `FERRUM_PROXY_HTTP_PORT`/`FERRUM_ADMIN_HTTP_PORT`/inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext. Excluded from `reserved_gateway_ports()`. Gateway warns if plaintext disabled and no TLS configured.
@@ -167,11 +168,11 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Istio empty-rule semantics**: K8s translation must preserve `AuthorizationPolicy` action semantics. `ALLOW` with no `rules` is allow-nothing (emit a never-matching rule); `DENY`/`AUDIT` with no `rules` are no-ops. Do not collapse all empty-rule policies to the same representation.
 
-**DestinationRule port-level settings**: only `connectionPool.tcp.connectTimeout` is enforced today. Per-port `loadBalancer`/`outlierDetection` are parsed but warning-only (one balancer + one passive-health-check per upstream). Phantom ports (DR entries whose port isn't on any target) are skipped with a warning. Admin-API POST/PUT setting `Upstream.port_overrides` is rejected — canonical surface is a DestinationRule.
+**DestinationRule port-level settings**: `connectionPool.tcp.connectTimeout` lands on `Upstream.port_overrides[port].connect_timeout_ms` and is enforced by HTTP/H2/H3, gRPC, TCP, and HBONE dispatch. Per-port `loadBalancer` and `outlierDetection` land on the same slot and are enforced by HTTP-family / gRPC / WebSocket / HBONE dispatch via isolated per-port LB counters/hash rings and passive thresholds. TCP/UDP/DTLS stream proxies currently enforce only `connect_timeout_ms` and use upstream-level LB/passive policy. Phantom ports (DR entries whose port isn't on any target) are skipped with a warning. Admin-API POST/PUT setting `Upstream.port_overrides` is rejected — canonical surface is a DestinationRule.
 
 **Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-passthrough TCP proxies (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from ServiceEntries with `location: mesh_external` (egress topology only).
 
-**Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
+**Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). IPv4/IPv6 capture CIDRs are partitioned into `iptables`/`ip6tables` blocks; `FERRUM_MESH_IP6TABLES_ENABLED=auto|true|false` controls IPv6 fan-out, and cleanup scripts must stay best-effort even when `ip6tables` is missing. SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 
 ### Domain Model (`src/config/types.rs`)
 
@@ -554,7 +555,7 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 **Canonical reference**: [docs/configuration.md](docs/configuration.md). **Runtime parsing**: `src/config/env_config.rs`. **Editable template**: `ferrum.conf`. Only the load-bearing ones are listed here — for the full list (90+ vars), use the docs.
 
 **Required by mode:**
-- `FERRUM_MODE` (`database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`)
+- `FERRUM_MODE` (`database`/`file`/`cp`/`dp`/`mesh`/`injector`/`node_agent`/`migrate`)
 - `FERRUM_NAMESPACE` (`ferrum`) — which namespace this instance loads
 - `FERRUM_FILE_CONFIG_PATH` (required `file`)
 - `FERRUM_DB_TYPE` + `FERRUM_DB_URL` (required `database`/`cp`)

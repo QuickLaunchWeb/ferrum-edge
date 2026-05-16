@@ -12,12 +12,17 @@
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
+
+use crate::modes::mesh::config::TracingProvider;
 
 use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
@@ -31,54 +36,160 @@ pub struct OtelTracing {
     service_name: String,
     /// Whether to generate trace IDs for requests without traceparent.
     generate_trace_id: bool,
-    /// OTLP span sender (if endpoint is configured).
-    otlp_sender: Option<mpsc::Sender<SpanData>>,
-    /// OTLP endpoint hostname for DNS warmup.
-    otlp_hostname: Option<String>,
+    /// OTLP span exporter (if endpoint is configured).
+    exporter: Option<Arc<dyn TraceExporter>>,
 }
 
 /// Internal span data collected during the request lifecycle.
 #[derive(Clone)]
-struct SpanData {
-    trace_id: String,
-    span_id: String,
-    parent_span_id: String,
-    service_name: String,
-    http_method: String,
-    http_url: String,
-    http_status_code: u16,
-    client_ip: String,
-    duration_ms: f64,
-    gateway_processing_ms: f64,
-    backend_ttfb_ms: f64,
-    backend_ms: f64,
-    plugin_execution_ms: f64,
-    gateway_overhead_ms: f64,
-    consumer: Option<String>,
-    timestamp_received: String,
+pub(crate) struct SpanData {
+    pub(crate) trace_id: String,
+    pub(crate) span_id: String,
+    pub(crate) parent_span_id: String,
+    pub(crate) service_name: String,
+    pub(crate) span_name: String,
+    pub(crate) span_kind: u8,
+    pub(crate) http_method: String,
+    pub(crate) http_url: String,
+    pub(crate) http_status_code: Option<u16>,
+    pub(crate) client_ip: String,
+    pub(crate) duration_ms: f64,
+    pub(crate) gateway_processing_ms: f64,
+    pub(crate) backend_ttfb_ms: f64,
+    pub(crate) backend_ms: f64,
+    pub(crate) plugin_execution_ms: f64,
+    pub(crate) gateway_overhead_ms: f64,
+    pub(crate) consumer: Option<String>,
+    pub(crate) timestamp_received: String,
     // Rich attributes from TransactionSummary
-    user_agent: Option<String>,
-    proxy_id: Option<String>,
-    matched_route: Option<String>,
-    backend_target_url: Option<String>,
-    backend_resolved_ip: Option<String>,
-    error_class: Option<String>,
-    response_streamed: bool,
-    client_disconnected: bool,
-    mesh_attributes: Vec<(String, String)>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) proxy_id: Option<String>,
+    pub(crate) matched_route: Option<String>,
+    pub(crate) backend_target_url: Option<String>,
+    pub(crate) backend_resolved_ip: Option<String>,
+    pub(crate) error_class: Option<String>,
+    pub(crate) response_streamed: bool,
+    pub(crate) client_disconnected: bool,
+    pub(crate) mesh_attributes: Vec<(String, String)>,
+    pub(crate) stream_protocol: Option<String>,
+    pub(crate) stream_listen_port: Option<u16>,
+    pub(crate) stream_bytes_sent: Option<u64>,
+    pub(crate) stream_bytes_received: Option<u64>,
 }
 
-struct GeneratedTraceContext {
-    trace_id: String,
-    span_id: String,
-    traceparent: String,
+/// Queue-backed span exporter used by tracing plugins.
+pub(crate) trait TraceExporter: Send + Sync {
+    fn provider_name(&self) -> &'static str;
+    fn hostname(&self) -> Option<&str>;
+    fn try_export(&self, span: SpanData) -> Result<(), String>;
 }
 
-struct ParsedTraceParent<'a> {
-    version: &'a str,
-    trace_id: &'a str,
-    parent_span_id: &'a str,
-    flags: &'a str,
+pub(crate) struct GeneratedTraceContext {
+    pub(crate) trace_id: String,
+    pub(crate) span_id: String,
+    pub(crate) traceparent: String,
+}
+
+pub(crate) struct ParsedTraceParent<'a> {
+    pub(crate) version: &'a str,
+    pub(crate) trace_id: &'a str,
+    pub(crate) parent_span_id: &'a str,
+    pub(crate) flags: &'a str,
+}
+
+impl SpanData {
+    pub(crate) fn from_transaction_summary(
+        summary: &TransactionSummary,
+        service_name: &str,
+    ) -> Option<Self> {
+        let trace_id = summary.metadata.get("trace_id")?.clone();
+        let span_id = summary.metadata.get("span_id")?.clone();
+        let parent_span_id = summary
+            .metadata
+            .get("parent_span_id")
+            .cloned()
+            .unwrap_or_default();
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id,
+            service_name: service_name.to_string(),
+            span_name: format!("{} {}", summary.http_method, summary.request_path),
+            span_kind: 2,
+            http_method: summary.http_method.clone(),
+            http_url: summary.request_path.clone(),
+            http_status_code: Some(summary.response_status_code),
+            client_ip: summary.client_ip.clone(),
+            duration_ms: summary.latency_total_ms,
+            gateway_processing_ms: summary.latency_gateway_processing_ms,
+            backend_ttfb_ms: summary.latency_backend_ttfb_ms,
+            backend_ms: summary.latency_backend_total_ms,
+            plugin_execution_ms: summary.latency_plugin_execution_ms,
+            gateway_overhead_ms: summary.latency_gateway_overhead_ms,
+            consumer: summary.consumer_username.clone(),
+            timestamp_received: summary.timestamp_received.clone(),
+            user_agent: summary.request_user_agent.clone(),
+            proxy_id: summary.proxy_id.clone(),
+            matched_route: summary.proxy_name.clone(),
+            backend_target_url: summary.backend_target_url.clone(),
+            backend_resolved_ip: summary.backend_resolved_ip.clone(),
+            error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
+            response_streamed: summary.response_streamed,
+            client_disconnected: summary.client_disconnected,
+            mesh_attributes: mesh_trace_attributes(&summary.metadata),
+            stream_protocol: None,
+            stream_listen_port: None,
+            stream_bytes_sent: None,
+            stream_bytes_received: None,
+        })
+    }
+
+    pub(crate) fn from_stream_summary(
+        summary: &StreamTransactionSummary,
+        service_name: &str,
+    ) -> Option<Self> {
+        let trace_id = summary.metadata.get("trace_id")?.clone();
+        let span_id = summary.metadata.get("span_id")?.clone();
+        let parent_span_id = summary
+            .metadata
+            .get("parent_span_id")
+            .cloned()
+            .unwrap_or_default();
+        let span_name = format!("{} {}", summary.protocol, summary.backend_target);
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id,
+            service_name: service_name.to_string(),
+            span_name,
+            span_kind: 2,
+            http_method: summary.protocol.clone(),
+            http_url: summary.backend_target.clone(),
+            http_status_code: None,
+            client_ip: summary.client_ip.clone(),
+            duration_ms: summary.duration_ms,
+            gateway_processing_ms: 0.0,
+            backend_ttfb_ms: 0.0,
+            backend_ms: summary.duration_ms,
+            plugin_execution_ms: 0.0,
+            gateway_overhead_ms: 0.0,
+            consumer: summary.consumer_username.clone(),
+            timestamp_received: summary.timestamp_connected.clone(),
+            user_agent: None,
+            proxy_id: Some(summary.proxy_id.clone()),
+            matched_route: summary.proxy_name.clone(),
+            backend_target_url: Some(summary.backend_target.clone()),
+            backend_resolved_ip: summary.backend_resolved_ip.clone(),
+            error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
+            response_streamed: false,
+            client_disconnected: summary.connection_error.is_some(),
+            mesh_attributes: mesh_trace_attributes(&summary.metadata),
+            stream_protocol: Some(summary.protocol.clone()),
+            stream_listen_port: Some(summary.listen_port),
+            stream_bytes_sent: Some(summary.bytes_sent),
+            stream_bytes_received: Some(summary.bytes_received),
+        })
+    }
 }
 
 impl OtelTracing {
@@ -94,48 +205,30 @@ impl OtelTracing {
         // Endpoint is optional — when absent, plugin runs in propagation-only mode
         let endpoint = optional_string_config(config, "endpoint")?;
 
-        let (otlp_sender, otlp_hostname) = if let Some(endpoint) = endpoint {
-            let otlp_hostname = validate_endpoint(&endpoint)?;
-            let batch_size = usize_config(config, "batch_size", 50, 1)?;
-            let flush_interval_ms = u64_config(config, "flush_interval_ms", 5000, 100)?;
-            let buffer_capacity = usize_config(config, "buffer_capacity", 10000, 1)?;
+        let exporter = if let Some(endpoint) = endpoint {
+            let options =
+                TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
             let authorization = optional_string_config(config, "authorization")?;
-
-            // Parse custom headers from config
             let custom_headers = parse_custom_headers(config.get("headers"))?;
-
-            let (sender, receiver) = mpsc::channel(buffer_capacity);
-
-            let otlp_config = OtlpConfig {
+            Some(Arc::new(OtlpTraceExporter::new(
                 endpoint,
                 authorization,
                 custom_headers,
-                http_client,
-                batch_size,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                max_retries: u32_config(config, "max_retries", 2, 0)?,
-                retry_delay: Duration::from_millis(u64_config(config, "retry_delay_ms", 1000, 0)?),
-                service_name: service_name.clone(),
-                deployment_environment: deployment_environment.clone(),
-            };
-
-            tokio::spawn(otlp_flush_loop(receiver, otlp_config));
-
-            (Some(sender), Some(otlp_hostname))
+                options.with_deployment_environment(deployment_environment),
+            )?) as Arc<dyn TraceExporter>)
         } else {
-            (None, None)
+            None
         };
 
         Ok(Self {
             service_name,
             generate_trace_id,
-            otlp_sender,
-            otlp_hostname,
+            exporter,
         })
     }
 
     /// Generate a W3C trace context without reparsing the generated header.
-    fn generate_trace_context() -> GeneratedTraceContext {
+    pub(crate) fn generate_trace_context() -> GeneratedTraceContext {
         let trace_id = Self::generate_trace_id();
         let span_id = Self::generate_span_id();
         let traceparent = build_traceparent("00", &trace_id, &span_id, "01");
@@ -147,7 +240,7 @@ impl OtelTracing {
     }
 
     /// Parse a traceparent header into (version, trace_id, parent_span_id, flags).
-    fn parse_traceparent(value: &str) -> Option<ParsedTraceParent<'_>> {
+    pub(crate) fn parse_traceparent(value: &str) -> Option<ParsedTraceParent<'_>> {
         let mut parts = value.split('-');
         let version = parts.next()?;
         let trace_id = parts.next()?;
@@ -181,12 +274,12 @@ impl OtelTracing {
     }
 
     /// Generate a new trace ID.
-    fn generate_trace_id() -> String {
+    pub(crate) fn generate_trace_id() -> String {
         hex_encode(Uuid::new_v4().as_bytes())
     }
 
     /// Generate a new span ID for the gateway hop.
-    fn generate_span_id() -> String {
+    pub(crate) fn generate_span_id() -> String {
         hex_encode(&Uuid::new_v4().as_bytes()[..8])
     }
 }
@@ -247,6 +340,17 @@ impl Plugin for OtelTracing {
             bytes_received = %summary.bytes_received,
             "stream trace"
         );
+
+        if let Some(exporter) = &self.exporter
+            && let Some(span_data) = SpanData::from_stream_summary(summary, &self.service_name)
+            && let Err(error) = exporter.try_export(span_data)
+        {
+            warn!(
+                "{} export buffer full — dropping span: {}",
+                exporter.provider_name(),
+                error
+            );
+        }
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -368,52 +472,79 @@ impl Plugin for OtelTracing {
         );
 
         // Send to OTLP exporter if configured
-        if let Some(ref sender) = self.otlp_sender {
-            let span_data = SpanData {
-                trace_id: trace_id.clone(),
-                span_id: span_id.to_string(),
-                parent_span_id: parent_span_id.to_string(),
-                service_name: self.service_name.clone(),
-                http_method: summary.http_method.clone(),
-                http_url: summary.request_path.clone(),
-                http_status_code: summary.response_status_code,
-                client_ip: summary.client_ip.clone(),
-                duration_ms: summary.latency_total_ms,
-                gateway_processing_ms: summary.latency_gateway_processing_ms,
-                backend_ttfb_ms: summary.latency_backend_ttfb_ms,
-                backend_ms: summary.latency_backend_total_ms,
-                plugin_execution_ms: summary.latency_plugin_execution_ms,
-                gateway_overhead_ms: summary.latency_gateway_overhead_ms,
-                consumer: summary.consumer_username.clone(),
-                timestamp_received: summary.timestamp_received.clone(),
-                user_agent: summary.request_user_agent.clone(),
-                proxy_id: summary.proxy_id.clone(),
-                matched_route: summary.proxy_name.clone(),
-                backend_target_url: summary.backend_target_url.clone(),
-                backend_resolved_ip: summary.backend_resolved_ip.clone(),
-                error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
-                response_streamed: summary.response_streamed,
-                client_disconnected: summary.client_disconnected,
-                mesh_attributes: mesh_trace_attributes(&summary.metadata),
-            };
-
-            if sender.try_send(span_data).is_err() {
-                warn!("OTLP export buffer full — dropping span");
-            }
+        if let Some(exporter) = &self.exporter
+            && let Some(span_data) = SpanData::from_transaction_summary(summary, &self.service_name)
+            && let Err(error) = exporter.try_export(span_data)
+        {
+            warn!(
+                "{} export buffer full — dropping span: {}",
+                exporter.provider_name(),
+                error
+            );
         }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.otlp_hostname
+        self.exporter
             .as_ref()
-            .map(|h| vec![h.clone()])
+            .and_then(|exporter| exporter.hostname().map(ToOwned::to_owned))
+            .map(|hostname| vec![hostname])
             .unwrap_or_default()
     }
 }
 
 // ─── OTLP HTTP/JSON Exporter ───────────────────────────────────────────
 
-struct OtlpConfig {
+#[derive(Clone)]
+pub(crate) struct TraceExporterOptions {
+    http_client: PluginHttpClient,
+    batch_size: usize,
+    flush_interval: Duration,
+    buffer_capacity: usize,
+    max_retries: u32,
+    retry_delay: Duration,
+    service_name: String,
+    deployment_environment: Option<String>,
+}
+
+impl TraceExporterOptions {
+    pub(crate) fn from_config(
+        config: &Value,
+        service_name: String,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            http_client,
+            batch_size: usize_config(config, "batch_size", 50, 1)?,
+            flush_interval: Duration::from_millis(u64_config(
+                config,
+                "flush_interval_ms",
+                5000,
+                100,
+            )?),
+            buffer_capacity: usize_config(config, "buffer_capacity", 10000, 1)?,
+            max_retries: u32_config(config, "max_retries", 2, 0)?,
+            retry_delay: Duration::from_millis(u64_config(config, "retry_delay_ms", 1000, 0)?),
+            service_name,
+            deployment_environment: optional_string_config(config, "deployment_environment")?,
+        })
+    }
+
+    fn with_deployment_environment(mut self, deployment_environment: Option<String>) -> Self {
+        self.deployment_environment = deployment_environment;
+        self
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TracePayloadKind {
+    Otlp,
+    Zipkin,
+    Datadog,
+}
+
+struct TraceHttpExporterConfig {
+    provider_name: &'static str,
     endpoint: String,
     authorization: Option<String>,
     custom_headers: Vec<(String, String)>,
@@ -424,6 +555,280 @@ struct OtlpConfig {
     retry_delay: Duration,
     service_name: String,
     deployment_environment: Option<String>,
+    payload_kind: TracePayloadKind,
+}
+
+struct BufferedTraceExporter {
+    provider_name: &'static str,
+    hostname: String,
+    sender: mpsc::Sender<SpanData>,
+    started: AtomicBool,
+    // Cold-path only: try_export() reaches this only before the deferred
+    // exporter task starts, then the AtomicBool gates all steady-state calls.
+    deferred_start: Mutex<Option<(mpsc::Receiver<SpanData>, TraceHttpExporterConfig)>>,
+}
+
+impl BufferedTraceExporter {
+    fn new(cfg: TraceHttpExporterConfig, buffer_capacity: usize) -> Result<Self, String> {
+        let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
+        let (sender, receiver) = mpsc::channel(buffer_capacity);
+        let provider_name = cfg.provider_name;
+        let (started, deferred_start) = if let Ok(handle) = Handle::try_current() {
+            handle.spawn(trace_export_flush_loop(receiver, cfg));
+            (true, Mutex::new(None))
+        } else {
+            (false, Mutex::new(Some((receiver, cfg))))
+        };
+        Ok(Self {
+            provider_name,
+            hostname,
+            sender,
+            started: AtomicBool::new(started),
+            deferred_start,
+        })
+    }
+
+    fn ensure_started(&self) -> Result<(), String> {
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut deferred = self
+            .deferred_start
+            .lock()
+            .map_err(|_| "trace exporter deferred startup lock poisoned".to_string())?;
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some((receiver, cfg)) = deferred.take() else {
+            self.started.store(true, Ordering::Release);
+            return Ok(());
+        };
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(trace_export_flush_loop(receiver, cfg));
+                self.started.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                *deferred = Some((receiver, cfg));
+                Err(format!(
+                    "trace exporter flush task has no Tokio runtime: {error}"
+                ))
+            }
+        }
+    }
+}
+
+impl TraceExporter for BufferedTraceExporter {
+    fn provider_name(&self) -> &'static str {
+        self.provider_name
+    }
+
+    fn hostname(&self) -> Option<&str> {
+        Some(&self.hostname)
+    }
+
+    fn try_export(&self, span: SpanData) -> Result<(), String> {
+        if !self.started.load(Ordering::Acquire) {
+            self.ensure_started()?;
+        }
+        self.sender.try_send(span).map_err(|e| e.to_string())
+    }
+}
+
+pub(crate) struct OtlpTraceExporter {
+    inner: BufferedTraceExporter,
+}
+
+pub(crate) struct ZipkinTraceExporter {
+    inner: BufferedTraceExporter,
+}
+
+pub(crate) struct DatadogTraceExporter {
+    inner: BufferedTraceExporter,
+}
+
+pub(crate) struct LightstepTraceExporter {
+    inner: BufferedTraceExporter,
+}
+
+macro_rules! impl_trace_exporter_delegate {
+    ($ty:ty) => {
+        impl TraceExporter for $ty {
+            fn provider_name(&self) -> &'static str {
+                self.inner.provider_name()
+            }
+
+            fn hostname(&self) -> Option<&str> {
+                self.inner.hostname()
+            }
+
+            fn try_export(&self, span: SpanData) -> Result<(), String> {
+                self.inner.try_export(span)
+            }
+        }
+    };
+}
+
+impl OtlpTraceExporter {
+    pub(crate) fn new(
+        endpoint: String,
+        authorization: Option<String>,
+        custom_headers: Vec<(String, String)>,
+        options: TraceExporterOptions,
+    ) -> Result<Self, String> {
+        let cfg = TraceHttpExporterConfig::from_options(
+            "OTLP",
+            endpoint,
+            authorization,
+            custom_headers,
+            TracePayloadKind::Otlp,
+            &options,
+        );
+        Ok(Self {
+            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+        })
+    }
+}
+
+impl ZipkinTraceExporter {
+    pub(crate) fn new(endpoint: String, options: TraceExporterOptions) -> Result<Self, String> {
+        let cfg = TraceHttpExporterConfig::from_options(
+            "Zipkin",
+            endpoint,
+            None,
+            Vec::new(),
+            TracePayloadKind::Zipkin,
+            &options,
+        );
+        Ok(Self {
+            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+        })
+    }
+}
+
+impl DatadogTraceExporter {
+    pub(crate) fn new(
+        agent_url: String,
+        service_name: String,
+        mut options: TraceExporterOptions,
+    ) -> Result<Self, String> {
+        options.service_name = service_name;
+        let cfg = TraceHttpExporterConfig::from_options(
+            "Datadog",
+            datadog_traces_endpoint(&agent_url)?,
+            None,
+            Vec::new(),
+            TracePayloadKind::Datadog,
+            &options,
+        );
+        Ok(Self {
+            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+        })
+    }
+}
+
+impl LightstepTraceExporter {
+    pub(crate) fn new(
+        collector_url: String,
+        access_token: String,
+        options: TraceExporterOptions,
+    ) -> Result<Self, String> {
+        let cfg = TraceHttpExporterConfig::from_options(
+            "Lightstep",
+            collector_url,
+            Some(format!("Bearer {access_token}")),
+            Vec::new(),
+            TracePayloadKind::Otlp,
+            &options,
+        );
+        Ok(Self {
+            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+        })
+    }
+}
+
+impl_trace_exporter_delegate!(OtlpTraceExporter);
+impl_trace_exporter_delegate!(ZipkinTraceExporter);
+impl_trace_exporter_delegate!(DatadogTraceExporter);
+impl_trace_exporter_delegate!(LightstepTraceExporter);
+
+impl TraceHttpExporterConfig {
+    fn from_options(
+        provider_name: &'static str,
+        endpoint: String,
+        authorization: Option<String>,
+        custom_headers: Vec<(String, String)>,
+        payload_kind: TracePayloadKind,
+        options: &TraceExporterOptions,
+    ) -> Self {
+        Self {
+            provider_name,
+            endpoint,
+            authorization,
+            custom_headers,
+            http_client: options.http_client.clone(),
+            batch_size: options.batch_size,
+            flush_interval: options.flush_interval,
+            max_retries: options.max_retries,
+            retry_delay: options.retry_delay,
+            service_name: options.service_name.clone(),
+            deployment_environment: options.deployment_environment.clone(),
+            payload_kind,
+        }
+    }
+}
+
+pub(crate) fn trace_exporters_from_providers(
+    providers: &[TracingProvider],
+    default_service_name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+) -> Result<Vec<Arc<dyn TraceExporter>>, String> {
+    if providers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let service_name = string_config(config, "service_name", default_service_name)?;
+    let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    providers
+        .iter()
+        .map(|provider| match provider {
+            TracingProvider::Zipkin { url } => Ok(Arc::new(ZipkinTraceExporter::new(
+                url.clone(),
+                options.clone(),
+            )?) as Arc<dyn TraceExporter>),
+            TracingProvider::Datadog { agent_url, service } => {
+                let provider_service = service.clone().unwrap_or_else(|| service_name.clone());
+                Ok(Arc::new(DatadogTraceExporter::new(
+                    agent_url.clone(),
+                    provider_service,
+                    options.clone(),
+                )?) as Arc<dyn TraceExporter>)
+            }
+            TracingProvider::Lightstep {
+                collector_url,
+                access_token_env,
+            } => {
+                let access_token = std::env::var(access_token_env).map_err(|error| {
+                    format!(
+                        "Lightstep access token env var '{access_token_env}' is not set or unreadable: {error}"
+                    )
+                })?;
+                Ok(Arc::new(LightstepTraceExporter::new(
+                    collector_url.clone(),
+                    access_token,
+                    options.clone(),
+                )?) as Arc<dyn TraceExporter>)
+            }
+            TracingProvider::OpenTelemetry { endpoint } => Ok(Arc::new(OtlpTraceExporter::new(
+                endpoint.clone(),
+                None,
+                Vec::new(),
+                options.clone(),
+            )?)
+                as Arc<dyn TraceExporter>),
+        })
+        .collect()
 }
 
 /// Parse custom headers from the `headers` config field.
@@ -461,7 +866,10 @@ fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, 
     Ok(headers)
 }
 
-async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig) {
+async fn trace_export_flush_loop(
+    mut receiver: mpsc::Receiver<SpanData>,
+    cfg: TraceHttpExporterConfig,
+) {
     let mut buffer: Vec<SpanData> = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
     timer.tick().await; // skip first immediate tick
@@ -475,13 +883,13 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
                     Some(span) => {
                         buffer.push(span);
                         if buffer.len() >= cfg.batch_size {
-                            send_otlp_batch(&cfg, &buffer).await;
+                            send_trace_batch(&cfg, &buffer).await;
                             buffer.clear();
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            send_otlp_batch(&cfg, &buffer).await;
+                            send_trace_batch(&cfg, &buffer).await;
                         }
                         break;
                     }
@@ -490,7 +898,7 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
 
             _ = timer.tick() => {
                 if !buffer.is_empty() {
-                    send_otlp_batch(&cfg, &buffer).await;
+                    send_trace_batch(&cfg, &buffer).await;
                     buffer.clear();
                 }
             }
@@ -498,20 +906,25 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
     }
 }
 
-async fn send_otlp_batch(cfg: &OtlpConfig, batch: &[SpanData]) {
+async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     let total_attempts = cfg.max_retries + 1;
     let entry_count = batch.len();
-    let payload = build_otlp_payload(
-        &cfg.service_name,
-        cfg.deployment_environment.as_deref(),
-        batch,
-    );
+    let payload = match cfg.payload_kind {
+        TracePayloadKind::Otlp => build_otlp_payload(
+            &cfg.service_name,
+            cfg.deployment_environment.as_deref(),
+            batch,
+        ),
+        TracePayloadKind::Zipkin => build_zipkin_payload(&cfg.service_name, batch),
+        TracePayloadKind::Datadog => build_datadog_payload(&cfg.service_name, batch),
+    };
 
     for attempt in 1..=total_attempts {
-        let mut req = cfg
-            .http_client
-            .get()
-            .post(&cfg.endpoint)
+        let request = match cfg.payload_kind {
+            TracePayloadKind::Datadog => cfg.http_client.get().put(&cfg.endpoint),
+            _ => cfg.http_client.get().post(&cfg.endpoint),
+        };
+        let mut req = request
             .header("Content-Type", "application/json")
             .json(&payload);
 
@@ -528,8 +941,8 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: &[SpanData]) {
             Ok(response) => {
                 let status = response.status();
                 warn!(
-                    "OTLP export failed with status {} (attempt {}/{})",
-                    status, attempt, total_attempts,
+                    "{} export failed with status {} (attempt {}/{})",
+                    cfg.provider_name, status, attempt, total_attempts,
                 );
                 // 4xx is a client error — retrying a malformed/unauthorized
                 // payload just delays the drop. Bail immediately, except for
@@ -540,16 +953,16 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: &[SpanData]) {
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     warn!(
-                        "OTLP export batch discarded due to {} response ({} spans lost)",
-                        status, entry_count,
+                        "{} export batch discarded due to {} response ({} spans lost)",
+                        cfg.provider_name, status, entry_count,
                     );
                     return;
                 }
             }
             Err(e) => {
                 warn!(
-                    "OTLP export failed: {} (attempt {}/{})",
-                    e, attempt, total_attempts,
+                    "{} export failed: {} (attempt {}/{})",
+                    cfg.provider_name, e, attempt, total_attempts,
                 );
             }
         }
@@ -559,8 +972,8 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: &[SpanData]) {
     }
 
     warn!(
-        "OTLP export batch discarded after {} attempts ({} spans lost)",
-        total_attempts, entry_count,
+        "{} export batch discarded after {} attempts ({} spans lost)",
+        cfg.provider_name, total_attempts, entry_count,
     );
 }
 
@@ -587,15 +1000,12 @@ fn build_otlp_payload(
             };
 
             // Parse start time from ISO 8601 timestamp
-            let start_ns = chrono::DateTime::parse_from_rfc3339(&s.timestamp_received)
-                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                .unwrap_or(0);
-            let end_ns = start_ns + (s.duration_ms * 1_000_000.0) as i64;
+            let start_ns = timestamp_nanos(&s.timestamp_received);
+            let end_ns = start_ns + (s.duration_ms.max(0.0) * 1_000_000.0) as i64;
 
             let mut attributes = vec![
                 otlp_attribute("http.request.method", &s.http_method),
                 otlp_attribute("url.path", &s.http_url),
-                otlp_attribute_int("http.response.status_code", s.http_status_code as i64),
                 otlp_attribute("client.address", &s.client_ip),
                 otlp_attribute("service.name", &s.service_name),
                 otlp_attribute_double("gateway.latency.total_ms", s.duration_ms),
@@ -603,6 +1013,12 @@ fn build_otlp_payload(
                 otlp_attribute_double("gateway.latency.backend_ttfb_ms", s.backend_ttfb_ms),
             ];
 
+            if let Some(status_code) = s.http_status_code {
+                attributes.push(otlp_attribute_int(
+                    "http.response.status_code",
+                    status_code as i64,
+                ));
+            }
             if s.backend_ms >= 0.0 {
                 attributes.push(otlp_attribute_double(
                     "gateway.latency.backend_total_ms",
@@ -635,6 +1051,24 @@ fn build_otlp_payload(
             if let Some(ref resolved) = s.backend_resolved_ip {
                 attributes.push(otlp_attribute("server.socket.address", resolved));
             }
+            if let Some(ref protocol) = s.stream_protocol {
+                attributes.push(otlp_attribute("network.protocol.name", protocol));
+            }
+            if let Some(port) = s.stream_listen_port {
+                attributes.push(otlp_attribute_int("server.port", port as i64));
+            }
+            if let Some(bytes) = s.stream_bytes_sent {
+                attributes.push(otlp_attribute_int(
+                    "gateway.stream.bytes_sent",
+                    bytes as i64,
+                ));
+            }
+            if let Some(bytes) = s.stream_bytes_received {
+                attributes.push(otlp_attribute_int(
+                    "gateway.stream.bytes_received",
+                    bytes as i64,
+                ));
+            }
             if s.response_streamed {
                 attributes.push(otlp_attribute_bool("gateway.response.streamed", true));
             }
@@ -665,7 +1099,7 @@ fn build_otlp_payload(
                 }));
             }
 
-            let status_code = if s.http_status_code >= 500 {
+            let status_code = if s.http_status_code.is_some_and(|code| code >= 500) {
                 2 // ERROR
             } else {
                 1 // OK (includes 4xx — client errors are not server errors)
@@ -674,8 +1108,8 @@ fn build_otlp_payload(
             let mut span = serde_json::json!({
                 "traceId": trace_id_bytes,
                 "spanId": span_id_bytes,
-                "name": format!("{} {}", s.http_method, s.http_url),
-                "kind": 2, // SPAN_KIND_SERVER
+                "name": s.span_name.clone(),
+                "kind": s.span_kind,
                 "startTimeUnixNano": start_ns.to_string(),
                 "endTimeUnixNano": end_ns.to_string(),
                 "attributes": attributes,
@@ -721,6 +1155,180 @@ fn build_otlp_payload(
             }]
         }]
     })
+}
+
+fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
+    let zipkin_spans: Vec<Value> = spans
+        .iter()
+        .map(|span| {
+            let start_us = timestamp_micros(&span.timestamp_received);
+            let duration_us = (span.duration_ms.max(0.0) * 1_000.0) as i64;
+            let mut tags = serde_json::Map::new();
+            insert_tag(&mut tags, "http.method", &span.http_method);
+            insert_tag(&mut tags, "http.path", &span.http_url);
+            if let Some(status_code) = span.http_status_code {
+                insert_tag(&mut tags, "http.status_code", &status_code.to_string());
+            }
+            insert_tag(&mut tags, "client.ip", &span.client_ip);
+            insert_tag(
+                &mut tags,
+                "gateway.latency.total_ms",
+                &span.duration_ms.to_string(),
+            );
+            if let Some(ref proxy_id) = span.proxy_id {
+                insert_tag(&mut tags, "gateway.proxy.id", proxy_id);
+            }
+            if let Some(ref route) = span.matched_route {
+                insert_tag(&mut tags, "http.route", route);
+            }
+            if let Some(ref target) = span.backend_target_url {
+                insert_tag(&mut tags, "server.address", target);
+            }
+            if let Some(ref protocol) = span.stream_protocol {
+                insert_tag(&mut tags, "network.protocol.name", protocol);
+            }
+            for (key, value) in &span.mesh_attributes {
+                insert_tag(&mut tags, key, value);
+            }
+
+            let mut value = serde_json::json!({
+                "traceId": span.trace_id.clone(),
+                "id": span.span_id.clone(),
+                "name": span.span_name.clone(),
+                "timestamp": start_us,
+                "duration": duration_us,
+                "localEndpoint": {
+                    "serviceName": service_name
+                },
+                "tags": tags,
+            });
+            if !span.parent_span_id.is_empty() {
+                value["parentId"] = Value::String(span.parent_span_id.clone());
+            }
+            value
+        })
+        .collect();
+    Value::Array(zipkin_spans)
+}
+
+fn build_datadog_payload(service_name: &str, spans: &[SpanData]) -> Value {
+    let mut traces: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for span in spans {
+        traces
+            .entry(span.trace_id.as_str())
+            .or_default()
+            .push(datadog_span_value(service_name, span));
+    }
+    Value::Array(
+        traces
+            .into_values()
+            .map(Value::Array)
+            .collect::<Vec<Value>>(),
+    )
+}
+
+fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
+    let start_ns = timestamp_nanos(&span.timestamp_received);
+    let duration_ns = (span.duration_ms.max(0.0) * 1_000_000.0) as i64;
+    let mut meta = serde_json::Map::new();
+    insert_tag(&mut meta, "http.method", &span.http_method);
+    insert_tag(&mut meta, "http.url", &span.http_url);
+    insert_tag(&mut meta, "client.ip", &span.client_ip);
+    if let Some(high_trace_bits) = datadog_high_trace_id(&span.trace_id) {
+        insert_tag(&mut meta, "_dd.p.tid", high_trace_bits);
+    }
+    if let Some(ref proxy_id) = span.proxy_id {
+        insert_tag(&mut meta, "gateway.proxy.id", proxy_id);
+    }
+    if let Some(ref route) = span.matched_route {
+        insert_tag(&mut meta, "http.route", route);
+    }
+    if let Some(ref target) = span.backend_target_url {
+        insert_tag(&mut meta, "server.address", target);
+    }
+    if let Some(ref protocol) = span.stream_protocol {
+        insert_tag(&mut meta, "network.protocol.name", protocol);
+    }
+    for (key, value) in &span.mesh_attributes {
+        insert_tag(&mut meta, key, value);
+    }
+
+    let mut metrics = serde_json::Map::new();
+    metrics.insert(
+        "_sampling_priority_v1".to_string(),
+        serde_json::json!(1.0_f64),
+    );
+    metrics.insert(
+        "gateway.latency.total_ms".to_string(),
+        serde_json::json!(span.duration_ms),
+    );
+    if let Some(status_code) = span.http_status_code {
+        metrics.insert(
+            "http.status_code".to_string(),
+            serde_json::json!(status_code as i64),
+        );
+    }
+
+    serde_json::json!({
+        "trace_id": hex_low_u64(&span.trace_id),
+        "span_id": hex_low_u64(&span.span_id),
+        "parent_id": hex_low_u64(&span.parent_span_id),
+        "name": "ferrum.edge.request",
+        "resource": span.span_name.clone(),
+        "service": service_name,
+        "type": "web",
+        "start": start_ns,
+        "duration": duration_ns,
+        "meta": meta,
+        "metrics": metrics,
+    })
+}
+
+fn insert_tag(map: &mut serde_json::Map<String, Value>, key: &str, value: &str) {
+    map.insert(key.to_string(), Value::String(value.to_string()));
+}
+
+fn timestamp_nanos(timestamp: &str) -> i64 {
+    if timestamp.is_empty() {
+        return 0;
+    }
+    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+        Ok(dt) => match dt.timestamp_nanos_opt() {
+            Some(nanos) => nanos,
+            None => {
+                debug!(
+                    timestamp,
+                    "trace timestamp outside nanosecond range; using unix epoch fallback"
+                );
+                0
+            }
+        },
+        Err(error) => {
+            debug!(
+                timestamp,
+                %error,
+                "invalid trace timestamp; using unix epoch fallback"
+            );
+            0
+        }
+    }
+}
+
+fn timestamp_micros(timestamp: &str) -> i64 {
+    timestamp_nanos(timestamp) / 1_000
+}
+
+fn hex_low_u64(hex: &str) -> u64 {
+    let start = hex.len().saturating_sub(16);
+    u64::from_str_radix(&hex[start..], 16).unwrap_or(0)
+}
+
+fn datadog_high_trace_id(hex: &str) -> Option<&str> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let high = &hex[..16];
+    high.chars().any(|ch| ch != '0').then_some(high)
 }
 
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
@@ -790,24 +1398,55 @@ fn u32_config(config: &Value, key: &str, default: u32, min: u32) -> Result<u32, 
     u32::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
 }
 
-fn validate_endpoint(endpoint: &str) -> Result<String, String> {
+fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result<String, String> {
     let url = Url::parse(endpoint)
-        .map_err(|e| format!("otel_tracing: 'endpoint' must be a valid URL: {e}"))?;
+        .map_err(|e| format!("{provider_name}: 'endpoint' must be a valid URL: {e}"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "otel_tracing: 'endpoint' scheme must be http or https, got: {scheme}"
+                "{provider_name}: 'endpoint' scheme must be http or https, got: {scheme}"
             ));
         }
     }
     url.host_str()
         .filter(|host| !host.is_empty())
         .map(|host| host.to_string())
-        .ok_or_else(|| "otel_tracing: 'endpoint' must include a hostname".to_string())
+        .ok_or_else(|| format!("{provider_name}: 'endpoint' must include a hostname"))
 }
 
-fn build_traceparent(version: &str, trace_id: &str, span_id: &str, flags: &str) -> String {
+fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
+    let mut url = Url::parse(agent_url)
+        .map_err(|e| format!("Datadog: 'agent_url' must be a valid URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "Datadog: 'agent_url' scheme must be http or https, got: {scheme}"
+            ));
+        }
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("Datadog: 'agent_url' must include a hostname".to_string());
+    }
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        url.set_path("/v0.3/traces");
+    } else if path != "/v0.3/traces" {
+        let mut combined = String::with_capacity(path.len() + "/v0.3/traces".len());
+        combined.push_str(path);
+        combined.push_str("/v0.3/traces");
+        url.set_path(&combined);
+    }
+    Ok(url.to_string())
+}
+
+pub(crate) fn build_traceparent(
+    version: &str,
+    trace_id: &str,
+    span_id: &str,
+    flags: &str,
+) -> String {
     let mut traceparent =
         String::with_capacity(version.len() + trace_id.len() + span_id.len() + flags.len() + 3);
     traceparent.push_str(version);
@@ -818,6 +1457,64 @@ fn build_traceparent(version: &str, trace_id: &str, span_id: &str, flags: &str) 
     traceparent.push('-');
     traceparent.push_str(flags);
     traceparent
+}
+
+pub(crate) fn ensure_trace_metadata(
+    metadata: &mut HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) {
+    if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
+        return;
+    }
+
+    if let Some(existing) = header_value_case_insensitive(headers, TRACEPARENT_HEADER)
+        && let Some(parsed) = OtelTracing::parse_traceparent(existing)
+    {
+        metadata.insert("trace_id".to_string(), parsed.trace_id.to_string());
+        metadata.insert(
+            "parent_span_id".to_string(),
+            parsed.parent_span_id.to_string(),
+        );
+        let span_id = OtelTracing::generate_span_id();
+        metadata.insert("span_id".to_string(), span_id.clone());
+        metadata.insert(
+            TRACEPARENT_HEADER.to_string(),
+            build_traceparent(parsed.version, parsed.trace_id, &span_id, parsed.flags),
+        );
+        return;
+    }
+
+    let generated = OtelTracing::generate_trace_context();
+    metadata.insert("trace_id".to_string(), generated.trace_id);
+    metadata.insert("span_id".to_string(), generated.span_id);
+    metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
+}
+
+/// Return true only when metadata carries an affirmative sampling decision.
+///
+/// Missing `trace_sampled` and traceparent flags are treated as not sampled;
+/// callers that want fallback local sampling should apply it explicitly.
+pub(crate) fn trace_is_sampled(metadata: &HashMap<String, String>) -> bool {
+    if let Some(value) = metadata.get("trace_sampled") {
+        return value.eq_ignore_ascii_case("true");
+    }
+    metadata
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| OtelTracing::parse_traceparent(value))
+        .and_then(|parsed| u8::from_str_radix(parsed.flags, 16).ok())
+        .is_some_and(|flags| flags & 0x01 == 0x01)
+}
+
+fn header_value_case_insensitive<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -888,6 +1585,91 @@ fn hex_to_base64(hex: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_span(trace_id: &str, span_id: &str) -> SpanData {
+        SpanData {
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            parent_span_id: String::new(),
+            service_name: "ferrum-edge".to_string(),
+            span_name: "GET /api".to_string(),
+            span_kind: 2,
+            http_method: "GET".to_string(),
+            http_url: "/api".to_string(),
+            http_status_code: Some(200),
+            client_ip: "127.0.0.1".to_string(),
+            duration_ms: 10.0,
+            gateway_processing_ms: 1.0,
+            backend_ttfb_ms: 2.0,
+            backend_ms: 3.0,
+            plugin_execution_ms: 1.0,
+            gateway_overhead_ms: 1.0,
+            consumer: None,
+            timestamp_received: "2025-01-01T00:00:00Z".to_string(),
+            user_agent: None,
+            proxy_id: Some("proxy-a".to_string()),
+            matched_route: Some("api".to_string()),
+            backend_target_url: None,
+            backend_resolved_ip: None,
+            error_class: None,
+            response_streamed: false,
+            client_disconnected: false,
+            mesh_attributes: Vec::new(),
+            stream_protocol: None,
+            stream_listen_port: None,
+            stream_bytes_sent: None,
+            stream_bytes_received: None,
+        }
+    }
+
+    fn test_trace_http_exporter_config() -> TraceHttpExporterConfig {
+        TraceHttpExporterConfig {
+            provider_name: "workload_metrics",
+            endpoint: "http://collector:4318/v1/traces".to_string(),
+            authorization: None,
+            custom_headers: Vec::new(),
+            http_client: PluginHttpClient::default(),
+            batch_size: 16,
+            flush_interval: Duration::from_secs(60),
+            max_retries: 0,
+            retry_delay: Duration::from_millis(1),
+            service_name: "ferrum-edge".to_string(),
+            deployment_environment: None,
+            payload_kind: TracePayloadKind::Otlp,
+        }
+    }
+
+    #[test]
+    fn buffered_trace_exporter_defers_start_without_runtime() {
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+            .expect("exporter config accepted");
+
+        assert!(!exporter.started.load(Ordering::Acquire));
+        assert!(
+            exporter
+                .try_export(test_span(
+                    "4bf92f3577b34da6a3ce929d0e0e4736",
+                    "00f067aa0ba902b7"
+                ))
+                .is_err(),
+            "enqueue should report missing runtime instead of silently dropping deferred startup"
+        );
+        assert!(
+            !exporter.started.load(Ordering::Acquire),
+            "failed deferred startup must stay retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_trace_exporter_marks_started_when_runtime_available() {
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+            .expect("exporter config accepted");
+
+        assert!(
+            exporter.started.load(Ordering::Acquire),
+            "exporter constructed inside a runtime should enter steady-state without per-span locking"
+        );
+    }
+
     #[test]
     fn hex_to_base64_decodes_even_length_input() {
         // Standard 16-byte trace_id (32 hex chars).
@@ -927,15 +1709,61 @@ mod tests {
     }
 
     #[test]
+    fn datadog_payload_groups_spans_by_trace_and_preserves_128_bit_id() {
+        let trace_a = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let trace_b = "0000000000000000000000000000002a";
+        let payload = build_datadog_payload(
+            "ferrum-edge",
+            &[
+                test_span(trace_a, "00f067aa0ba902b7"),
+                test_span(trace_b, "00f067aa0ba902b8"),
+                test_span(trace_a, "00f067aa0ba902b9"),
+            ],
+        );
+
+        let traces = payload.as_array().expect("datadog trace array");
+        assert_eq!(traces.len(), 2);
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.as_array().unwrap().len() == 2)
+        );
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.as_array().unwrap().len() == 1)
+        );
+
+        let first_trace_span = traces
+            .iter()
+            .flat_map(|trace| trace.as_array().unwrap())
+            .find(|span| span["meta"]["_dd.p.tid"] == "4bf92f3577b34da6")
+            .expect("128-bit trace high bits preserved");
+        assert_eq!(
+            first_trace_span["trace_id"],
+            serde_json::json!(0xa3ce_929d_0e0e_4736_u64)
+        );
+
+        let low_only_span = traces
+            .iter()
+            .flat_map(|trace| trace.as_array().unwrap())
+            .find(|span| span["trace_id"] == serde_json::json!(42_u64))
+            .expect("low-only trace present");
+        assert!(low_only_span["meta"].get("_dd.p.tid").is_none());
+    }
+
+    #[test]
     fn otlp_payload_includes_mesh_identity_attributes() {
         let span = SpanData {
             trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
             span_id: "00f067aa0ba902b7".to_string(),
             parent_span_id: String::new(),
             service_name: "ferrum-edge".to_string(),
+            span_name: "GET /".to_string(),
+            span_kind: 2,
             http_method: "GET".to_string(),
             http_url: "/".to_string(),
-            http_status_code: 200,
+            http_status_code: Some(200),
             client_ip: "127.0.0.1".to_string(),
             duration_ms: 10.0,
             gateway_processing_ms: 1.0,
@@ -963,6 +1791,10 @@ mod tests {
                     "payments".to_string(),
                 ),
             ],
+            stream_protocol: None,
+            stream_listen_port: None,
+            stream_bytes_sent: None,
+            stream_bytes_received: None,
         };
 
         let payload = build_otlp_payload("ferrum-edge", None, &[span]);

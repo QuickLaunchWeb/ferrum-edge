@@ -213,6 +213,7 @@ fn record_cross_protocol_retry_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_next_cross_protocol_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
@@ -221,44 +222,23 @@ fn select_next_cross_protocol_retry_target(
     current_target: Option<&Arc<UpstreamTarget>>,
     path: &str,
     query_string: &str,
+    client_ip: &str,
+    proxy_headers: &HashMap<String, String>,
 ) -> Option<(Arc<UpstreamTarget>, String, String)> {
-    let (Some(upstream_id), Some(prev_target), Some(hash_key)) =
-        (&proxy.upstream_id, current_target, lb_hash_key)
-    else {
-        return None;
-    };
+    let (prev_target, hash_key) = (current_target?, lb_hash_key?);
 
-    let health_ctx = crate::load_balancer::HealthContext {
-        active_unhealthy: &state.health_checker.active_unhealthy_targets,
-        proxy_passive: state
-            .health_checker
-            .passive_health
-            .get(&proxy.id)
-            .map(|r| r.value().clone()),
-        max_ejection_percent: crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
-            &epoch.load_balancer,
-            upstream_id,
-        ),
-    };
-
-    let next = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-        crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
-            &epoch.load_balancer,
-            upstream_id,
-            hash_key,
-            subset_name,
-            prev_target,
-            Some(&health_ctx),
-        )
-    } else {
-        crate::load_balancer::LoadBalancerCache::select_next_target_from(
-            &epoch.load_balancer,
-            upstream_id,
-            hash_key,
-            prev_target,
-            Some(&health_ctx),
-        )
-    }?;
+    // Centralised in `backend_dispatch::select_next_retry_target` —
+    // see that helper for the per-port `hash_on` recomputation contract
+    // shared with the HTTP/H2/gRPC/WS retry sites.
+    let next = crate::proxy::backend_dispatch::select_next_retry_target(
+        state,
+        epoch,
+        proxy,
+        prev_target,
+        hash_key,
+        client_ip,
+        proxy_headers,
+    )?;
 
     let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
     let next_url = crate::proxy::build_backend_url_with_target(
@@ -760,6 +740,8 @@ where
                                     current_target.as_ref(),
                                     path,
                                     query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 )
                             {
                                 current_target = Some(next_target);
@@ -820,6 +802,8 @@ where
                                     current_target.as_ref(),
                                     path,
                                     query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 )
                             {
                                 current_target = Some(next_target);
@@ -1669,6 +1653,8 @@ where
                     current_target.as_ref(),
                     path,
                     query_string,
+                    client_ip,
+                    proxy_headers,
                 )
             {
                 current_target = Some(next_target);

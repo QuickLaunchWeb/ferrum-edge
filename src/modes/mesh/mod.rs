@@ -35,9 +35,9 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
-    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    service_entry_exported_to_namespace,
+    MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
+    ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -559,6 +559,7 @@ fn gateway_config_from_mesh_slice(
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
+            ..MeshConfig::default()
         })),
         loaded_at,
         ..GatewayConfig::default()
@@ -1058,29 +1059,6 @@ fn apply_destination_rules(
                     continue;
                 }
 
-                // The K8s translator emits warnings for
-                // `portLevelSettings[].loadBalancer` / `outlierDetection` at
-                // translate time (src/config_sources/k8s/istio.rs), but
-                // native MeshSubscribe / xDS slices bypass that path. Surface
-                // the same gap here so operators see the unenforced fields
-                // regardless of how the slice arrives at the data plane.
-                if port_policy.load_balancer.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied"
-                    );
-                }
-                if port_policy.outlier_detection.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied"
-                    );
-                }
-
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
             }
@@ -1134,23 +1112,22 @@ fn apply_destination_rules(
 }
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
-///
-/// Only `connect_timeout_ms` is wired into the dispatch hot path today
-/// (`Upstream::effective_connect_timeout_ms`). Per-port LB algorithm and
-/// hash-key are intentionally NOT applied — the gateway keeps a single
-/// `LoadBalancer` per upstream and switching algorithm/ring per destination
-/// port would require per-port balancer instances (different counters /
-/// hash rings). The translator emits a warning when operators set these on
-/// `portLevelSettings[].loadBalancer` so they know the gap.
-///
-/// Per-port `outlierDetection` is also not split out — it produces a single
-/// `PassiveHealthCheck` on the upstream via the top-level policy.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,
 ) {
     if let Some(timeout_ms) = policy.connect_timeout_ms {
         slot.connect_timeout_ms = Some(timeout_ms);
+    }
+    if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+        slot.algorithm = Some(algorithm);
+        // Unconditional: clears stale hash keys when switching a port to a non-hash algorithm.
+        slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
+    }
+    if let Some(ref od) = policy.outlier_detection {
+        let mut passive = slot.passive_health_check.clone().unwrap_or_default();
+        apply_outlier_detection_to_passive(&mut passive, od);
+        slot.passive_health_check = Some(passive);
     }
 }
 
@@ -1201,19 +1178,11 @@ fn apply_traffic_policy_to_upstream(
     policy: &MeshTrafficPolicy,
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
-    if let Some(lb) = &policy.load_balancer {
-        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
-            upstream.algorithm = algorithm;
-        }
-        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
-            if let Some(header) = &ch.http_header_name {
-                upstream.hash_on = Some(format!("header:{header}"));
-            } else if let Some(cookie) = &ch.http_cookie_name {
-                upstream.hash_on = Some(format!("cookie:{cookie}"));
-            } else if ch.use_source_ip {
-                upstream.hash_on = Some("ip".to_string());
-            }
-        }
+    if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+        upstream.algorithm = algorithm;
+    }
+    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
+        upstream.hash_on = Some(hash_on);
     }
 
     // Outlier detection -> passive health check.
@@ -1224,18 +1193,7 @@ fn apply_traffic_policy_to_upstream(
             .passive
             .get_or_insert_with(PassiveHealthCheck::default);
 
-        if let Some(consecutive) = od.consecutive_errors {
-            passive.unhealthy_threshold = consecutive;
-        }
-        if let Some(interval) = od.interval_seconds {
-            passive.unhealthy_window_seconds = interval;
-        }
-        if let Some(ejection) = od.base_ejection_seconds {
-            passive.healthy_after_seconds = ejection;
-        }
-        if let Some(max_pct) = od.max_ejection_percent {
-            passive.max_ejection_percent = Some(max_pct);
-        }
+        apply_outlier_detection_to_passive(passive, od);
     }
 
     // Backend TLS posture override from DestinationRule.trafficPolicy.tls.
@@ -1416,6 +1374,36 @@ fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgori
         },
         Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
         None => None,
+    }
+}
+
+fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
+    let Some(MeshLoadBalancer::ConsistentHash(ch)) = lb else {
+        return None;
+    };
+    if let Some(header) = &ch.http_header_name {
+        Some(format!("header:{header}"))
+    } else if let Some(cookie) = &ch.http_cookie_name {
+        Some(format!("cookie:{cookie}"))
+    } else if ch.use_source_ip {
+        Some("ip".to_string())
+    } else {
+        None
+    }
+}
+
+fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
+    if let Some(consecutive) = od.consecutive_errors {
+        passive.unhealthy_threshold = consecutive;
+    }
+    if let Some(interval) = od.interval_seconds {
+        passive.unhealthy_window_seconds = interval;
+    }
+    if let Some(ejection) = od.base_ejection_seconds {
+        passive.healthy_after_seconds = ejection;
+    }
+    if let Some(max_pct) = od.max_ejection_percent {
+        passive.max_ejection_percent = Some(max_pct);
     }
 }
 
@@ -1901,8 +1889,13 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_header_tags"] =
                 serde_json::json!(tracing.custom_header_tags);
         }
-        if let Some(provider) = &tracing.provider {
-            workload_metrics_config["tracing_provider"] = serde_json::json!(provider);
+        if tracing.disable_span_reporting.unwrap_or(false) {
+            workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
+        }
+        if !tracing.providers.is_empty() {
+            // Keep provider config visible for introspection and propagation even
+            // when span_reporting_disabled makes WorkloadMetrics skip exporters.
+            workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
     }
     if let Some(metrics) = &merged_telemetry.metrics {
@@ -2009,14 +2002,22 @@ fn merge_tracing_config(
     next: &crate::modes::mesh::config::MeshTracingConfig,
 ) {
     let current = merged.get_or_insert_with(|| crate::modes::mesh::config::MeshTracingConfig {
+        mode: None,
         sampling_percentage: None,
+        disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
-        provider: None,
+        providers: Vec::new(),
     });
 
+    if next.mode.is_some() {
+        current.mode = next.mode;
+    }
     if next.sampling_percentage.is_some() {
         current.sampling_percentage = next.sampling_percentage;
+    }
+    if next.disable_span_reporting.is_some() {
+        current.disable_span_reporting = next.disable_span_reporting;
     }
     if !next.custom_tags.is_empty() {
         current.custom_tags.clone_from(&next.custom_tags);
@@ -2026,8 +2027,8 @@ fn merge_tracing_config(
             .custom_header_tags
             .clone_from(&next.custom_header_tags);
     }
-    if next.provider.is_some() {
-        current.provider.clone_from(&next.provider);
+    if !next.providers.is_empty() {
+        current.providers.clone_from(&next.providers);
     }
 }
 
@@ -4246,16 +4247,14 @@ mod tests {
         );
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1111);
 
-        // Per-port 8080 connect-timeout override lands on port_overrides[8080]
-        // without disturbing the upstream-level fields or the proxy-default
-        // connect timeout. The LB algorithm in `portLevelSettings[].loadBalancer`
-        // is intentionally NOT mirrored here today — see
-        // `apply_traffic_policy_to_port_override` rationale.
+        // Per-port policy lands on port_overrides[8080] without disturbing
+        // the upstream-level fields or the proxy-default connect timeout.
         let port_8080 = config.upstreams[0]
             .port_overrides
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
+        assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
 
         // Proof that the override is actually consulted at dispatch time via
         // the helper the hot path uses — port 8080 wins, other ports fall
@@ -4328,12 +4327,21 @@ mod tests {
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(p8080.connect_timeout_ms, Some(750));
+        assert_eq!(
+            p8080.algorithm,
+            Some(LoadBalancerAlgorithm::LeastConnections)
+        );
 
         let p9090 = config.upstreams[0]
             .port_overrides
             .get(&9090)
             .expect("port 9090 override");
         assert_eq!(p9090.connect_timeout_ms, Some(3000));
+        assert_eq!(
+            p9090.algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
 
         // Effective-timeout helper is what the dispatch hot path consults.
         // Each port's own override wins; an unrelated port falls back to the
@@ -4342,6 +4350,144 @@ mod tests {
         assert_eq!(upstream.effective_connect_timeout_ms(8080, 5000), 750);
         assert_eq!(upstream.effective_connect_timeout_ms(9090, 5000), 3000);
         assert_eq!(upstream.effective_connect_timeout_ms(7777, 5000), 5000);
+    }
+
+    #[test]
+    fn destination_rule_per_port_outlier_detection_merges_partial_overrides() {
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut first_port_policy = HashMap::new();
+        first_port_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(7),
+                    interval_seconds: Some(30),
+                    base_ejection_seconds: Some(60),
+                    max_ejection_percent: Some(40),
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let mut second_port_policy = HashMap::new();
+        second_port_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(2),
+                    interval_seconds: None,
+                    base_ejection_seconds: None,
+                    max_ejection_percent: None,
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "a-base".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: first_port_policy,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "b-partial".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: second_port_policy,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let passive = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .and_then(|override_config| override_config.passive_health_check.as_ref())
+            .expect("port passive health");
+        assert_eq!(passive.unhealthy_threshold, 2);
+        assert_eq!(passive.unhealthy_window_seconds, 30);
+        assert_eq!(passive.healthy_after_seconds, 60);
+        assert_eq!(passive.max_ejection_percent, Some(40));
+    }
+
+    #[test]
+    fn destination_rule_per_port_non_hash_policy_clears_stale_hash_key() {
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut hash_policy = HashMap::new();
+        hash_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                    crate::modes::mesh::config::MeshConsistentHash {
+                        http_header_name: Some("x-user".to_string()),
+                        http_cookie_name: None,
+                        use_source_ip: false,
+                    },
+                )),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let mut random_policy = HashMap::new();
+        random_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "a-hash".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: hash_policy,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "b-random".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: random_policy,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let port = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override");
+        assert_eq!(port.algorithm, Some(LoadBalancerAlgorithm::Random));
+        assert!(
+            port.hash_on.is_none(),
+            "later non-hash policy must clear an earlier hash key"
+        );
     }
 
     #[test]
@@ -4365,10 +4511,12 @@ mod tests {
                     scope: PolicyScope::MeshWide,
                     config: MeshTelemetryConfig {
                         tracing: Some(MeshTracingConfig {
+                            mode: None,
                             sampling_percentage: Some(100.0),
+                            disable_span_reporting: Some(true),
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
-                            provider: None,
+                            providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -4384,13 +4532,15 @@ mod tests {
                     },
                     config: MeshTelemetryConfig {
                         tracing: Some(MeshTracingConfig {
+                            mode: None,
                             sampling_percentage: None,
+                            disable_span_reporting: None,
                             custom_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
                             custom_header_tags: HashMap::from([(
                                 "tenant".to_string(),
                                 "x-tenant".to_string(),
                             )]),
-                            provider: None,
+                            providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -4407,6 +4557,7 @@ mod tests {
         let tracing = merged.tracing.expect("tracing merged");
 
         assert_eq!(tracing.sampling_percentage, Some(100.0));
+        assert_eq!(tracing.disable_span_reporting, Some(true));
         assert_eq!(
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
@@ -4415,6 +4566,96 @@ mod tests {
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
         );
+    }
+
+    #[test]
+    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: "test".to_string(),
+            telemetry_resources: vec![
+                MeshTelemetryResource {
+                    name: "mesh-defaults".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            mode: None,
+                            sampling_percentage: Some(25.0),
+                            disable_span_reporting: None,
+                            custom_tags: HashMap::from([
+                                ("env".to_string(), "staging".to_string()),
+                                ("mesh".to_string(), "ferrum".to_string()),
+                            ]),
+                            custom_header_tags: HashMap::from([(
+                                "mesh-tenant".to_string(),
+                                "x-mesh-tenant".to_string(),
+                            )]),
+                            providers: vec![TracingProvider::Zipkin {
+                                url: "http://zipkin:9411/api/v2/spans".to_string(),
+                            }],
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+                MeshTelemetryResource {
+                    name: "workload-override".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            mode: None,
+                            sampling_percentage: None,
+                            disable_span_reporting: None,
+                            custom_tags: HashMap::from([
+                                ("env".to_string(), "prod".to_string()),
+                                ("region".to_string(), "us-east".to_string()),
+                            ]),
+                            custom_header_tags: HashMap::from([(
+                                "tenant".to_string(),
+                                "x-tenant".to_string(),
+                            )]),
+                            providers: vec![TracingProvider::OpenTelemetry {
+                                endpoint: "http://otel:4318/v1/traces".to_string(),
+                            }],
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        let merged = merge_applicable_telemetry(&mesh_slice);
+        let tracing = merged.tracing.expect("tracing merged");
+
+        assert_eq!(tracing.sampling_percentage, Some(25.0));
+        assert_eq!(
+            tracing.custom_tags.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert!(!tracing.custom_tags.contains_key("mesh"));
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
+        assert_eq!(
+            tracing.custom_header_tags.get("tenant").map(String::as_str),
+            Some("x-tenant")
+        );
+        assert_eq!(tracing.providers.len(), 1);
+        assert!(matches!(
+            tracing.providers.first(),
+            Some(TracingProvider::OpenTelemetry { .. })
+        ));
     }
 
     #[test]
@@ -4758,12 +4999,14 @@ mod tests {
                 },
                 config: MeshTelemetryConfig {
                     tracing: Some(MeshTracingConfig {
+                        mode: None,
                         sampling_percentage: Some(10.0),
+                        disable_span_reporting: None,
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
-                        provider: Some(TracingProvider::Zipkin {
+                        providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
-                        }),
+                        }],
                     }),
                     ..MeshTelemetryConfig::default()
                 },
@@ -4779,10 +5022,12 @@ mod tests {
             .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
             .expect("workload_metrics plugin injected");
 
-        let provider = workload_metrics
+        let providers = workload_metrics
             .config
-            .get("tracing_provider")
-            .expect("tracing_provider merged into workload_metrics");
+            .get("tracing_providers")
+            .and_then(serde_json::Value::as_array)
+            .expect("tracing_providers merged into workload_metrics");
+        let provider = providers.first().expect("zipkin provider present");
         assert_eq!(
             provider.get("kind").and_then(serde_json::Value::as_str),
             Some("zipkin")
@@ -4797,6 +5042,66 @@ mod tests {
         assert_eq!(
             workload_metrics.config["sampling_percentage"],
             serde_json::json!(10.0)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_preserves_provider_when_span_reporting_disabled() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "api-tracing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                config: MeshTelemetryConfig {
+                    tracing: Some(MeshTracingConfig {
+                        mode: None,
+                        sampling_percentage: Some(100.0),
+                        disable_span_reporting: Some(true),
+                        custom_tags: HashMap::new(),
+                        custom_header_tags: HashMap::new(),
+                        providers: vec![TracingProvider::Zipkin {
+                            url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
+                        }],
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let workload_metrics = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+
+        assert_eq!(
+            workload_metrics.config["span_reporting_disabled"],
+            serde_json::json!(true)
+        );
+        let providers = workload_metrics
+            .config
+            .get("tracing_providers")
+            .and_then(serde_json::Value::as_array)
+            .expect("tracing_providers kept for propagation");
+        assert_eq!(
+            providers
+                .first()
+                .and_then(|provider| provider.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("zipkin")
         );
     }
 

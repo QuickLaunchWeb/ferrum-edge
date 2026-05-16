@@ -29,6 +29,7 @@ mod functional_mongodb_test;
 mod functional_mtls_acl_test;
 mod functional_mtls_test;
 mod functional_namespace_test;
+mod functional_node_agent_test;
 mod functional_otel_ldap_test;
 mod functional_overload_test;
 mod functional_passthrough_test;

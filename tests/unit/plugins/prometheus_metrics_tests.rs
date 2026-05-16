@@ -1,5 +1,6 @@
 //! Tests for prometheus_metrics plugin
 
+use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, HboneRelayFailureKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
@@ -173,6 +174,23 @@ async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
     assert!(output.contains("# TYPE ferrum_mesh_request_duration_ms histogram"));
     assert!(output.contains("ferrum_mesh_request_duration_ms_bucket{"));
     assert!(output.contains("le=\"+Inf\""));
+}
+
+#[tokio::test]
+async fn test_registry_renders_node_agent_metrics_when_registered() {
+    let registry = MetricsRegistry::new();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    metrics.pods_enrolled.fetch_add(3, Ordering::Relaxed);
+    metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
+    metrics.attach_errors.fetch_add(2, Ordering::Relaxed);
+
+    registry.set_node_agent_metrics(metrics);
+    let output = registry.render_uncached();
+
+    assert!(output.contains("# TYPE ferrum_node_agent_pods_enrolled_total counter"));
+    assert!(output.contains("ferrum_node_agent_pods_enrolled_total 3"));
+    assert!(output.contains("ferrum_node_agent_pods_unenrolled_total 1"));
+    assert!(output.contains("ferrum_node_agent_attach_errors_total 2"));
 }
 
 #[tokio::test]
