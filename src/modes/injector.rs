@@ -33,6 +33,8 @@ use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
+const MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB: usize = 1024;
+const MIB_BYTES: usize = 1024 * 1024;
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
@@ -225,8 +227,8 @@ impl InjectorConfig {
 fn parse_injector_admission_review_max_body_bytes_from_mib(
     value: Option<&str>,
 ) -> Result<usize, String> {
-    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024);
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * MIB_BYTES);
     };
     let parsed = raw.parse::<usize>().map_err(|_| {
         "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be an unsigned integer"
@@ -238,7 +240,12 @@ fn parse_injector_admission_review_max_body_bytes_from_mib(
                 .to_string(),
         );
     }
-    parsed.checked_mul(1024 * 1024).ok_or_else(|| {
+    if parsed > MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB {
+        return Err(format!(
+            "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be at most {MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB} MiB"
+        ));
+    }
+    parsed.checked_mul(MIB_BYTES).ok_or_else(|| {
         format!(
             "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: value too large: {raw}"
         )
@@ -642,9 +649,8 @@ async fn handle_injector_request(
 }
 
 fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
-    const MIB: usize = 1024 * 1024;
-    if max_body_bytes % MIB == 0 {
-        format!("{max_body_bytes} bytes / {} MiB", max_body_bytes / MIB)
+    if max_body_bytes % MIB_BYTES == 0 {
+        format!("{} MiB", max_body_bytes / MIB_BYTES)
     } else {
         format!("{max_body_bytes} bytes")
     }
@@ -1737,15 +1743,15 @@ mod tests {
     fn injector_admission_review_max_body_size_mib_defaults_and_validates() {
         assert_eq!(
             parse_injector_admission_review_max_body_bytes_from_mib(None).unwrap(),
-            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
+            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * MIB_BYTES
         );
         assert_eq!(
             parse_injector_admission_review_max_body_bytes_from_mib(Some("")).unwrap(),
-            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
+            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * MIB_BYTES
         );
         assert_eq!(
             parse_injector_admission_review_max_body_bytes_from_mib(Some("1")).unwrap(),
-            1024 * 1024
+            MIB_BYTES
         );
         assert!(
             parse_injector_admission_review_max_body_bytes_from_mib(Some("0"))
@@ -1757,11 +1763,11 @@ mod tests {
                 .unwrap_err()
                 .contains("unsigned integer")
         );
-        let overflow_mib = usize::MAX.to_string();
+        let overflow_mib = (MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB + 1).to_string();
         assert!(
             parse_injector_admission_review_max_body_bytes_from_mib(Some(&overflow_mib))
                 .unwrap_err()
-                .contains("value too large")
+                .contains("must be at most 1024 MiB")
         );
     }
 
@@ -1769,7 +1775,7 @@ mod tests {
     fn admission_review_body_limit_display_formats_mib_when_aligned() {
         assert_eq!(
             admission_review_body_limit_display(4 * 1024 * 1024),
-            "4194304 bytes / 4 MiB"
+            "4 MiB"
         );
         assert_eq!(admission_review_body_limit_display(1024), "1024 bytes");
     }
