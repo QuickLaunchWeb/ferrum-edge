@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
-use http_body_util::{BodyExt, Full, LengthLimitError};
+use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
@@ -51,6 +51,7 @@ use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
 };
+use crate::util::body_limit::is_length_limit_error;
 
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
@@ -1053,7 +1054,7 @@ pub async fn proxy_grpc_request(
         match BodyExt::collect(limited).await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                if e.downcast_ref::<LengthLimitError>().is_some() {
+                if is_length_limit_error(e.as_ref()) {
                     return (
                         Err(GrpcProxyError::ResourceExhausted(format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
@@ -1357,7 +1358,7 @@ pub async fn collect_grpc_request_body(
         match BodyExt::collect(limited).await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                if e.downcast_ref::<LengthLimitError>().is_some() {
+                if is_length_limit_error(e.as_ref()) {
                     return Err(GrpcProxyError::ResourceExhausted(format!(
                         "gRPC request payload size exceeds maximum of {} bytes",
                         max_grpc_recv_size_bytes

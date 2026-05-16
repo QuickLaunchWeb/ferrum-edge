@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ use crate::admin::api_specs::{
 use crate::admin::spec_codec;
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
+use crate::util::body_limit::is_length_limit_error;
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -713,7 +714,7 @@ async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>,
     match Limited::new(req.into_body(), max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes().to_vec()),
         Err(e) => {
-            if e.downcast_ref::<LengthLimitError>().is_some() {
+            if is_length_limit_error(e.as_ref()) {
                 Err(ApiSpecError::PayloadTooLarge(max_mib))
             } else {
                 Err(ApiSpecError::BodyCollect(e.to_string()))

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -30,6 +30,7 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::identity::spiffe::TrustDomain;
 use crate::tls::{self, TlsPolicy};
+use crate::util::body_limit::is_length_limit_error;
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
@@ -618,7 +619,7 @@ async fn handle_injector_request(
     {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            if e.downcast_ref::<LengthLimitError>().is_some() {
+            if is_length_limit_error(e.as_ref()) {
                 warn!(
                     remote_addr = %remote_addr,
                     max_body_bytes,
@@ -637,7 +638,7 @@ async fn handle_injector_request(
             );
             return Ok(response(
                 StatusCode::BAD_REQUEST,
-                format!("failed to read AdmissionReview body: {e}"),
+                "failed to read AdmissionReview body",
             ));
         }
     };
@@ -1178,8 +1179,7 @@ mod tests {
             tls_key_path: None,
             tls_handshake_timeout_seconds: 10,
             admission_review_max_body_bytes: DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB
-                * 1024
-                * 1024,
+                * MIB_BYTES,
         }
     }
 
@@ -1717,9 +1717,45 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status().as_u16(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let text = resp.text().await.unwrap();
         assert!(text.contains("AdmissionReview body too large (max 1024 bytes)"));
+        assert_server_finished(server).await;
+    }
+
+    #[tokio::test]
+    async fn injector_request_accepts_body_exactly_at_limit() {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "abc",
+                "namespace": "payments",
+                "object": {
+                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+                    "spec": {"containers": []}
+                }
+            }
+        });
+        let mut body = review.to_string();
+        assert!(body.len() < 1024);
+        body.push_str(&" ".repeat(1024 - body.len()));
+
+        let mut config = test_config(true, CaptureMode::Explicit);
+        config.admission_review_max_body_bytes = body.len();
+        let (addr, server) = spawn_injector_test_server(config).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/mutate"))
+            .header("connection", "close")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains(r#""allowed":true"#), "got: {text}");
         assert_server_finished(server).await;
     }
 
