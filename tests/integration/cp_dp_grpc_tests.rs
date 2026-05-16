@@ -2395,6 +2395,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
                 port: *p,
                 weight: 100,
                 tags: HashMap::new(),
+                locality: None,
                 path: None,
             })
             .collect(),
@@ -2405,6 +2406,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         service_discovery: None,
         subsets: None,
         port_overrides: HashMap::new(),
+        source_locality: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,

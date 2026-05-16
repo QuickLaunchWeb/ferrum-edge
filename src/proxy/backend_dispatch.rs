@@ -676,6 +676,7 @@ mod tests {
             port: 443,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         })
     }
@@ -882,6 +883,7 @@ mod tests {
             port: 9090,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         };
         let second_target = UpstreamTarget {
@@ -889,6 +891,7 @@ mod tests {
             port: 9090,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         };
         state.health_checker.report_response(
