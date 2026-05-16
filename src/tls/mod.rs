@@ -29,6 +29,7 @@ pub use spiffe::{
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::net::SocketAddr;
@@ -509,6 +510,17 @@ pub struct MeshServerIdentity {
     key: PrivateKeyDer<'static>,
 }
 
+impl fmt::Debug for MeshServerIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeshServerIdentity")
+            .field("cert_path", &self.cert_path)
+            .field("key_path", &self.key_path)
+            .field("cert_chain_len", &self.cert_chain.len())
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
 impl MeshServerIdentity {
     pub fn cert_path(&self) -> &str {
         &self.cert_path
@@ -561,8 +573,46 @@ pub fn load_mesh_tls_config_with_identity(
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    if let Some(ca_path) = client_ca_bundle_path {
-        check_cert_expiry(ca_path, "mesh client CA bundle", cert_expiry_warning_days)?;
+    let client_ca_bundle_pem = client_ca_bundle_path
+        .map(|path| {
+            std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("mesh client CA bundle: failed to read '{}': {}", path, e)
+            })
+        })
+        .transpose()?;
+
+    load_mesh_tls_config_with_identity_and_client_ca_bytes(
+        identity,
+        client_ca_bundle_path,
+        client_ca_bundle_pem.as_deref(),
+        client_auth,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+}
+
+/// Build mesh TLS config using caller-provided client CA bytes.
+///
+/// PeerAuthentication live reload uses this path so the reload snapshot and
+/// rustls verifier are built from the same CA bundle contents.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
+    identity: &MeshServerIdentity,
+    client_ca_bundle_path: Option<&str>,
+    client_ca_bundle_pem: Option<&[u8]>,
+    client_auth: MeshClientAuth,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    if let (Some(ca_path), Some(ca_pem)) = (client_ca_bundle_path, client_ca_bundle_pem) {
+        check_cert_expiry_from_pem_bytes(
+            ca_pem,
+            "mesh client CA bundle",
+            ca_path,
+            cert_expiry_warning_days,
+        )?;
     }
 
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
@@ -578,9 +628,15 @@ pub fn load_mesh_tls_config_with_identity(
                     client_auth
                 )
             })?;
+            let ca_bundle_pem = client_ca_bundle_pem.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
+                     from FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+                    client_auth
+                )
+            })?;
 
-            let ca_file = File::open(ca_bundle_path)?;
-            let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+            let ca_certs: Vec<_> = certs(&mut &ca_bundle_pem[..])
                 .filter_map(|r| r.ok())
                 .collect();
 
@@ -891,7 +947,15 @@ pub fn check_cert_expiry(
 ) -> Result<(), anyhow::Error> {
     let pem_data = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("{}: failed to read '{}': {}", label, pem_path, e))?;
+    check_cert_expiry_from_pem_bytes(&pem_data, label, pem_path, warning_days)
+}
 
+pub(crate) fn check_cert_expiry_from_pem_bytes(
+    pem_data: &[u8],
+    label: &str,
+    display_path: &str,
+    warning_days: u64,
+) -> Result<(), anyhow::Error> {
     let der_certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
         .filter_map(|r| r.ok())
         .collect();
@@ -900,7 +964,7 @@ pub fn check_cert_expiry(
         return Err(anyhow::anyhow!(
             "{}: no valid PEM certificates found in '{}'",
             label,
-            pem_path
+            display_path
         ));
     }
 
@@ -910,7 +974,7 @@ pub fn check_cert_expiry(
                 "{}: failed to parse certificate #{} in '{}': {}",
                 label,
                 i + 1,
-                pem_path,
+                display_path,
                 e
             )
         })?;
@@ -930,7 +994,7 @@ pub fn check_cert_expiry(
                     label,
                     i + 1,
                     subject,
-                    pem_path,
+                    display_path,
                     validity.not_before
                 ));
             } else {
@@ -939,7 +1003,7 @@ pub fn check_cert_expiry(
                     label,
                     i + 1,
                     subject,
-                    pem_path,
+                    display_path,
                     validity.not_after
                 ));
             }
@@ -957,7 +1021,7 @@ pub fn check_cert_expiry(
                     label,
                     i + 1,
                     subject,
-                    pem_path,
+                    display_path,
                     remaining_days,
                     validity.not_after
                 );

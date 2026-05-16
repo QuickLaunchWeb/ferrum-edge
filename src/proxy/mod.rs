@@ -6042,7 +6042,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 /// accepts pick up the new config without restarting the listener. Existing
 /// in-flight connections keep their original TLS state.
 ///
-/// Each accept performs one `ArcSwap::load_full()` plus one inner `Arc` clone,
+/// Each accept performs one `ArcSwap::load()` plus one inner `Arc` clone,
 /// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
 pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     addr: SocketAddr,

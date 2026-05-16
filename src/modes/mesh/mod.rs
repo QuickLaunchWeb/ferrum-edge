@@ -16,7 +16,7 @@ pub mod runtime;
 pub mod slice;
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2468,17 +2468,7 @@ async fn serve_mesh_runtime(
         startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
     let mesh_frontend_identity = load_mesh_frontend_server_identity(&env_config)?;
-    let frontend_tls = load_mesh_frontend_tls(
-        &env_config,
-        &tls_policy,
-        &crls,
-        inbound_mtls_mode,
-        mesh_frontend_identity.as_deref(),
-    )?;
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
-        proxy_state
-            .mesh_inbound_tls
-            .store(Arc::new(frontend_tls.clone()));
         Some(mesh_inbound_tls_reload_snapshot(
             &env_config,
             inbound_mtls_mode,
@@ -2486,6 +2476,22 @@ async fn serve_mesh_runtime(
     } else {
         None
     };
+    let frontend_tls = load_mesh_frontend_tls(
+        &env_config,
+        &tls_policy,
+        &crls,
+        inbound_mtls_mode,
+        mesh_frontend_identity.as_deref(),
+        initial_inbound_tls_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
+    )?;
+    // Keep the slot populated with startup TLS even when live reload is
+    // disabled. The flag controls which listener source is used; the slot
+    // itself always mirrors the current mesh inbound TLS state.
+    proxy_state
+        .mesh_inbound_tls
+        .store(Arc::new(frontend_tls.clone()));
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
@@ -2514,9 +2520,22 @@ async fn serve_mesh_runtime(
     let mut listener_handles = Vec::new();
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
-        let tls_config =
-            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode);
-        if tls_config.is_none()
+        let uses_live_inbound_tls = env_config.mesh_peer_auth_live_reload_enabled
+            && matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            );
+        let tls_config = if uses_live_inbound_tls {
+            None
+        } else {
+            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode)
+        };
+        let listener_has_tls = if uses_live_inbound_tls {
+            proxy_state.mesh_inbound_tls.load().as_ref().is_some()
+        } else {
+            tls_config.is_some()
+        };
+        if !listener_has_tls
             && matches!(
                 listener.kind,
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
@@ -2743,10 +2762,25 @@ fn live_reload_inbound_mtls_mode(
     Some(resolved)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct MeshInboundClientCaBundle {
+    path: String,
+    pem: Arc<[u8]>,
+}
+
+impl fmt::Debug for MeshInboundClientCaBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeshInboundClientCaBundle")
+            .field("path", &self.path)
+            .field("pem_len", &self.pem.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MeshInboundTlsReloadSnapshot {
     mtls_mode: config::MtlsMode,
-    client_ca_bundle_hash: Option<u64>,
+    client_ca_bundle: Option<MeshInboundClientCaBundle>,
 }
 
 struct MeshInboundTlsReloadState {
@@ -2758,29 +2792,23 @@ fn mesh_inbound_tls_reload_snapshot(
     env_config: &EnvConfig,
     mtls_mode: config::MtlsMode,
 ) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
-    let client_ca_bundle_hash =
-        if mtls_mode == config::MtlsMode::Disable {
-            None
-        } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
-            Some(file_content_hash(path).with_context(|| {
-                format!("failed to hash mesh frontend client CA bundle at {path}")
-            })?)
-        } else {
-            None
-        };
+    let client_ca_bundle = if mtls_mode == config::MtlsMode::Disable {
+        None
+    } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
+        let pem: Arc<[u8]> = std::fs::read(path)
+            .with_context(|| format!("failed to read mesh frontend client CA bundle at {path}"))?
+            .into();
+        Some(MeshInboundClientCaBundle {
+            path: path.to_string(),
+            pem,
+        })
+    } else {
+        None
+    };
     Ok(MeshInboundTlsReloadSnapshot {
         mtls_mode,
-        client_ca_bundle_hash,
+        client_ca_bundle,
     })
-}
-
-fn file_content_hash(path: &str) -> Result<u64, std::io::Error> {
-    let bytes = std::fs::read(path)?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Non-cryptographic change detection only; collisions can miss a reload
-    // but do not form a security boundary.
-    bytes.hash(&mut hasher);
-    Ok(hasher.finish())
 }
 
 fn load_mesh_frontend_server_identity(
@@ -2809,6 +2837,7 @@ fn load_mesh_frontend_tls(
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
     mtls_mode: config::MtlsMode,
     server_identity: Option<&tls::MeshServerIdentity>,
+    client_ca_bundle: Option<&MeshInboundClientCaBundle>,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     if mtls_mode == config::MtlsMode::Disable {
         info!(
@@ -2826,7 +2855,9 @@ fn load_mesh_frontend_tls(
         return Ok(None);
     };
 
-    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+    let client_ca_bundle_path = client_ca_bundle
+        .map(|bundle| bundle.path.as_str())
+        .or(env_config.frontend_tls_client_ca_bundle_path.as_deref());
     let client_auth = match mtls_mode {
         config::MtlsMode::Strict => tls::MeshClientAuth::Required,
         config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
@@ -2857,14 +2888,26 @@ fn load_mesh_frontend_tls(
         }
     };
 
-    let mut tls_config = tls::load_mesh_tls_config_with_identity(
-        server_identity,
-        client_ca_bundle_path,
-        client_auth,
-        tls_policy,
-        env_config.tls_cert_expiry_warning_days,
-        crls,
-    )
+    let mut tls_config = if let Some(bundle) = client_ca_bundle {
+        tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
+            server_identity,
+            Some(bundle.path.as_str()),
+            Some(bundle.pem.as_ref()),
+            client_auth,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+    } else {
+        tls::load_mesh_tls_config_with_identity(
+            server_identity,
+            client_ca_bundle_path,
+            client_auth,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+    }
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
     tls::enable_early_data(&mut tls_config, tls_policy);
     if env_config.ktls_enabled.could_be_enabled() {
@@ -2960,9 +3003,9 @@ fn plan_mesh_inbound_tls_reload(
     let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
         warn!(
             mesh_slice_version = %slice.version,
-            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; keeping previous TLS config"
+            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; skipping TLS slot update and applying proxy config only"
         );
-        return None;
+        return Some(MeshInboundTlsReloadPlan::Unchanged);
     };
     match load_mesh_frontend_tls(
         &proxy_state.env_config,
@@ -2970,6 +3013,7 @@ fn plan_mesh_inbound_tls_reload(
         &proxy_state.crls,
         mtls_mode,
         server_identity,
+        next_snapshot.client_ca_bundle.as_ref(),
     ) {
         Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
             snapshot: next_snapshot,
@@ -3065,7 +3109,10 @@ fn start_mesh_slice_apply_task(
                                 // live slot is swapped only after proxy config acceptance. That
                                 // creates a tiny accept window where listeners may still see the
                                 // previous TLS config, and avoids pre-swapping TLS for a proxy
-                                // config that the runtime rejects.
+                                // config that the runtime rejects. On a Permissive-to-Strict
+                                // escalation, an accepted connection in that window can enter the
+                                // new plugin chain without a peer principal; mesh authz still
+                                // fails closed for identity-required policy until the slot swaps.
                                 let applied = proxy_state.update_config(config);
                                 let current_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let accepted = mesh_proxy_update_was_accepted(
@@ -7036,8 +7083,9 @@ mod tests {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let err = load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict, None)
-            .expect_err("strict mTLS must require cert and key material");
+        let err =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict, None, None)
+                .expect_err("strict mTLS must require cert and key material");
 
         assert!(
             err.to_string()
@@ -7050,9 +7098,15 @@ mod tests {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let tls_config =
-            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive, None)
-                .expect("permissive mTLS can run without frontend TLS materials");
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            None,
+            None,
+        )
+        .expect("permissive mTLS can run without frontend TLS materials");
 
         assert!(tls_config.is_none());
     }
@@ -7076,6 +7130,7 @@ mod tests {
             &[],
             config::MtlsMode::Permissive,
             mesh_frontend_identity.as_deref(),
+            None,
         )
         .expect("permissive without CA bundle should succeed");
 
@@ -7112,8 +7167,42 @@ mod tests {
             &[],
             config::MtlsMode::Strict,
             mesh_frontend_identity.as_deref(),
+            None,
         )
         .expect("strict rebuild should use cached server identity");
+
+        assert!(tls_config.is_some());
+    }
+
+    #[test]
+    fn mesh_frontend_tls_rebuild_uses_snapshot_client_ca_bytes() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::copy("tests/certs/server.crt", &ca_path).expect("copy CA");
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..EnvConfig::default()
+        };
+        let snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("snapshot reads CA bytes");
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("load identity");
+
+        std::fs::write(&ca_path, b"not a ca").expect("replace CA");
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            snapshot.client_ca_bundle.as_ref(),
+        )
+        .expect("strict rebuild should use snapshot CA bytes");
 
         assert!(tls_config.is_some());
     }
@@ -7329,6 +7418,7 @@ mod tests {
             &[],
             config::MtlsMode::Permissive,
             mesh_frontend_identity.as_deref(),
+            None,
         )
         .expect("TLS config builds")
         .expect("TLS config present");

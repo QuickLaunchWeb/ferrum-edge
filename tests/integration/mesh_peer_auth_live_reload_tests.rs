@@ -11,6 +11,7 @@ use ferrum_edge::tls::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 
 use crate::scaffolding::ports::reserve_port;
 
@@ -70,30 +71,65 @@ async fn send_plain_http(addr: SocketAddr) -> std::io::Result<Vec<u8>> {
     Ok(response)
 }
 
+async fn start_live_reload_listener_with_retry(
+    state: ProxyState,
+) -> (
+    SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+    JoinHandle<Result<(), anyhow::Error>>,
+) {
+    let mut last_error = String::new();
+    for attempt in 1..=5 {
+        let reservation = reserve_port().await.expect("reserve proxy port");
+        let port = reservation.drop_and_take_port();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let listener_state = state.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn(async move {
+            start_proxy_listener_with_mesh_inbound_tls_and_signal(
+                addr,
+                listener_state,
+                shutdown_rx,
+                Some(started_tx),
+            )
+            .await
+        });
+
+        match tokio::time::timeout(Duration::from_secs(2), started_rx).await {
+            Ok(Ok(())) => return (addr, shutdown_tx, listener),
+            Ok(Err(error)) => {
+                last_error = format!("listener start signal dropped on attempt {attempt}: {error}");
+            }
+            Err(error) => {
+                last_error = format!("listener start timed out on attempt {attempt}: {error}");
+            }
+        }
+
+        let _ = shutdown_tx.send(true);
+        match tokio::time::timeout(Duration::from_secs(2), listener).await {
+            Ok(Ok(Err(error))) => {
+                last_error = format!("{last_error}; listener returned error: {error}");
+            }
+            Ok(Err(error)) => {
+                last_error = format!("{last_error}; listener task join error: {error}");
+            }
+            Err(error) => {
+                last_error = format!("{last_error}; listener task did not stop: {error}");
+            }
+            Ok(Ok(Ok(()))) => {}
+        }
+    }
+
+    panic!("listener did not bind after retries: {last_error}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap() {
     ensure_crypto_provider();
-    let reservation = reserve_port().await.expect("reserve proxy port");
-    let port = reservation.drop_and_take_port();
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let state = test_proxy_state(test_env_config());
     let state_for_swap = state.clone();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let listener = tokio::spawn(async move {
-        start_proxy_listener_with_mesh_inbound_tls_and_signal(
-            addr,
-            state,
-            shutdown_rx,
-            Some(started_tx),
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), started_rx)
-        .await
-        .expect("listener start signal")
-        .expect("listener started");
+    let (addr, shutdown_tx, listener) = start_live_reload_listener_with_retry(state).await;
 
     let plaintext_response = send_plain_http(addr).await.expect("plaintext request");
     assert!(
