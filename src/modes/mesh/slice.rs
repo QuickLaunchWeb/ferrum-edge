@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
@@ -512,6 +512,10 @@ fn narrow_workload_identities(
         warn!(
             admitted_services = admitted_services.len(),
             "Sidecar workload identity narrowing found no reachable identities; admitted MeshService.workloads lists are empty"
+        );
+    } else if admitted_services.is_empty() {
+        debug!(
+            "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
     workloads
