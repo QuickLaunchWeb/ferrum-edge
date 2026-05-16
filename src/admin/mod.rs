@@ -40,7 +40,7 @@ use crate::plugins;
 use crate::proxy::ProxyState;
 use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
@@ -119,6 +119,9 @@ pub struct AdminState {
     pub mesh_registry: Option<Arc<MeshNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    /// Live mesh runtime state (mesh mode only). Carries the per-runtime egress
+    /// scope snapshot/counters powering `/mesh/egress-scope` and `/health`.
+    pub mesh_runtime_state: Option<crate::modes::mesh::runtime::MeshRuntimeState>,
     /// Admin HTTP header read timeout (seconds). 0 disables.
     pub admin_http_header_read_timeout_seconds: u64,
     /// Admin TLS handshake timeout (seconds). 0 disables.
@@ -532,6 +535,22 @@ pub async fn handle_admin_request(
             });
         }
 
+        if state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
+            || state.mode == "mesh"
+        {
+            let egress_health = state
+                .mesh_runtime_state
+                .as_ref()
+                .map(|rt| rt.egress_scope_state().health())
+                .unwrap_or_default();
+            health_status["mesh"] = json!({
+                "egress_scope": egress_health
+            });
+        }
+
         if !startup_ready {
             health_status["status"] = json!("starting");
             return Ok(json_response(
@@ -832,6 +851,12 @@ pub async fn handle_admin_request(
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
 
+        // Mesh egress-scope operability
+        (Method::GET, ["mesh", "egress-scope"]) => handle_mesh_egress_scope_get(&state).await,
+        (Method::POST, ["mesh", "egress-scope", "test"]) => {
+            handle_mesh_egress_scope_test(&state, &body_bytes).await
+        }
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -858,6 +883,119 @@ pub async fn handle_admin_request(
             &json!({"error": "Not Found"}),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct MeshEgressScopeTestRequest {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+async fn handle_mesh_egress_scope_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(proxy_state) = state.proxy_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No proxy state available"}),
+        ));
+    };
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    let egress = mesh_runtime.egress_scope_state();
+    let Some(scope) = egress.snapshot() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "namespace": proxy_state.env_config.namespace,
+            "scope": scope,
+            "health": egress.health(),
+        }),
+    ))
+}
+
+async fn handle_mesh_egress_scope_test(
+    state: &AdminState,
+    body_bytes: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.proxy_state.as_ref().is_none() {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No proxy state available"}),
+        ));
+    }
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    let egress = mesh_runtime.egress_scope_state();
+    let Some(scope) = egress.snapshot() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh egress scope"}),
+        ));
+    };
+    let candidate: MeshEgressScopeTestRequest = match serde_json::from_slice(body_bytes) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid JSON body: {e}")}),
+            ));
+        }
+    };
+    let host = candidate.host.trim();
+    if host.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "host is required"}),
+        ));
+    }
+
+    let (host, parsed_port) = crate::plugins::mesh::outbound_registry::split_host_header(host);
+    let port = candidate.port.or(parsed_port);
+    if port.is_some_and(|port| port == 0) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "port must be between 1 and 65535"}),
+        ));
+    }
+    // Memoized — rebuilt only on slice install. Repeated admin calls reuse the
+    // same `Arc<OutboundRegistry>` so we don't re-parse / re-normalise the
+    // full registry on every request.
+    let registry = match egress.test_registry() {
+        Some(registry) => registry,
+        None => {
+            tracing::error!("mesh egress-scope test registry unavailable");
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to build mesh egress-scope registry"}),
+            ));
+        }
+    };
+    let allowed = registry.contains(host, port);
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "allowed": allowed,
+            "decision": if allowed { "admit" } else { "deny" },
+            "host": host,
+            "port": port,
+            "dry_run": scope.dry_run,
+        }),
+    ))
 }
 
 // ---- Consumer CRUD ----

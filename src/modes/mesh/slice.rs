@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
@@ -30,6 +30,15 @@ pub struct MeshSliceRequest {
     /// callers wire this from `FERRUM_MESH_SIDECAR_ENFORCED` (or set
     /// directly in tests).
     pub enforce_sidecar_egress: bool,
+    /// When `true`, compute the Sidecar egress scope and diagnostics but keep
+    /// the slice output on the unenforced path. This lets operators validate
+    /// denials before flipping enforcement.
+    pub sidecar_egress_dry_run: bool,
+    /// When `true`, and only when Sidecar egress narrowing is also enabled and
+    /// applicable, the slice builder filters `workloads` to identities
+    /// referenced by admitted services. Defaults to `false` for a one-release
+    /// dry-run window.
+    pub enforce_sidecar_identity_narrowing: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -41,6 +50,8 @@ impl Default for MeshSliceRequest {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 }
@@ -59,6 +70,8 @@ impl MeshSliceRequest {
             labels: labels.into_iter().collect(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 
@@ -75,6 +88,8 @@ impl MeshSliceRequest {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 
@@ -84,6 +99,20 @@ impl MeshSliceRequest {
     /// that don't care about Sidecar scoping (xDS, tests, future protocols).
     pub fn with_enforce_sidecar_egress(mut self, enforce: bool) -> Self {
         self.enforce_sidecar_egress = enforce;
+        self
+    }
+
+    /// Returns `self` with dry-run sidecar egress diagnostics enabled.
+    pub fn with_sidecar_egress_dry_run(mut self, dry_run: bool) -> Self {
+        self.sidecar_egress_dry_run = dry_run;
+        self
+    }
+
+    /// Returns `self` with workload identity narrowing set to `enforce`.
+    /// The builder intentionally does not imply egress narrowing; callers pass
+    /// both env-driven flags so tests can exercise the guard independently.
+    pub fn with_enforce_sidecar_identity_narrowing(mut self, enforce: bool) -> Self {
+        self.enforce_sidecar_identity_narrowing = enforce;
         self
     }
 
@@ -135,6 +164,53 @@ pub struct MeshSlice {
     /// `workloads.addresses`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+    /// Cold-path operator view of the Sidecar egress scope that was applied,
+    /// or would have been applied when dry-run is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshEgressScopeSnapshot {
+    #[serde(default)]
+    pub sidecar_enforced: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub sidecar_applied: bool,
+    #[serde(default)]
+    pub sidecar_admitted_services: usize,
+    #[serde(default)]
+    pub sidecar_denied_services: usize,
+    /// Admitted DestinationRules after Sidecar egress narrowing. Surfaced so
+    /// operators can verify which DRs the resolved scope reaches (DRs are one
+    /// of the three resources affected by Sidecar narrowing, alongside
+    /// services and service_entries).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<MeshEgressScopeResource>,
+    /// Count of DestinationRules in scope before narrowing was applied,
+    /// matched against the workload namespace using the same predicate as the
+    /// narrowed pass. `destination_rules.len()` is the admitted count.
+    #[serde(default)]
+    pub sidecar_admitted_destination_rules: usize,
+    #[serde(default)]
+    pub sidecar_denied_destination_rules: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<MeshEgressScopeResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_entries: Vec<MeshEgressScopeResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_destinations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshEgressScopeResource {
+    pub namespace: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
 }
 
 impl MeshSlice {
@@ -159,6 +235,7 @@ impl MeshSlice {
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
             && self.outbound_traffic_policy == other.outbound_traffic_policy
+            && self.sidecar_egress_scope == other.sidecar_egress_scope
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -292,6 +369,8 @@ impl MeshSlice {
 
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
+        let sidecar_enforced = request.enforce_sidecar_egress;
+        let sidecar_dry_run = request.sidecar_egress_dry_run;
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -310,10 +389,10 @@ impl MeshSlice {
         // `service_entries`, and `destination_rules`. Returns `None` when no
         // Sidecar applies or when the applicable Sidecar inherits system
         // defaults with no namespace or root-namespace default to inherit
-        // from. The enforcement flag gates the entire narrowing pass so
-        // existing deployments see zero behavior change unless
-        // `FERRUM_MESH_SIDECAR_ENFORCED=true`.
-        let applicable_sidecar = if request.enforce_sidecar_egress {
+        // from. The enforcement and dry-run flags gate Sidecar resolution so
+        // existing deployments see zero behavior change unless one of the
+        // rollout flags is enabled.
+        let resolved_sidecar = if sidecar_enforced || sidecar_dry_run {
             resolve_applicable_sidecar_egress(
                 &mesh.sidecars,
                 effective_namespace,
@@ -323,13 +402,18 @@ impl MeshSlice {
         } else {
             None
         };
+        let applicable_sidecar = if sidecar_dry_run {
+            None
+        } else {
+            resolved_sidecar
+        };
 
         // Sidecar-only indexes: skip the full scan over `mesh.services` and
         // `mesh.service_entries` when no Sidecar applies (default-off feature,
         // or an enforced workload that no Sidecar resource targets). The
         // destination-rules filter is the only consumer and short-circuits
         // before reading these when `applicable_sidecar` is `None`.
-        let (mesh_service_identities, service_entry_hosts) = if applicable_sidecar.is_some() {
+        let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some() {
             (
                 mesh_service_identities(mesh),
                 visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
@@ -444,6 +528,26 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
+        let workloads =
+            if request.enforce_sidecar_identity_narrowing && applicable_sidecar.is_some() {
+                narrow_workload_identities(workloads, &services, &request)
+            } else {
+                workloads
+            };
+
+        let sidecar_egress_scope = resolved_sidecar.map(|sidecar| {
+            build_sidecar_egress_scope_snapshot(EgressScopeBuildContext {
+                mesh,
+                sidecar,
+                workload_namespace: effective_namespace,
+                workload_labels: &effective_labels,
+                cluster_domain: &cluster_domain,
+                mesh_service_identities: &mesh_service_identities,
+                service_entry_hosts: &service_entry_hosts,
+                sidecar_enforced,
+                dry_run: sidecar_dry_run,
+            })
+        });
 
         Self {
             node_id: request.node_id,
@@ -463,8 +567,51 @@ impl MeshSlice {
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
+            sidecar_egress_scope,
         }
     }
+}
+
+/// Filter `workloads` down to the SPIFFE identities referenced by admitted
+/// services.
+///
+/// The local workload running this sidecar is usually not in any admitted
+/// service's `workloads[]` and can therefore be removed from `slice.workloads`.
+/// Consumers that need the local identity must read `MeshSlice::workload_spiffe_id`
+/// or use `inferred_workload_labels_for_request`, which runs before narrowing.
+///
+/// Inbound mTLS peer validation uses `slice.trust_bundles`, and HBONE
+/// `source.principal` baggage uses peer-cert trust-domain matching plus
+/// `FERRUM_MESH_TRUST_DOMAIN_ALIASES`, so neither depends on this list.
+fn narrow_workload_identities(
+    workloads: Vec<Workload>,
+    admitted_services: &[MeshService],
+    request: &MeshSliceRequest,
+) -> Vec<Workload> {
+    let reachable_identities: HashSet<_> = admitted_services
+        .iter()
+        .flat_map(|service| service.workloads.iter().map(|workload| &workload.spiffe_id))
+        .collect();
+    if !admitted_services.is_empty() && reachable_identities.is_empty() {
+        warn!(
+            node_id = request.node_id.as_str(),
+            namespace = request.namespace.as_str(),
+            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            admitted_services = admitted_services.len(),
+            "Sidecar workload identity narrowing found no reachable identities; admitted MeshService.workloads lists are empty"
+        );
+    } else if admitted_services.is_empty() {
+        debug!(
+            node_id = request.node_id.as_str(),
+            namespace = request.namespace.as_str(),
+            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
+        );
+    }
+    workloads
+        .into_iter()
+        .filter(|workload| reachable_identities.contains(&workload.spiffe_id))
+        .collect()
 }
 
 fn inferred_workload_labels_for_request(
@@ -535,6 +682,173 @@ fn insert_known_destination(
     }
     if !inserted_port {
         entries.insert(format!("{host}:*"));
+    }
+}
+
+struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
+    mesh: &'a MeshConfig,
+    sidecar: ResolvedSidecarEgress<'a>,
+    workload_namespace: &'a str,
+    workload_labels: &'a L,
+    cluster_domain: &'a str,
+    mesh_service_identities: &'a BTreeSet<(String, String)>,
+    service_entry_hosts: &'a BTreeSet<String>,
+    sidecar_enforced: bool,
+    dry_run: bool,
+}
+
+fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
+    ctx: EgressScopeBuildContext<'_, L>,
+) -> MeshEgressScopeSnapshot {
+    let EgressScopeBuildContext {
+        mesh,
+        sidecar,
+        workload_namespace,
+        workload_labels,
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+        sidecar_enforced,
+        dry_run,
+    } = ctx;
+    let scoped_services: Vec<MeshService> = mesh
+        .services
+        .iter()
+        .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
+        .collect();
+    let scoped_service_entries: Vec<ServiceEntry> = mesh
+        .service_entries
+        .iter()
+        .filter(|entry| {
+            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
+        })
+        .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
+        .collect();
+    let scoped_workloads: Vec<Workload> = mesh
+        .workloads
+        .iter()
+        .filter(|workload| workload.namespace == workload_namespace)
+        .cloned()
+        .collect();
+    let scoped_destination_rules: Vec<MeshDestinationRule> = mesh
+        .destination_rules
+        .iter()
+        .filter(|dr| {
+            let (resource_namespace, host_candidates) = destination_rule_host_scope(
+                dr,
+                cluster_domain,
+                mesh_service_identities,
+                service_entry_hosts,
+            );
+            let dr_namespace = dr.namespace.as_str();
+            if dr_namespace != workload_namespace && dr_namespace != resource_namespace.as_str() {
+                return false;
+            }
+            let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+            sidecar_egress_includes_service(
+                sidecar.namespace,
+                sidecar.egress,
+                &resource_namespace,
+                &host_refs,
+                None,
+            )
+        })
+        .cloned()
+        .collect();
+
+    let baseline_local_services = mesh
+        .services
+        .iter()
+        .filter(|service| service.namespace == workload_namespace)
+        .count();
+    let admitted_local_services = scoped_services
+        .iter()
+        .filter(|service| service.namespace == workload_namespace)
+        .count();
+    let baseline_local_destination_rules = mesh
+        .destination_rules
+        .iter()
+        .filter(|dr| dr.namespace == workload_namespace)
+        .count();
+    let admitted_local_destination_rules = scoped_destination_rules
+        .iter()
+        .filter(|dr| dr.namespace == workload_namespace)
+        .count();
+    let destination_rule_resources: Vec<MeshEgressScopeResource> = scoped_destination_rules
+        .iter()
+        .map(destination_rule_scope_resource)
+        .collect();
+    let scope_slice = MeshSlice {
+        namespace: workload_namespace.to_string(),
+        workloads: scoped_workloads,
+        services: scoped_services.clone(),
+        service_entries: scoped_service_entries.clone(),
+        destination_rules: scoped_destination_rules,
+        outbound_traffic_policy: mesh.outbound_traffic_policy,
+        ..MeshSlice::default()
+    };
+
+    MeshEgressScopeSnapshot {
+        sidecar_enforced,
+        dry_run,
+        sidecar_applied: sidecar_enforced && !dry_run,
+        sidecar_admitted_services: admitted_local_services,
+        sidecar_denied_services: baseline_local_services.saturating_sub(admitted_local_services),
+        sidecar_admitted_destination_rules: admitted_local_destination_rules,
+        sidecar_denied_destination_rules: baseline_local_destination_rules
+            .saturating_sub(admitted_local_destination_rules),
+        destination_rules: destination_rule_resources,
+        services: scoped_services
+            .iter()
+            .map(|service| mesh_service_scope_resource(service, cluster_domain))
+            .collect(),
+        service_entries: scoped_service_entries
+            .iter()
+            .map(service_entry_scope_resource)
+            .collect(),
+        known_destinations: scope_slice.build_known_destinations(cluster_domain),
+    }
+}
+
+fn destination_rule_scope_resource(rule: &MeshDestinationRule) -> MeshEgressScopeResource {
+    MeshEgressScopeResource {
+        namespace: rule.namespace.clone(),
+        name: rule.name.clone(),
+        hosts: vec![rule.host.clone()],
+        ports: Vec::new(),
+    }
+}
+
+fn mesh_service_scope_resource(
+    service: &MeshService,
+    cluster_domain: &str,
+) -> MeshEgressScopeResource {
+    let mut hosts = mesh_service_host_candidates(service, cluster_domain);
+    hosts.sort();
+    hosts.dedup();
+    let mut ports: Vec<u16> = service.ports.iter().map(|port| port.port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    MeshEgressScopeResource {
+        namespace: service.namespace.clone(),
+        name: service.name.clone(),
+        hosts,
+        ports,
+    }
+}
+
+fn service_entry_scope_resource(entry: &ServiceEntry) -> MeshEgressScopeResource {
+    let mut hosts = entry.hosts.clone();
+    hosts.sort();
+    hosts.dedup();
+    let mut ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    MeshEgressScopeResource {
+        namespace: entry.namespace.clone(),
+        name: entry.name.clone(),
+        hosts,
+        ports,
     }
 }
 
@@ -1249,7 +1563,7 @@ mod tests {
         MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MtlsMode,
         MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster,
         ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
-        WorkloadPort, WorkloadSelector,
+        WorkloadPort, WorkloadRef, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -1304,6 +1618,19 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
         }
+    }
+
+    fn make_service_with_workload_refs(
+        namespace: &str,
+        name: &str,
+        workload_spiffe_ids: Vec<SpiffeId>,
+    ) -> MeshService {
+        let mut service = make_service(namespace, name);
+        service.workloads = workload_spiffe_ids
+            .into_iter()
+            .map(|spiffe_id| WorkloadRef { spiffe_id })
+            .collect();
+        service
     }
 
     fn make_policy(name: &str, namespace: &str, scope: PolicyScope) -> MeshPolicy {
@@ -1419,6 +1746,8 @@ mod tests {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 
@@ -1433,6 +1762,8 @@ mod tests {
             labels,
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 
@@ -1465,6 +1796,7 @@ mod tests {
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
             outbound_traffic_policy: None,
+            sidecar_egress_scope: None,
         };
         assert!(slice.content_eq(&slice.clone()));
     }
@@ -2152,6 +2484,8 @@ mod tests {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -2200,6 +2534,8 @@ mod tests {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -2269,6 +2605,8 @@ mod tests {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -2308,6 +2646,8 @@ mod tests {
             labels: BTreeMap::from([("custom".into(), "value".into())]),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -2631,6 +2971,8 @@ mod tests {
                 labels: BTreeMap::new(),
                 cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
                 enforce_sidecar_egress: false,
+                sidecar_egress_dry_run: false,
+                enforce_sidecar_identity_narrowing: false,
             },
         );
 
@@ -3357,6 +3699,8 @@ mod tests {
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: true,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         }
     }
 
@@ -3371,11 +3715,86 @@ mod tests {
             labels,
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: true,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
+        }
+    }
+
+    fn slice_request_dry_run(namespace: &str) -> MeshSliceRequest {
+        MeshSliceRequest {
+            namespace: namespace.to_string(),
+            sidecar_egress_dry_run: true,
+            ..MeshSliceRequest::default()
+        }
+    }
+
+    fn slice_request_enforced_with_identity_narrowing(namespace: &str) -> MeshSliceRequest {
+        MeshSliceRequest {
+            enforce_sidecar_identity_narrowing: true,
+            ..slice_request_enforced(namespace)
+        }
+    }
+
+    fn slice_request_identity_narrowing_only(namespace: &str) -> MeshSliceRequest {
+        MeshSliceRequest {
+            enforce_sidecar_egress: false,
+            enforce_sidecar_identity_narrowing: true,
+            ..slice_request_enforced(namespace)
         }
     }
 
     fn port_numbers(ports: &[ServicePort]) -> Vec<u16> {
         ports.iter().map(|port| port.port).collect()
+    }
+
+    #[test]
+    fn sidecar_dry_run_keeps_services_but_reports_would_be_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_ports("alpha", "reviews", &[80, 8080]),
+                make_service_with_ports("alpha", "ratings", &[9090]),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_dry_run("alpha"));
+
+        assert_eq!(
+            slice
+                .services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews", "ratings"]
+        );
+        let scope = slice
+            .sidecar_egress_scope
+            .as_ref()
+            .expect("dry-run scope is recorded");
+        assert!(!scope.sidecar_enforced);
+        assert!(scope.dry_run);
+        assert!(!scope.sidecar_applied);
+        assert_eq!(scope.sidecar_admitted_services, 1);
+        assert_eq!(scope.sidecar_denied_services, 1);
+        assert_eq!(scope.services.len(), 1);
+        assert_eq!(scope.services[0].name, "reviews");
+        assert_eq!(scope.services[0].ports, vec![80, 8080]);
+        assert!(
+            scope
+                .known_destinations
+                .contains(&"reviews.alpha.svc.cluster.local:8080".to_string())
+        );
+        assert!(
+            !scope
+                .known_destinations
+                .contains(&"ratings.alpha.svc.cluster.local:9090".to_string())
+        );
     }
 
     #[test]
@@ -3632,6 +4051,243 @@ mod tests {
         assert_eq!(slice.services[0].name, "reviews");
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_filters_to_admitted_service_workloads() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let checkout = make_workload("alpha", "checkout", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone(), checkout.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews.clone(), checkout.clone(), payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        let identities: Vec<_> = slice
+            .workloads
+            .iter()
+            .map(|workload| workload.spiffe_id.as_str())
+            .collect();
+        assert_eq!(
+            identities,
+            vec![reviews.spiffe_id.as_str(), checkout.spiffe_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_is_independently_flag_gated() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(
+            slice.workloads.len(),
+            2,
+            "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false keeps the legacy workload list"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_requires_sidecar_egress_enforcement() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice =
+            MeshSlice::from_gateway_config(&config, slice_request_identity_narrowing_only("alpha"));
+
+        assert_eq!(
+            slice.services.len(),
+            2,
+            "identity narrowing alone must not enable sidecar egress narrowing"
+        );
+        assert_eq!(
+            slice.workloads.len(),
+            2,
+            "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true is a no-op until FERRUM_MESH_SIDECAR_ENFORCED=true"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_drops_workloads_when_no_services_admitted() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar("default-sc", "alpha", None, vec![vec!["~/*"]])],
+            services: vec![
+                make_service_with_workload_refs(
+                    "alpha",
+                    "reviews",
+                    vec![reviews.spiffe_id.clone()],
+                ),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert!(
+            slice.services.is_empty(),
+            "the Sidecar egress scope admits no services"
+        );
+        assert!(
+            slice.workloads.is_empty(),
+            "identity narrowing follows the empty admitted-service set"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_drops_workloads_when_services_have_no_refs() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let payments = make_workload("alpha", "payments", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "payments",
+                    vec![payments.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews, payments],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        assert!(
+            slice.workloads.is_empty(),
+            "admitted services without workload refs yield an empty reachable identity set"
+        );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_preserves_trust_bundles_for_inbound_mtls() {
+        let reviews = make_workload("alpha", "reviews", HashMap::new());
+        let filtered = make_workload("alpha", "filtered", HashMap::new());
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![make_service_with_workload_refs(
+                "alpha",
+                "reviews",
+                vec![reviews.spiffe_id.clone()],
+            )],
+            workloads: vec![reviews, filtered.clone()],
+            trust_bundles: Some(make_trust_bundle_set()),
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert!(
+            !slice
+                .workloads
+                .iter()
+                .any(|workload| workload.spiffe_id == filtered.spiffe_id),
+            "identity narrowing should remove workloads not referenced by admitted services"
+        );
+        assert!(
+            slice.trust_bundles.is_some(),
+            "inbound mTLS peer validation uses trust bundles, so narrowing workloads must not drop them"
+        );
     }
 
     #[test]

@@ -800,6 +800,7 @@ pub async fn serve(
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
 

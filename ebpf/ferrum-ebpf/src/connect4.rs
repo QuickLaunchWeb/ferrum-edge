@@ -61,6 +61,8 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let orig = OrigDst4 {
         addr: dst_ip,
         port: dst_port as u32,
+        pod_uid: [0; 16],
+        workload_spiffe_hash: 0,
     };
     let _ = FERRUM_ORIG_DST4.insert(&key, &orig, 0);
 

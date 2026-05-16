@@ -10,11 +10,13 @@ pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
 pub mod hbone;
+pub mod node_waypoint;
 pub mod policy;
 pub mod runtime;
 pub mod slice;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +90,7 @@ pub struct MeshListener {
 
 /// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
 /// ambient selects HBONE termination instead of sidecar inbound mTLS,
+/// node-waypoint uses one HBONE listener for multiple node-local pods,
 /// east-west gateway delegates SNI passthrough to the stream listener manager,
 /// and egress gateway materializes HTTP-family proxies from external
 /// `ServiceEntry` resources for controlled mesh-to-external routing.
@@ -95,6 +98,7 @@ pub struct MeshListener {
 pub enum MeshTopology {
     Sidecar,
     Ambient,
+    NodeWaypoint,
     EastWestGateway,
     EgressGateway,
 }
@@ -104,10 +108,11 @@ impl MeshTopology {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
+            "node_waypoint" | "node-waypoint" => Ok(Self::NodeWaypoint),
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, east_west_gateway, or egress_gateway"
+                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, east_west_gateway, or egress_gateway"
             )),
         }
     }
@@ -116,6 +121,7 @@ impl MeshTopology {
         match self {
             Self::Sidecar => "sidecar",
             Self::Ambient => "ambient",
+            Self::NodeWaypoint => "node_waypoint",
             Self::EastWestGateway => "east_west_gateway",
             Self::EgressGateway => "egress_gateway",
         }
@@ -243,6 +249,15 @@ pub struct MeshRuntimeConfig {
     /// in `MeshConfig` but the slice projection ignores them — behavior is
     /// identical to today, preserving safe-rollout semantics.
     pub sidecar_enforced: bool,
+    /// When `true`, compute Sidecar egress diagnostics while keeping the
+    /// unenforced slice output. Sourced from
+    /// `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` (default `false`).
+    pub sidecar_enforced_dry_run: bool,
+    /// When `true`, and only when `sidecar_enforced` is also true, per-workload
+    /// slices filter `workloads` down to identities referenced by admitted
+    /// services. Sourced from `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
+    /// (default `false`).
+    pub sidecar_identity_narrowing: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -404,6 +419,8 @@ impl MeshRuntimeConfig {
             outbound_traffic_policy,
             outbound_registry_reject_status,
             sidecar_enforced: env_config.mesh_sidecar_enforced,
+            sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
+            sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
         })
     }
 
@@ -460,6 +477,11 @@ impl MeshRuntimeConfig {
                     addr: self.hbone_listen_addr,
                 },
             ],
+            MeshTopology::NodeWaypoint => vec![MeshListener {
+                direction: MeshTrafficDirection::Inbound,
+                kind: MeshListenerKind::HboneTermination,
+                addr: self.hbone_listen_addr,
+            }],
             MeshTopology::EastWestGateway => Vec::new(),
             MeshTopology::EgressGateway => vec![MeshListener {
                 direction: MeshTrafficDirection::Inbound,
@@ -482,6 +504,8 @@ impl MeshRuntimeConfig {
                 .collect(),
             cluster_domain: self.cluster_domain.clone(),
             enforce_sidecar_egress: self.sidecar_enforced,
+            sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
+            enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
         }
     }
 }
@@ -1843,6 +1867,7 @@ fn inject_mesh_global_plugins(
                 "registry": registry,
                 "outbound_listen_ports": outbound_listen_ports,
                 "reject_status": runtime.outbound_registry_reject_status,
+                "namespace": runtime.namespace.clone(),
             });
             ensure_global_plugin(
                 config,
@@ -2342,6 +2367,14 @@ async fn serve_mesh_runtime(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
+        info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
+        proxy_state.with_node_waypoint_identity_resolver(Arc::new(
+            node_waypoint::NodeWaypointIdentityResolver::new(env_config.pool_shard_amount),
+        ))
+    } else {
+        proxy_state
+    };
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -2434,31 +2467,58 @@ async fn serve_mesh_runtime(
         None
     };
 
-    // Resolve mTLS mode from the initial mesh slice. This is evaluated once at
-    // startup — PeerAuthentication changes pushed via CP/xDS update the slice
-    // but do NOT live-rotate the inbound TLS ServerConfig (consistent with the
-    // project's static-TLS-material model). A restart is required.
+    // Resolve mTLS mode from the initial mesh slice. By default this remains a
+    // startup-only decision. When the opt-in live reload flag is enabled, the
+    // mesh accept loops read `proxy_state.mesh_inbound_tls` on every accept and
+    // slice apply may atomically swap the inbound ServerConfig.
     let inbound_mtls_mode =
-        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
-    validate_inbound_mtls_mode_for_topology(&runtime, inbound_mtls_mode)?;
-
-    let mesh_apply_handle = start_mesh_slice_apply_task(
-        mesh_state,
-        proxy_state.clone(),
-        runtime.clone(),
-        initial_applied_mesh_slice,
-        shutdown_tx.subscribe(),
-        dns_proxy_handle,
-    );
-
+        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let frontend_tls = load_mesh_frontend_tls(&env_config, &tls_policy, &crls, inbound_mtls_mode)?;
+    let mesh_frontend_identity = load_mesh_frontend_server_identity(&env_config)?;
+    let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
+        Some(mesh_inbound_tls_reload_snapshot(
+            &env_config,
+            inbound_mtls_mode,
+        )?)
+    } else {
+        None
+    };
+    let frontend_tls = load_mesh_frontend_tls(
+        &env_config,
+        &tls_policy,
+        &crls,
+        inbound_mtls_mode,
+        mesh_frontend_identity.as_deref(),
+        initial_inbound_tls_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
+    )?;
+    // Keep the slot populated with startup TLS even when live reload is
+    // disabled. The flag controls which listener source is used; without live
+    // reload the slot never updates again, so readers must not treat it as the
+    // current PeerAuthentication state.
+    proxy_state
+        .mesh_inbound_tls
+        .store(Arc::new(frontend_tls.clone()));
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
             .set_frontend_tls_config(Some(tls_config.clone()))
             .await;
     }
+
+    let mesh_apply_handle = start_mesh_slice_apply_task(
+        mesh_state,
+        proxy_state.clone(),
+        runtime.clone(),
+        initial_applied_mesh_slice,
+        MeshInboundTlsReloadState {
+            server_identity: mesh_frontend_identity,
+            last_snapshot: initial_inbound_tls_snapshot,
+        },
+        shutdown_tx.subscribe(),
+        dns_proxy_handle,
+    );
 
     info!(
         listeners = runtime.listener_plan().len(),
@@ -2468,9 +2528,22 @@ async fn serve_mesh_runtime(
     let mut listener_handles = Vec::new();
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
-        let tls_config =
-            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode);
-        if tls_config.is_none()
+        let uses_live_inbound_tls = env_config.mesh_peer_auth_live_reload_enabled
+            && matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            );
+        let tls_config = if uses_live_inbound_tls {
+            None
+        } else {
+            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode)
+        };
+        let listener_has_tls = if uses_live_inbound_tls {
+            proxy_state.mesh_inbound_tls.load().as_ref().is_some()
+        } else {
+            tls_config.is_some()
+        };
+        if !listener_has_tls
             && matches!(
                 listener.kind,
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
@@ -2498,15 +2571,29 @@ async fn serve_mesh_runtime(
                 addr = %addr,
                 "Starting mesh listener"
             );
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-                addr,
-                state,
-                shutdown,
-                tls_config,
-                Some(started_tx),
-            )
-            .await
-            {
+            let listener_result = if state.env_config.mesh_peer_auth_live_reload_enabled
+                && matches!(
+                    kind,
+                    MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+                ) {
+                proxy::start_proxy_listener_with_mesh_inbound_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    Some(started_tx),
+                )
+                .await
+            } else {
+                proxy::start_proxy_listener_with_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
+                    Some(started_tx),
+                )
+                .await
+            };
+            if let Err(e) = listener_result {
                 error!(
                     direction = ?direction,
                     kind = ?kind,
@@ -2612,6 +2699,7 @@ fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
     match runtime.topology {
         MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
         MeshTopology::Ambient => runtime.hbone_listen_addr.port(),
+        MeshTopology::NodeWaypoint => runtime.hbone_listen_addr.port(),
         MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
         // East-west gateways do SNI passthrough — no TLS termination, no port
         // override surface. Use inbound for stability; the resolved mode is
@@ -2623,8 +2711,8 @@ fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
 /// Reject `MtlsMode::Disable` on topologies whose inbound listener is
 /// fundamentally mTLS-only:
 ///
-/// - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running it plaintext
-///   is not a valid HBONE listener.
+/// - **Ambient / NodeWaypoint**: HBONE is HTTP/2 CONNECT over mTLS — running
+///   it plaintext is not a valid HBONE listener.
 /// - **EgressGateway**: the egress listener must verify sidecar client
 ///   certificates (already enforced for env-derived TLS materials by
 ///   `validate_egress_gateway_mtls_config`; this check covers the
@@ -2640,10 +2728,11 @@ fn validate_inbound_mtls_mode_for_topology(
         return Ok(());
     }
     match runtime.topology {
-        MeshTopology::Ambient => Err(anyhow::anyhow!(
-            "Mesh PeerAuthentication resolved to DISABLE on Ambient topology, but HBONE \
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on {} topology, but HBONE \
              (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
-             workload, or move it to Sidecar topology if plaintext-only is intended."
+             workload, or move it to Sidecar topology if plaintext-only is intended.",
+            runtime.topology.as_str()
         )),
         MeshTopology::EgressGateway => Err(anyhow::anyhow!(
             "Mesh PeerAuthentication resolved to DISABLE on EgressGateway topology, but the \
@@ -2651,6 +2740,104 @@ fn validate_inbound_mtls_mode_for_topology(
              STRICT for this workload."
         )),
         MeshTopology::Sidecar | MeshTopology::EastWestGateway => Ok(()),
+    }
+}
+
+fn startup_inbound_mtls_mode(
+    initial_slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
+) -> Result<config::MtlsMode, anyhow::Error> {
+    let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
+    validate_inbound_mtls_mode_for_topology(runtime, resolved)?;
+    Ok(resolved)
+}
+
+fn live_reload_inbound_mtls_mode(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Option<config::MtlsMode> {
+    let resolved = resolve_inbound_mtls_mode(Some(slice), runtime);
+    if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, resolved) {
+        warn!(
+            mesh_slice_version = %slice.version,
+            ?resolved,
+            topology = ?runtime.topology,
+            "Rejecting mesh slice apply because PeerAuthentication mTLS mode is invalid \
+             for this topology: {error}; keeping the previous mesh config"
+        );
+        return None;
+    }
+    Some(resolved)
+}
+
+#[derive(Clone, Eq)]
+struct MeshInboundClientCaBundle {
+    path: String,
+    pem: Arc<[u8]>,
+}
+
+impl PartialEq for MeshInboundClientCaBundle {
+    fn eq(&self, other: &Self) -> bool {
+        self.pem == other.pem
+    }
+}
+
+impl fmt::Debug for MeshInboundClientCaBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeshInboundClientCaBundle")
+            .field("path", &self.path)
+            .field("pem_len", &self.pem.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshInboundTlsReloadSnapshot {
+    mtls_mode: config::MtlsMode,
+    client_ca_bundle: Option<MeshInboundClientCaBundle>,
+}
+
+struct MeshInboundTlsReloadState {
+    server_identity: Option<Arc<tls::MeshServerIdentity>>,
+    last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
+}
+
+fn mesh_inbound_tls_reload_snapshot(
+    env_config: &EnvConfig,
+    mtls_mode: config::MtlsMode,
+) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
+    let client_ca_bundle = if mtls_mode == config::MtlsMode::Disable {
+        None
+    } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
+        let pem: Arc<[u8]> = std::fs::read(path)
+            .with_context(|| format!("failed to read mesh frontend client CA bundle at {path}"))?
+            .into();
+        Some(MeshInboundClientCaBundle {
+            path: path.to_string(),
+            pem,
+        })
+    } else {
+        None
+    };
+    Ok(MeshInboundTlsReloadSnapshot {
+        mtls_mode,
+        client_ca_bundle,
+    })
+}
+
+fn load_mesh_frontend_server_identity(
+    env_config: &EnvConfig,
+) -> Result<Option<Arc<tls::MeshServerIdentity>>, anyhow::Error> {
+    match (
+        env_config.frontend_tls_cert_path.as_deref(),
+        env_config.frontend_tls_key_path.as_deref(),
+    ) {
+        (Some(cert_path), Some(key_path)) => Ok(Some(tls::load_mesh_server_identity(
+            cert_path,
+            key_path,
+            env_config.tls_cert_expiry_warning_days,
+        )?)),
+        _ => Ok(None),
     }
 }
 
@@ -2663,6 +2850,8 @@ fn load_mesh_frontend_tls(
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
     mtls_mode: config::MtlsMode,
+    server_identity: Option<&tls::MeshServerIdentity>,
+    client_ca_bundle: Option<&MeshInboundClientCaBundle>,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     if mtls_mode == config::MtlsMode::Disable {
         info!(
@@ -2671,10 +2860,7 @@ fn load_mesh_frontend_tls(
         return Ok(None);
     }
 
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.frontend_tls_cert_path.as_ref(),
-        env_config.frontend_tls_key_path.as_ref(),
-    ) else {
+    let Some(server_identity) = server_identity else {
         if mtls_mode == config::MtlsMode::Strict {
             return Err(anyhow::anyhow!(
                 "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
@@ -2683,7 +2869,9 @@ fn load_mesh_frontend_tls(
         return Ok(None);
     };
 
-    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+    let client_ca_bundle_path = client_ca_bundle
+        .map(|bundle| bundle.path.as_str())
+        .or(env_config.frontend_tls_client_ca_bundle_path.as_deref());
     let client_auth = match mtls_mode {
         config::MtlsMode::Strict => tls::MeshClientAuth::Required,
         config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
@@ -2714,15 +2902,28 @@ fn load_mesh_frontend_tls(
         }
     };
 
-    let mut tls_config = tls::load_mesh_tls_config(
-        cert_path,
-        key_path,
-        client_ca_bundle_path,
-        client_auth,
-        tls_policy,
-        env_config.tls_cert_expiry_warning_days,
-        crls,
-    )
+    let mut tls_config = if let Some(bundle) = client_ca_bundle {
+        tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
+            server_identity,
+            Some(tls::ClientCaBundleRef {
+                path: bundle.path.as_str(),
+                pem: bundle.pem.as_ref(),
+            }),
+            client_auth,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+    } else {
+        tls::load_mesh_tls_config_with_identity(
+            server_identity,
+            client_ca_bundle_path,
+            client_auth,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+    }
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
     tls::enable_early_data(&mut tls_config, tls_policy);
     if env_config.ktls_enabled.could_be_enabled() {
@@ -2786,11 +2987,96 @@ fn listener_tls_config_for_mtls_mode(
     listener_tls_config(listener, frontend_tls)
 }
 
+enum MeshInboundTlsReloadPlan {
+    Unchanged,
+    Swap {
+        snapshot: MeshInboundTlsReloadSnapshot,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    },
+}
+
+fn plan_mesh_inbound_tls_reload(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+    mtls_mode: config::MtlsMode,
+    server_identity: Option<&tls::MeshServerIdentity>,
+    last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
+) -> Option<MeshInboundTlsReloadPlan> {
+    let next_snapshot = match mesh_inbound_tls_reload_snapshot(&proxy_state.env_config, mtls_mode) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Unable to inspect mesh inbound TLS reload inputs: {error}; keeping previous TLS config"
+            );
+            return None;
+        }
+    };
+    if last_snapshot == Some(&next_snapshot) {
+        return Some(MeshInboundTlsReloadPlan::Unchanged);
+    }
+    let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+        error!(
+            mesh_slice_version = %slice.version,
+            ?mtls_mode,
+            "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; this is a programming error. Applying proxy config only; the inbound TLS slot remains at its previous value until restart and will be re-evaluated on later slice applies."
+        );
+        return Some(MeshInboundTlsReloadPlan::Unchanged);
+    };
+    match load_mesh_frontend_tls(
+        &proxy_state.env_config,
+        tls_policy,
+        &proxy_state.crls,
+        mtls_mode,
+        server_identity,
+        next_snapshot.client_ca_bundle.as_ref(),
+    ) {
+        Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
+            snapshot: next_snapshot,
+            tls_config,
+        }),
+        Err(error) => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; keeping previous TLS config"
+            );
+            None
+        }
+    }
+}
+
+fn apply_mesh_inbound_tls_reload(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+    mtls_mode: config::MtlsMode,
+    plan: MeshInboundTlsReloadPlan,
+    last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
+) {
+    match plan {
+        MeshInboundTlsReloadPlan::Unchanged => {}
+        MeshInboundTlsReloadPlan::Swap {
+            snapshot,
+            tls_config,
+        } => {
+            proxy_state.mesh_inbound_tls.store(Arc::new(tls_config));
+            *last_snapshot = Some(snapshot);
+            info!(
+                mesh_slice_version = %slice.version,
+                ?mtls_mode,
+                "Mesh inbound PeerAuthentication TLS config reloaded"
+            );
+        }
+    }
+}
+
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
     runtime: MeshRuntimeConfig,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    mut inbound_tls_reload: MeshInboundTlsReloadState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
@@ -2810,49 +3096,89 @@ fn start_mesh_slice_apply_task(
                         "Skipping no-op mesh slice update"
                     );
                 } else {
-                    match gateway_config_from_mesh_slice(slice, &runtime) {
-                        Ok(config) => {
-                            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
-                            let candidate_loaded_at = config.loaded_at;
-                            let applied = proxy_state.update_config(config);
-                            let current_loaded_at = proxy_state.config.load_full().loaded_at;
-                            let accepted = mesh_proxy_update_was_accepted(
-                                applied,
-                                previous_loaded_at,
-                                current_loaded_at,
-                                candidate_loaded_at,
-                            );
-                            record_mesh_slice_apply_result(
-                                &mut last_applied_slice,
+                    let live_reload_enabled =
+                        proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
+                    let live_reload = if live_reload_enabled {
+                        live_reload_inbound_mtls_mode(slice, &runtime).and_then(|mtls_mode| {
+                            plan_mesh_inbound_tls_reload(
+                                &proxy_state,
                                 slice,
-                                accepted,
-                            );
-                            if accepted && let Some(ref dns_proxy) = dns_proxy {
-                                dns_proxy.update_from_slice(slice);
+                                mtls_mode,
+                                inbound_tls_reload.server_identity.as_deref(),
+                                inbound_tls_reload.last_snapshot.as_ref(),
+                            )
+                            .map(|plan| (mtls_mode, plan))
+                        })
+                    } else {
+                        None
+                    };
+                    if live_reload_enabled && live_reload.is_none() {
+                        warn!(
+                            mesh_slice_version = %slice.version,
+                            "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
+                        );
+                    } else {
+                        match gateway_config_from_mesh_slice(slice, &runtime) {
+                            Ok(config) => {
+                                let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+                                let candidate_loaded_at = config.loaded_at;
+                                // The TLS reload plan is validated before config apply, but the
+                                // live slot is swapped only after proxy config acceptance. That
+                                // creates a tiny accept window where listeners may still see the
+                                // previous TLS config, and avoids pre-swapping TLS for a proxy
+                                // config that the runtime rejects. On a Permissive-to-Strict
+                                // escalation, an accepted connection in that window can enter the
+                                // new plugin chain without a peer principal; mesh authz still
+                                // fails closed for identity-required policy until the slot swaps.
+                                let applied = proxy_state.update_config(config);
+                                let current_loaded_at = proxy_state.config.load_full().loaded_at;
+                                let accepted = mesh_proxy_update_was_accepted(
+                                    applied,
+                                    previous_loaded_at,
+                                    current_loaded_at,
+                                    candidate_loaded_at,
+                                );
+                                record_mesh_slice_apply_result(
+                                    &mut last_applied_slice,
+                                    slice,
+                                    accepted,
+                                );
+                                if accepted && let Some((mtls_mode, plan)) = live_reload {
+                                    apply_mesh_inbound_tls_reload(
+                                        &proxy_state,
+                                        slice,
+                                        mtls_mode,
+                                        plan,
+                                        &mut inbound_tls_reload.last_snapshot,
+                                    );
+                                }
+                                if accepted && let Some(ref dns_proxy) = dns_proxy {
+                                    dns_proxy.update_from_slice(slice);
+                                }
+                                if applied {
+                                    info!(
+                                        mesh_slice_version = %slice.version,
+                                        "Applied mesh slice to proxy runtime"
+                                    );
+                                } else if accepted {
+                                    debug!(
+                                        mesh_slice_version = %slice.version,
+                                        "Accepted mesh slice with no proxy runtime delta"
+                                    );
+                                } else {
+                                    warn!(
+                                        mesh_slice_version = %slice.version,
+                                        "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
+                                    );
+                                }
                             }
-                            if applied {
-                                info!(
-                                    mesh_slice_version = %slice.version,
-                                    "Applied mesh slice to proxy runtime"
-                                );
-                            } else if accepted {
-                                debug!(
-                                    mesh_slice_version = %slice.version,
-                                    "Accepted mesh slice with no proxy runtime delta"
-                                );
-                            } else {
+                            Err(e) => {
                                 warn!(
                                     mesh_slice_version = %slice.version,
-                                    "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
+                                    error = %e,
+                                    "Ignoring invalid mesh slice update"
                                 );
                             }
-                        }
-                        Err(e) => {
-                            warn!(
-                                mesh_slice_version = %slice.version,
-                                error = %e,
-                                "Ignoring invalid mesh slice update"
-                            );
                         }
                     }
                 }
@@ -3031,6 +3357,10 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     fn with_mesh_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let keys = [
@@ -3060,6 +3390,8 @@ mod tests {
             "FERRUM_MESH_CLUSTER_DOMAIN",
             "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY",
             "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS",
+            "FERRUM_MESH_SIDECAR_ENFORCED",
+            "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING",
             "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
@@ -3125,6 +3457,32 @@ mod tests {
                 );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
                 assert_eq!(runtime.outbound_registry_reject_status, 502);
+                assert!(!runtime.sidecar_identity_narrowing);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_parses_sidecar_identity_narrowing_flag() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.sidecar_identity_narrowing);
+                assert!(
+                    !runtime.sidecar_enforced,
+                    "identity narrowing is parsed independently but only takes effect during slicing when Sidecar enforcement is also enabled"
+                );
             },
         );
     }
@@ -3493,6 +3851,8 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
+            sidecar_identity_narrowing: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3588,6 +3948,8 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
+            sidecar_identity_narrowing: false,
         }
     }
 
@@ -3601,6 +3963,20 @@ mod tests {
                 ..EnvConfig::default()
             },
             None,
+            None,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
+    }
+
+    fn make_test_proxy_state_with_env(initial_config: GatewayConfig, env: EnvConfig) -> ProxyState {
+        ensure_crypto_provider();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("test TLS policy");
+        ProxyState::new(
+            initial_config,
+            DnsCache::new(DnsConfig::default()),
+            env,
+            Some(tls_policy),
             None,
         )
         .expect("ProxyState construction should succeed in tests")
@@ -4551,6 +4927,7 @@ mod tests {
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
+            sidecar_egress_scope: None,
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
@@ -5108,18 +5485,7 @@ mod tests {
     async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let observed = proxy_state
-                    .current_config()
-                    .plugin_configs
-                    .iter()
-                    .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
-                    .and_then(|plugin| {
-                        plugin
-                            .config
-                            .pointer(&format!("/mesh_slice/labels/{key}"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
-                    });
+                let observed = mesh_authz_label(proxy_state, key);
                 if observed.as_deref() == Some(expected) {
                     return;
                 }
@@ -5128,6 +5494,34 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("mesh_authz label {key} did not become {expected}"));
+    }
+
+    fn mesh_authz_label(proxy_state: &ProxyState, key: &str) -> Option<String> {
+        proxy_state
+            .current_config()
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .and_then(|plugin| {
+                plugin
+                    .config
+                    .pointer(&format!("/mesh_slice/labels/{key}"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+    }
+
+    async fn wait_for_mesh_inbound_tls(proxy_state: &ProxyState, expected_present: bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if proxy_state.mesh_inbound_tls.load_full().is_some() == expected_present {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mesh inbound TLS slot should update");
     }
 
     #[test]
@@ -5191,6 +5585,32 @@ mod tests {
                         && listener.kind == MeshListenerKind::HboneTermination
                         && listener.addr.port() == 15008
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_uses_node_waypoint_hbone_only() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+
+                assert_eq!(plan.len(), 1);
+                assert_eq!(plan[0].direction, MeshTrafficDirection::Inbound);
+                assert_eq!(plan[0].kind, MeshListenerKind::HboneTermination);
+                assert_eq!(plan[0].addr.port(), 15008);
             },
         );
     }
@@ -5902,6 +6322,10 @@ mod tests {
             proxy_state.clone(),
             runtime,
             None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: None,
+            },
             shutdown_rx,
             None,
         );
@@ -5919,6 +6343,148 @@ mod tests {
             ..MeshSlice::default()
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_live_reloads_peer_auth_tls_slot() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: mesh_frontend_identity,
+                last_snapshot: Some(initial_snapshot),
+            },
+            shutdown_rx,
+            None,
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "strict".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, true).await;
+        let strict_tls_slot = proxy_state.mesh_inbound_tls.load_full();
+
+        mesh_state.install_slice(MeshSlice {
+            version: "strict-label-only".to_string(),
+            labels: [("app".to_string(), "same-peer-auth".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "same-peer-auth").await;
+        let unchanged_tls_slot = proxy_state.mesh_inbound_tls.load_full();
+        assert!(
+            Arc::ptr_eq(&strict_tls_slot, &unchanged_tls_slot),
+            "unchanged PeerAuthentication inputs should not rebuild the TLS slot"
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "disable".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, false).await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_rejects_peer_auth_reload_when_tls_rebuild_fails() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("/missing/server.crt".to_string()),
+            frontend_tls_key_path: Some("/missing/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: Some(initial_snapshot),
+            },
+            shutdown_rx,
+            None,
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "good-disable".to_string(),
+            labels: [("app".to_string(), "good-baseline".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "good-baseline").await;
+
+        mesh_state.install_slice(MeshSlice {
+            version: "bad-strict".to_string(),
+            labels: [("app".to_string(), "bad-tls".to_string())].into(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            proxy_state.mesh_inbound_tls.load_full().is_none(),
+            "failed TLS rebuild should keep the previous plaintext slot"
+        );
+        assert_eq!(
+            mesh_authz_label(&proxy_state, "app").as_deref(),
+            Some("good-baseline"),
+            "failed TLS rebuild should keep the previous proxy config"
+        );
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
@@ -6416,7 +6982,24 @@ mod tests {
         );
     }
 
-    // ── EgressGateway topology tests ─────────────────────────────────────
+    // ── Mesh topology tests ──────────────────────────────────────────────
+
+    #[test]
+    fn mesh_topology_parses_node_waypoint_variants() {
+        assert_eq!(
+            MeshTopology::parse("node_waypoint").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(
+            MeshTopology::parse("node-waypoint").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(
+            MeshTopology::parse("NODE_WAYPOINT").unwrap(),
+            MeshTopology::NodeWaypoint
+        );
+        assert_eq!(MeshTopology::NodeWaypoint.as_str(), "node_waypoint");
+    }
 
     #[test]
     fn mesh_topology_parses_egress_gateway_variants() {
@@ -6523,8 +7106,9 @@ mod tests {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let err = load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict)
-            .expect_err("strict mTLS must require cert and key material");
+        let err =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict, None, None)
+                .expect_err("strict mTLS must require cert and key material");
 
         assert!(
             err.to_string()
@@ -6537,15 +7121,22 @@ mod tests {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let tls_config =
-            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
-                .expect("permissive mTLS can run without frontend TLS materials");
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            None,
+            None,
+        )
+        .expect("permissive mTLS can run without frontend TLS materials");
 
         assert!(tls_config.is_none());
     }
 
     #[test]
     fn permissive_without_ca_bundle_degrades_to_no_client_auth() {
+        ensure_crypto_provider();
         let env = EnvConfig {
             frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
             frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
@@ -6553,15 +7144,90 @@ mod tests {
             ..EnvConfig::default()
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
 
-        let tls_config =
-            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
-                .expect("permissive without CA bundle should succeed");
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            mesh_frontend_identity.as_deref(),
+            None,
+        )
+        .expect("permissive without CA bundle should succeed");
 
         assert!(
             tls_config.is_some(),
             "TLS config should be built (no client auth, but server TLS active)"
         );
+    }
+
+    #[test]
+    fn mesh_frontend_tls_rebuild_uses_cached_server_identity() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::copy("tests/certs/server.crt", &cert_path).expect("copy cert");
+        std::fs::copy("tests/certs/server.key", &key_path).expect("copy key");
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            frontend_tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("load identity");
+
+        std::fs::write(&cert_path, b"not a cert").expect("replace cert");
+        std::fs::write(&key_path, b"not a key").expect("replace key");
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            None,
+        )
+        .expect("strict rebuild should use cached server identity");
+
+        assert!(tls_config.is_some());
+    }
+
+    #[test]
+    fn mesh_frontend_tls_rebuild_uses_snapshot_client_ca_bytes() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::copy("tests/certs/server.crt", &ca_path).expect("copy CA");
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..EnvConfig::default()
+        };
+        let snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("snapshot reads CA bytes");
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("load identity");
+
+        std::fs::write(&ca_path, b"not a ca").expect("replace CA");
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            snapshot.client_ca_bundle.as_ref(),
+        )
+        .expect("strict rebuild should use snapshot CA bytes");
+
+        assert!(tls_config.is_some());
     }
 
     // ── Topology-aware port resolution + Disable-mode validation ────────
@@ -6604,6 +7270,9 @@ mod tests {
 
         let ambient = runtime_with_topology(MeshTopology::Ambient);
         assert_eq!(inbound_mtls_resolution_port(&ambient), 15008);
+
+        let node_waypoint = runtime_with_topology(MeshTopology::NodeWaypoint);
+        assert_eq!(inbound_mtls_resolution_port(&node_waypoint), 15008);
 
         let egress = runtime_with_topology(MeshTopology::EgressGateway);
         assert_eq!(inbound_mtls_resolution_port(&egress), 15090);
@@ -6664,7 +7333,17 @@ mod tests {
         let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
             .expect_err("Disable on Ambient must be rejected");
 
-        assert!(err.to_string().contains("Ambient"));
+        assert!(err.to_string().contains("ambient"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_node_waypoint() {
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on NodeWaypoint must be rejected");
+
+        assert!(err.to_string().contains("node_waypoint"));
         assert!(err.to_string().contains("HBONE"));
     }
 
@@ -6685,6 +7364,108 @@ mod tests {
     }
 
     #[test]
+    fn startup_inbound_mtls_mode_rejects_invalid_initial_disable() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Disable,
+        )]);
+
+        let err = startup_inbound_mtls_mode(Some(&slice), &runtime)
+            .expect_err("Disable on Ambient should fail closed at startup");
+
+        assert!(err.to_string().contains("ambient"));
+    }
+
+    #[test]
+    fn startup_inbound_mtls_mode_accepts_valid_initial_mode() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Strict,
+        )]);
+
+        let mode = startup_inbound_mtls_mode(Some(&slice), &runtime)
+            .expect("strict mode should be accepted at startup");
+
+        assert_eq!(mode, config::MtlsMode::Strict);
+    }
+
+    #[test]
+    fn live_reload_inbound_mtls_mode_rejects_invalid_disable_slice() {
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15090,
+            config::MtlsMode::Disable,
+        )]);
+
+        assert!(
+            live_reload_inbound_mtls_mode(&slice, &runtime).is_none(),
+            "invalid live PeerAuthentication update should be rejected"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_tls_reload_snapshot_tracks_client_ca_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_path, b"first-ca").expect("write first CA");
+        let env = EnvConfig {
+            frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().to_string()),
+            ..EnvConfig::default()
+        };
+
+        let first = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("first snapshot");
+        std::fs::write(&ca_path, b"second-ca").expect("write second CA");
+        let second = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+            .expect("second snapshot");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn mesh_inbound_tls_slot_swaps_atomically() {
+        ensure_crypto_provider();
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            mesh_frontend_identity.as_deref(),
+            None,
+        )
+        .expect("TLS config builds")
+        .expect("TLS config present");
+        let slot: crate::proxy::SharedMeshInboundTls =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+
+        slot.store(Arc::new(Some(tls_config.clone())));
+        let loaded = slot.load_full();
+        assert!(
+            loaded
+                .as_ref()
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &tls_config)),
+            "load_full should observe the swapped TLS config"
+        );
+
+        slot.store(Arc::new(None));
+        assert!(
+            slot.load_full().is_none(),
+            "load_full should observe the plaintext swap"
+        );
+    }
+
+    #[test]
     fn validate_inbound_mtls_mode_accepts_disable_on_east_west_gateway() {
         // East-west gateways do SNI passthrough — there is no TLS-terminating
         // listener to fail closed. The resolved mode is structurally unused.
@@ -6698,6 +7479,7 @@ mod tests {
         for topology in [
             MeshTopology::Sidecar,
             MeshTopology::Ambient,
+            MeshTopology::NodeWaypoint,
             MeshTopology::EastWestGateway,
             MeshTopology::EgressGateway,
         ] {

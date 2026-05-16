@@ -62,6 +62,7 @@
 //! ```
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use http::header::HeaderName;
 use serde_json::Value;
@@ -70,7 +71,9 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use super::utils::aws_sigv4;
-use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::utils::response_body::{
+    BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
+};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Cloud provider for the serverless function.
@@ -185,15 +188,12 @@ impl ServerlessFunction {
             return Err("serverless_function: timeout_ms must be > 0".to_string());
         }
 
-        let max_response_body_bytes =
-            optional_u64(config, "max_response_body_bytes")?.unwrap_or(10 * 1024 * 1024);
-        if max_response_body_bytes == 0 {
-            return Err("serverless_function: max_response_body_bytes must be > 0".to_string());
-        }
-        let max_response_body_bytes = usize::try_from(max_response_body_bytes).map_err(|_| {
-            "serverless_function: max_response_body_bytes is too large for this platform"
-                .to_string()
-        })?;
+        let max_response_body_bytes = parse_max_response_body_bytes(
+            config,
+            "serverless_function",
+            "max_response_body_bytes",
+            10 * 1024 * 1024,
+        )?;
 
         // Strict `on_error` validation — a typo here changes whether a function
         // failure rejects the request or silently continues, so silent
@@ -459,7 +459,7 @@ impl ServerlessFunction {
         &self,
         payload: &Value,
         ctx: &RequestContext,
-    ) -> Result<(u16, HashMap<String, String>, Vec<u8>), String> {
+    ) -> Result<(u16, HashMap<String, String>, Bytes), String> {
         let payload_bytes = serde_json::to_vec(payload)
             .map_err(|e| format!("serverless_function: failed to serialize payload: {e}"))?;
 
@@ -819,7 +819,7 @@ impl Plugin for ServerlessFunction {
                 }
                 PluginResult::RejectBinary {
                     status_code: status,
-                    body: body.into(),
+                    body,
                     headers: resp_headers,
                 }
             }

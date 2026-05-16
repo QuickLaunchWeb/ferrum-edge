@@ -189,6 +189,7 @@ fn build_cp_admin_state(
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
 }
@@ -223,6 +224,7 @@ fn build_dp_admin_state(
         mesh_registry: None,
         cp_connection_state: Some(conn_state),
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
 }

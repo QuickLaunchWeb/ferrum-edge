@@ -505,6 +505,156 @@ paths:
                   error:
                     type: string
 
+  # ── Mesh egress scope (mesh mode) ────────────────────────────────────
+  /mesh/egress-scope:
+    get:
+      operationId: getMeshEgressScope
+      summary: Inspect the resolved Sidecar egress scope for this workload
+      description: |
+        Returns the current workload's resolved Sidecar egress scope, including
+        admitted services, admitted service-entries, admitted destination-rules,
+        the deduplicated `known_destinations` list used by the outbound
+        registry, dry-run status, and admit/deny counts.
+
+        The payload reveals mesh topology shape (service names, hosts, ports,
+        FQDN aliases) — scope JWT issuance accordingly even though no traffic
+        bodies or credentials are exposed.
+
+        Returns `404 Not Found` when no mesh slice has been installed yet
+        instead of fabricating counts from raw config; this is intentional so
+        operators can distinguish pre-slice startup state from real scope.
+      tags: [Mesh Egress Scope]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Active mesh egress scope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [namespace, scope, health]
+                properties:
+                  namespace:
+                    type: string
+                  scope:
+                    type: object
+                  health:
+                    type: object
+                    properties:
+                      sidecar_admitted_services:
+                        type: integer
+                        format: int64
+                      sidecar_denied_services:
+                        type: integer
+                        format: int64
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh egress scope
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Proxy state unavailable in this mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /mesh/egress-scope/test:
+    post:
+      operationId: testMeshEgressScopeCandidate
+      summary: Dry-run a candidate destination against the current Sidecar egress scope
+      description: |
+        Tests whether a candidate destination is admitted by the current
+        resolved Sidecar egress scope. Never mutates slice state.
+
+        Useful to validate critical destinations before flipping
+        `FERRUM_MESH_SIDECAR_ENFORCED=true` on the control plane.
+
+        The handler memoises the `OutboundRegistry` against the installed
+        snapshot so repeated admin calls reuse the same registry instance.
+      tags: [Mesh Egress Scope]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host]
+              properties:
+                host:
+                  type: string
+                  description: Destination host (FQDN or short name). Required, non-empty.
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  description: Optional destination port. When omitted, the registry tries any-port and host-only matches.
+            example:
+              host: reviews.alpha.svc.cluster.local
+              port: 8080
+      responses:
+        "200":
+          description: Decision computed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed, decision, host, dry_run]
+                properties:
+                  allowed:
+                    type: boolean
+                  decision:
+                    type: string
+                    enum: [admit, deny]
+                  host:
+                    type: string
+                  port:
+                    type: integer
+                    nullable: true
+                  dry_run:
+                    type: boolean
+        "400":
+          description: Malformed JSON body, empty/missing host, or port 0
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh egress scope
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Proxy state unavailable in this mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Batch ────────────────────────────────────────────────────────────
   /batch:
     parameters:
@@ -6774,7 +6924,7 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
       required:
         - spec_url
       properties:
@@ -6792,6 +6942,12 @@ components:
           format: uint64
           default: 300
           description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 26214400
+          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object

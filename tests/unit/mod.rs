@@ -6,3 +6,4 @@ mod identity;
 mod notifications;
 mod plugins;
 mod secrets;
+mod tls;
