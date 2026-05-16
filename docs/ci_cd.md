@@ -52,7 +52,7 @@ Push tag v* (e.g., v0.2.0)
 
 The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
 
-CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run.
+CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation; rerun the latest workflow if a publish was canceled mid-flight.
 
 ### Jobs
 
@@ -128,7 +128,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. The shared-types test uses stable because the workflow installs `dtolnay/rust-toolchain@stable` after nightly; keep that ordering if the job is edited. When no eBPF files changed, the job no-ops and reports success.
 
 #### 5. Performance Regression Job
 
@@ -148,6 +148,8 @@ python3 tests/performance/ci_overhead_bench.py \
   --overhead-threshold 50 \
   --output tests/performance/ci_results/overhead_results.json
 ```
+
+`--overhead-threshold 50` is a percentage threshold: the script fails when measured gateway overhead exceeds 50%.
 
 **Failures**:
 - Indicate performance regression issues
@@ -392,8 +394,9 @@ cargo build --features cloud-secrets --release --target aarch64-apple-darwin
 cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
 # Stage platform-suffixed assets before checksums/upload, matching CI asset names.
-# Collect the built target artifacts from the Linux, macOS, and Windows hosts
-# into this checkout before running these staging commands.
+# Run these POSIX staging commands from one checkout after copying in the built
+# artifacts from the Linux, macOS, and Windows hosts. On Windows-only recovery,
+# use equivalent PowerShell commands or copy the .exe back to a POSIX shell.
 mkdir -p dist
 cp target/x86_64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-x86_64
 cp target/aarch64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-aarch64
@@ -615,7 +618,7 @@ Modify build commands in workflows:
 
 ```yaml
 - name: Build with custom features
-  run: cargo build --release --features "ebpf"
+  run: cargo build --release --features "cloud-secrets"
 ```
 
 ### Notification Integration
