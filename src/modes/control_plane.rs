@@ -501,6 +501,7 @@ pub async fn run(
             istio_root_namespace: env_config.k8s_istio_root_namespace.clone(),
             watch_namespaces: env_config.k8s_watch_namespaces.clone(),
             watch_istio: env_config.k8s_watch_istio_crds,
+            watch_mesh_config: env_config.k8s_watch_mesh_config,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
