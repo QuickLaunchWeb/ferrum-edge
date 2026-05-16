@@ -285,9 +285,8 @@ fn decide_admin_bind_address(
         )
     })?;
 
-    let any_signal_present = signals.bind_address_explicit
-        || signals.jwt_secret_set
-        || signals.allowed_cidrs_set;
+    let any_signal_present =
+        signals.bind_address_explicit || signals.jwt_secret_set || signals.allowed_cidrs_set;
     let is_default_unspecified = !signals.bind_address_explicit
         && (configured_ip.is_unspecified() || configured_bind == "0.0.0.0");
 
@@ -1507,9 +1506,8 @@ mod tests {
     fn decide_admin_bind_defaults_to_loopback_when_no_signals() {
         // Default unspecified bind + no auth, no allowlist, no explicit bind →
         // override to 127.0.0.1 to avoid exposing unauthenticated /metrics.
-        let addr =
-            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, false))
-                .expect("default 0.0.0.0 bind should be valid");
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, false))
+            .expect("default 0.0.0.0 bind should be valid");
         assert_eq!(
             addr,
             std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
@@ -1519,54 +1517,41 @@ mod tests {
     #[test]
     fn decide_admin_bind_respects_explicit_bind_address() {
         // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 → respected.
-        let addr =
-            decide_admin_bind_address("0.0.0.0", 9000, &signals(true, false, false))
-                .expect("explicit bind should be valid");
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(true, false, false))
+            .expect("explicit bind should be valid");
         assert_eq!(
             addr,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                9000
-            )
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
         );
     }
 
     #[test]
     fn decide_admin_bind_respects_jwt_secret_signal() {
         // JWT secret configured → operator opted into auth, respect 0.0.0.0.
-        let addr =
-            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, true, false))
-                .expect("0.0.0.0 with JWT secret should be valid");
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, true, false))
+            .expect("0.0.0.0 with JWT secret should be valid");
         assert_eq!(
             addr,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                9000
-            )
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
         );
     }
 
     #[test]
     fn decide_admin_bind_respects_allowed_cidrs_signal() {
         // Allowlist configured → operator scoped network exposure, respect 0.0.0.0.
-        let addr =
-            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, true))
-                .expect("0.0.0.0 with allowed cidrs should be valid");
+        let addr = decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, true))
+            .expect("0.0.0.0 with allowed cidrs should be valid");
         assert_eq!(
             addr,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                9000
-            )
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
         );
     }
 
     #[test]
     fn decide_admin_bind_respects_explicit_loopback() {
         // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 → respected.
-        let addr =
-            decide_admin_bind_address("127.0.0.1", 9000, &signals(true, false, false))
-                .expect("loopback should be valid");
+        let addr = decide_admin_bind_address("127.0.0.1", 9000, &signals(true, false, false))
+            .expect("loopback should be valid");
         assert_eq!(
             addr,
             std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
@@ -1580,19 +1565,15 @@ mod tests {
             .expect("explicit :: should be valid");
         assert_eq!(
             addr,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                9000
-            )
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 9000)
         );
     }
 
     #[test]
     fn decide_admin_bind_overrides_v6_unspecified_with_no_signals() {
         // IPv6 :: with NO signals → also unsafe, override to loopback.
-        let addr =
-            decide_admin_bind_address("::", 9000, &signals(false, false, false))
-                .expect("default :: bind should be valid");
+        let addr = decide_admin_bind_address("::", 9000, &signals(false, false, false))
+            .expect("default :: bind should be valid");
         assert_eq!(
             addr,
             std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)

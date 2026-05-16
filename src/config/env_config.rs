@@ -2566,8 +2566,7 @@ impl EnvConfig {
             if self.node_agent_hbone_redirect_port == 0 {
                 return Err("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must be non-zero".into());
             }
-            let outbound_capture_port = crate::capture::CaptureConfig::from_env()?.outbound_port;
-            if self.node_agent_hbone_redirect_port == outbound_capture_port {
+            if self.node_agent_hbone_redirect_port == ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT {
                 return Err(
                     "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must differ from the outbound capture port"
                         .into(),
