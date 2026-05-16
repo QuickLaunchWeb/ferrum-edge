@@ -39,7 +39,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderValue;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -251,14 +251,7 @@ impl SpecExpose {
                     error = %e,
                     "spec_expose: failed to fetch spec document"
                 );
-                let mut headers = HashMap::with_capacity(1);
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                PluginResult::Reject {
-                    status_code: 502,
-                    body: r#"{"error":"Failed to fetch API specification from upstream"}"#
-                        .to_string(),
-                    headers,
-                }
+                reject_502_json("Failed to fetch API specification from upstream")
             })?;
 
         if !response.status().is_success() {
@@ -268,13 +261,9 @@ impl SpecExpose {
                 upstream_status = status,
                 "spec_expose: upstream returned non-success status"
             );
-            let mut headers = HashMap::with_capacity(1);
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            return Err(PluginResult::Reject {
-                status_code: 502,
-                body: format!(r#"{{"error":"Upstream spec endpoint returned status {status}"}}"#),
-                headers,
-            });
+            return Err(reject_502_json(format!(
+                "Upstream spec endpoint returned status {status}"
+            )));
         }
 
         // Content-Length is an untrusted upstream hint, so this is only a
@@ -291,7 +280,7 @@ impl SpecExpose {
                 max_response_body_bytes = self.max_response_body_bytes,
                 "spec_expose: upstream spec response body exceeds configured limit"
             );
-            return Err(self.body_too_large_reject());
+            return Err(body_too_large_reject());
         }
 
         // Determine content-type: plugin override > upstream response > default.
@@ -318,7 +307,7 @@ impl SpecExpose {
                         read_so_far,
                         "spec_expose: upstream spec response body exceeded configured limit while streaming"
                     );
-                    self.body_too_large_reject()
+                    body_too_large_reject()
                 }
                 BoundedReadError::Stream(e) => {
                     tracing::warn!(
@@ -326,14 +315,7 @@ impl SpecExpose {
                         error = %e,
                         "spec_expose: failed to read spec response body"
                     );
-                    let mut headers = HashMap::with_capacity(1);
-                    headers.insert("content-type".to_string(), "application/json".to_string());
-                    PluginResult::Reject {
-                        status_code: 502,
-                        body: r#"{"error":"Failed to read API specification response body"}"#
-                            .to_string(),
-                        headers,
-                    }
+                    reject_502_json("Failed to read API specification response body")
                 }
             })?;
 
@@ -348,15 +330,19 @@ impl SpecExpose {
         }
         Ok(entry)
     }
+}
 
-    fn body_too_large_reject(&self) -> PluginResult {
-        let mut headers = HashMap::with_capacity(1);
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        PluginResult::Reject {
-            status_code: 502,
-            body: r#"{"error":"API specification response too large"}"#.to_string(),
-            headers,
-        }
+fn body_too_large_reject() -> PluginResult {
+    reject_502_json("API specification response too large")
+}
+
+fn reject_502_json(message: impl Into<String>) -> PluginResult {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    PluginResult::Reject {
+        status_code: 502,
+        body: json!({ "error": message.into() }).to_string(),
+        headers,
     }
 }
 

@@ -500,6 +500,10 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
             if socket.write_all(b"\r\n").await.is_err() {
                 return;
             }
+            if socket.flush().await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = socket.write_all(b"0\r\n\r\n").await;
     });

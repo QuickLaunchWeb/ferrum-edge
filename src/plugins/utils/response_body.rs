@@ -21,6 +21,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+// Bound only the upfront allocation. Larger in-limit bodies still grow the
+// buffer organically, which avoids letting Content-Length force a large alloc
+// before the first byte streams in.
 const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 1024 * 1024;
 
 /// Error returned by [`read_response_body_bounded`].
