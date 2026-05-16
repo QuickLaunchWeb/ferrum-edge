@@ -165,7 +165,7 @@ Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, m
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `latest-release` job and the per-platform Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
+On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
 
 ## Release Pipeline (release.yml)
 
