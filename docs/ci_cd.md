@@ -183,13 +183,13 @@ Builds optimized release binaries for all target platforms:
 **Build Process**:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
-3. Install protobuf compiler
+3. Install protobuf compiler plus platform prerequisites (Linux `libcurl4-openssl-dev`, Windows NASM)
 4. Build release binary in `--release` mode with `--features cloud-secrets`
 5. Generate SHA256 checksum
 6. Upload artifact
 
 **Cross-Compilation**:
-- Linux ARM64 uses `cross` tool for seamless compilation
+- Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
 - Other targets use standard `cargo build`; macOS x86_64 is cross-compiled on the ARM64 `macos-latest` runner.
 
 **Output**:
@@ -285,13 +285,8 @@ git tag release-0.2.0
 **1. Update Version in Cargo.toml**
 
 ```bash
-# Edit Cargo.toml
-cat > Cargo.toml << EOF
-[package]
-name = "ferrum-edge"
-version = "0.2.0"
-...
-EOF
+# Edit the existing [package] version line in Cargo.toml.
+$EDITOR Cargo.toml
 ```
 
 **2. Commit Changes**
@@ -345,7 +340,8 @@ If automatic release fails:
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
-# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`).
+# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`)
+# with Docker or Podman running.
 # Run macOS targets on a macOS host and the Windows MSVC target on Windows.
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
 cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
@@ -361,13 +357,24 @@ cp target/x86_64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-x86_64
 cp target/aarch64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-aarch64
 cp target/x86_64-pc-windows-msvc/release/ferrum-edge.exe dist/ferrum-edge-windows-x86_64.exe
 
-# Generate checksums.
-(cd dist && sha256sum ferrum-edge-* > checksums.txt)
+# Generate per-asset checksums, matching CI release assets.
+(cd dist && for asset in \
+  ferrum-edge-linux-x86_64 \
+  ferrum-edge-linux-aarch64 \
+  ferrum-edge-macos-x86_64 \
+  ferrum-edge-macos-aarch64 \
+  ferrum-edge-windows-x86_64.exe
+do
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$asset" > "$asset.sha256"
+  else
+    shasum -a 256 "$asset" > "$asset.sha256"
+  fi
+done)
 
 # Create release in GitHub UI or via gh:
 gh release create v0.2.0 \
   dist/ferrum-edge-* \
-  dist/checksums.txt \
   --title "Release v0.2.0" \
   --notes "$(cat release-notes.md)"
 ```
