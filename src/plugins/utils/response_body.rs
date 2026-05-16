@@ -53,7 +53,7 @@ impl std::fmt::Display for BoundedReadError {
             } => {
                 write!(
                     f,
-                    "response body size {} exceeds max_response_body_bytes {}",
+                    "response body size {} exceeds configured response body limit {}",
                     read_so_far, max_bytes
                 )
             }

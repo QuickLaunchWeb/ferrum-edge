@@ -819,7 +819,7 @@ impl Plugin for ServerlessFunction {
                 }
                 PluginResult::RejectBinary {
                     status_code: status,
-                    body: body.into(),
+                    body,
                     headers: resp_headers,
                 }
             }
