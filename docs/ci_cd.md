@@ -128,11 +128,15 @@ Builds the gateway in the `ci-release` profile, builds `tests/performance/backen
 
 ```bash
 python3 tests/performance/ci_overhead_bench.py \
+  --gateway-url http://127.0.0.1:8000/api/users \
+  --backend-url http://127.0.0.1:3001/api/users \
+  --gateway-health-url http://127.0.0.1:8000/health \
   --concurrency 50 \
   --duration 5 \
   --iterations 3 \
   --warmup 2 \
-  --overhead-threshold 50
+  --overhead-threshold 50 \
+  --output tests/performance/ci_results/overhead_results.json
 ```
 
 **Failures**:
@@ -376,8 +380,10 @@ done)
 gh release create v0.2.0 \
   dist/ferrum-edge-* \
   --title "Release v0.2.0" \
-  --notes "$(cat release-notes.md)"
+  --generate-notes
 ```
+
+This manual GitHub Release fallback only recreates release assets. If the tag workflow also failed before Docker publishing completed, rerun/fix the release workflow or manually publish the Docker Hub and GHCR images before treating the version release as complete.
 
 ## Binaries and Downloads
 
@@ -468,6 +474,8 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
+The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<git-sha>` tag uses the full commit SHA from `github.sha`.
+
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it tracks the GitHub repository owner/name if the repository is moved or forked.
 
 ## GitHub Actions Secrets
@@ -515,7 +523,7 @@ gh secret set DOCKERHUB_USERNAME --body "your-username"
 gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 # Via web UI
-1. Settings → Secrets → New repository secret
+1. Settings → Secrets and variables → Actions → New repository secret
 2. Name: DOCKERHUB_USERNAME
 3. Value: your-username
 4. Click "Add secret"
@@ -555,7 +563,7 @@ Modify build commands in workflows:
 
 ```yaml
 - name: Build with custom features
-  run: cargo build --release --features "vendored-openssl"
+  run: cargo build --release --features "cloud-secrets"
 ```
 
 ### Notification Integration
@@ -596,8 +604,8 @@ git show v0.2.0
 3. Expand job logs for details
 
 **Common Issues**:
-- `protoc` not installed: Fixed in CI (installs protoc)
-- Missing dependencies: Check `Cargo.toml`
+- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows
+- Missing dependencies: Check `Cargo.toml` and the release Build Process prerequisites above
 - Rust version: Workflows use `stable` Rust toolchain
 
 ### Docker Push Failing
@@ -611,7 +619,7 @@ gh secret list
 **Test credentials**:
 ```bash
 # Local login test
-docker login -u $USERNAME -p $PASSWORD
+docker login -u "$USERNAME" --password-stdin <<< "$PASSWORD"
 
 # Update secrets if needed
 gh secret set DOCKERHUB_TOKEN --body "new-token"
