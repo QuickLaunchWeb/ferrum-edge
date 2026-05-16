@@ -596,16 +596,18 @@ async fn webhook_oversized_chunked_response_body_is_rejected_and_redacted() {
             .await
             .unwrap();
 
-        let chunk = vec![b'x'; 2 * 1024 * 1024];
-        let head = format!("{:x}\r\n", chunk.len());
-        if socket.write_all(head.as_bytes()).await.is_err() {
-            return;
-        }
-        if socket.write_all(&chunk).await.is_err() {
-            return;
-        }
-        if socket.write_all(b"\r\n").await.is_err() {
-            return;
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..5 {
+            let head = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(&chunk).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
         }
         let _ = socket.write_all(b"0\r\n\r\n").await;
     });
@@ -709,6 +711,9 @@ async fn webhook_non_success_status_short_circuits_oversized_body_drain() {
 
 #[tokio::test]
 async fn non_success_status_errors_include_redacted_url_for_all_channels() {
+    // This covers the non-success short-circuit for every channel. Oversized
+    // response-body paths share `finalize_dispatch_response`, so the webhook
+    // tests above exercise those branches once through the shared helper.
     let configs = [
         (
             "slack",

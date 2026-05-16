@@ -24,7 +24,8 @@ pub mod webhook;
 
 /// Webhook acknowledgements are normally a few hundred bytes. The 1 MiB cap is
 /// only a DoS guard so a misbehaving sink cannot make us stream an unbounded
-/// body just to keep the keep-alive connection reusable.
+/// body just to keep the keep-alive connection reusable. Peak memory is the
+/// cap plus one body chunk because the streaming check fires after each read.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[allow(unused_imports)]
@@ -243,7 +244,7 @@ pub(super) fn redacted_endpoint_url(raw: &str) -> String {
     url.to_string()
 }
 
-pub(super) async fn drain_response_body_redacted(
+async fn drain_response_body_redacted(
     resp: reqwest::Response,
     channel: &str,
     redacted_url: &str,
@@ -251,6 +252,8 @@ pub(super) async fn drain_response_body_redacted(
     if let Some(content_length) = resp.content_length()
         && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64
     {
+        // Keep this wording distinct from the streaming abort below; tests use
+        // "before reading" vs. "after reading" to pin the intended path.
         return Err(format!(
             "{channel} dispatch response body exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes before reading advertised {content_length}-byte response from {redacted_url}"
         ));
@@ -279,7 +282,7 @@ pub(super) async fn drain_response_body_redacted(
 
 pub(super) async fn finalize_dispatch_response(
     resp: reqwest::Response,
-    channel: &'static str,
+    channel: &str,
     redacted_url: &str,
 ) -> Result<(), String> {
     let status = resp.status();
