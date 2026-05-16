@@ -147,7 +147,8 @@ async fn connect_backend(
     let effective_connect_timeout_ms = proxy
         .dispatch_port_overrides
         .as_ref()
-        .and_then(|m| m.get(&port).copied())
+        .and_then(|m| m.get(&port))
+        .and_then(|override_config| override_config.connect_timeout_ms)
         .unwrap_or(proxy.backend_connect_timeout_ms);
 
     let resolved_ip = state
@@ -409,14 +410,14 @@ pub(super) async fn handle_hbone_request(
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
         && let Some(upstream) =
             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id)
-        && let Some(hc) = &upstream.health_checks
     {
+        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
             &proxy.id,
             target,
             StatusCode::OK.as_u16(),
             false,
-            hc.passive.as_ref(),
+            passive,
         );
     }
 

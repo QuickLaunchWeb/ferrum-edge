@@ -43,6 +43,14 @@ pub struct PodInfo {
     pub _pad: u32,
 }
 
+/// Node-agent supplied capture settings in the `FERRUM_CAPTURE_CONFIG` map.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BpfCaptureConfig {
+    pub outbound_capture_port: u32,
+    pub hbone_redirect_port: u32,
+}
+
 /// IPv4 address payload for `FERRUM_CIDR_INCLUDE` / `FERRUM_CIDR_EXCLUDE`.
 ///
 /// Aya's LPM trie wrapper stores the leading `prefix_len` separately in
@@ -66,6 +74,9 @@ pub const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 
 /// Inbound HBONE port. TC ingress redirects inbound packets here.
 pub const INBOUND_HBONE_PORT: u16 = 15008;
+
+/// Singleton key for `FERRUM_CAPTURE_CONFIG`.
+pub const FERRUM_CAPTURE_CONFIG_KEY: u32 = 0;
 
 /// IPv4 loopback (127.0.0.1) stored as the `u32` the kernel's `user_ip4`
 /// field expects (network byte order in memory).
@@ -96,6 +107,19 @@ impl CidrKey6 {
     }
 }
 
+impl BpfCaptureConfig {
+    pub const fn new(outbound_capture_port: u16, hbone_redirect_port: u16) -> Self {
+        Self {
+            outbound_capture_port: outbound_capture_port as u32,
+            hbone_redirect_port: hbone_redirect_port as u32,
+        }
+    }
+
+    pub const fn default_ports() -> Self {
+        Self::new(OUTBOUND_CAPTURE_PORT, INBOUND_HBONE_PORT)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -108,6 +132,7 @@ mod tests {
         assert_eq!(mem::size_of::<OrigDst4>(), 8);
         assert_eq!(mem::size_of::<OrigDst6>(), 24);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
     }
@@ -119,6 +144,7 @@ mod tests {
         assert_copy::<OrigDst4>();
         assert_copy::<OrigDst6>();
         assert_copy::<PodInfo>();
+        assert_copy::<BpfCaptureConfig>();
         assert_copy::<CidrKey4>();
         assert_copy::<CidrKey6>();
     }
@@ -154,5 +180,13 @@ mod tests {
         assert_eq!(IPV6_LOOPBACK_NBO[2], 0);
         let last = IPV6_LOOPBACK_NBO[3].to_ne_bytes();
         assert_eq!(last, [0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn capture_config_defaults_match_public_ports() {
+        let config = BpfCaptureConfig::default_ports();
+        assert_eq!(config.outbound_capture_port, OUTBOUND_CAPTURE_PORT as u32);
+        assert_eq!(config.hbone_redirect_port, INBOUND_HBONE_PORT as u32);
+        assert_eq!(FERRUM_CAPTURE_CONFIG_KEY, 0);
     }
 }

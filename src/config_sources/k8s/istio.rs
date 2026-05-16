@@ -11,7 +11,8 @@ use crate::modes::mesh::config::{
     MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
     MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction,
     PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    ServicePort, TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload,
+    WorkloadPort, WorkloadSelector,
 };
 
 use super::{
@@ -698,15 +699,6 @@ fn destination_rule(
 /// [`MeshTrafficPolicy`] map keyed by port number. Each entry is a regular
 /// traffic-policy block scoped to one port; the cold-path apply pass layers
 /// the resolved policy onto the matching upstream's `port_overrides`.
-///
-/// Today only `connectionPool.tcp.connectTimeout` is actually enforced
-/// per-port — see `Upstream::effective_connect_timeout_ms` and the dispatch
-/// call to `resolve_effective_proxy_for_target`. Per-port `loadBalancer`
-/// and `outlierDetection` fields ARE parsed (so the slice round-trips), but
-/// the gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per
-/// upstream — switching algorithm/hash-ring or thresholds per destination
-/// port would require per-port balancer instances and is out of scope here.
-/// We emit translator warnings so operators see the gap at apply time.
 fn translate_port_level_settings(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -742,23 +734,6 @@ fn translate_port_level_settings(
             ));
         }
         let port = port_u64 as u16;
-
-        // Warn for parsed-but-not-enforced per-port fields so operators see
-        // the gap at apply time instead of silently expecting per-port LB
-        // / outlier behaviour. `connectTimeout` IS enforced and stays
-        // silent.
-        if entry.get("loadBalancer").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied at request time",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
-        if entry.get("outlierDetection").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied at request time",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
 
         let policy = translate_traffic_policy(acc, object, entry)?;
 
@@ -2060,49 +2035,101 @@ fn telemetry(
         .spec
         .get("tracing")
         .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .map(|t| {
-            let sampling = t.get("randomSamplingPercentage").and_then(Value::as_f64);
-            let mut custom_header_tags = HashMap::new();
-            let custom_tags = t
-                .get("customTags")
-                .and_then(Value::as_object)
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(|(key, val)| {
-                            // Istio customTags: { tagName: { literal: { value: "v" } } }
-                            if let Some(header_name) = val
-                                .get("header")
-                                .and_then(|h| h.get("name"))
-                                .and_then(Value::as_str)
-                            {
-                                custom_header_tags.insert(key.clone(), header_name.to_string());
-                                return None;
-                            }
+        .map(|entries| {
+            let mut merged = MeshTracingConfig {
+                mode: Some(TelemetryTracingMode::Server),
+                sampling_percentage: None,
+                disable_span_reporting: None,
+                custom_tags: HashMap::new(),
+                custom_header_tags: HashMap::new(),
+                providers: Vec::new(),
+            };
+            let mut saw_server_entry = false;
+            for t in entries {
+                let mode = telemetry_tracing_mode(object, t)?;
+                if mode == Some(TelemetryTracingMode::Client) {
+                    continue;
+                }
+                saw_server_entry = true;
+                let sampling = telemetry_sampling_percentage(object, t)?;
+                let mut custom_header_tags: HashMap<String, String> = HashMap::new();
+                let custom_tags: HashMap<String, String> = t
+                    .get("customTags")
+                    .and_then(Value::as_object)
+                    .map(|tags| {
+                        tags.iter()
+                            .filter_map(|(key, val)| {
+                                // Istio customTags: { tagName: { literal: { value: "v" } } }
+                                if let Some(header_name) = val
+                                    .get("header")
+                                    .and_then(|h| h.get("name"))
+                                    .and_then(Value::as_str)
+                                {
+                                    custom_header_tags.insert(key.clone(), header_name.to_string());
+                                    return None;
+                                }
 
-                            let value = val
-                                .get("literal")
-                                .and_then(|l| l.get("value"))
-                                .and_then(Value::as_str)
-                                .or_else(|| {
-                                    val.get("environment")
-                                        .and_then(|e| e.get("name"))
-                                        .and_then(Value::as_str)
-                                });
-                            value.map(|v| (key.clone(), v.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let provider = telemetry_tracing_provider(object, t)?;
-            Ok::<_, K8sTranslateError>(MeshTracingConfig {
-                sampling_percentage: sampling,
-                custom_tags,
-                custom_header_tags,
-                provider,
-            })
+                                let value = val
+                                    .get("literal")
+                                    .and_then(|l| l.get("value"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or_else(|| {
+                                        let env_tag = val.get("environment")?;
+                                        let name = env_tag.get("name").and_then(Value::as_str)?;
+                                        if telemetry_custom_tag_env_var_is_sensitive(name) {
+                                            tracing::warn!(
+                                                tag = %key,
+                                                env_var = %name,
+                                                "dropping telemetry custom tag that references a sensitive environment variable"
+                                            );
+                                            return None;
+                                        }
+                                        match std::env::var(name) {
+                                            Ok(value) => Some(value),
+                                            Err(error) => {
+                                                let default_value = env_tag
+                                                    .get("defaultValue")
+                                                    .and_then(Value::as_str)
+                                                    .map(str::to_string);
+                                                if default_value.is_none() {
+                                                    tracing::debug!(
+                                                        tag = %key,
+                                                        env_var = %name,
+                                                        %error,
+                                                        "dropping telemetry custom tag with unresolved environment value"
+                                                    );
+                                                }
+                                                default_value
+                                            }
+                                        }
+                                    });
+                                value.map(|v| (key.clone(), v))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let providers = telemetry_tracing_providers(object, t)?;
+                if sampling.is_some() {
+                    merged.sampling_percentage = sampling;
+                }
+                if let Some(disabled) = t.get("disableSpanReporting").and_then(Value::as_bool) {
+                    merged.disable_span_reporting = Some(disabled);
+                }
+                if !custom_tags.is_empty() {
+                    merged.custom_tags.extend(custom_tags);
+                }
+                if !custom_header_tags.is_empty() {
+                    merged.custom_header_tags.extend(custom_header_tags);
+                }
+                if !providers.is_empty() {
+                    extend_unique_tracing_providers(&mut merged.providers, providers);
+                }
+            }
+            Ok::<_, K8sTranslateError>(saw_server_entry.then_some(merged))
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
 
     let metrics = object
         .spec
@@ -2194,11 +2221,79 @@ fn telemetry(
     })
 }
 
-/// Extract the first `tracing[].providers[]` entry as a [`TracingProvider`].
+fn telemetry_sampling_percentage(
+    object: &K8sObject,
+    tracing_entry: &Value,
+) -> Result<Option<f64>, K8sTranslateError> {
+    let Some(value) = tracing_entry.get("randomSamplingPercentage") else {
+        return Ok(None);
+    };
+    let Some(sampling) = value.as_f64() else {
+        return Err(invalid_resource(
+            object,
+            "Telemetry tracing.randomSamplingPercentage must be a finite number between 0 and 100",
+        ));
+    };
+    if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "Telemetry tracing.randomSamplingPercentage must be between 0 and 100 (got {sampling})"
+            ),
+        ));
+    }
+    Ok(Some(sampling))
+}
+
+fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if [
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "PRIVATE_KEY",
+        "CLIENT_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker))
+    {
+        return true;
+    }
+    if matches!(
+        upper.as_str(),
+        "DATABASE_URL"
+            | "DB_URL"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "KUBECONFIG"
+    ) {
+        return true;
+    }
+    upper.starts_with("FERRUM_")
+        && ["DB_URL", "DATABASE_URL"]
+            .iter()
+            .any(|marker| upper.contains(marker))
+}
+
+fn extend_unique_tracing_providers(
+    current: &mut Vec<TracingProvider>,
+    providers: Vec<TracingProvider>,
+) {
+    for provider in providers {
+        if !current.contains(&provider) {
+            current.push(provider);
+        }
+    }
+}
+
+/// Extract every inline `tracing[].providers[]` entry as [`TracingProvider`]s.
 ///
 /// Mirrors Istio's Telemetry CRD: `providers[]` is a list of named provider
-/// references. Today we surface only the first entry; multi-provider fan-out
-/// is deferred.
+/// references. Inline providers fan out to the injected workload metrics
+/// exporter. Name-only meshConfig references are still deferred.
 ///
 /// Istio's standard provider model defines providers once at the mesh-config
 /// level (`meshConfig.extensionProviders`) and references them by name from
@@ -2207,25 +2302,28 @@ fn telemetry(
 /// itself). Name-only references (`{name: "my-zipkin"}` with no inline
 /// fields) and unrecognised provider names are gracefully skipped with a
 /// warning — `meshConfig.extensionProviders` lookup is deferred.
-fn telemetry_tracing_provider(
+fn telemetry_tracing_providers(
     object: &K8sObject,
     tracing_entry: &Value,
-) -> Result<Option<TracingProvider>, K8sTranslateError> {
+) -> Result<Vec<TracingProvider>, K8sTranslateError> {
     let Some(providers) = tracing_entry.get("providers").and_then(Value::as_array) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let Some(first) = providers.first() else {
-        return Ok(None);
-    };
-    if providers.len() > 1 {
-        tracing::warn!(
-            resource = %object.metadata.name,
-            namespace = %object.metadata.namespace,
-            count = providers.len(),
-            "Telemetry tracing.providers[] has multiple entries; only the first is surfaced (multi-provider fan-out is deferred)"
-        );
+    let mut translated = Vec::new();
+    for entry in providers {
+        let Some(provider) = telemetry_tracing_provider(object, entry)? else {
+            continue;
+        };
+        translated.push(provider);
     }
-    let name = first
+    Ok(translated)
+}
+
+fn telemetry_tracing_provider(
+    object: &K8sObject,
+    entry: &Value,
+) -> Result<Option<TracingProvider>, K8sTranslateError> {
+    let name = entry
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_resource(object, "Telemetry tracing.providers[].name is required"))?
@@ -2236,7 +2334,7 @@ fn telemetry_tracing_provider(
             "Telemetry tracing.providers[].name must not be empty",
         ));
     }
-    let is_reference_only = first
+    let is_reference_only = entry
         .as_object()
         .map(|obj| obj.keys().all(|k| k == "name"))
         .unwrap_or(false);
@@ -2253,18 +2351,18 @@ fn telemetry_tracing_provider(
     }
     let provider = match name {
         "zipkin" => {
-            let url = telemetry_provider_string_field(object, first, "zipkin", "url")?;
+            let url = telemetry_provider_string_field(object, entry, "zipkin", "url")?;
             TracingProvider::Zipkin { url }
         }
         "datadog" => {
             let agent_url = telemetry_provider_string_field_aliased(
                 object,
-                first,
+                entry,
                 "datadog",
                 "agentUrl",
                 &["agent_url"],
             )?;
-            let service = first
+            let service = entry
                 .get("service")
                 .and_then(Value::as_str)
                 .map(str::to_string);
@@ -2273,26 +2371,26 @@ fn telemetry_tracing_provider(
         "lightstep" => {
             let collector_url = telemetry_provider_string_field_aliased(
                 object,
-                first,
+                entry,
                 "lightstep",
                 "collectorUrl",
                 &["collector_url"],
             )?;
-            let access_token = telemetry_provider_string_field_aliased(
+            let access_token_env = telemetry_provider_string_field_aliased(
                 object,
-                first,
+                entry,
                 "lightstep",
-                "accessToken",
-                &["access_token"],
+                "accessTokenEnv",
+                &["access_token_env"],
             )?;
             TracingProvider::Lightstep {
                 collector_url,
-                access_token,
+                access_token_env,
             }
         }
         "opentelemetry" => {
             let endpoint =
-                telemetry_provider_string_field(object, first, "opentelemetry", "endpoint")?;
+                telemetry_provider_string_field(object, entry, "opentelemetry", "endpoint")?;
             TracingProvider::OpenTelemetry { endpoint }
         }
         other => {
@@ -2309,6 +2407,30 @@ fn telemetry_tracing_provider(
         }
     };
     Ok(Some(provider))
+}
+
+fn telemetry_tracing_mode(
+    object: &K8sObject,
+    tracing_entry: &Value,
+) -> Result<Option<TelemetryTracingMode>, K8sTranslateError> {
+    let Some(mode) = tracing_entry
+        .get("match")
+        .and_then(|m| m.get("mode"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    match mode {
+        "SERVER" | "server" => Ok(Some(TelemetryTracingMode::Server)),
+        // Ferrum emits server-side spans today; keep CLIENT_AND_SERVER entries
+        // by collapsing them to Server until client-side span emission exists.
+        "CLIENT_AND_SERVER" | "client_and_server" => Ok(Some(TelemetryTracingMode::Server)),
+        "CLIENT" | "client" => Ok(Some(TelemetryTracingMode::Client)),
+        other => Err(invalid_resource(
+            object,
+            format!("Telemetry tracing.match.mode '{other}' is unsupported"),
+        )),
+    }
 }
 
 fn telemetry_provider_string_field(
@@ -4093,6 +4215,196 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_environment_custom_tag_uses_default_when_env_missing() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "region": {
+                                "environment": {
+                                    "name": "FERRUM_TEST_TELEMETRY_REGION_UNSET",
+                                    "defaultValue": "us-east-1"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_drops_sensitive_env_reference() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "admin_secret": {
+                                "environment": {
+                                    "name": "FERRUM_ADMIN_JWT_SECRET",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            },
+                            "redis_password": {
+                                "environment": {
+                                    "name": "REDIS_PASSWORD",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            },
+                            "vendor_api_key": {
+                                "environment": {
+                                    "name": "DATADOG_API_KEY",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            },
+                            "cloud_credentials": {
+                                "environment": {
+                                    "name": "MY_APP_CREDENTIALS",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert!(!tracing.custom_tags.contains_key("admin_secret"));
+        assert!(!tracing.custom_tags.contains_key("redis_password"));
+        assert!(!tracing.custom_tags.contains_key("vendor_api_key"));
+        assert!(!tracing.custom_tags.contains_key("cloud_credentials"));
+    }
+
+    #[test]
+    fn telemetry_tracing_entries_merge_custom_tags_and_providers() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [
+                        {
+                            "randomSamplingPercentage": 15.0,
+                            "customTags": {
+                                "env": {"literal": {"value": "staging"}},
+                                "mesh": {"literal": {"value": "ferrum"}}
+                            },
+                            "providers": [{
+                                "name": "zipkin",
+                                "url": "http://zipkin:9411/api/v2/spans"
+                            }]
+                        },
+                        {
+                            "customTags": {
+                                "env": {"literal": {"value": "prod"}},
+                                "region": {"literal": {"value": "us-east"}}
+                            },
+                            "providers": [{
+                                "name": "opentelemetry",
+                                "endpoint": "http://otel:4318/v1/traces"
+                            }]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.sampling_percentage, Some(15.0));
+        assert_eq!(
+            tracing.custom_tags.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert_eq!(tracing.providers.len(), 2);
+        assert!(matches!(
+            tracing.providers.first(),
+            Some(TracingProvider::Zipkin { .. })
+        ));
+        assert!(matches!(
+            tracing.providers.get(1),
+            Some(TracingProvider::OpenTelemetry { .. })
+        ));
+    }
+
+    #[test]
+    fn telemetry_tracing_rejects_invalid_sampling_percentage() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{"randomSamplingPercentage": 150.0}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("out-of-range sampling should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("randomSamplingPercentage must be between 0 and 100"),
+            "got: {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{"randomSamplingPercentage": "100"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-numeric sampling should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("randomSamplingPercentage must be a finite number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn telemetry_access_log_filter_with_or_is_rejected() {
         let err = translate_k8s_objects(
             &[object(
@@ -4221,7 +4533,7 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
+        match tracing.providers.first().expect("provider translated") {
             TracingProvider::Zipkin { url } => {
                 assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
             }
@@ -4254,7 +4566,7 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
+        match tracing.providers.first().expect("provider translated") {
             TracingProvider::Datadog { agent_url, service } => {
                 assert_eq!(agent_url, "http://datadog-agent:8126");
                 assert_eq!(service.as_deref(), Some("reviews"));
@@ -4290,7 +4602,7 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
+        match tracing.providers.first().expect("provider translated") {
             TracingProvider::Datadog { agent_url, service } => {
                 assert_eq!(agent_url, "http://datadog-agent:8126");
                 assert!(service.is_none(), "service omitted in manifest");
@@ -4338,7 +4650,7 @@ mod tests {
                         "providers": [{
                             "name": "lightstep",
                             "collectorUrl": "https://ingest.lightstep.com:443",
-                            "accessToken": "secret-token"
+                            "accessTokenEnv": "LIGHTSTEP_ACCESS_TOKEN"
                         }]
                     }]
                 }),
@@ -4353,13 +4665,18 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
-            TracingProvider::Lightstep {
+        match tracing.providers.first().expect("provider translated") {
+            provider @ TracingProvider::Lightstep {
                 collector_url,
-                access_token,
+                access_token_env,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
-                assert_eq!(access_token, "secret-token");
+                assert_eq!(access_token_env, "LIGHTSTEP_ACCESS_TOKEN");
+                let debug = format!("{provider:?}");
+                assert!(debug.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                let serialized = serde_json::to_string(provider).expect("provider serializes");
+                assert!(serialized.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                assert!(!serialized.contains("secret-token"));
             }
             other => panic!("expected Lightstep, got {other:?}"),
         }
@@ -4389,7 +4706,7 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
+        match tracing.providers.first().expect("provider translated") {
             TracingProvider::OpenTelemetry { endpoint } => {
                 assert_eq!(endpoint, "http://otel-collector.istio-system:4317");
             }
@@ -4420,7 +4737,7 @@ mod tests {
             .expect("tracing config");
         assert_eq!(tracing.sampling_percentage, Some(25.0));
         assert!(
-            tracing.provider.is_none(),
+            tracing.providers.is_empty(),
             "providers omitted, provider should be None"
         );
     }
@@ -4450,7 +4767,7 @@ mod tests {
             .as_ref()
             .expect("tracing config");
         assert!(
-            tracing.provider.is_none(),
+            tracing.providers.is_empty(),
             "unrecognised provider name should be skipped, not surfaced"
         );
     }
@@ -4483,7 +4800,7 @@ mod tests {
             .as_ref()
             .expect("tracing config");
         assert!(
-            tracing.provider.is_none(),
+            tracing.providers.is_empty(),
             "name-only reference should be skipped (extensionProviders lookup deferred)"
         );
     }
@@ -4514,19 +4831,16 @@ mod tests {
             .as_ref()
             .expect("tracing config");
         assert!(
-            tracing.provider.is_none(),
+            tracing.providers.is_empty(),
             "custom extensionProvider reference should be skipped"
         );
     }
 
     #[test]
-    fn telemetry_tracing_multiple_providers_takes_first() {
+    fn telemetry_tracing_multiple_providers_surfaces_all_inline_entries() {
         // Istio's Telemetry CRD allows `providers[]` to list multiple entries.
-        // Multi-provider fan-out is deferred; today we surface only the first
-        // entry. This test pins that behavior so the limitation cannot drift
-        // silently as later providers (Stackdriver/SkyWalking) are added — a
-        // future change that needs to surface every entry should also update
-        // this test.
+        // Ferrum fans out spans to every inline provider while still skipping
+        // name-only meshConfig references until GAP-2C.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -4555,11 +4869,19 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        match tracing.provider.as_ref().expect("provider translated") {
+        assert_eq!(tracing.providers.len(), 2);
+        match &tracing.providers[0] {
             TracingProvider::Zipkin { url } => {
                 assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
             }
-            other => panic!("expected first-entry Zipkin, got {other:?}"),
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+        match &tracing.providers[1] {
+            TracingProvider::Datadog { agent_url, service } => {
+                assert_eq!(agent_url, "http://datadog-agent:8126");
+                assert!(service.is_none());
+            }
+            other => panic!("expected Datadog, got {other:?}"),
         }
     }
 
@@ -4596,9 +4918,121 @@ mod tests {
             "sampling omitted in manifest"
         );
         assert!(
-            tracing.provider.is_some(),
+            !tracing.providers.is_empty(),
             "provider should surface independently of sampling"
         );
+    }
+
+    #[test]
+    fn telemetry_tracing_disable_span_reporting_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "disableSpanReporting": true,
+                        "providers": [{
+                            "name": "opentelemetry",
+                            "endpoint": "http://otel-collector:4318/v1/traces"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.disable_span_reporting, Some(true));
+        assert_eq!(tracing.providers.len(), 1);
+    }
+
+    #[test]
+    fn telemetry_tracing_client_mode_is_skipped_for_server_span_export() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [
+                        {
+                            "match": {"mode": "CLIENT"},
+                            "providers": [{
+                                "name": "zipkin",
+                                "url": "http://client-zipkin:9411/api/v2/spans"
+                            }]
+                        },
+                        {
+                            "match": {"mode": "SERVER"},
+                            "providers": [{
+                                "name": "zipkin",
+                                "url": "http://server-zipkin:9411/api/v2/spans"
+                            }]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("server tracing config");
+        match tracing
+            .providers
+            .first()
+            .expect("server provider translated")
+        {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://server-zipkin:9411/api/v2/spans");
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_client_and_server_mode_is_kept_for_server_span_export() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "match": {"mode": "CLIENT_AND_SERVER"},
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://shared-zipkin:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("server tracing config");
+        match tracing
+            .providers
+            .first()
+            .expect("shared provider translated")
+        {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://shared-zipkin:9411/api/v2/spans");
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
     }
 
     #[test]
