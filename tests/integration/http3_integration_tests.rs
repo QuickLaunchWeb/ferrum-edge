@@ -28,6 +28,10 @@ fn init_crypto_provider() {
     }
 }
 
+fn empty_mesh_inbound_tls() -> ferrum_edge::proxy::SharedMeshInboundTls {
+    Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
 /// Test HTTP/3 server configuration
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -404,9 +408,11 @@ async fn test_http3_proxy_state_creation() {
         ),
         early_data_methods: Arc::new(std::collections::HashSet::new()),
         mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
+        node_waypoint_identity_resolver: None,
         gateway_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        mesh_inbound_tls: empty_mesh_inbound_tls(),
     };
 
     // Verify proxy state is created successfully
@@ -661,9 +667,11 @@ async fn test_http3_full_integration() {
         ),
         early_data_methods: Arc::new(std::collections::HashSet::new()),
         mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
+        node_waypoint_identity_resolver: None,
         gateway_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        mesh_inbound_tls: empty_mesh_inbound_tls(),
     };
 
     // Verify proxy state is created successfully

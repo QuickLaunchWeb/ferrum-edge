@@ -86,7 +86,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "Telemetry" => {
-            acc.mesh.telemetry_resources.push(telemetry(acc, object)?);
+            let telemetry = telemetry(acc, object)?;
+            acc.mesh.telemetry_resources.push(telemetry);
             Ok(true)
         }
         "ProxyConfig" => {
@@ -2026,7 +2027,7 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
 }
 
 fn telemetry(
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
 ) -> Result<MeshTelemetryResource, K8sTranslateError> {
     let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
@@ -2109,7 +2110,7 @@ fn telemetry(
                             .collect()
                     })
                     .unwrap_or_default();
-                let providers = telemetry_tracing_providers(object, t)?;
+                let providers = telemetry_tracing_providers(acc, object, t)?;
                 if sampling.is_some() {
                     merged.sampling_percentage = sampling;
                 }
@@ -2289,29 +2290,37 @@ fn extend_unique_tracing_providers(
     }
 }
 
-/// Extract every inline `tracing[].providers[]` entry as [`TracingProvider`]s.
+/// Extract every `tracing[].providers[]` entry as [`TracingProvider`]s.
 ///
 /// Mirrors Istio's Telemetry CRD: `providers[]` is a list of named provider
 /// references. Inline providers fan out to the injected workload metrics
-/// exporter. Name-only meshConfig references are still deferred.
+/// exporter. Name-only entries resolve through the translation-time MeshConfig
+/// provider registry when the root `istio` ConfigMap is present.
 ///
 /// Istio's standard provider model defines providers once at the mesh-config
 /// level (`meshConfig.extensionProviders`) and references them by name from
-/// Telemetry resources. This translator supports **inline** provider config
-/// only (provider type inferred from `name`, required fields on the entry
-/// itself). Name-only references (`{name: "my-zipkin"}` with no inline
-/// fields) and unrecognised provider names are gracefully skipped with a
-/// warning — `meshConfig.extensionProviders` lookup is deferred.
+/// Telemetry resources. This translator also keeps the existing inline
+/// provider shorthand for Ferrum-native test and fixture manifests.
 fn telemetry_tracing_providers(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     tracing_entry: &Value,
 ) -> Result<Vec<TracingProvider>, K8sTranslateError> {
-    let Some(providers) = tracing_entry.get("providers").and_then(Value::as_array) else {
-        return Ok(Vec::new());
+    let Some(providers_value) = tracing_entry.get("providers") else {
+        return Ok(default_telemetry_tracing_providers(acc, object));
     };
+    let Some(providers) = providers_value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "Telemetry tracing.providers must be an array",
+        ));
+    };
+    if providers.is_empty() {
+        return Ok(default_telemetry_tracing_providers(acc, object));
+    }
     let mut translated = Vec::new();
     for entry in providers {
-        let Some(provider) = telemetry_tracing_provider(object, entry)? else {
+        let Some(provider) = telemetry_tracing_provider(acc, object, entry)? else {
             continue;
         };
         translated.push(provider);
@@ -2320,6 +2329,7 @@ fn telemetry_tracing_providers(
 }
 
 fn telemetry_tracing_provider(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     entry: &Value,
 ) -> Result<Option<TracingProvider>, K8sTranslateError> {
@@ -2339,14 +2349,10 @@ fn telemetry_tracing_provider(
         .map(|obj| obj.keys().all(|k| k == "name"))
         .unwrap_or(false);
     if is_reference_only {
-        tracing::warn!(
-            resource = %object.metadata.name,
-            namespace = %object.metadata.namespace,
-            provider_name = name,
-            "Telemetry tracing.providers[] entry is a name-only reference \
-             (no inline config fields); meshConfig.extensionProviders lookup \
-             is not yet supported — provider skipped"
-        );
+        if let Some(provider) = acc.mesh_config_registry.tracing_provider(name).cloned() {
+            return Ok(Some(provider));
+        }
+        warn_missing_mesh_config_provider(acc, object, name);
         return Ok(None);
     }
     let provider = match name {
@@ -2394,19 +2400,66 @@ fn telemetry_tracing_provider(
             TracingProvider::OpenTelemetry { endpoint }
         }
         other => {
+            let warning = format!(
+                "Telemetry {}/{} tracing.providers[] name '{}' is not a recognised inline \
+                 provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
+                 meshConfig.extensionProviders lookup only resolves entries shaped as \
+                 `{{name: \"...\"}}` (no extra fields) — provider skipped",
+                object.metadata.namespace, object.metadata.name, other
+            );
             tracing::warn!(
                 resource = %object.metadata.name,
                 namespace = %object.metadata.namespace,
                 provider_name = other,
-                "Telemetry tracing.providers[] name '{other}' is not a recognised \
-                 inline provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
-                 if this references a meshConfig.extensionProviders entry, that lookup \
-                 is not yet supported — provider skipped"
+                "{warning}"
             );
+            acc.warnings.push(warning);
             return Ok(None);
         }
     };
     Ok(Some(provider))
+}
+
+fn default_telemetry_tracing_providers(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Vec<TracingProvider> {
+    let names: Vec<String> = acc
+        .mesh_config_registry
+        .default_tracing_provider_names()
+        .to_vec();
+    let mut providers = Vec::new();
+    for name in names {
+        if let Some(provider) = acc.mesh_config_registry.tracing_provider(&name).cloned() {
+            providers.push(provider);
+        } else {
+            warn_missing_mesh_config_provider(acc, object, &name);
+        }
+    }
+    providers
+}
+
+fn warn_missing_mesh_config_provider(acc: &mut K8sAccumulator, object: &K8sObject, name: &str) {
+    let warning = if acc.mesh_config_registry.is_known_non_tracing_provider(name) {
+        format!(
+            "Telemetry {}/{} references meshConfig extensionProvider '{}' which is declared but \
+             not a tracing provider type Ferrum supports (zipkin/datadog/lightstep/opentelemetry); \
+             provider skipped",
+            object.metadata.namespace, object.metadata.name, name
+        )
+    } else {
+        format!(
+            "Telemetry {}/{} references unknown meshConfig extensionProvider '{}'; provider skipped",
+            object.metadata.namespace, object.metadata.name, name
+        )
+    };
+    tracing::warn!(
+        resource = %object.metadata.name,
+        namespace = %object.metadata.namespace,
+        provider_name = name,
+        "{warning}"
+    );
+    acc.warnings.push(warning);
 }
 
 fn telemetry_tracing_mode(
@@ -2732,18 +2785,42 @@ mod tests {
     }
 
     fn object(kind: &str, spec: Value) -> K8sObject {
+        object_with_metadata(kind, "security.istio.io/v1", "sample", "default", spec)
+    }
+
+    fn object_with_metadata(
+        kind: &str,
+        api_version: &str,
+        name: &str,
+        namespace: &str,
+        spec: Value,
+    ) -> K8sObject {
         K8sObject {
-            api_version: "security.istio.io/v1".to_string(),
+            api_version: api_version.to_string(),
             kind: kind.to_string(),
             metadata: K8sMetadata {
-                name: "sample".to_string(),
-                namespace: "default".to_string(),
+                name: name.to_string(),
+                namespace: namespace.to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
             },
             spec,
             status: Value::Object(serde_json::Map::new()),
         }
+    }
+
+    fn istio_mesh_config(mesh_yaml: &str) -> K8sObject {
+        object_with_metadata(
+            "ConfigMap",
+            "v1",
+            "istio",
+            "istio-system",
+            serde_json::json!({
+                "data": {
+                    "mesh": mesh_yaml,
+                }
+            }),
+        )
     }
 
     fn translated_authorization_policy(spec: Value) -> MeshPolicy {
@@ -4776,8 +4853,8 @@ mod tests {
     fn telemetry_tracing_name_only_reference_gracefully_skipped() {
         // Standard Istio pattern: providers[].name references a
         // meshConfig.extensionProviders entry with no inline fields.
-        // Since extensionProviders lookup is deferred, the translator
-        // should gracefully skip these rather than failing.
+        // Without a root meshConfig registry entry, the translator should
+        // gracefully skip these rather than failing.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -4801,8 +4878,116 @@ mod tests {
             .expect("tracing config");
         assert!(
             tracing.providers.is_empty(),
-            "name-only reference should be skipped (extensionProviders lookup deferred)"
+            "name-only reference should be skipped when extensionProviders lookup misses"
         );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unknown meshConfig extensionProvider 'zipkin'")),
+            "unknown name-only provider should produce an operator-visible warning"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_name_only_reference_resolves_from_mesh_config() {
+        let result = translate_k8s_objects(
+            &[
+                object(
+                    "Telemetry",
+                    serde_json::json!({
+                        "tracing": [{
+                            "providers": [{
+                                "name": "zipkin-prod"
+                            }]
+                        }]
+                    }),
+                ),
+                istio_mesh_config(
+                    r#"
+extensionProviders:
+- name: zipkin-prod
+  zipkin:
+    service: zipkin.istio-system.svc.cluster.local
+    port: 9411
+"#,
+                ),
+            ],
+            options(),
+        )
+        .expect("meshConfig-backed provider reference should translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.providers.first().expect("provider translated") {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(
+                    url,
+                    "http://zipkin.istio-system.svc.cluster.local:9411/api/v2/spans"
+                );
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+        assert!(
+            result.warnings.is_empty(),
+            "resolved meshConfig provider should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_default_provider_resolves_from_mesh_config() {
+        let result = translate_k8s_objects(
+            &[
+                istio_mesh_config(
+                    r#"
+defaultProviders:
+  tracing:
+  - otel-default
+extensionProviders:
+- name: otel-default
+  opentelemetry:
+    service: otel-collector.istio-system.svc.cluster.local
+    port: 4318
+"#,
+                ),
+                object(
+                    "Telemetry",
+                    serde_json::json!({
+                        "tracing": [{
+                            "randomSamplingPercentage": 25.0
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("meshConfig default provider should translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.sampling_percentage, Some(25.0));
+        match tracing
+            .providers
+            .first()
+            .expect("default provider translated")
+        {
+            TracingProvider::OpenTelemetry { endpoint } => {
+                assert_eq!(
+                    endpoint,
+                    "http://otel-collector.istio-system.svc.cluster.local:4318"
+                );
+            }
+            other => panic!("expected OpenTelemetry, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4839,8 +5024,8 @@ mod tests {
     #[test]
     fn telemetry_tracing_multiple_providers_surfaces_all_inline_entries() {
         // Istio's Telemetry CRD allows `providers[]` to list multiple entries.
-        // Ferrum fans out spans to every inline provider while still skipping
-        // name-only meshConfig references until GAP-2C.
+        // Ferrum fans out spans to every inline provider while still allowing
+        // name-only meshConfig references to resolve through the registry.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -8636,6 +8821,8 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             cluster_domain: "cluster.local".to_string(),
             enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and

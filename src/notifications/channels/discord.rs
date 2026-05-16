@@ -10,7 +10,7 @@ use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
 use super::{
-    drain_response_body_redacted, redacted_endpoint_url, resolve_optional_string,
+    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
     validate_webhook_url,
 };
 
@@ -84,14 +84,7 @@ impl DiscordChannel {
             .execute_redacted(req, "notification_discord", &redacted_url)
             .await
             .map_err(|e| format!("discord dispatch failed: {e}"))?;
-        let status = resp.status();
-        drain_response_body_redacted(resp, "discord", &redacted_url).await?;
-        if !status.is_success() {
-            return Err(format!(
-                "discord dispatch returned non-success status {status}"
-            ));
-        }
-        Ok(())
+        finalize_dispatch_response(resp, "discord", &redacted_url).await
     }
 }
 

@@ -1295,7 +1295,9 @@ impl Http3ConnectionPool {
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let connect_started = Instant::now();
-        let connecting = endpoint.connect_with(client_config, addr, host)?;
+        let tls_server_name =
+            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
+        let connecting = endpoint.connect_with(client_config, addr, tls_server_name)?;
         let connection =
             timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 
@@ -1384,7 +1386,9 @@ impl Http3ConnectionPool {
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let connect_started = Instant::now();
-        let connecting = endpoint.connect_with(client_config, addr, host)?;
+        let tls_server_name =
+            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
+        let connecting = endpoint.connect_with(client_config, addr, tls_server_name)?;
         let connection =
             timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 

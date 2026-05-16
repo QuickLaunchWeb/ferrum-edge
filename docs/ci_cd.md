@@ -18,99 +18,160 @@ Two main workflows handle different aspects of the development lifecycle:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Push to `main`, Pull Requests | Test and lint |
-| **Release** (`release.yml`) | Push tag matching `v*` | Build platform-specific binaries, create GitHub release |
+| **CI** (`ci.yml`) | Pull Requests, push to `main` | PR validation; latest binaries and Docker images on `main` |
+| **Release** (`release.yml`) | Push tag matching `v*` | Versioned binaries, GitHub release, and Docker tags |
 
 ### CI Pipeline Flow
 
 ```
-Push to main / Pull Request
-        │
-        ├─► Test (cargo test)
-        └─► Lint (clippy, fmt)
-```
+Pull Request
+    ├─► Format
+    ├─► Unit / inline-lib / integration / functional-shard tests
+    ├─► Lint, eBPF change check, performance regression check
+    └─► Five target release builds
 
-> **Note**: Build Release and Docker Build jobs are currently disabled (commented out in ci.yml) while the project is in early development. They will be enabled when the project is mature. See the release pipeline for producing binaries on version tags.
+Push to main
+    └─► Five target release builds
+            ├─► Replace latest GitHub prerelease
+            └─► Push per-arch Docker images to Docker Hub and GHCR
+                    └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
+```
 
 ### Release Pipeline Flow
 
 ```
 Push tag v* (e.g., v0.2.0)
-        │
-        ├─► Build linux-x86_64
-        ├─► Build linux-aarch64 (ARM)
-        ├─► Build macos-x86_64
-        ├─► Build macos-aarch64 (Apple Silicon)
-        │
-        └─► Create GitHub Release with binaries and checksums
+    └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
+        macos-x86_64 / macos-aarch64 / windows-x86_64)
+            └─► Push versioned Docker images to Docker Hub and GHCR
+                    └─► Create Docker manifest tags
+                            └─► Create GitHub Release with binaries and checksums
 ```
 
 ## CI Pipeline (ci.yml)
 
-The CI pipeline runs on every push to `main` and all pull requests.
+The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Format, test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
+
+CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
 ### Jobs
 
-#### 1. Test Job
+#### 1. Format Job
 
 **Runs**: `ubuntu-latest`
 
-Tests all code changes and dependencies:
+Checks Rust formatting on pull requests:
 
 ```bash
-# Executed
-cargo test --verbose --all-features
+cargo fmt --all -- --check
+```
+
+**Failures**:
+- Indicate formatting drift
+- Must be fixed before merging
+
+#### 2. Test Jobs
+
+**Runs**: `ubuntu-latest`
+
+Runs the PR test matrix in parallel. The commands below are grouped by job,
+not run as one sequential shell script:
+
+```bash
+# test-unit
+cargo test --test unit_tests
+
+# test-lib
+cargo test --lib
+
+# test-integration
+cargo test --test integration_tests
+
+# build-gateway-binary
+cargo build --bin ferrum-edge
+
+# test-functional-{harness,admin-routing,data-plane,plugins,protocols,resilience}
+cargo nextest run --test functional_tests \
+  --run-ignored=all \
+  --no-fail-fast \
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
 
 **What it tests**:
-- All unit tests in `src/`
-- All integration tests in `tests/`
-- Feature combinations
-- Build dependencies
+- Unit tests in `tests/unit_tests.rs`
+- Inline `#[cfg(test)]` modules in `src/`
+- Integration tests
+- Functional tests split across six shards (harness, admin-routing, data-plane, plugins, protocols, and resilience). CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
 
 **Output**:
 - Test pass/fail status
 - Failures block PR merges (if branch protection enabled)
 
-#### 2. Lint Job
+#### 3. Lint Job
 
 **Runs**: `ubuntu-latest`
 
-Enforces code quality standards:
+Enforces code quality:
 
 ```bash
-# Clippy (warnings as errors)
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Format check
-cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 ```
 
 **What it checks**:
 - Code style and idioms (clippy)
-- Code formatting (rustfmt)
-- Unsafe code warnings
-- Performance issues
 
 **Failures**:
-- Indicate code quality issues
+- Indicate quality issues
 - Must be fixed before merging
 
-#### 3. Build Release Job (Currently Disabled)
+#### 4. eBPF Build Job
 
-> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
+**Runs**: `ubuntu-latest`
 
-When enabled, builds optimized release binaries for multiple platforms (Linux x86_64, macOS x86_64, macOS aarch64). Gated on test and lint jobs passing, and only runs on push to `main` (not on PRs).
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed, the job no-ops and reports success.
 
-#### 4. Docker Build Job (Currently Disabled)
+#### 5. Performance Regression Job
 
-> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
+**Runs**: `ubuntu-latest`
 
-When enabled, builds and optionally pushes a Docker image. Gated on test and lint jobs passing, and only runs on push to `main`. Requires `DOCKER_USERNAME` and `DOCKER_PASSWORD` GitHub Secrets for pushing to a registry.
+Builds the gateway in the `ci-release` profile, builds `tests/performance/backend_server`, starts both services, and runs:
+
+```bash
+python3 tests/performance/ci_overhead_bench.py \
+  --gateway-url http://127.0.0.1:8000/api/users \
+  --backend-url http://127.0.0.1:3001/api/users \
+  --gateway-health-url http://127.0.0.1:8000/health \
+  --concurrency 50 \
+  --duration 5 \
+  --iterations 3 \
+  --warmup 2 \
+  --overhead-threshold 50 \
+  --output tests/performance/ci_results/overhead_results.json
+```
+
+`--overhead-threshold 50` is a percentage threshold: the script fails when median gateway overhead across iterations exceeds 50%.
+
+**Failures**:
+- Indicate performance regression issues
+- Must be fixed before merging
+
+#### 6. Cross-Platform Build Jobs
+
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
+
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. The job installs the same prerequisites as the Release pipeline matrix — `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
+
+#### 7. Latest Release and Docker Jobs
+
+**Runs**: `ubuntu-latest`
+
+On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
 The Release pipeline creates official releases when a version tag is pushed.
+
+Release runs use `concurrency.group: release-${{ github.ref }}` with `cancel-in-progress: false`, so a versioned release is never canceled by a later tag push.
 
 ### Trigger
 
@@ -124,7 +185,7 @@ git push origin v0.2.0
 
 ### Release Build Job
 
-**Runs**: `ubuntu-latest`, `macos-latest` (matrix)
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (matrix)
 
 Builds optimized release binaries for all target platforms:
 
@@ -133,18 +194,19 @@ Builds optimized release binaries for all target platforms:
 - `aarch64-unknown-linux-gnu` - Linux ARM64
 - `x86_64-apple-darwin` - macOS x86_64
 - `aarch64-apple-darwin` - macOS ARM64 (Apple Silicon)
+- `x86_64-pc-windows-msvc` - Windows x86_64
 
 **Build Process**:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
-3. Install protobuf compiler
-4. Build release binary in `--release` mode
+3. Install protobuf compiler plus platform prerequisites (Linux `libcurl4-openssl-dev`, Windows NASM)
+4. Build release binary in `--release` mode with `--features cloud-secrets`
 5. Generate SHA256 checksum
 6. Upload artifact
 
 **Cross-Compilation**:
-- Linux ARM64 uses `cross` tool for seamless compilation
-- Other targets use standard `cargo build`
+- Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
+- Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
 - Binary: `ferrum-edge-{platform}`
@@ -152,9 +214,9 @@ Builds optimized release binaries for all target platforms:
 
 ### Create Release Job
 
-**Depends On**: Release Build Job (all targets)
+**Depends On**: Release Build Job and Docker Manifest Job
 
-Creates a GitHub Release with all binaries and checksums:
+Creates a GitHub Release with all binaries and checksums only after the versioned Docker manifests have been pushed. A Docker Hub or GHCR manifest failure blocks GitHub Release creation.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)
@@ -165,22 +227,47 @@ Creates a GitHub Release with all binaries and checksums:
 3. Attachments: All platform-specific binaries
 
 **Release Notes Example**:
-```markdown
+````markdown
 # Release v0.2.0
 
 ## Binaries
 
-- ferrum-edge-linux-x86_64
-- ferrum-edge-linux-aarch64
-- ferrum-edge-macos-x86_64
-- ferrum-edge-macos-aarch64
+Pre-built binaries for all supported platforms:
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `ferrum-edge-linux-x86_64` |
+| Linux ARM64 | `ferrum-edge-linux-aarch64` |
+| macOS x86_64 | `ferrum-edge-macos-x86_64` |
+| macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
+| Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
+
+## Docker
+
+```bash
+docker pull ferrumedge/ferrum-edge:v0.2.0
+docker pull ghcr.io/ferrum-edge/ferrum-edge:v0.2.0
+```
 
 ## Checksums
 
+Verify the integrity of downloaded binaries:
+
+```
 abc123... ferrum-edge-linux-x86_64
 def456... ferrum-edge-linux-aarch64
 ...
 ```
+
+## Usage
+
+Download the binary for your platform and make it executable:
+
+```bash
+chmod +x ferrum-edge-linux-x86_64
+FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 run
+```
+````
 
 ## How Releases Work
 
@@ -191,12 +278,12 @@ def456... ferrum-edge-linux-aarch64
 ```toml
 [package]
 name = "ferrum-edge"
-version = "0.1.0"
+version = "<version>"
 ```
 
 **Release Process**:
-1. Update `Cargo.toml` version before tagging
-2. Tag: `git tag v0.2.0` (matching new version)
+1. Update `Cargo.toml` version to the intended release version before tagging
+2. Tag: `git tag v<version>` (matching the new version)
 3. Release: GitHub Actions automatically builds and publishes
 
 ### Version Numbering
@@ -238,13 +325,8 @@ git tag release-0.2.0
 **1. Update Version in Cargo.toml**
 
 ```bash
-# Edit Cargo.toml
-cat > Cargo.toml << EOF
-[package]
-name = "ferrum-edge"
-version = "0.2.0"
-...
-EOF
+# Edit the existing [package] version line in Cargo.toml.
+$EDITOR Cargo.toml
 ```
 
 **2. Commit Changes**
@@ -258,7 +340,7 @@ git push origin main
 **3. Wait for CI to Pass**
 
 - Push to main triggers CI pipeline
-- All jobs must pass (test, lint, build)
+- The main-push build and publish jobs must pass; PR-only test, lint, eBPF, and performance gates should already have passed before merge
 - Check GitHub Actions tab for status
 
 **4. Create and Push Version Tag**
@@ -296,22 +378,57 @@ sha256sum -c ferrum-edge-*.sha256
 If automatic release fails:
 
 ```bash
-# Build binaries manually
-cargo build --release --target x86_64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
-cargo build --release --target x86_64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
+# Build binaries manually with the same release features as CI. Install protoc
+# for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
+# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`)
+# with Docker or Podman running.
+# On a Linux host:
+cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
+cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
 
-# Generate checksums
-sha256sum target/*/release/ferrum-edge > checksums.txt
+# On a macOS host:
+cargo build --features cloud-secrets --release --target x86_64-apple-darwin
+cargo build --features cloud-secrets --release --target aarch64-apple-darwin
+
+# On a Windows host:
+cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
+
+# Stage platform-suffixed assets before checksums/upload, matching CI asset names.
+# Run these POSIX staging commands from one checkout after copying in the built
+# artifacts from the Linux, macOS, and Windows hosts. On Windows-only recovery,
+# use equivalent PowerShell commands or copy the .exe back to a POSIX shell.
+mkdir -p dist
+cp target/x86_64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-x86_64
+cp target/aarch64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-aarch64
+cp target/x86_64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-x86_64
+cp target/aarch64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-aarch64
+cp target/x86_64-pc-windows-msvc/release/ferrum-edge.exe dist/ferrum-edge-windows-x86_64.exe
+
+# Generate per-asset checksums, matching CI release assets.
+(cd dist && for asset in \
+  ferrum-edge-linux-x86_64 \
+  ferrum-edge-linux-aarch64 \
+  ferrum-edge-macos-x86_64 \
+  ferrum-edge-macos-aarch64 \
+  ferrum-edge-windows-x86_64.exe
+do
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$asset" > "$asset.sha256"
+  else
+    shasum -a 256 "$asset" > "$asset.sha256"
+  fi
+done)
 
 # Create release in GitHub UI or via gh:
+# The glob matches both binaries and their .sha256 sidecars.
 gh release create v0.2.0 \
-  target/*/release/ferrum-edge \
-  checksums.txt \
+  dist/ferrum-edge-* \
   --title "Release v0.2.0" \
-  --notes "$(cat release-notes.md)"
+  --generate-notes
 ```
+
+This manual GitHub Release fallback only recreates release assets. If the tag workflow also failed before Docker publishing completed, rerun/fix the release workflow or manually publish the Docker Hub and GHCR images before treating the version release as complete.
+Generated notes are acceptable for this fallback, but they do not include the workflow's curated Docker pull and checksum sections.
 
 ## Binaries and Downloads
 
@@ -319,17 +436,17 @@ gh release create v0.2.0 \
 
 All released binaries available at:
 ```
-https://github.com/your-org/ferrum-edge/releases
+https://github.com/ferrum-edge/ferrum-edge/releases
 ```
 
 ### Download Latest Release
 
 ```bash
 # Using GitHub CLI
-gh release download --repo your-org/ferrum-edge -p "*linux-x86_64"
+gh release download --repo ferrum-edge/ferrum-edge -p "*linux-x86_64"
 
 # Using curl
-RELEASE_URL=$(curl -s https://api.github.com/repos/your-org/ferrum-edge/releases/latest | \
+RELEASE_URL=$(curl -s https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/latest | \
   jq -r '.assets[] | select(.name == "ferrum-edge-linux-x86_64") | .browser_download_url')
 curl -L -o ferrum-edge $RELEASE_URL
 chmod +x ferrum-edge
@@ -365,6 +482,12 @@ chmod +x ferrum-edge-macos-aarch64
 ./ferrum-edge-macos-aarch64 run
 ```
 
+**Windows x86_64** (Intel/AMD 64-bit)
+```powershell
+gh release download v0.2.0 -p "ferrum-edge-windows-x86_64.exe"
+./ferrum-edge-windows-x86_64.exe run
+```
+
 ### Checksum Verification
 
 Always verify binary integrity using SHA256:
@@ -381,16 +504,30 @@ sha256sum -c *.sha256
 # ferrum-edge-linux-aarch64: OK
 # ferrum-edge-macos-x86_64: OK
 # ferrum-edge-macos-aarch64: OK
+# ferrum-edge-windows-x86_64.exe: OK
 ```
 
-### Docker Hub Images
+### Docker Images
 
-Pre-built Docker images also available (if Docker Hub credentials configured):
+Pre-built Docker images are published to Docker Hub and GitHub Container Registry by the main-push and version-tag workflows. Docker Hub credentials must be configured before those publish workflows run:
 
 ```bash
-docker pull your-registry/ferrum-edge:v0.2.0
-docker pull your-registry/ferrum-edge:latest
+docker pull ferrumedge/ferrum-edge:latest
+docker pull ferrumedge/ferrum-edge:main-<sha>
+docker pull ferrumedge/ferrum-edge:v1.2.3
+docker pull ferrumedge/ferrum-edge:1.2.3
+docker pull ferrumedge/ferrum-edge:1.2
+
+docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+docker pull ghcr.io/ferrum-edge/ferrum-edge:main-<sha>
+docker pull ghcr.io/ferrum-edge/ferrum-edge:v1.2.3
+docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
+docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
+
+The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<sha>` tag uses the full commit SHA from `github.sha`.
+
+The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in both `ci.yml` and `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
 ## GitHub Actions Secrets
 
@@ -404,39 +541,41 @@ Configure secrets for Docker image publishing and releases.
 
 ### Required Secrets
 
-#### Docker Registry (Optional)
+#### Docker Registry
 
-For pushing Docker images to registry:
+Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on main-push and version-tag Docker jobs, so missing secrets fail publishing:
 
-- `DOCKER_USERNAME` - Docker Hub username
-- `DOCKER_PASSWORD` - Docker Hub access token or password
+- `DOCKERHUB_USERNAME` - Docker Hub username
+- `DOCKERHUB_TOKEN` - Docker Hub access token
 
 **Generate Docker Token**:
 1. Log in to Docker Hub
 2. Account Settings → Security
 3. Create new access token
-4. Copy token to `DOCKER_PASSWORD`
+4. Copy token to `DOCKERHUB_TOKEN`
 
-### Environment Variables in Workflows
+For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare job-level `permissions: { contents: write }` for release creation and `permissions: { contents: read, packages: write }` for Docker/GHCR publishing. Repository **Settings → Actions → General → Workflow permissions** must allow read/write access (including `packages: write`) for those per-job grants to take effect.
 
-Access secrets in workflows:
+### Secret Usage in Workflows
+
+The Docker Hub login steps use:
 
 ```yaml
-env:
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+with:
+  username: ${{ secrets.DOCKERHUB_USERNAME }}
+  password: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
 
 ### Setting Secrets
 
 ```bash
 # Using GitHub CLI
-gh secret set DOCKER_USERNAME --body "your-username"
-gh secret set DOCKER_PASSWORD --body "your-token"
+gh secret set DOCKERHUB_USERNAME --body "your-username"
+gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 # Via web UI
-1. Settings → Secrets → New repository secret
-2. Name: DOCKER_USERNAME
+1. Settings → Secrets and variables → Actions → New repository secret
+2. Name: DOCKERHUB_USERNAME
 3. Value: your-username
 4. Click "Add secret"
 ```
@@ -445,28 +584,32 @@ gh secret set DOCKER_PASSWORD --body "your-token"
 
 ### Adding New Targets
 
-Edit `.github/workflows/release.yml`:
+Edit both `.github/workflows/ci.yml` (`build-binaries`) and `.github/workflows/release.yml` (`build-release-binaries`):
 
 ```yaml
 strategy:
   matrix:
     include:
-      # Add Windows target
-      - os: windows-latest
-        target: x86_64-pc-windows-gnu
-        artifact_name: ferrum-edge.exe
-        asset_name: ferrum-edge-windows-x86_64.exe
+      # Example: add a Linux musl target
+      - os: ubuntu-latest
+        target: x86_64-unknown-linux-musl
+        artifact_name: ferrum-edge
+        asset_name: ferrum-edge-linux-x86_64-musl
 ```
+
+Musl targets need their own toolchain setup. Add `musl-tools` before a native
+`cargo build`, or route the target through `cross build` and install `cross`
+in the workflow the same way the ARM64 Linux target does.
 
 ### Skipping Steps
 
-Skip specific jobs per commit:
+Skip the entire workflow run for a commit:
 
 ```bash
 # Skip CI for documentation changes
 git commit -m "docs: update README [skip ci]"
 
-# Automatically skips test/lint/build jobs
+# Skips the whole GitHub Actions workflow run for this commit
 ```
 
 ### Custom Build Flags
@@ -475,7 +618,7 @@ Modify build commands in workflows:
 
 ```yaml
 - name: Build with custom features
-  run: cargo build --release --features "vendored-openssl"
+  run: cargo build --release --features "cloud-secrets"
 ```
 
 ### Notification Integration
@@ -516,8 +659,8 @@ git show v0.2.0
 3. Expand job logs for details
 
 **Common Issues**:
-- `protoc` not installed: Fixed in CI (installs protoc)
-- Missing dependencies: Check `Cargo.toml`
+- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows
+- Missing dependencies: Check `Cargo.toml` and the release Build Process prerequisites above
 - Rust version: Workflows use `stable` Rust toolchain
 
 ### Docker Push Failing
@@ -525,16 +668,16 @@ git show v0.2.0
 **Verify secrets**:
 ```bash
 gh secret list
-# Should show DOCKER_USERNAME and DOCKER_PASSWORD
+# Should show DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
 ```
 
 **Test credentials**:
 ```bash
 # Local login test
-docker login -u $USERNAME -p $PASSWORD
+printf '%s' "$PASSWORD" | docker login -u "$USERNAME" --password-stdin
 
 # Update secrets if needed
-gh secret set DOCKER_PASSWORD --body "new-token"
+gh secret set DOCKERHUB_TOKEN --body "new-token"
 ```
 
 ## See Also

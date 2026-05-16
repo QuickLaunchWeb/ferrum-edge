@@ -30,7 +30,8 @@
 //!   "spec_url": "https://internal-service/docs/openapi.yaml",
 //!   "content_type": "application/yaml",    // optional override
 //!   "tls_no_verify": false,                // optional, skip TLS verification
-//!   "cache_ttl_seconds": 300               // optional, 0 = disable
+//!   "cache_ttl_seconds": 300,              // optional, 0 = disable
+//!   "max_response_body_bytes": 26214400    // optional, default 25 MiB
 //! }
 //! ```
 
@@ -38,7 +39,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderValue;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,10 +47,15 @@ use tokio::sync::Mutex;
 
 use crate::dns::DnsCacheResolver;
 
+use super::utils::response_body::{
+    BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Default cache TTL for fetched spec bodies (5 minutes).
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+/// Default maximum upstream spec body size (25 MiB).
+const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// A cached spec response (body + content-type + insertion time).
 #[derive(Clone)]
@@ -65,6 +71,7 @@ pub struct SpecExpose {
     content_type_override: Option<String>,
     warmup_hostname: Option<String>,
     cache_ttl: Duration,
+    max_response_body_bytes: usize,
     cache: ArcSwap<Option<CachedSpec>>,
     /// Single-flight lock around the upstream fetch. Concurrent cache-miss
     /// callers serialize here; whoever acquires first does the upstream fetch
@@ -144,6 +151,13 @@ impl SpecExpose {
         };
         let cache_ttl = Duration::from_secs(cache_ttl_seconds);
 
+        let max_response_body_bytes = parse_max_response_body_bytes(
+            config,
+            "spec_expose",
+            "max_response_body_bytes",
+            DEFAULT_MAX_RESPONSE_BODY_BYTES,
+        )?;
+
         // Build a dedicated reqwest client for spec fetching.
         // We use a separate client so we can honour the per-plugin tls_no_verify
         // setting independently of the shared plugin HTTP client, but we still
@@ -185,6 +199,7 @@ impl SpecExpose {
             content_type_override,
             warmup_hostname,
             cache_ttl,
+            max_response_body_bytes,
             cache: ArcSwap::from_pointee(None),
             fetch_lock: Mutex::new(()),
             http_client,
@@ -236,14 +251,7 @@ impl SpecExpose {
                     error = %e,
                     "spec_expose: failed to fetch spec document"
                 );
-                let mut headers = HashMap::with_capacity(1);
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                PluginResult::Reject {
-                    status_code: 502,
-                    body: r#"{"error":"Failed to fetch API specification from upstream"}"#
-                        .to_string(),
-                    headers,
-                }
+                reject_502_json("Failed to fetch API specification from upstream")
             })?;
 
         if !response.status().is_success() {
@@ -253,13 +261,30 @@ impl SpecExpose {
                 upstream_status = status,
                 "spec_expose: upstream returned non-success status"
             );
-            let mut headers = HashMap::with_capacity(1);
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            return Err(PluginResult::Reject {
-                status_code: 502,
-                body: format!(r#"{{"error":"Upstream spec endpoint returned status {status}"}}"#),
-                headers,
-            });
+            return Err(reject_502_json(format!(
+                "Upstream spec endpoint returned status {status}"
+            )));
+        }
+
+        // Content-Length is an untrusted upstream hint, so this is only a
+        // cooperative fast path. The streaming guard below is authoritative.
+        // A lying inflated Content-Length is conservatively rejected even when
+        // the eventual payload might be smaller; the unauthenticated /specz
+        // endpoint should not spend memory or time proving an oversized hint
+        // wrong.
+        // The plugin HTTP client is built without reqwest auto-decompression
+        // features today. If that changes, do not rely on this hint for safety:
+        // the streaming guard still remains authoritative.
+        if let Some(content_length) = response.content_length()
+            && content_length > self.max_response_body_bytes as u64
+        {
+            tracing::warn!(
+                spec_url = %self.spec_url,
+                content_length,
+                max_response_body_bytes = self.max_response_body_bytes,
+                "spec_expose: upstream spec response body exceeds configured limit"
+            );
+            return Err(body_too_large_reject());
         }
 
         // Determine content-type: plugin override > upstream response > default.
@@ -276,20 +301,27 @@ impl SpecExpose {
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let body = response.bytes().await.map_err(|e| {
-            tracing::warn!(
-                spec_url = %self.spec_url,
-                error = %e,
-                "spec_expose: failed to read spec response body"
-            );
-            let mut headers = HashMap::with_capacity(1);
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            PluginResult::Reject {
-                status_code: 502,
-                body: r#"{"error":"Failed to read API specification response body"}"#.to_string(),
-                headers,
-            }
-        })?;
+        let body = read_response_body_bounded(response, self.max_response_body_bytes)
+            .await
+            .map_err(|e| match e {
+                BoundedReadError::LimitExceeded { read_so_far, .. } => {
+                    tracing::warn!(
+                        spec_url = %self.spec_url,
+                        max_response_body_bytes = self.max_response_body_bytes,
+                        read_so_far,
+                        "spec_expose: upstream spec response body exceeded configured limit while streaming"
+                    );
+                    body_too_large_reject()
+                }
+                BoundedReadError::Stream(e) => {
+                    tracing::warn!(
+                        spec_url = %self.spec_url,
+                        error = %e,
+                        "spec_expose: failed to read spec response body"
+                    );
+                    reject_502_json("Failed to read API specification response body")
+                }
+            })?;
 
         let entry = CachedSpec {
             body,
@@ -301,6 +333,37 @@ impl SpecExpose {
             self.cache.store(Arc::new(Some(entry.clone())));
         }
         Ok(entry)
+    }
+}
+
+/// Build a 502 rejection for an oversized upstream spec body.
+///
+/// **Security:** `/specz` is intentionally unauthenticated, so the public error
+/// body intentionally omits the configured `max_response_body_bytes` value to
+/// avoid leaking operator config to anonymous probes. Operator-facing detail
+/// (the configured cap and how many bytes were observed) stays in the
+/// structured `tracing::warn!` at the call site. Do not "improve" the message
+/// by adding the limit back — the tests at
+/// `tests/unit/plugins/spec_expose_tests.rs` explicitly assert the public body
+/// does NOT contain `max_response_body_bytes`.
+fn body_too_large_reject() -> PluginResult {
+    reject_502_json("API specification response too large")
+}
+
+/// Build a 502 `Reject` with a JSON `{"error": message}` body.
+///
+/// Uses `serde_json::json!` to escape the message safely — never inline
+/// user-controlled or upstream-derived strings into the response with raw
+/// `format!`. Callers should keep operator-facing detail (URL, cap value,
+/// upstream status) in structured `tracing::warn!` logs rather than the
+/// response body, since `/specz` is unauthenticated.
+fn reject_502_json(message: impl Into<String>) -> PluginResult {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    PluginResult::Reject {
+        status_code: 502,
+        body: json!({ "error": message.into() }).to_string(),
+        headers,
     }
 }
 

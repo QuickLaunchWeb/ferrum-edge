@@ -64,6 +64,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
 }
@@ -193,6 +194,7 @@ async fn test_admin_state_mode_field() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
     assert_eq!(admin_state_prod.mode, "production");
@@ -234,6 +236,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
     assert!(
@@ -267,6 +270,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
     let resp = state.check_write_allowed();
@@ -306,6 +310,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
     let resp = state.check_write_allowed();
@@ -344,6 +349,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
     assert!(
@@ -377,6 +383,7 @@ async fn test_db_available_flag_transitions() {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     };
 

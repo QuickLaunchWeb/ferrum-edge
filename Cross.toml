@@ -10,4 +10,12 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-6.0/lib"]
+# `RUSTC_WRAPPER=` (explicit empty) overrides the project-level
+# `[build] rustc-wrapper = "sccache"` from `.cargo/config.toml` so the cross
+# container does not try to spawn an sccache binary that isn't installed
+# inside it. Local `cargo build` outside the container still uses sccache.
+passthrough = [
+    "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
+    "RUSTC_WRAPPER=",
+    "CARGO_BUILD_RUSTC_WRAPPER=",
+]

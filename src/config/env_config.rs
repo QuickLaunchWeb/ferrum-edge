@@ -589,6 +589,13 @@ pub struct EnvConfig {
     /// happens unconditionally; this flag only gates the slice-narrowing
     /// pass.
     pub mesh_sidecar_enforced: bool,
+    /// When true, compute and expose the Sidecar egress scope but keep the
+    /// unenforced slice so traffic remains admitted.
+    pub mesh_sidecar_enforced_dry_run: bool,
+    /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
+    /// slice builder also narrows `workloads` to SPIFFE identities referenced
+    /// by admitted services. Default `false` for a one-release rollout window.
+    pub mesh_sidecar_identity_narrowing: bool,
 
     /// Opt-in: emit `mesh_route_dispatch` plugin instances for Istio
     /// VirtualService routes that carry method/header/queryParam predicates.
@@ -597,6 +604,10 @@ pub struct EnvConfig {
     /// override channel runs through `RequestContext.route_override_*` and
     /// is applied to dispatch after admission plugins have run.
     pub mesh_vs_header_routing_experimental: bool,
+    /// Opt-in live reload for PeerAuthentication-derived inbound mTLS mode
+    /// and client CA verifier. Cert/key paths remain static operational
+    /// inputs.
+    pub mesh_peer_auth_live_reload_enabled: bool,
 
     // Node agent
     /// Node-agent capture topology between the per-node capture manager and
@@ -640,6 +651,13 @@ pub struct EnvConfig {
     /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
     /// telemetry.istio.io). Default: true.
     pub k8s_watch_istio_crds: bool,
+    /// Enable watching the root-namespace `istio` ConfigMap for
+    /// `meshConfig.extensionProviders` / `defaultProviders.tracing` lookup.
+    /// Requires `configmaps` `get/list/watch` RBAC in the istio root
+    /// namespace. When `false`, Telemetry name-only provider references
+    /// resolve as unknown and inline-provider Telemetry continues to work.
+    /// Default: true (only effective when `FERRUM_K8S_WATCH_ISTIO_CRDS=true`).
+    pub k8s_watch_mesh_config: bool,
     /// Enable watching Gateway API CRDs (gateway.networking.k8s.io).
     /// Default: true.
     pub k8s_watch_gateway_api_crds: bool,
@@ -1385,7 +1403,10 @@ impl Default for EnvConfig {
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
+            mesh_sidecar_enforced_dry_run: false,
+            mesh_sidecar_identity_narrowing: false,
             mesh_vs_header_routing_experimental: false,
+            mesh_peer_auth_live_reload_enabled: false,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
@@ -1397,6 +1418,7 @@ impl Default for EnvConfig {
             k8s_reconcile_debounce_ms: 500,
             k8s_full_sync_interval_secs: 300,
             k8s_watch_istio_crds: true,
+            k8s_watch_mesh_config: true,
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
@@ -1689,7 +1711,10 @@ impl EnvConfig {
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
+            mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
+            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
+            mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
@@ -1701,6 +1726,7 @@ impl EnvConfig {
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
             k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
             k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
+            k8s_watch_mesh_config: bool = "FERRUM_K8S_WATCH_MESH_CONFIG" => true;
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
@@ -2065,7 +2091,10 @@ impl EnvConfig {
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
+            mesh_sidecar_enforced_dry_run,
+            mesh_sidecar_identity_narrowing,
             mesh_vs_header_routing_experimental,
+            mesh_peer_auth_live_reload_enabled,
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,
@@ -2077,6 +2106,7 @@ impl EnvConfig {
             k8s_reconcile_debounce_ms,
             k8s_full_sync_interval_secs,
             k8s_watch_istio_crds,
+            k8s_watch_mesh_config,
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
             k8s_cluster_domain,
