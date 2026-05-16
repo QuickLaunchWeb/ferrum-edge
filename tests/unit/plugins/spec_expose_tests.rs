@@ -353,6 +353,34 @@ fn test_creation_accepts_zero_cache_ttl() {
     assert!(plugin.is_ok());
 }
 
+#[test]
+fn test_creation_rejects_non_integer_max_body_bytes() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "max_body_bytes": "large"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-integer max_body_bytes must be rejected");
+    assert!(err.contains("max_body_bytes"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_zero_max_body_bytes() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "max_body_bytes": 0
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("zero max_body_bytes must be rejected");
+    assert!(err.contains("greater than zero"), "got: {err}");
+}
+
 #[tokio::test]
 async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
     use wiremock::matchers::{method, path};
@@ -392,6 +420,45 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
             assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
         }
         other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_specz_request_rejects_oversized_spec_body() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_bytes(b"openapi: 3.0.0\ninfo: too large\n".to_vec()),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "max_body_bytes": 8
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("max_body_bytes"), "got: {body}");
+        }
+        other => panic!("expected Reject, got {other:?}"),
     }
 }
 

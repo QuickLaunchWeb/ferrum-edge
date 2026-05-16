@@ -30,7 +30,8 @@
 //!   "spec_url": "https://internal-service/docs/openapi.yaml",
 //!   "content_type": "application/yaml",    // optional override
 //!   "tls_no_verify": false,                // optional, skip TLS verification
-//!   "cache_ttl_seconds": 300               // optional, 0 = disable
+//!   "cache_ttl_seconds": 300,              // optional, 0 = disable
+//!   "max_body_bytes": 26214400             // optional, default 25 MiB
 //! }
 //! ```
 
@@ -46,10 +47,13 @@ use tokio::sync::Mutex;
 
 use crate::dns::DnsCacheResolver;
 
+use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Default cache TTL for fetched spec bodies (5 minutes).
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+/// Default maximum upstream spec body size (25 MiB).
+const DEFAULT_MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// A cached spec response (body + content-type + insertion time).
 #[derive(Clone)]
@@ -65,6 +69,7 @@ pub struct SpecExpose {
     content_type_override: Option<String>,
     warmup_hostname: Option<String>,
     cache_ttl: Duration,
+    max_body_bytes: usize,
     cache: ArcSwap<Option<CachedSpec>>,
     /// Single-flight lock around the upstream fetch. Concurrent cache-miss
     /// callers serialize here; whoever acquires first does the upstream fetch
@@ -144,6 +149,23 @@ impl SpecExpose {
         };
         let cache_ttl = Duration::from_secs(cache_ttl_seconds);
 
+        let max_body_bytes = match config.get("max_body_bytes") {
+            None | Some(Value::Null) => DEFAULT_MAX_BODY_BYTES,
+            Some(v) => {
+                let raw = v.as_u64().ok_or_else(|| {
+                    format!("spec_expose: 'max_body_bytes' must be a positive integer, got: {v}")
+                })?;
+                if raw == 0 {
+                    return Err(
+                        "spec_expose: 'max_body_bytes' must be greater than zero".to_string()
+                    );
+                }
+                usize::try_from(raw).map_err(|_| {
+                    format!("spec_expose: 'max_body_bytes' is too large for this platform: {raw}")
+                })?
+            }
+        };
+
         // Build a dedicated reqwest client for spec fetching.
         // We use a separate client so we can honour the per-plugin tls_no_verify
         // setting independently of the shared plugin HTTP client, but we still
@@ -185,6 +207,7 @@ impl SpecExpose {
             content_type_override,
             warmup_hostname,
             cache_ttl,
+            max_body_bytes,
             cache: ArcSwap::from_pointee(None),
             fetch_lock: Mutex::new(()),
             http_client,
@@ -262,6 +285,19 @@ impl SpecExpose {
             });
         }
 
+        if response
+            .content_length()
+            .is_some_and(|len| len > self.max_body_bytes as u64)
+        {
+            tracing::warn!(
+                spec_url = %self.spec_url,
+                content_length = response.content_length(),
+                max_body_bytes = self.max_body_bytes,
+                "spec_expose: upstream spec response body exceeds configured limit"
+            );
+            return Err(Self::body_too_large_reject(self.max_body_bytes));
+        }
+
         // Determine content-type: plugin override > upstream response > default.
         // Computed before consuming the response.
         let content_type = self
@@ -276,23 +312,36 @@ impl SpecExpose {
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let body = response.bytes().await.map_err(|e| {
-            tracing::warn!(
-                spec_url = %self.spec_url,
-                error = %e,
-                "spec_expose: failed to read spec response body"
-            );
-            let mut headers = HashMap::with_capacity(1);
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            PluginResult::Reject {
-                status_code: 502,
-                body: r#"{"error":"Failed to read API specification response body"}"#.to_string(),
-                headers,
-            }
-        })?;
+        let body = read_response_body_bounded(response, self.max_body_bytes)
+            .await
+            .map_err(|e| match e {
+                BoundedReadError::LimitExceeded { .. } => {
+                    tracing::warn!(
+                        spec_url = %self.spec_url,
+                        max_body_bytes = self.max_body_bytes,
+                        "spec_expose: upstream spec response body exceeded configured limit while streaming"
+                    );
+                    Self::body_too_large_reject(self.max_body_bytes)
+                }
+                BoundedReadError::Stream(e) => {
+                    tracing::warn!(
+                        spec_url = %self.spec_url,
+                        error = %e,
+                        "spec_expose: failed to read spec response body"
+                    );
+                    let mut headers = HashMap::with_capacity(1);
+                    headers.insert("content-type".to_string(), "application/json".to_string());
+                    PluginResult::Reject {
+                        status_code: 502,
+                        body: r#"{"error":"Failed to read API specification response body"}"#
+                            .to_string(),
+                        headers,
+                    }
+                }
+            })?;
 
         let entry = CachedSpec {
-            body,
+            body: Bytes::from(body),
             content_type,
             inserted_at: Instant::now(),
         };
@@ -301,6 +350,18 @@ impl SpecExpose {
             self.cache.store(Arc::new(Some(entry.clone())));
         }
         Ok(entry)
+    }
+
+    fn body_too_large_reject(max_body_bytes: usize) -> PluginResult {
+        let mut headers = HashMap::with_capacity(1);
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        PluginResult::Reject {
+            status_code: 502,
+            body: format!(
+                r#"{{"error":"API specification response exceeds max_body_bytes ({max_body_bytes})"}}"#
+            ),
+            headers,
+        }
     }
 }
 
