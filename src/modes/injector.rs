@@ -1766,6 +1766,15 @@ mod tests {
     }
 
     #[test]
+    fn admission_review_body_limit_display_formats_mib_when_aligned() {
+        assert_eq!(
+            admission_review_body_limit_display(4 * 1024 * 1024),
+            "4194304 bytes / 4 MiB"
+        );
+        assert_eq!(admission_review_body_limit_display(1024), "1024 bytes");
+    }
+
+    #[test]
     fn admission_response_encodes_json_patch() {
         let review = json!({
             "apiVersion": "admission.k8s.io/v1",
