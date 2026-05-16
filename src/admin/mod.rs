@@ -2709,8 +2709,10 @@ async fn handle_node_waypoint_identities_get(
             &json!({"error": "node-waypoint topology not enabled"}),
         ));
     };
-    let snapshot = resolver.identities_snapshot();
-    let (cookies_v4, cookies_v6) = resolver.cookie_count();
+    // Single pass over `cookie_records` returns both the per-identity
+    // summaries and the (v4, v6) totals; this honors the documented
+    // "iterates each shard of three DashMaps once" cold-path contract.
+    let (snapshot, (cookies_v4, cookies_v6)) = resolver.identities_snapshot_with_cookie_totals();
     let entries: Vec<serde_json::Value> = snapshot
         .iter()
         .map(|summary| {

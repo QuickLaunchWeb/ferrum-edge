@@ -233,37 +233,59 @@ impl NodeWaypointIdentityResolver {
     /// This is a cold-path snapshot — it iterates every entry of each
     /// `DashMap` once. Not safe to call on a hot accept path.
     pub fn identities_snapshot(&self) -> Vec<NodeWaypointIdentitySummary> {
+        self.identities_snapshot_with_cookie_totals().0
+    }
+
+    /// Cold-path snapshot that returns both the per-identity summary list and
+    /// the grand totals of `(orig_dst4, orig_dst6)` cookie records in a single
+    /// pass over the `cookie_records` map. The admin endpoint uses this to
+    /// honor the documented "iterates each shard of three `DashMap`s once"
+    /// contract — invoking [`identities_snapshot`] and [`cookie_count`]
+    /// separately would walk `cookie_records` twice.
+    ///
+    /// The totals include cookies whose `pod_uid` has no enrolled identity
+    /// (eBPF saw the connection but the node-agent has not yet registered the
+    /// pod) so the admin "cookies" summary reflects the full eBPF state, not
+    /// just the slice that maps to known identities.
+    pub fn identities_snapshot_with_cookie_totals(
+        &self,
+    ) -> (Vec<NodeWaypointIdentitySummary>, (usize, usize)) {
         let mut cookie_counts: HashMap<[u8; 16], (usize, usize)> = HashMap::new();
+        let mut totals = (0usize, 0usize);
         for entry in self.cookie_records.iter() {
             let counters = cookie_counts.entry(entry.value().pod_uid).or_insert((0, 0));
             match entry.value().family {
-                CookieFamily::V4 => counters.0 += 1,
-                CookieFamily::V6 => counters.1 += 1,
+                CookieFamily::V4 => {
+                    counters.0 += 1;
+                    totals.0 += 1;
+                }
+                CookieFamily::V6 => {
+                    counters.1 += 1;
+                    totals.1 += 1;
+                }
             }
         }
 
         let policy_scopes = self.policy_scopes_by_pod_uid.load();
-        let mut out: Vec<NodeWaypointIdentitySummary> = self
-            .identities_by_pod_uid
-            .iter()
-            .map(|entry| {
-                let identity = entry.value();
-                let (orig_dst4_cookies, orig_dst6_cookies) = cookie_counts
-                    .get(&identity.pod_uid)
-                    .copied()
-                    .unwrap_or((0, 0));
-                NodeWaypointIdentitySummary {
-                    pod_uid: identity.pod_uid,
-                    spiffe_id: identity.spiffe_id.as_str().to_string(),
-                    workload_spiffe_hash: identity.workload_spiffe_hash,
-                    orig_dst4_cookies,
-                    orig_dst6_cookies,
-                    has_policy_scope: policy_scopes.contains_key(&identity.pod_uid),
-                }
-            })
-            .collect();
+        let mut out: Vec<NodeWaypointIdentitySummary> =
+            Vec::with_capacity(self.identities_by_pod_uid.len());
+        out.extend(self.identities_by_pod_uid.iter().map(|entry| {
+            let identity = entry.value();
+            let (orig_dst4_cookies, orig_dst6_cookies) = cookie_counts
+                .get(&identity.pod_uid)
+                .copied()
+                .unwrap_or((0, 0));
+            NodeWaypointIdentitySummary {
+                pod_uid: identity.pod_uid,
+                spiffe_id: identity.spiffe_id.as_str().to_string(),
+                workload_spiffe_hash: identity.workload_spiffe_hash,
+                orig_dst4_cookies,
+                orig_dst6_cookies,
+                has_policy_scope: policy_scopes.contains_key(&identity.pod_uid),
+            }
+        }));
         out.sort_by_key(|summary| summary.pod_uid);
-        out
+        (out, totals)
     }
 
     /// Number of currently enrolled identities. Cheap-ish; uses DashMap's
@@ -272,9 +294,10 @@ impl NodeWaypointIdentityResolver {
         self.identities_by_pod_uid.len()
     }
 
-    /// Total cookie records (IPv4 + IPv6) currently tracked. Useful for the
-    /// admin endpoint summary so operators see "1k cookies / 10 identities"
-    /// without scanning per-identity entries.
+    /// Total cookie records (IPv4 + IPv6) currently tracked. Useful for
+    /// standalone diagnostics; the admin endpoint instead calls
+    /// [`identities_snapshot_with_cookie_totals`] so it walks `cookie_records`
+    /// once rather than twice.
     pub fn cookie_count(&self) -> (usize, usize) {
         let mut v4 = 0usize;
         let mut v6 = 0usize;
@@ -583,6 +606,38 @@ mod tests {
 
         let snapshot_post = resolver.identities_snapshot();
         assert!(snapshot_post[0].has_policy_scope);
+    }
+
+    #[test]
+    fn identities_snapshot_with_cookie_totals_counts_orphans_in_totals_only() {
+        // Regression guard for the cold-path "single pass" contract used by
+        // GET /node-waypoint/identities: the returned totals include cookies
+        // whose pod_uid has no enrolled identity (so the admin "cookies"
+        // summary reflects full eBPF state), but the per-identity summaries
+        // omit those orphans.
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_a = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let pod_orphan = parse_pod_uid("33333333-3333-3333-3333-333333333333").unwrap();
+        let identity_a = NodeWaypointIdentity::new(pod_a, spiffe("spiffe://td/ns/default/sa/api"));
+        let hash_a = identity_a.workload_spiffe_hash;
+        resolver.upsert_identity(identity_a);
+        // Enrolled pod gets one v4 + one v6 cookie. Orphan pod (not enrolled)
+        // gets one v6 cookie — represents an eBPF capture racing identity
+        // registration.
+        resolver.record_orig_dst4(11, orig_dst4(pod_a, hash_a));
+        resolver.record_orig_dst6(12, orig_dst6(pod_a, hash_a));
+        resolver.record_orig_dst6(99, orig_dst6(pod_orphan, 0xdead_beef));
+
+        let (snapshot, totals) = resolver.identities_snapshot_with_cookie_totals();
+        // Snapshot contains only the enrolled pod.
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].pod_uid, pod_a);
+        assert_eq!(snapshot[0].orig_dst4_cookies, 1);
+        assert_eq!(snapshot[0].orig_dst6_cookies, 1);
+        // Totals include the orphan v6 cookie.
+        assert_eq!(totals, (1, 2));
+        // And matches cookie_count() (which iterates separately).
+        assert_eq!(resolver.cookie_count(), totals);
     }
 
     #[test]
