@@ -135,6 +135,12 @@ impl CaptureConfig {
             ip6tables_mode,
         })
     }
+
+    pub fn ensure_exclude_port(&mut self, port: u16) {
+        if !self.exclude_ports.contains(&port) {
+            self.exclude_ports.push(port);
+        }
+    }
 }
 
 fn parse_cidr_env(raw: &str) -> Vec<String> {

@@ -60,7 +60,8 @@ impl NodeAgentConfig {
             return Err("FERRUM_NODE_AGENT_NODE_NAME must not be empty".to_string());
         }
 
-        let capture_config = CaptureConfig::from_env()?;
+        let mut capture_config = CaptureConfig::from_env()?;
+        capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
             .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
         let bpf_fs_path = resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH")
@@ -924,6 +925,71 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureMode, Ip6TablesMode};
     use crate::ebpf::MockEbpfBackend;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let result = f();
+
+        for (key, value) in previous {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe {
+                match value {
+                    Some(previous_value) => std::env::set_var(key, previous_value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn from_env_config_auto_excludes_configured_hbone_redirect_port() {
+        let env_config = EnvConfig {
+            node_agent_hbone_redirect_port: 16008,
+            ..EnvConfig::default()
+        };
+
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                (
+                    "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS",
+                    "15001,15006,15008,15020",
+                ),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&env_config)
+                    .expect("node-agent config should parse");
+
+                assert!(
+                    config.capture_config.exclude_ports.contains(&16008),
+                    "custom HBONE redirect port must bypass outbound capture"
+                );
+                assert_eq!(
+                    config
+                        .capture_config
+                        .exclude_ports
+                        .iter()
+                        .filter(|&&port| port == 16008)
+                        .count(),
+                    1,
+                    "auto-added HBONE redirect port should not duplicate"
+                );
+            },
+        );
+    }
 
     #[test]
     fn initialize_backend_populates_maps() {
