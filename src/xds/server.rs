@@ -386,8 +386,8 @@ impl XdsAdsServer {
         // `per_resource_version`); a client-supplied version in
         // `initial_resource_versions` can only suppress its own delivery by
         // claiming a value that the server independently re-derives from
-        // current bytes, so a spoofed claim is at worst a self-DoS. The
-        // `value` byte-equality check against the previous snapshot is a
+        // current bytes, so a spoofed claim is at worst a self-DoS. On the
+        // previous-ACKed-snapshot path, the `value` byte-equality check is a
         // defensive guard against the 64-bit truncation in the per-resource
         // hash.
         let explicit_wildcard_subscribe =

@@ -234,10 +234,10 @@ fn content_version(base_version: &str, resources: &[XdsResource]) -> String {
 /// Per-resource version: first 8 bytes (16 hex chars) of
 /// `SHA-256(type_url || 0x00 || name || 0x00 || value)`. Truncation keeps the
 /// version field small on the wire; with ~10k resources per type URL the
-/// birthday-bound collision probability is ~3e-12, and the delta-response
-/// filter pairs this version check with a byte-equality check on `value`
-/// against the previous snapshot before skipping a resource so a 64-bit hash
-/// collision cannot, on its own, suppress a real content change.
+/// birthday-bound collision probability is ~3e-12. On a live stream, the
+/// delta-response filter pairs this version check with a byte-equality check
+/// on `value` against the previous ACKed snapshot before skipping a resource;
+/// reconnect `initial_resource_versions` skips by the reported version match.
 fn per_resource_version(resource: &XdsResource) -> String {
     let mut hasher = Sha256::new();
     hasher.update(resource.type_url.as_bytes());
