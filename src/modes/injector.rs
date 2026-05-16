@@ -1744,6 +1744,12 @@ mod tests {
                 .unwrap_err()
                 .contains("unsigned integer")
         );
+        let overflow_mib = usize::MAX.to_string();
+        assert!(
+            parse_injector_admission_review_max_body_size_mib(Some(&overflow_mib))
+                .unwrap_err()
+                .contains("value too large")
+        );
     }
 
     #[test]
