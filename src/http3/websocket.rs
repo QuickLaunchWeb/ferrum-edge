@@ -583,10 +583,12 @@ pub(crate) async fn handle_h3_websocket(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
         let strategy = if has_port_override {
             crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_for_port_from(
                 &epoch.load_balancer,

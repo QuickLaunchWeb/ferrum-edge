@@ -184,10 +184,8 @@ pub(crate) fn select_upstream_target(
         proxy,
         LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
     );
-    let has_port_override = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .is_some_and(|overrides| overrides.contains_key(&dispatch_port));
+    let has_port_override =
+        has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
     let max_ejection_percent = if has_port_override {
         LoadBalancerCache::max_ejection_percent_for_port_from(
             balancers,
@@ -271,10 +269,7 @@ pub(crate) fn select_upstream_target(
             // strategy.
             let needs_set = if selection.target.port != dispatch_port {
                 let tp = selection.target.port;
-                let tp_override = proxy
-                    .dispatch_port_overrides
-                    .as_ref()
-                    .is_some_and(|overrides| overrides.contains_key(&tp));
+                let tp_override = has_effective_port_override(proxy, balancers, upstream_id, tp);
                 let tp_strategy = if tp_override {
                     LoadBalancerCache::get_hash_on_strategy_for_port_from(
                         balancers,
@@ -316,6 +311,20 @@ pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream_port_override: u16) 
     }
 
     upstream_port_override
+}
+
+#[inline]
+pub(crate) fn has_effective_port_override(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> bool {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.contains_key(&port))
+        && LoadBalancerCache::has_port_override_state_from(balancers, upstream_id, port)
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with
@@ -572,7 +581,14 @@ pub(crate) fn select_next_retry_target(
 ) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
-    let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target);
+    let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target)
+        .filter(|port| {
+            LoadBalancerCache::has_port_override_state_from(
+                &epoch.load_balancer,
+                upstream_id,
+                *port,
+            )
+        });
 
     // Recompute the retry hash key when the per-port `hash_on` strategy
     // differs from the upstream-level one. Steady-state retries reuse the
@@ -814,6 +830,92 @@ mod tests {
             first.target.as_ref().map(|t| t.port),
             second.target.as_ref().map(|t| t.port),
             "mixed-port upstreams must keep using the upstream-level balancer until a target is selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_selection_ignores_phantom_port_override_policy() {
+        let port_passive = PassiveHealthCheck {
+            unhealthy_threshold: 1,
+            max_ejection_percent: Some(50),
+            ..PassiveHealthCheck::default()
+        };
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 8080,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 9090},
+                        {"host": "10.0.0.2", "port": 9090}
+                    ],
+                    "algorithm": "round_robin"
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.upstreams[0].port_overrides.insert(
+            8080,
+            crate::config::types::UpstreamPortOverride {
+                passive_health_check: Some(port_passive.clone()),
+                ..Default::default()
+            },
+        );
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let first_target = UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 9090,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        };
+        let second_target = UpstreamTarget {
+            host: "10.0.0.2".to_string(),
+            port: 9090,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        };
+        state.health_checker.report_response(
+            &proxy.id,
+            &first_target,
+            500,
+            false,
+            Some(&port_passive),
+        );
+        state.health_checker.report_response(
+            &proxy.id,
+            &second_target,
+            500,
+            false,
+            Some(&port_passive),
+        );
+
+        let selection =
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new());
+
+        assert!(
+            selection.is_fallback,
+            "a configured override for a port with no balancer lane must not re-admit upstream-level targets with port-scoped ejection policy"
+        );
+        assert_eq!(
+            selection.target.as_ref().map(|target| target.port),
+            Some(9090)
         );
     }
 }

@@ -4533,10 +4533,12 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let has_port_override = backend_dispatch::has_effective_port_override(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
         let strategy = if has_port_override {
             LoadBalancerCache::get_hash_on_strategy_for_port_from(
                 &epoch.load_balancer,
@@ -8575,10 +8577,12 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let has_port_override = proxy
-                        .dispatch_port_overrides
-                        .as_ref()
-                        .is_some_and(|overrides| overrides.contains_key(&target.port));
+                    let has_port_override = backend_dispatch::has_effective_port_override(
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_id,
+                        target.port,
+                    );
                     let strategy = if has_port_override {
                         LoadBalancerCache::get_hash_on_strategy_for_port_from(
                             &epoch.load_balancer,
@@ -9272,10 +9276,12 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let has_port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let has_port_override = backend_dispatch::has_effective_port_override(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
         let strategy = if has_port_override {
             LoadBalancerCache::get_hash_on_strategy_for_port_from(
                 &epoch.load_balancer,

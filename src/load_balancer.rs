@@ -622,6 +622,22 @@ impl LoadBalancerCache {
             .unwrap_or(0)
     }
 
+    /// Returns true when the precomputed load balancer has an actual per-port
+    /// state lane for `port`. `Proxy.dispatch_port_overrides` may still contain
+    /// phantom ports from config/service-discovery churn; callers should not use
+    /// port-scoped policy unless this says the balancer can also select on it.
+    #[inline]
+    pub fn has_port_override_state_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        port: u16,
+    ) -> bool {
+        snapshot
+            .balancers
+            .get(upstream_id)
+            .is_some_and(|b| b.has_port_override_state(port))
+    }
+
     #[inline]
     pub fn get_upstream_from(
         snapshot: &LoadBalancerCacheInner,
@@ -764,11 +780,12 @@ impl LoadBalancerCache {
         proxy: &Proxy,
         port: u16,
     ) -> Option<u8> {
-        if let Some(port_passive) = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|overrides| overrides.get(&port))
-            .and_then(|override_config| override_config.passive_health_check.as_ref())
+        if Self::has_port_override_state_from(snapshot, upstream_id, port)
+            && let Some(port_passive) = proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&port))
+                .and_then(|override_config| override_config.passive_health_check.as_ref())
         {
             return port_passive.max_ejection_percent;
         }
@@ -1874,6 +1891,11 @@ impl LoadBalancer {
             .get(subset_name)
             .map(Vec::as_slice)
             .unwrap_or(&self.hash_ring)
+    }
+
+    #[inline]
+    fn has_port_override_state(&self, port: u16) -> bool {
+        self.port_overrides.contains_key(&port)
     }
 
     #[inline]
