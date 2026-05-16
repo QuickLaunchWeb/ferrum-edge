@@ -6,12 +6,16 @@
 # ── Linker optimisations (optional) ──────────────────────────────────────
 # Using a faster linker can cut link times by 2-5x. Uncomment the section
 # that matches your platform after installing the required linker.
+# Keep host-specific linker choices in ~/.cargo/config.toml rather than this
+# checked-in file so GitHub-hosted macOS runners keep using their default linker.
 #
-# macOS — install lld: `brew install llvm` then add to PATH
+# macOS local example — install LLVM with `brew install llvm`
 # [target.aarch64-apple-darwin]
+# linker = "/opt/homebrew/opt/llvm/bin/clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # [target.x86_64-apple-darwin]
+# linker = "/usr/local/opt/llvm/bin/clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # Linux — install mold: `sudo apt-get install mold` (fastest linker)
