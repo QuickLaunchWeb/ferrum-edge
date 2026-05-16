@@ -268,6 +268,10 @@ impl SpecExpose {
 
         // Content-Length is an untrusted upstream hint, so this is only a
         // cooperative fast path. The streaming guard below is authoritative.
+        // A lying inflated Content-Length is conservatively rejected even when
+        // the eventual payload might be smaller; the unauthenticated /specz
+        // endpoint should not spend memory or time proving an oversized hint
+        // wrong.
         // The plugin HTTP client is built without reqwest auto-decompression
         // features. If that changes, content_length() can become None for
         // encoded responses and the streaming guard still remains authoritative.
@@ -320,7 +324,7 @@ impl SpecExpose {
             })?;
 
         let entry = CachedSpec {
-            body: Bytes::from(body),
+            body,
             content_type,
             inserted_at: Instant::now(),
         };
@@ -333,6 +337,8 @@ impl SpecExpose {
 }
 
 fn body_too_large_reject() -> PluginResult {
+    // /specz is unauthenticated, so the public error intentionally omits the
+    // configured limit while structured logs retain the operator-facing detail.
     reject_502_json("API specification response too large")
 }
 

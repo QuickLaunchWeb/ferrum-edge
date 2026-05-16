@@ -62,6 +62,7 @@
 //! ```
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use http::header::HeaderName;
 use serde_json::Value;
@@ -458,7 +459,7 @@ impl ServerlessFunction {
         &self,
         payload: &Value,
         ctx: &RequestContext,
-    ) -> Result<(u16, HashMap<String, String>, Vec<u8>), String> {
+    ) -> Result<(u16, HashMap<String, String>, Bytes), String> {
         let payload_bytes = serde_json::to_vec(payload)
             .map_err(|e| format!("serverless_function: failed to serialize payload: {e}"))?;
 

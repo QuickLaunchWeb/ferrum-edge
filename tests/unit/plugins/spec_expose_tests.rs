@@ -424,6 +424,49 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
 }
 
 #[tokio::test]
+async fn test_specz_request_allows_custom_cap_at_exact_body_size() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let body = b"openapi\n".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.clone())
+                .insert_header("content-type", "application/yaml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "max_response_body_bytes": body.len()
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            body: returned_body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(returned_body, bytes::Bytes::from(body));
+            assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_specz_request_rejects_oversized_content_length_spec_body() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

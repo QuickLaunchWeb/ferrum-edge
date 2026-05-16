@@ -17,13 +17,15 @@
 //! `proxy::collect_response_with_limit` so plugin-side reads share the same
 //! hardened pattern.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::Value;
 
-// Bound only the upfront allocation. Larger in-limit bodies still grow the
-// buffer organically, which avoids letting Content-Length force a large alloc
-// before the first byte streams in.
+// Bound only the upfront allocation. One MiB covers common API specs and
+// serverless-function responses without repeated tiny reallocations, while
+// larger in-limit bodies still grow one chunk at a time up to the configured
+// cap. This avoids letting Content-Length force a large allocation before the
+// first byte streams in.
 const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 1024 * 1024;
 
 /// Error returned by [`read_response_body_bounded`].
@@ -85,7 +87,7 @@ pub fn parse_max_response_body_bytes(
     }
 }
 
-/// Stream a `reqwest::Response` body and accumulate chunks into a `Vec<u8>`,
+/// Stream a `reqwest::Response` body and accumulate chunks into `Bytes`,
 /// aborting as soon as the running total exceeds `max_bytes`.
 ///
 /// Returns `Ok(body)` when the full body fits inside the limit, or
@@ -100,7 +102,7 @@ pub fn parse_max_response_body_bytes(
 pub async fn read_response_body_bounded(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Vec<u8>, BoundedReadError> {
+) -> Result<Bytes, BoundedReadError> {
     // Pre-size from Content-Length when available, but never larger than a
     // modest ceiling. A misbehaving sink or oversized operator setting should
     // not be able to force a huge allocation before streaming starts.
@@ -114,7 +116,7 @@ pub async fn read_response_body_bounded(
         })
         .unwrap_or(0);
 
-    let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
+    let mut buf = BytesMut::with_capacity(initial_capacity);
     let mut total = 0usize;
     let mut stream = response.bytes_stream();
 
@@ -130,7 +132,7 @@ pub async fn read_response_body_bounded(
         buf.extend_from_slice(&chunk);
     }
 
-    Ok(buf)
+    Ok(buf.freeze())
 }
 
 /// Stream a `reqwest::Response` body to determine its total length without

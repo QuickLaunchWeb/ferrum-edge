@@ -109,7 +109,7 @@ async fn test_read_response_body_bounded_within_limit() {
         .await
         .expect("body within limit should succeed");
     assert_eq!(buf.len(), 512);
-    assert_eq!(buf, body);
+    assert_eq!(buf.as_ref(), body.as_slice());
 }
 
 /// Empty body (204) returns Ok with empty bytes.
@@ -139,7 +139,7 @@ async fn test_read_response_body_bounded_exactly_at_limit() {
     let resp = reqwest::get(server.uri()).await.unwrap();
     let buf = read_response_body_bounded(resp, 1024).await.unwrap();
     assert_eq!(buf.len(), 1024);
-    assert_eq!(buf, body);
+    assert_eq!(buf.as_ref(), body.as_slice());
 }
 
 /// `measure_response_body_bounded` returns the size for an in-limit body.
