@@ -77,7 +77,7 @@ pub fn parse_max_response_body_bytes(
         Some(v) => {
             let raw = v
                 .as_u64()
-                .ok_or_else(|| format!("{plugin_name}: '{key}' must be an unsigned integer"))?;
+                .ok_or_else(|| format!("{plugin_name}: '{key}' must be a non-negative integer"))?;
             if raw == 0 {
                 return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
             }

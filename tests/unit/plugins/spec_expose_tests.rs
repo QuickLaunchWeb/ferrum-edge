@@ -554,6 +554,9 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
             if socket.flush().await.is_err() {
                 return;
             }
+            // Best effort: separate writes make the fixture exercise the
+            // no-Content-Length streaming path even if the OS later coalesces
+            // some chunks before reqwest yields them.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = socket.write_all(b"0\r\n\r\n").await;
@@ -728,6 +731,61 @@ async fn test_cache_does_not_store_failed_fetches() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn test_cache_does_not_store_oversized_fetches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"too large body".to_vec()))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_bytes(b"ok\n".to_vec()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60,
+            "max_response_body_bytes": 8
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let r1 = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        r1,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+
+    let mut ctx2 = make_ctx("GET", "/api/specz", "/api");
+    let r2 = plugin.on_request_received(&mut ctx2).await;
+    match r2 {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body, bytes::Bytes::from_static(b"ok\n"));
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
 }
 
 // Regression: cold-cache concurrent requests must not all fan out to the

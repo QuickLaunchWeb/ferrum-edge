@@ -38,12 +38,12 @@ fn test_parse_max_response_body_bytes_defaults_and_validates() {
     assert!(
         parse_max_response_body_bytes(&json!({ "limit": -1 }), "test_plugin", "limit", 4096)
             .unwrap_err()
-            .contains("unsigned integer")
+            .contains("non-negative integer")
     );
     assert!(
         parse_max_response_body_bytes(&json!({ "limit": "8192" }), "test_plugin", "limit", 4096)
             .unwrap_err()
-            .contains("unsigned integer")
+            .contains("non-negative integer")
     );
 
     let max_u64_result =
