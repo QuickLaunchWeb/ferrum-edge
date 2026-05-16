@@ -32,6 +32,10 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
+use crate::tls::backend::{
+    BackendSvidGeneration, append_backend_tls_pool_key_fields,
+    backend_svid_generation_for_client_cert, backend_tls_pool_key_has_svid_generation,
+};
 
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
 ///
@@ -682,6 +686,10 @@ pub struct Http3ConnectionPool {
     /// distribute frame processing across QUIC driver tasks, preventing a
     /// single-driver CPU bottleneck at high concurrency.
     connections_per_backend: usize,
+    /// Shared backend SVID revision. Pool keys include this so new requests
+    /// after a rotation create fresh QUIC/TLS state without disturbing
+    /// established connections.
+    backend_svid_generation: BackendSvidGeneration,
     /// Shared QUIC endpoint for IPv4 backends. All IPv4 connections share a
     /// single UDP socket, reducing FD usage and enabling kernel-level port reuse.
     ipv4_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
@@ -689,15 +697,26 @@ pub struct Http3ConnectionPool {
     ipv6_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
 }
 
-#[derive(Clone, Default)]
-struct Http3PoolManager;
+#[derive(Clone)]
+struct Http3PoolManager {
+    backend_svid_generation: BackendSvidGeneration,
+    global_backend_client_cert_path: Option<String>,
+    workload_svid_cert_path: Option<String>,
+}
 
 #[async_trait]
 impl PoolManager for Http3PoolManager {
     type Connection = H3PooledConnection;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
-        Http3ConnectionPool::write_pool_key_with_host(buf, host, port, proxy, shard);
+        Http3ConnectionPool::write_pool_key_with_host_and_generation(
+            buf,
+            host,
+            port,
+            proxy,
+            shard,
+            self.svid_generation_for_proxy(proxy),
+        );
     }
 
     // HTTP/3 request paths establish new connections through
@@ -728,8 +747,36 @@ impl PoolManager for Http3PoolManager {
     }
 }
 
+impl Http3PoolManager {
+    fn current_svid_generation(&self) -> u64 {
+        self.backend_svid_generation.load(Ordering::Acquire)
+    }
+
+    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
+        let effective_client_cert_path = proxy
+            .resolved_tls
+            .client_cert_path
+            .as_deref()
+            .or(self.global_backend_client_cert_path.as_deref());
+        backend_svid_generation_for_client_cert(
+            effective_client_cert_path,
+            self.workload_svid_cert_path.as_deref(),
+            self.current_svid_generation(),
+        )
+    }
+}
+
 impl Http3ConnectionPool {
+    #[allow(dead_code)] // Used by tests and standalone H3 callers without shared SVID rotation state.
     pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
+        Self::new_with_svid_generation(env_config, dns_cache, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn new_with_svid_generation(
+        env_config: Arc<crate::config::EnvConfig>,
+        dns_cache: crate::dns::DnsCache,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         let connections_per_backend = env_config.http3_connections_per_backend;
         let cleanup_interval = Duration::from_secs(env_config.pool_cleanup_interval_seconds.max(1));
         let shards = crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
@@ -741,7 +788,13 @@ impl Http3ConnectionPool {
 
         Self {
             pool: GenericPool::new(
-                Arc::new(Http3PoolManager),
+                Arc::new(Http3PoolManager {
+                    backend_svid_generation: backend_svid_generation.clone(),
+                    global_backend_client_cert_path: env_config
+                        .backend_tls_client_cert_path
+                        .clone(),
+                    workload_svid_cert_path: env_config.gateway_svid_cert_path.clone(),
+                }),
                 pool_cfg,
                 cleanup_interval,
                 shards,
@@ -750,6 +803,7 @@ impl Http3ConnectionPool {
             dns_cache,
             conn_counter: AtomicU64::new(0),
             connections_per_backend,
+            backend_svid_generation,
             ipv4_endpoint: tokio::sync::OnceCell::new(),
             ipv6_endpoint: tokio::sync::OnceCell::new(),
         }
@@ -776,8 +830,31 @@ impl Http3ConnectionPool {
         self.pool.pool_size()
     }
 
+    pub fn force_drain_svid_generation(&self, generation: u64) {
+        self.pool
+            .invalidate_matching(|key| backend_tls_pool_key_has_svid_generation(key, generation));
+    }
+
+    fn current_svid_generation(&self) -> u64 {
+        self.backend_svid_generation.load(Ordering::Acquire)
+    }
+
+    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
+        let effective_client_cert_path = proxy
+            .resolved_tls
+            .client_cert_path
+            .as_deref()
+            .or(self.env_config.backend_tls_client_cert_path.as_deref());
+        backend_svid_generation_for_client_cert(
+            effective_client_cert_path,
+            self.env_config.gateway_svid_cert_path.as_deref(),
+            self.current_svid_generation(),
+        )
+    }
+
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
+    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key(proxy: &Proxy, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key(&mut key, proxy, index);
@@ -787,10 +864,19 @@ impl Http3ConnectionPool {
     /// Write pool key into the provided buffer, avoiding intermediate
     /// `format!()` allocations. Called from both the allocating `pool_key()`
     /// (cold path) and the thread-local buffer lookup (hot path).
+    #[allow(dead_code)] // Paired with pool_key() for external tests/helpers.
     fn write_pool_key(buf: &mut String, proxy: &Proxy, index: usize) {
-        Self::write_pool_key_with_host(buf, &proxy.backend_host, proxy.backend_port, proxy, index);
+        Self::write_pool_key_with_host_and_generation(
+            buf,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            index,
+            None,
+        );
     }
 
+    #[allow(dead_code)] // Paired with pool_key_for_target() for external tests/helpers.
     fn write_pool_key_with_host(
         buf: &mut String,
         host: &str,
@@ -798,10 +884,21 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         index: usize,
     ) {
+        Self::write_pool_key_with_host_and_generation(buf, host, port, proxy, index, None);
+    }
+
+    fn write_pool_key_with_host_and_generation(
+        buf: &mut String,
+        host: &str,
+        port: u16,
+        proxy: &Proxy,
+        index: usize,
+        svid_generation: Option<u64>,
+    ) {
         use std::fmt::Write;
         buf.clear();
         // Key shape:
-        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
+        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
         //
         // This must cover every dimension that affects QUIC connection
         // identity *and* matches the backend-capability registry key for
@@ -818,12 +915,13 @@ impl Http3ConnectionPool {
             index,
             proxy.dns_override.as_deref().unwrap_or_default(),
         );
-        crate::tls::backend::append_backend_tls_pool_key_fields(
+        append_backend_tls_pool_key_fields(
             buf,
             &proxy.resolved_tls,
             proxy.resolved_tls.client_cert_path.as_deref(),
             proxy.resolved_tls.client_key_path.as_deref(),
             proxy.resolved_tls.verify_server_cert,
+            svid_generation,
         );
     }
 
@@ -836,9 +934,42 @@ impl Http3ConnectionPool {
     /// a capability probed through one proxy's resolver / cert material
     /// could be served by a pooled QUIC connection originated by a
     /// different proxy.
+    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key_for_target(proxy: &Proxy, host: &str, port: u16, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key_with_host(&mut key, host, port, proxy, index);
+        key
+    }
+
+    fn pool_key_with_current_generation(&self, proxy: &Proxy, index: usize) -> String {
+        let mut key = String::with_capacity(128);
+        Self::write_pool_key_with_host_and_generation(
+            &mut key,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            index,
+            self.svid_generation_for_proxy(proxy),
+        );
+        key
+    }
+
+    fn pool_key_for_target_with_current_generation(
+        &self,
+        proxy: &Proxy,
+        host: &str,
+        port: u16,
+        index: usize,
+    ) -> String {
+        let mut key = String::with_capacity(128);
+        Self::write_pool_key_with_host_and_generation(
+            &mut key,
+            host,
+            port,
+            proxy,
+            index,
+            self.svid_generation_for_proxy(proxy),
+        );
         key
     }
 
@@ -919,7 +1050,7 @@ impl Http3ConnectionPool {
             Self::warmup_shard_indices(proxy, self.connections_per_backend).len();
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
 
-        let primary_key = Self::pool_key(proxy, 0);
+        let primary_key = self.pool_key_with_current_generation(proxy, 0);
         if self.pool.cached(&primary_key).is_none() {
             let _ = self
                 .create_or_get_proxy_sender(
@@ -940,7 +1071,7 @@ impl Http3ConnectionPool {
                 let tls_config = tls_config.clone();
                 let h3_config = h3_config.clone();
                 async move {
-                    let key = Self::pool_key(proxy, index);
+                    let key = self.pool_key_with_current_generation(proxy, index);
                     if self.pool.cached(&key).is_some() {
                         return;
                     }
@@ -997,9 +1128,16 @@ impl Http3ConnectionPool {
 
         let mut any_request_on_wire = false;
 
-        let cached = self
-            .pool
-            .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
+        let cached = self.pool.cached_with(|buf| {
+            Self::write_pool_key_with_host_and_generation(
+                buf,
+                &proxy.backend_host,
+                proxy.backend_port,
+                proxy,
+                start,
+                self.svid_generation_for_proxy(proxy),
+            )
+        });
         let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
 
         if let Some(pooled) = cached {
@@ -1028,7 +1166,7 @@ impl Http3ConnectionPool {
 
         // Slow path: allocate pool key String for cache miss, error recovery,
         // and new connection creation.
-        let key = Self::pool_key(proxy, start);
+        let key = self.pool_key_with_current_generation(proxy, start);
 
         // Try cached connection on the selected index first
         if let Some(pooled) = self.pool.cached(&key) {
@@ -1055,7 +1193,8 @@ impl Http3ConnectionPool {
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = Self::pool_key(proxy, fallback_index);
+                        let fallback_key =
+                            self.pool_key_with_current_generation(proxy, fallback_index);
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request(
@@ -1139,7 +1278,12 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
+        let key = self.pool_key_for_target_with_current_generation(
+            proxy,
+            target_host,
+            target_port,
+            start,
+        );
 
         let mut any_request_on_wire = false;
         let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
@@ -1172,7 +1316,7 @@ impl Http3ConnectionPool {
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = Self::pool_key_for_target(
+                        let fallback_key = self.pool_key_for_target_with_current_generation(
                             proxy,
                             target_host,
                             target_port,
@@ -1882,7 +2026,7 @@ impl Http3ConnectionPool {
         // No thread-local fast path for streaming body — the frontend stream is
         // consumed during the request, so we can't retry on a different connection
         // if the first attempt fails mid-body. Go straight to the slow path.
-        let key = Self::pool_key(proxy, start);
+        let key = self.pool_key_with_current_generation(proxy, start);
 
         if let Some(pooled) = self.pool.cached(&key) {
             // Single attempt — body is consumed, no retry possible.
@@ -1957,7 +2101,7 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key(proxy, start);
+        let key = self.pool_key_with_current_generation(proxy, start);
         let mut frontend_body = Some(frontend_body);
 
         if let Some(pooled) = self.pool.cached(&key) {
@@ -2037,7 +2181,12 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
+        let key = self.pool_key_for_target_with_current_generation(
+            proxy,
+            target_host,
+            target_port,
+            start,
+        );
 
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
@@ -2117,7 +2266,12 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
+        let key = self.pool_key_for_target_with_current_generation(
+            proxy,
+            target_host,
+            target_port,
+            start,
+        );
         let mut frontend_body = Some(frontend_body);
 
         if let Some(pooled) = self.pool.cached(&key) {
@@ -2200,9 +2354,16 @@ impl Http3ConnectionPool {
 
         let mut any_request_on_wire = false;
 
-        let cached = self
-            .pool
-            .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
+        let cached = self.pool.cached_with(|buf| {
+            Self::write_pool_key_with_host_and_generation(
+                buf,
+                &proxy.backend_host,
+                proxy.backend_port,
+                proxy,
+                start,
+                self.svid_generation_for_proxy(proxy),
+            )
+        });
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
@@ -2225,7 +2386,7 @@ impl Http3ConnectionPool {
         }
 
         // Slow path: allocate pool key String
-        let key = Self::pool_key(proxy, start);
+        let key = self.pool_key_with_current_generation(proxy, start);
 
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
@@ -2249,7 +2410,8 @@ impl Http3ConnectionPool {
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = Self::pool_key(proxy, fallback_index);
+                        let fallback_key =
+                            self.pool_key_with_current_generation(proxy, fallback_index);
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request_streaming(
@@ -2318,7 +2480,12 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
+        let key = self.pool_key_for_target_with_current_generation(
+            proxy,
+            target_host,
+            target_port,
+            start,
+        );
 
         let mut any_request_on_wire = false;
 
@@ -2347,7 +2514,7 @@ impl Http3ConnectionPool {
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key = Self::pool_key_for_target(
+                        let fallback_key = self.pool_key_for_target_with_current_generation(
                             proxy,
                             target_host,
                             target_port,
@@ -2917,6 +3084,14 @@ mod h3_pool_health_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
+    fn test_pool_manager() -> Http3PoolManager {
+        Http3PoolManager {
+            backend_svid_generation: Arc::new(AtomicU64::new(0)),
+            global_backend_client_cert_path: None,
+            workload_svid_cert_path: None,
+        }
+    }
+
     fn install_provider() {
         // rustls 0.23 requires a process-wide crypto provider before any
         // `ClientConfig::builder()` / `ServerConfig::builder()` call. The
@@ -3077,7 +3252,7 @@ mod h3_pool_health_tests {
         });
 
         let pooled = H3PooledConnection::new(send_request, client_conn);
-        let manager = Http3PoolManager;
+        let manager = test_pool_manager();
 
         assert!(
             manager.is_healthy(&pooled),
@@ -3099,7 +3274,7 @@ mod h3_pool_health_tests {
         });
 
         let pooled = H3PooledConnection::new(send_request, client_conn.clone());
-        let manager = Http3PoolManager;
+        let manager = test_pool_manager();
 
         // Sanity: live before close.
         assert!(manager.is_healthy(&pooled));
@@ -3176,7 +3351,7 @@ mod h3_pool_health_tests {
             ..PoolConfig::default()
         };
         let pool = GenericPool::new(
-            Arc::new(Http3PoolManager),
+            Arc::new(test_pool_manager()),
             pool_cfg,
             Duration::from_millis(50),
             64,

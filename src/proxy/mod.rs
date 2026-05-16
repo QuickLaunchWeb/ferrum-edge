@@ -98,6 +98,7 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
+use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::{NoVerifier, TlsPolicy};
 
 use self::backend_capabilities::{
@@ -1548,6 +1549,15 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Backend client SVID revision channel. SVID rotation producers send the
+    /// new monotonic revision here; a background task moves it into the
+    /// generation atomic used by backend TLS/pool keys.
+    #[allow(dead_code)]
+    // Producer hookup lands outside this state constructor; tests exercise the channel.
+    pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
+    /// Current backend client SVID generation shared by backend pools.
+    #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
+    pub backend_svid_generation: BackendSvidGeneration,
 }
 
 #[inline]
@@ -1636,6 +1646,75 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
         "Loaded gateway SPIFFE SVID bundle"
     );
     Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_backend_svid_rotation_task(
+    mut revision_rx: tokio::sync::watch::Receiver<u64>,
+    generation: BackendSvidGeneration,
+    connection_pool: Arc<ConnectionPool>,
+    http2_pool: Arc<Http2ConnectionPool>,
+    grpc_pool: Arc<GrpcConnectionPool>,
+    h3_pool: Arc<Http3ConnectionPool>,
+    drain_seconds: u64,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut current_generation = *revision_rx.borrow();
+        generation.store(current_generation, Ordering::Release);
+        let mut shutdown_rx = shutdown_rx;
+
+        loop {
+            let changed = if let Some(shutdown) = shutdown_rx.as_mut() {
+                tokio::select! {
+                    changed = revision_rx.changed() => changed,
+                    _ = shutdown.changed() => return,
+                }
+            } else {
+                revision_rx.changed().await
+            };
+            if changed.is_err() {
+                return;
+            }
+
+            let next_generation = *revision_rx.borrow();
+            if next_generation == current_generation {
+                continue;
+            }
+
+            let old_generation = current_generation;
+            current_generation = next_generation;
+            generation.store(next_generation, Ordering::Release);
+            connection_pool.drain_backend_tls_config_cache_svid_generation(old_generation);
+            http2_pool.drain_backend_tls_config_cache_svid_generation(old_generation);
+            grpc_pool.drain_backend_tls_config_cache_svid_generation(old_generation);
+
+            info!(
+                old_svid_generation = old_generation,
+                new_svid_generation = next_generation,
+                drain_seconds,
+                "Backend client SVID rotation observed; new backend TLS connections will use fresh identity"
+            );
+
+            if drain_seconds > 0 {
+                let connection_pool = connection_pool.clone();
+                let http2_pool = http2_pool.clone();
+                let grpc_pool = grpc_pool.clone();
+                let h3_pool = h3_pool.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(drain_seconds)).await;
+                    connection_pool.force_drain_svid_generation(old_generation);
+                    http2_pool.force_drain_svid_generation(old_generation);
+                    grpc_pool.force_drain_svid_generation(old_generation);
+                    h3_pool.force_drain_svid_generation(old_generation);
+                    info!(
+                        old_svid_generation = old_generation,
+                        "Forced drain of backend pool entries from previous SVID generation completed"
+                    );
+                });
+            }
+        }
+    })
 }
 
 impl ProxyState {
@@ -1754,19 +1833,24 @@ impl ProxyState {
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-        let grpc_pool = Arc::new(GrpcConnectionPool::new(
+        let backend_svid_generation = Arc::new(AtomicU64::new(0));
+        let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
+            tokio::sync::watch::channel(0u64);
+        let grpc_pool = Arc::new(GrpcConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config.clone(),
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
-        let http2_pool = Arc::new(Http2ConnectionPool::new(
+        let http2_pool = Arc::new(Http2ConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config.clone(),
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
@@ -1784,20 +1868,22 @@ impl ProxyState {
             gateway_svid_bundle.clone(),
             pool_shard_amount,
         ));
-        let h3_pool = Arc::new(Http3ConnectionPool::new(
+        let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
+            backend_svid_generation.clone(),
         ));
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
         let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
-        let connection_pool = Arc::new(ConnectionPool::new(
+        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
+            backend_svid_generation.clone(),
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
@@ -1873,8 +1959,18 @@ impl ProxyState {
         // Drain the spawned task handles BEFORE wrapping in Arc so the
         // caller can await them in the background-drain phase. Drop is
         // a no-op safety net once the Vec is empty.
-        let health_check_handles = health_checker.take_active_check_handles();
+        let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
+        health_check_handles.push(spawn_backend_svid_rotation_task(
+            backend_svid_rotation_rx,
+            backend_svid_generation.clone(),
+            connection_pool.clone(),
+            http2_pool.clone(),
+            grpc_pool.clone(),
+            h3_pool.clone(),
+            env_config_arc.mesh_svid_rotation_drain_seconds,
+            health_check_restart_rx.clone(),
+        ));
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
             env_config_arc.circuit_breaker_cache_max_entries,
@@ -2104,6 +2200,8 @@ impl ProxyState {
             gateway_file_svid_bundle,
             gateway_trust_bundles,
             mesh_inbound_tls,
+            backend_svid_rotation_tx,
+            backend_svid_generation,
         };
         Ok((state, health_check_handles))
     }
@@ -15827,6 +15925,25 @@ mod tests {
         ProxyState::new(initial_config, dns_cache, env_config, None, None)
             .expect("ProxyState construction should succeed in tests")
             .0
+    }
+
+    #[tokio::test]
+    async fn backend_svid_rotation_channel_updates_pool_generation() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        assert_eq!(state.backend_svid_generation.load(Ordering::Acquire), 0);
+
+        state.backend_svid_rotation_tx.send_replace(7);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.backend_svid_generation.load(Ordering::Acquire) == 7 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("backend SVID generation should update");
     }
 
     fn make_validation_proxy(id: &str, listen_path: &str) -> Proxy {

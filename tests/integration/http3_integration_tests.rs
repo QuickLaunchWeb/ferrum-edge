@@ -327,6 +327,7 @@ async fn test_http3_proxy_state_creation() {
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
+    let (backend_svid_rotation_tx, _) = tokio::sync::watch::channel(0u64);
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -413,6 +414,8 @@ async fn test_http3_proxy_state_creation() {
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
+        backend_svid_rotation_tx,
+        backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Verify proxy state is created successfully
@@ -586,6 +589,7 @@ async fn test_http3_full_integration() {
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
+    let (backend_svid_rotation_tx, _) = tokio::sync::watch::channel(0u64);
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -672,6 +676,8 @@ async fn test_http3_full_integration() {
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
+        backend_svid_rotation_tx,
+        backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Verify proxy state is created successfully

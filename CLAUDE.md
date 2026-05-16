@@ -119,6 +119,8 @@ All file-based TLS materials are **static operational inputs**. Cert/key changes
 
 Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply for mesh HTTP/HBONE termination listeners. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config. Frontend cert/key paths still require restart.
 
+Narrow backend carve-out: backend client SVIDs are hot-swappable on rotation. Backend pools include a SVID generation in their keys, drain old numeric SVID-generation TLS config cache entries on each successful revision, and optionally force-drain old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. Backend CA bundles and operator-supplied backend client cert/key paths remain static startup inputs.
+
 ### Graceful Shutdown
 
 SIGTERM/SIGINT → accept loops exit → drain (`OverloadState.draining=true`, `Connection: close` on responses, wait up to `FERRUM_SHUTDOWN_DRAIN_SECONDS` for `active_connections` + `active_requests` to reach zero via RAII guards; `Notify::notify_one()` on last drop) → 5s background cleanup → exit.
@@ -414,10 +416,10 @@ Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain,
 
 Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include every field affecting connection identity (destination, TLS trust, client credentials, DNS routing). Missing field = pool poisoning; extra = fragmentation. `|` delimiter (IPv6 colons would be ambiguous).
 
-- **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
-- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
-- **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` (always TLS)
-- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{verify}` — matches `backend_capabilities::capability_key` so probe classification and QUIC reuse stay aligned. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` for the same reason.
+- **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
+- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
+- **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` + shard `#N` (always TLS)
+- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}`. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` so retry/probe paths include the same backend identity fields. Backend capability keys remain a protocol-classification key and use the static SVID-generation marker; rotation is handled by pool-key partitioning.
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
 

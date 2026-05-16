@@ -344,7 +344,7 @@ pub fn capability_key(proxy: &Proxy) -> String {
 /// they're reusing one (see `BackendCapabilityRegistry::get`).
 ///
 /// Key shape:
-/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|hbone_port`.
+/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=static|hbone_port`.
 /// `|` delimiter matches the pool-key conventions in the rest of the code.
 /// The HBONE port field is populated only when the upstream target opts into
 /// HBONE; direct backend capability observations remain shared for ordinary
@@ -372,6 +372,7 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
         proxy.resolved_tls.client_cert_path.as_deref(),
         proxy.resolved_tls.client_key_path.as_deref(),
         proxy.resolved_tls.verify_server_cert,
+        None,
     );
     buf.push('|');
     if let Some(port) = hbone_port {
