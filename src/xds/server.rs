@@ -362,11 +362,54 @@ impl XdsAdsServer {
             &subscription.type_url,
             &snapshot.version,
         );
-        let resources = snapshot.filtered_resources(
+        let candidates = snapshot.filtered_resources(
             &subscription.type_url,
             &subscription.resource_names,
             subscription.wildcard,
         );
+        // True delta semantics — only include resources that have CHANGED
+        // since the client's last-known state, plus any resource the client
+        // explicitly re-subscribed to (so a re-subscribe always re-flows a
+        // fresh copy even if unchanged). The wire-byte reduction is the
+        // point of delta xDS; sending unchanged resources on every snapshot
+        // turn defeats the protocol's purpose.
+        //
+        // "Client's last-known state" is either:
+        //   1. `initial_resource_versions` — the client's per-resource
+        //      version map, sent in the first delta request after a
+        //      reconnect; or
+        //   2. the server-side `previous` snapshot, when we know what the
+        //      client received last over this stream.
+        //
+        // If neither source has the resource, treat it as new and include
+        // it.
+        let explicit_subscribe_set: HashSet<&str> = explicitly_subscribed_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != "*")
+            .collect();
+        let previous_resources_by_name =
+            previous_resources_indexed(previous, &subscription.type_url);
+        let resources: Vec<_> = candidates
+            .into_iter()
+            .filter(|resource| {
+                if explicit_subscribe_set.contains(resource.name.as_str()) {
+                    return true;
+                }
+                if let Some(client_version) = initial_resource_versions.get(&resource.name)
+                    && client_version == &resource.version
+                {
+                    return false;
+                }
+                if let Some(prev_resource) = previous_resources_by_name.get(resource.name.as_str())
+                    && prev_resource.version == resource.version
+                    && prev_resource.value == resource.value
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
         let current_names: HashSet<String> = snapshot
             .resources(&subscription.type_url)
             .iter()
@@ -1170,6 +1213,20 @@ fn resolve_stream_node_id(
             "xDS Node.id cannot change on an established stream: {current} -> {requested}"
         ))),
     }
+}
+
+fn previous_resources_indexed<'a>(
+    previous: Option<&'a XdsSnapshot>,
+    type_url: &str,
+) -> HashMap<&'a str, &'a super::snapshot::XdsResource> {
+    previous
+        .map(|prev| {
+            prev.resources(type_url)
+                .iter()
+                .map(|resource| (resource.name.as_str(), resource))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn subscription_resources_changed(
@@ -2398,5 +2455,193 @@ mod tests {
         drop(second);
         assert!(server.snapshot_cache.get("node-a").is_none());
         assert!(server.nonce_tracker.is_empty());
+    }
+
+    // ── Delta wire-byte reduction (GAP-2L.2) ──
+    //
+    // True delta xDS only sends resources the client doesn't already have:
+    // - Resources known via `initial_resource_versions` with a matching version
+    //   are omitted (the client already has the same bytes).
+    // - Resources whose previous snapshot version + value match are omitted
+    //   (no change since the last response on this stream).
+    // - Explicit re-subscribes still re-flow a fresh copy of the resource.
+
+    #[test]
+    fn delta_response_skips_unchanged_resources_against_previous_snapshot() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        // Update only "admin"; keep "api" identical to provoke wire-byte
+        // reduction on the unchanged resource.
+        let mut next_config = gateway_config_with_services(&["api", "admin"], 1);
+        if let Some(mesh) = next_config.mesh.as_mut() {
+            for service in &mut mesh.services {
+                if service.name == "admin"
+                    && let Some(port) = service.ports.first_mut()
+                {
+                    port.port = 8081;
+                }
+            }
+        }
+        let next_snapshot = server.snapshot_for_config("node-a", &next_config);
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n == "cluster/default/api/8080"),
+            "unchanged resource should be omitted from delta response, got: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("cluster/default/admin/")),
+            "changed resource should appear, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn delta_response_skips_unchanged_resources_against_initial_resource_versions() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let cluster_version = snapshot
+            .resources(super::super::translator::CDS_TYPE_URL)
+            .iter()
+            .find(|r| r.name == cluster_name)
+            .map(|r| r.version.clone())
+            .expect("CDS resource should be present");
+
+        let initial_resource_versions = HashMap::from([(cluster_name.clone(), cluster_version)]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        assert!(
+            response.resources.is_empty(),
+            "client-known resource should be omitted on initial delta sync, got: {:?}",
+            response
+                .resources
+                .iter()
+                .map(|r| &r.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn delta_response_includes_resource_with_changed_version_against_initial() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+        let initial_resource_versions =
+            HashMap::from([(cluster_name.clone(), "v-stale".to_string())]);
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &initial_resource_versions,
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "stale-version resource should be re-flowed on initial delta sync"
+        );
+    }
+
+    #[test]
+    fn delta_response_resends_explicitly_resubscribed_unchanged_resource() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let next_snapshot =
+            server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let cluster_name = "cluster/default/api/8080".to_string();
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: vec![cluster_name.clone()],
+                wildcard: false,
+            },
+            &HashMap::new(),
+            std::slice::from_ref(&cluster_name),
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![cluster_name],
+            "explicit re-subscribe should re-flow the resource even when unchanged"
+        );
+    }
+
+    #[test]
+    fn delta_response_includes_new_resource_not_in_previous_snapshot() {
+        let server = test_server(gateway_config_with_services(&["api"], 0));
+        let previous =
+            server.snapshot_for_config("node-a", &gateway_config_with_services(&["api"], 0));
+        let next_snapshot = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "billing"], 1),
+        );
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        let names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster/default/billing/8080".to_string()],
+            "delta should ship the newly-introduced resource only"
+        );
     }
 }

@@ -1071,7 +1071,13 @@ Ferrum's ADS server honors explicit SotW (State-of-the-World) resource subscript
 
 Delta-xDS subscriptions across the same type URLs are additive: `resource_names_subscribe` appends to the per-stream subscription set and `resource_names_unsubscribe` removes from it, with empty lists treated as no-ops. Subscriptions persist across requests on the same stream, and updates only mutate the explicit subscription state without broadcasting unrelated resources.
 
-Delta xDS wire-byte optimization and ECDS `TypedExtensionConfig` resources remain staged follow-ups in the GAP-2L track; the current support is the explicit-resource subscription state machine.
+Delta-xDS responses ship only resources the client doesn't already have. Each resource carries a content-derived per-resource version (a SHA-256 prefix over `type_url + name + value`), independent of the aggregate snapshot version. Two snapshots that contain byte-identical bytes for a resource produce identical resource versions, so:
+
+- `DeltaDiscoveryRequest.initial_resource_versions` lets a client report what it currently has after a reconnect — resources whose versions match are skipped on the response.
+- Resources that were on the previous response over the same stream and whose bytes haven't changed are skipped on the next response.
+- Explicit `resource_names_subscribe` always re-flows the resource even when unchanged, so a re-subscribe always returns a fresh copy.
+
+ECDS `TypedExtensionConfig` resources remain a staged follow-up in the GAP-2L track.
 
 ## Istio Compatibility Gaps
 
