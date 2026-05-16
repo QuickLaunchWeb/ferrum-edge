@@ -2512,41 +2512,18 @@ async fn handle_h3_request(
                 attempt += 1;
 
                 // Try a different target on retry if load balancing is configured
-                if let (Some(upstream_id), Some(prev_target)) =
+                if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = {
-                        let health_ctx = crate::load_balancer::HealthContext {
-                            active_unhealthy: &state.health_checker.active_unhealthy_targets,
-                            proxy_passive: state
-                                .health_checker
-                                .passive_health
-                                .get(&proxy.id)
-                                .map(|r| r.value().clone()),
-                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                            ),
-                        };
-                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                            LoadBalancerCache::select_next_target_subset_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                                hash_key,
-                                subset_name,
-                                prev_target,
-                                Some(&health_ctx),
-                            )
-                        } else {
-                            LoadBalancerCache::select_next_target_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                                hash_key,
-                                prev_target,
-                                Some(&health_ctx),
-                            )
-                        }
-                    }
+                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        &proxy_headers,
+                    )
                 {
                     current_url = crate::proxy::build_backend_url_with_target(
                         &proxy,
@@ -3047,8 +3024,21 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+            proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();

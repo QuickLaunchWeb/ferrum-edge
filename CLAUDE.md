@@ -167,7 +167,7 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Istio empty-rule semantics**: K8s translation must preserve `AuthorizationPolicy` action semantics. `ALLOW` with no `rules` is allow-nothing (emit a never-matching rule); `DENY`/`AUDIT` with no `rules` are no-ops. Do not collapse all empty-rule policies to the same representation.
 
-**DestinationRule port-level settings**: only `connectionPool.tcp.connectTimeout` is enforced today. Per-port `loadBalancer`/`outlierDetection` are parsed but warning-only (one balancer + one passive-health-check per upstream). Phantom ports (DR entries whose port isn't on any target) are skipped with a warning. Admin-API POST/PUT setting `Upstream.port_overrides` is rejected — canonical surface is a DestinationRule.
+**DestinationRule port-level settings**: `connectionPool.tcp.connectTimeout` lands on `Upstream.port_overrides[port].connect_timeout_ms` and is enforced by HTTP/H2/H3, gRPC, TCP, and HBONE dispatch. Per-port `loadBalancer` and `outlierDetection` land on the same slot and are enforced by HTTP-family / gRPC / WebSocket / HBONE dispatch via isolated per-port LB counters/hash rings and passive thresholds. TCP/UDP/DTLS stream proxies currently enforce only `connect_timeout_ms` and use upstream-level LB/passive policy. Phantom ports (DR entries whose port isn't on any target) are skipped with a warning. Admin-API POST/PUT setting `Upstream.port_overrides` is rejected — canonical surface is a DestinationRule.
 
 **Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-passthrough TCP proxies (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from ServiceEntries with `location: mesh_external` (egress topology only).
 

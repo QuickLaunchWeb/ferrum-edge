@@ -1426,7 +1426,8 @@ async fn handle_tcp_connection_inner(
         let effective_backend_connect_timeout_ms = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&backend_port).copied())
+            .and_then(|m| m.get(&backend_port))
+            .and_then(|override_config| override_config.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
 
         let params = TcpConnParams {

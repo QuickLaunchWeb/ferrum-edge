@@ -4325,41 +4325,18 @@ async fn handle_websocket_request_authenticated(
                     ws_attempt += 1;
 
                     // Try a different target on retry if load balancing is configured
-                    if let (Some(upstream_id), Some(prev_target)) =
+                    if let (Some(_upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = {
-                            let health_ctx = crate::load_balancer::HealthContext {
-                                active_unhealthy: &state.health_checker.active_unhealthy_targets,
-                                proxy_passive: state
-                                    .health_checker
-                                    .passive_health
-                                    .get(&proxy.id)
-                                    .map(|r| r.value().clone()),
-                                max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                    &epoch.load_balancer,
-                                    upstream_id,
-                                ),
-                            };
-                            if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                                LoadBalancerCache::select_next_target_subset_from(
-                                    &epoch.load_balancer,
-                                    upstream_id,
-                                    hash_key,
-                                    subset_name,
-                                    prev_target,
-                                    Some(&health_ctx),
-                                )
-                            } else {
-                                LoadBalancerCache::select_next_target_from(
-                                    &epoch.load_balancer,
-                                    upstream_id,
-                                    hash_key,
-                                    prev_target,
-                                    Some(&health_ctx),
-                                )
-                            }
-                        }
+                        && let Some(next) = backend_dispatch::select_next_retry_target(
+                            &state,
+                            &epoch,
+                            &proxy,
+                            prev_target,
+                            hash_key,
+                            &ctx.client_ip,
+                            &ctx.headers,
+                        )
                     {
                         current_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
@@ -4556,8 +4533,21 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = backend_dispatch::has_effective_port_override(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -8054,41 +8044,18 @@ async fn handle_proxy_request_inner(
                 grpc_attempt += 1;
 
                 // Try a different target on retry if load balancing is configured
-                if let (Some(upstream_id), Some(prev_target)) =
+                if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = {
-                        let health_ctx = crate::load_balancer::HealthContext {
-                            active_unhealthy: &state.health_checker.active_unhealthy_targets,
-                            proxy_passive: state
-                                .health_checker
-                                .passive_health
-                                .get(&proxy.id)
-                                .map(|r| r.value().clone()),
-                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                            ),
-                        };
-                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                            LoadBalancerCache::select_next_target_subset_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                                hash_key,
-                                subset_name,
-                                prev_target,
-                                Some(&health_ctx),
-                            )
-                        } else {
-                            LoadBalancerCache::select_next_target_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                                hash_key,
-                                prev_target,
-                                Some(&health_ctx),
-                            )
-                        }
-                    }
+                    && let Some(next) = backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        proxy_headers,
+                    )
                 {
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
@@ -8610,10 +8577,24 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
+                    let has_port_override = backend_dispatch::has_effective_port_override(
+                        &proxy,
                         &epoch.load_balancer,
                         upstream_id,
+                        target.port,
                     );
+                    let strategy = if has_port_override {
+                        LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            target.port,
+                        )
+                    } else {
+                        LoadBalancerCache::get_hash_on_strategy_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                        )
+                    };
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
                             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -8897,40 +8878,17 @@ async fn handle_proxy_request_inner(
             // LB returns the same host:port (single-backend, sticky LB), the
             // snapshot stays unchanged so same-target retries keep the
             // same protocol.
-            if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
+            if let (Some(_upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = {
-                    let health_ctx = crate::load_balancer::HealthContext {
-                        active_unhealthy: &state.health_checker.active_unhealthy_targets,
-                        proxy_passive: state
-                            .health_checker
-                            .passive_health
-                            .get(&proxy.id)
-                            .map(|r| r.value().clone()),
-                        max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                        ),
-                    };
-                    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                        LoadBalancerCache::select_next_target_subset_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            hash_key,
-                            subset_name,
-                            prev_target,
-                            Some(&health_ctx),
-                        )
-                    } else {
-                        LoadBalancerCache::select_next_target_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            hash_key,
-                            prev_target,
-                            Some(&health_ctx),
-                        )
-                    }
-                }
+                && let Some(next) = backend_dispatch::select_next_retry_target(
+                    &state,
+                    &epoch,
+                    &proxy,
+                    prev_target,
+                    hash_key,
+                    &ctx.client_ip,
+                    proxy_headers,
+                )
             {
                 let target_changed = next.host != prev_target.host || next.port != prev_target.port;
                 current_url = build_backend_url_with_target(
@@ -9318,8 +9276,21 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = backend_dispatch::has_effective_port_override(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target.port,
+        );
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -9762,7 +9733,10 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(&override_ms) = overrides.get(&target.port) else {
+    let Some(override_config) = overrides.get(&target.port) else {
+        return std::borrow::Cow::Borrowed(proxy);
+    };
+    let Some(override_ms) = override_config.connect_timeout_ms else {
         return std::borrow::Cow::Borrowed(proxy);
     };
     if override_ms == proxy.backend_connect_timeout_ms {
@@ -9772,6 +9746,25 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let mut owned = proxy.clone();
     owned.backend_connect_timeout_ms = override_ms;
     std::borrow::Cow::Owned(owned)
+}
+
+/// Resolve the per-port retry lane after a concrete target has failed.
+///
+/// Initial selection may use the full upstream for mixed-port target sets when
+/// no request destination port is known yet. Retry is different: we have a
+/// failed `prev_target`, so staying in that target's configured port lane
+/// avoids switching destination ports and bypassing port-scoped LB/passive
+/// policy on the retry attempt.
+pub(crate) fn retry_port_override_dispatch_port(
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+) -> Option<u16> {
+    let dispatch_port = prev_target.port;
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.contains_key(&dispatch_port))
+        .then_some(dispatch_port)
 }
 
 /// Resolve the effective `Proxy` for backend pools that build their key and
@@ -13291,6 +13284,46 @@ mod tests {
     }
 
     #[test]
+    fn retry_port_override_dispatch_port_uses_selected_target_port() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.upstream_id = Some("u1".to_string());
+        proxy.backend_port = 0;
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::RoundRobin),
+                ..Default::default()
+            },
+        )]));
+
+        let selected_overridden_target = UpstreamTarget {
+            host: "a".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        };
+        let selected_non_overridden_target = UpstreamTarget {
+            host: "b".to_string(),
+            port: 9090,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        };
+
+        assert_eq!(
+            retry_port_override_dispatch_port(&proxy, &selected_overridden_target),
+            Some(8080),
+            "retries should stay in the failed target's per-port lane when one exists"
+        );
+        assert_eq!(
+            retry_port_override_dispatch_port(&proxy, &selected_non_overridden_target),
+            None,
+            "targets without a configured port override keep upstream-level retry selection"
+        );
+    }
+
+    #[test]
     fn websocket_flavor_does_not_allow_request_body_buffering() {
         assert!(
             !http_flavor_allows_request_body_buffering(HttpFlavor::WebSocket),
@@ -15958,7 +15991,20 @@ mod tests {
         proxy.dispatch_port_overrides = if overrides.is_empty() {
             None
         } else {
-            Some(overrides.iter().copied().collect())
+            Some(
+                overrides
+                    .iter()
+                    .map(|(port, timeout)| {
+                        (
+                            *port,
+                            crate::config::types::ResolvedPortOverride {
+                                connect_timeout_ms: Some(*timeout),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            )
         };
         proxy
     }
@@ -16116,6 +16162,7 @@ mod tests {
             8080,
             UpstreamPortOverride {
                 connect_timeout_ms: Some(750),
+                ..Default::default()
             },
         );
 
@@ -16132,7 +16179,10 @@ mod tests {
             .dispatch_port_overrides
             .as_ref()
             .expect("upstream has overrides → proxy must get the map");
-        assert_eq!(projected.get(&8080).copied(), Some(750));
+        assert_eq!(
+            projected.get(&8080).and_then(|ovr| ovr.connect_timeout_ms),
+            Some(750)
+        );
 
         // Upstreams without overrides should NOT install an empty map on the
         // proxy — that would defeat the fast-path None check.

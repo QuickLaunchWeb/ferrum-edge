@@ -204,13 +204,9 @@ pub struct SubsetTrafficPolicy {
 ///
 /// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
 /// (see [`crate::modes::mesh::config::MeshDestinationRule::port_level_settings`]).
-/// Currently only `connect_timeout_ms` is enforced at request time — it is
-/// resolved by [`Upstream::effective_connect_timeout_ms`] which the dispatch
-/// path consults via the helper in `crate::proxy::port_override`. Per-port LB
-/// algorithm / hash-key overrides are not yet enforced (one `LoadBalancer`
-/// per upstream today, not per upstream+port) and are intentionally absent
-/// from this struct — the translator emits a warning when Istio operators
-/// configure them so they know the gap.
+/// The gateway projects these into [`ResolvedPortOverride`] on each referencing
+/// `Proxy` during config resolution so request dispatch can consult a
+/// precomputed map instead of re-deriving DestinationRule policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UpstreamPortOverride {
     /// Per-port backend connect timeout override (milliseconds). Consulted on
@@ -218,6 +214,49 @@ pub struct UpstreamPortOverride {
     /// in `Upstream.port_overrides`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
+    /// Per-port load-balancing algorithm override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<LoadBalancerAlgorithm>,
+    /// Per-port consistent-hash key override. Uses the same `"ip"`,
+    /// `"header:<name>"`, and `"cookie:<name>"` syntax as `Upstream.hash_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on: Option<String>,
+    /// Per-port passive health override mapped from DestinationRule
+    /// `outlierDetection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passive_health_check: Option<PassiveHealthCheck>,
+}
+
+/// Cold-path projection of an [`UpstreamPortOverride`] onto a `Proxy`.
+///
+/// This is intentionally skipped during serde because it is derived state:
+/// upstreams own the mesh policy, proxies cache the small per-port view needed
+/// by request dispatch.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedPortOverride {
+    pub connect_timeout_ms: Option<u64>,
+    pub algorithm: Option<LoadBalancerAlgorithm>,
+    pub hash_on: Option<String>,
+    pub passive_health_check: Option<PassiveHealthCheck>,
+}
+
+impl ResolvedPortOverride {
+    pub fn from_upstream_override(value: &UpstreamPortOverride) -> Option<Self> {
+        let resolved = Self {
+            connect_timeout_ms: value.connect_timeout_ms,
+            algorithm: value.algorithm,
+            hash_on: value.hash_on.clone(),
+            passive_health_check: value.passive_health_check.clone(),
+        };
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.connect_timeout_ms.is_none()
+            && self.algorithm.is_none()
+            && self.hash_on.is_none()
+            && self.passive_health_check.is_none()
+    }
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -348,7 +387,7 @@ fn default_healthy_status_codes() -> Vec<u16> {
 /// 2. **On-success recovery**: If a request to the target succeeds
 ///    (e.g., via the all-unhealthy fallback path), it is immediately
 ///    marked healthy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PassiveHealthCheck {
     #[serde(default = "default_passive_unhealthy_codes")]
     pub unhealthy_status_codes: Vec<u16>,
@@ -1183,7 +1222,7 @@ pub struct Proxy {
     /// `GatewayConfig::resolve_dispatch_port_overrides()` after mesh
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
-    pub dispatch_port_overrides: Option<HashMap<u16, u64>>,
+    pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -1749,9 +1788,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Project per-port `connect_timeout_ms` overrides from each proxy's
-    /// referenced upstream onto `Proxy.dispatch_port_overrides` for O(1)
-    /// hot-path resolution.
+    /// Project per-port overrides from each proxy's referenced upstream onto
+    /// `Proxy.dispatch_port_overrides` for O(1) hot-path resolution.
     ///
     /// Must be called AFTER `apply_destination_rules` has populated
     /// `Upstream.port_overrides`. With this precomputed map on `Proxy`,
@@ -1761,15 +1799,18 @@ impl GatewayConfig {
     /// Same pattern as `resolve_upstream_tls` — derived projection cached on
     /// the proxy so the request path never re-derives it.
     pub fn resolve_dispatch_port_overrides(&mut self) {
-        let by_upstream: HashMap<&str, HashMap<u16, u64>> = self
+        let by_upstream: HashMap<&str, HashMap<u16, ResolvedPortOverride>> = self
             .upstreams
             .iter()
             .filter(|u| !u.port_overrides.is_empty())
             .map(|u| {
-                let ports: HashMap<u16, u64> = u
+                let ports: HashMap<u16, ResolvedPortOverride> = u
                     .port_overrides
                     .iter()
-                    .filter_map(|(port, ovr)| ovr.connect_timeout_ms.map(|t| (*port, t)))
+                    .filter_map(|(port, ovr)| {
+                        ResolvedPortOverride::from_upstream_override(ovr)
+                            .map(|resolved| (*port, resolved))
+                    })
                     .collect();
                 (u.id.as_str(), ports)
             })

@@ -90,7 +90,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer, Proxy, Upstream};
+use crate::config::types::{
+    BackendScheme, BackendTlsConfig, Consumer, Proxy, ResolvedPortOverride, Upstream,
+};
 use crate::consumer_index::ConsumerIndex;
 
 /// Protocol categories that plugins can declare support for.
@@ -763,11 +765,15 @@ pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
     matches!(name, "baggage" | "sec-websocket-protocol")
 }
 
-fn dispatch_port_overrides_from_upstream(upstream: &Upstream) -> Option<HashMap<u16, u64>> {
-    let overrides: HashMap<u16, u64> = upstream
+fn dispatch_port_overrides_from_upstream(
+    upstream: &Upstream,
+) -> Option<HashMap<u16, ResolvedPortOverride>> {
+    let overrides: HashMap<u16, ResolvedPortOverride> = upstream
         .port_overrides
         .iter()
-        .filter_map(|(port, ovr)| ovr.connect_timeout_ms.map(|timeout| (*port, timeout)))
+        .filter_map(|(port, ovr)| {
+            ResolvedPortOverride::from_upstream_override(ovr).map(|resolved| (*port, resolved))
+        })
         .collect();
     if overrides.is_empty() {
         None
