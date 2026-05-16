@@ -1083,7 +1083,7 @@ Delta-xDS responses ship only resources the client doesn't already have. Each re
 - Resources that were on the previous ACKed response for the same type URL and whose bytes haven't changed are skipped on the next response.
 - Explicit `resource_names_subscribe` always re-flows the resource even when unchanged, so a re-subscribe always returns a fresh copy.
 
-ECDS `TypedExtensionConfig` resources remain a staged follow-up in the GAP-2L track.
+ECDS (Extension Config Discovery Service) — `type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig` — is served alongside the standard xDS resource types. Operators populate `MeshConfig.extension_configs` with `MeshExtensionConfig { name, type_url, value }` entries; slice construction carries them into `MeshSlice.extension_configs`, and the translator emits one ECDS resource per entry whose payload is the encoded `TypedExtensionConfig` (with the inner `Any` carrying the operator-defined `type_url` and bytes). The GAP-2K DestinationRule-carrier path uses inner `type_url == type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier` to ship the original DR JSON across xDS when full DR semantics are required. Delta wire-byte reduction (GAP-2L.2) extends to ECDS naturally because per-resource versions are content-derived.
 
 ## Istio Compatibility Gaps
 

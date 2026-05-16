@@ -32,6 +32,6 @@ pub use server::XdsAdsServer;
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]
 pub use translator::{
-    CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
-    translate_mesh_slice_to_snapshot,
+    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
+    RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_mesh_slice_to_snapshot,
 };

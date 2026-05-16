@@ -12,13 +12,22 @@ pub const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Clus
 pub const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 pub const SDS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
+pub const ECDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig";
 
-pub const XDS_TYPE_URLS: [&str; 5] = [
+/// Inner `type_url` Ferrum uses for the DestinationRule-carrier ECDS payload.
+/// CPs that want full DR semantics across xDS wrap the original DR JSON in a
+/// TypedExtensionConfig with this inner type. GAP-2K's recovery path
+/// recognizes the marker and applies the embedded DR locally.
+pub const FERRUM_ECDS_DESTINATION_RULE_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier";
+
+pub const XDS_TYPE_URLS: [&str; 6] = [
     LDS_TYPE_URL,
     RDS_TYPE_URL,
     CDS_TYPE_URL,
     EDS_TYPE_URL,
     SDS_TYPE_URL,
+    ECDS_TYPE_URL,
 ];
 
 pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
@@ -28,6 +37,7 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     resources.extend(translate_cds(slice));
     resources.extend(translate_eds(slice));
     resources.extend(translate_sds(slice));
+    resources.extend(translate_ecds(slice));
     // Per-resource versions are content-derived so two snapshots with the
     // same resource bytes carry identical resource versions. This is the
     // basis for delta xDS wire-byte reduction: clients that report the
@@ -145,6 +155,42 @@ pub fn translate_eds(slice: &MeshSlice) -> Vec<XdsResource> {
                 proto::ClusterLoadAssignment { cluster_name: name },
             );
         }
+    }
+    resources
+}
+
+/// Translate operator-defined `MeshSlice.extension_configs` into ECDS resources.
+///
+/// Each entry becomes a top-level `XdsResource` whose `value` is the encoded
+/// `envoy.config.core.v3.TypedExtensionConfig` (i.e., `{name, typed_config:
+/// Any{type_url, value}}`). Clients subscribe under `ECDS_TYPE_URL` and
+/// dispatch on the inner `typed_config.type_url`.
+///
+/// The GAP-2K DestinationRule-carrier path emits one entry per DR with the
+/// inner `type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` and the original
+/// DR JSON as the inner bytes; the DP xDS consumer recognizes that marker
+/// and applies the embedded DR locally.
+pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
+    let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
+    for extension in &slice.extension_configs {
+        if extension.name.is_empty() || !seen_names.insert(extension.name.clone()) {
+            continue;
+        }
+        let typed_config = proto::Any {
+            type_url: extension.type_url.clone(),
+            value: extension.value.clone(),
+        };
+        let message = proto::TypedExtensionConfig {
+            name: extension.name.clone(),
+            typed_config: Some(typed_config),
+        };
+        resources.push(resource(
+            extension.name.clone(),
+            ECDS_TYPE_URL,
+            &slice.version,
+            message,
+        ));
     }
     resources
 }

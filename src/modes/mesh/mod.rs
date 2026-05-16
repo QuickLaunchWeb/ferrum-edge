@@ -4996,6 +4996,7 @@ mod tests {
             multi_cluster: None,
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
+            extension_configs: Vec::new(),
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
