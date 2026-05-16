@@ -204,37 +204,16 @@ impl NodeWaypointIdentityResolver {
         self.identities_by_pod_uid.len()
     }
 
-    /// Total cookie records (IPv4 + IPv6) currently tracked. Useful for the
-    /// admin endpoint summary so operators see "1k cookies / 10 identities"
-    /// without scanning per-identity entries.
+    /// Per-family cookie-record counts `(ipv4, ipv6)` currently tracked.
+    /// Useful for the admin endpoint summary so operators see
+    /// "1k cookies / 10 identities" without scanning per-identity entries.
     pub fn cookie_count(&self) -> (usize, usize) {
         (
             self.orig_dst4_by_cookie.len(),
             self.orig_dst6_by_cookie.len(),
         )
     }
-}
 
-/// One enrolled identity as exposed via `GET /node-waypoint/identities`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeWaypointIdentitySummary {
-    pub pod_uid: [u8; 16],
-    pub spiffe_id: String,
-    pub workload_spiffe_hash: u64,
-    pub orig_dst4_cookies: usize,
-    pub orig_dst6_cookies: usize,
-    pub has_policy_scope: bool,
-}
-
-impl NodeWaypointIdentitySummary {
-    /// Hyphenated lowercase UUID rendering of the pod UID. Matches the
-    /// Kubernetes `metadata.uid` format operators see in `kubectl` output.
-    pub fn pod_uid_string(&self) -> String {
-        pod_uid_label(&self.pod_uid)
-    }
-}
-
-impl NodeWaypointIdentityResolver {
     pub fn resolve_stream(
         &self,
         stream: &TcpStream,
@@ -289,6 +268,25 @@ impl NodeWaypointIdentityResolver {
 impl Default for NodeWaypointIdentityResolver {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+/// One enrolled identity as exposed via `GET /node-waypoint/identities`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeWaypointIdentitySummary {
+    pub pod_uid: [u8; 16],
+    pub spiffe_id: String,
+    pub workload_spiffe_hash: u64,
+    pub orig_dst4_cookies: usize,
+    pub orig_dst6_cookies: usize,
+    pub has_policy_scope: bool,
+}
+
+impl NodeWaypointIdentitySummary {
+    /// Hyphenated lowercase UUID rendering of the pod UID. Matches the
+    /// Kubernetes `metadata.uid` format operators see in `kubectl` output.
+    pub fn pod_uid_string(&self) -> String {
+        pod_uid_label(&self.pod_uid)
     }
 }
 

@@ -627,6 +627,8 @@ Field semantics:
 
 The endpoint is cold-path: it iterates each shard of three `DashMap`s once. Don't poll faster than a few times per second on a busy node.
 
+## Mesh Egress Scope (mesh mode)
+
 Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).
 
 ### `GET /mesh/egress-scope`
