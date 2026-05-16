@@ -1107,6 +1107,7 @@ fn apply_traffic_policy_to_port_override(
     }
     if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
         slot.algorithm = Some(algorithm);
+        // Unconditional: clears stale hash keys when switching a port to a non-hash algorithm.
         slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {

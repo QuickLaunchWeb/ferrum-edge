@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Upstream, UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshSimpleLb, MeshTrafficPolicy,
+    MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
+    MeshTrafficPolicy,
 };
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
@@ -79,6 +80,19 @@ fn upstream() -> Upstream {
     }
 }
 
+fn proxy() -> Proxy {
+    serde_json::from_value(serde_json::json!({
+        "id": "reviews-p",
+        "namespace": "default",
+        "hosts": ["reviews.example.com"],
+        "backend_host": "reviews.default.svc.cluster.local",
+        "backend_port": 0,
+        "backend_scheme": "http",
+        "upstream_id": "reviews-u"
+    }))
+    .expect("proxy fixture")
+}
+
 #[test]
 fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
     let mut port_level_settings = HashMap::new();
@@ -112,4 +126,75 @@ fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
         .get(&8080)
         .expect("port override projected");
     assert_eq!(port_override.algorithm, Some(LoadBalancerAlgorithm::Random));
+}
+
+#[test]
+fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(5),
+                interval_seconds: Some(11),
+                base_ejection_seconds: Some(17),
+                max_ejection_percent: Some(50),
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let upstream_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("upstream port override projected");
+    assert_eq!(
+        upstream_override.algorithm,
+        Some(LoadBalancerAlgorithm::Random)
+    );
+    let upstream_passive = upstream_override
+        .passive_health_check
+        .as_ref()
+        .expect("upstream passive health projected");
+    assert_eq!(upstream_passive.unhealthy_threshold, 5);
+    assert_eq!(upstream_passive.unhealthy_window_seconds, 11);
+    assert_eq!(upstream_passive.healthy_after_seconds, 17);
+    assert_eq!(upstream_passive.max_ejection_percent, Some(50));
+
+    let dispatch_override = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .expect("proxy dispatch port override projected");
+    assert_eq!(
+        dispatch_override.algorithm,
+        Some(LoadBalancerAlgorithm::Random)
+    );
+    let dispatch_passive = dispatch_override
+        .passive_health_check
+        .as_ref()
+        .expect("dispatch passive health projected");
+    assert_eq!(dispatch_passive.unhealthy_threshold, 5);
+    assert_eq!(dispatch_passive.unhealthy_window_seconds, 11);
+    assert_eq!(dispatch_passive.healthy_after_seconds, 17);
+    assert_eq!(dispatch_passive.max_ejection_percent, Some(50));
 }

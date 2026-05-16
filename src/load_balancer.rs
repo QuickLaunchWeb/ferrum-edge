@@ -922,6 +922,7 @@ pub struct LoadBalancer {
     initial_dispatch_port_override: u16,
 }
 
+#[derive(Debug)]
 struct PortLbState {
     target_indices: Vec<usize>,
     algorithm: LoadBalancerAlgorithm,
