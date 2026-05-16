@@ -31,9 +31,9 @@ Pull Request
     └─► Five target release builds
 
 Push to main
-    ├─► Five target release builds
-    ├─► Replace latest GitHub prerelease
-    └─► Push Docker images to Docker Hub and GHCR
+    └─► Five target release builds
+            ├─► Replace latest GitHub prerelease
+            └─► Push Docker images to Docker Hub and GHCR
 ```
 
 ### Release Pipeline Flow
@@ -46,13 +46,14 @@ Push tag v* (e.g., v0.2.0)
         ├─► Build macos-x86_64
         ├─► Build macos-aarch64 (Apple Silicon)
         ├─► Build windows-x86_64
-        ├─► Push versioned Docker images to Docker Hub and GHCR
-        └─► Create GitHub Release with binaries and checksums
+        └─► Push versioned Docker images to Docker Hub and GHCR
+                └─► Create Docker manifest tags
+                        └─► Create GitHub Release with binaries and checksums
 ```
 
 ## CI Pipeline (ci.yml)
 
-The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease plus Docker images.
+The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run.
 
@@ -117,7 +118,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but the build step only runs when files under `ebpf/` changed relative to the PR base. When no eBPF files changed, the job no-ops and reports success.
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs the nightly toolchain, builds `ferrum-ebpf`, runs `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
 
 #### 5. Performance Regression Job
 
@@ -142,13 +143,13 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. The macOS x86_64 build uses the `macos-latest` runner and targets `x86_64-apple-darwin`; on Apple Silicon runners this is a cross-compile target.
+Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. All CI binary builds use `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build uses the ARM64 `macos-latest` runner and targets `x86_64-apple-darwin`, so it is a cross-compile target.
 
 #### 7. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, creates or replaces the `latest` prerelease, then builds and pushes multi-arch Docker images to Docker Hub and GHCR. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
+On pushes to `main`, the `latest-release` job and Docker publishing jobs both depend on the completed build matrix and then run in parallel. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-${{ github.sha }}` tags.
 
 ## Release Pipeline (release.yml)
 
@@ -183,13 +184,13 @@ Builds optimized release binaries for all target platforms:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
 3. Install protobuf compiler
-4. Build release binary in `--release` mode
+4. Build release binary in `--release` mode with `--features cloud-secrets`
 5. Generate SHA256 checksum
 6. Upload artifact
 
 **Cross-Compilation**:
 - Linux ARM64 uses `cross` tool for seamless compilation
-- Other targets use standard `cargo build`; macOS x86_64 is target-selected on the macOS runner.
+- Other targets use standard `cargo build`; macOS x86_64 is cross-compiled on the ARM64 `macos-latest` runner.
 
 **Output**:
 - Binary: `ferrum-edge-{platform}`
@@ -304,7 +305,7 @@ git push origin main
 **3. Wait for CI to Pass**
 
 - Push to main triggers CI pipeline
-- All jobs must pass (test, lint, build)
+- The main-push build and publish jobs must pass; PR-only test, lint, eBPF, and performance gates should already have passed before merge
 - Check GitHub Actions tab for status
 
 **4. Create and Push Version Tag**
@@ -342,20 +343,21 @@ sha256sum -c ferrum-edge-*.sha256
 If automatic release fails:
 
 ```bash
-# Build binaries manually
-cargo build --release --target x86_64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
-cargo build --release --target x86_64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-pc-windows-msvc
+# Build binaries manually with the same release features as CI
+cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
+cargo build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
+cargo build --features cloud-secrets --release --target x86_64-apple-darwin
+cargo build --features cloud-secrets --release --target aarch64-apple-darwin
+cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
 # Generate checksums
 find target \( -path '*/release/ferrum-edge' -o -path '*/release/ferrum-edge.exe' \) \
   -exec sha256sum {} \; > checksums.txt
 
 # Create release in GitHub UI or via gh:
+release_assets=$(find target \( -path '*/release/ferrum-edge' -o -path '*/release/ferrum-edge.exe' \))
 gh release create v0.2.0 \
-  target/*/release/ferrum-edge \
+  $release_assets \
   checksums.txt \
   --title "Release v0.2.0" \
   --notes "$(cat release-notes.md)"
@@ -434,7 +436,7 @@ sha256sum -c *.sha256
 
 ### Docker Images
 
-Pre-built Docker images are published to Docker Hub and GitHub Container Registry when credentials and workflow permissions are configured:
+Pre-built Docker images are published to Docker Hub and GitHub Container Registry by the main-push and version-tag workflows. Docker Hub credentials must be configured before those publish workflows run:
 
 ```bash
 docker pull ferrumedge/ferrum-edge:latest
@@ -464,9 +466,9 @@ Configure secrets for Docker image publishing and releases.
 
 ### Required Secrets
 
-#### Docker Registry (Optional)
+#### Docker Registry
 
-For pushing Docker Hub images:
+Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on main-push and version-tag Docker jobs, so missing secrets fail publishing:
 
 - `DOCKERHUB_USERNAME` - Docker Hub username
 - `DOCKERHUB_TOKEN` - Docker Hub access token
