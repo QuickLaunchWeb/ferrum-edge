@@ -1,20 +1,24 @@
 //! Integration coverage for per-upstream backend TLS SAN allow-lists.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Once;
 
 use bytes::Bytes;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
+use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::CertificateRevocationListDer;
 use tempfile::TempDir;
+
+static INIT_CRYPTO: Once = Once::new();
 
 struct GeneratedCa {
     cert_pem: String,
@@ -24,6 +28,12 @@ struct GeneratedCa {
 struct GeneratedCert {
     cert_pem: String,
     key_pem: String,
+}
+
+fn ensure_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn generate_ca(cn: &str) -> GeneratedCa {
@@ -129,9 +139,8 @@ async fn start_h2_tls_backend(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .filter_map(|cert| cert.ok())
-        .collect();
+    let certs: Vec<_> =
+        rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
     let private_key =
         rustls_pemfile::private_key(&mut key_pem.as_bytes())?.ok_or("missing private key")?;
 
@@ -140,7 +149,7 @@ async fn start_h2_tls_backend(
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(certs, private_key)?;
-    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -169,12 +178,29 @@ async fn start_h2_tls_backend(
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
     Ok((handle, port))
+}
+
+fn reqwest_client_for_proxy(proxy: &Proxy) -> reqwest::Client {
+    let crls: Vec<CertificateRevocationListDer<'static>> = Vec::new();
+    BackendTlsConfigBuilder {
+        proxy,
+        policy: None,
+        global_ca: None,
+        global_no_verify: false,
+        global_client_cert: None,
+        global_client_key: None,
+        crls: &crls,
+    }
+    .build_reqwest()
+    .expect("build reqwest TLS config")
+    .build()
+    .expect("build reqwest client")
 }
 
 #[tokio::test]
 async fn h2_backend_tls_san_allow_list_accepts_match_and_rejects_mismatch() {
+    ensure_crypto_provider();
     let ca = generate_ca("h2-san-ca");
     let backend = generate_leaf(&ca, "localhost", &["localhost"]);
     let (_handle, port) = start_h2_tls_backend(&backend.cert_pem, &backend.key_pem)
@@ -207,5 +233,41 @@ async fn h2_backend_tls_san_allow_list_accepts_match_and_rejects_mismatch() {
     assert!(
         matches!(err, Http2PoolError::BackendUnavailable { .. }),
         "expected TLS backend unavailable for SAN mismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reqwest_backend_tls_san_allow_list_accepts_match_and_rejects_mismatch() {
+    ensure_crypto_provider();
+    let ca = generate_ca("reqwest-san-ca");
+    let backend = generate_leaf(&ca, "localhost", &["localhost"]);
+    let (_handle, port) = start_h2_tls_backend(&backend.cert_pem, &backend.key_pem)
+        .await
+        .expect("start TLS backend");
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let ca_path = temp_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca.cert_pem).expect("write CA");
+    let ca_path = ca_path.display().to_string();
+
+    let matching = create_test_proxy(port, &ca_path, vec!["localhost".to_string()]);
+    let matching_client = reqwest_client_for_proxy(&matching);
+    let response = matching_client
+        .get(format!("https://localhost:{port}/"))
+        .send()
+        .await
+        .expect("matching SAN allow-list should connect through reqwest");
+    assert!(response.status().is_success());
+
+    let mismatching = create_test_proxy(port, &ca_path, vec!["other.local".to_string()]);
+    let mismatching_client = reqwest_client_for_proxy(&mismatching);
+    let err = mismatching_client
+        .get(format!("https://localhost:{port}/"))
+        .send()
+        .await
+        .expect_err("mismatching SAN allow-list should reject through reqwest");
+    assert!(
+        err.is_connect() || err.to_string().contains("SAN allow-list"),
+        "expected TLS connect failure for SAN mismatch, got {err:?}"
     );
 }

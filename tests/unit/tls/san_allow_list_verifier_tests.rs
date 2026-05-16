@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use ferrum_edge::tls::backend::{SanAllowListVerifier, build_root_cert_store};
@@ -44,16 +44,15 @@ fn generate_leaf(
     ip_sans: &[IpAddr],
 ) -> GeneratedCert {
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
-    let mut params = CertificateParams::new(
-        dns_sans
-            .iter()
-            .map(|san| san.to_string())
-            .collect::<Vec<_>>(),
-    )
-    .expect("leaf params");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
+    for dns in dns_sans {
+        params.subject_alt_names.push(SanType::DnsName(
+            Ia5String::try_from((*dns).to_string()).expect("DNS SAN"),
+        ));
+    }
     for uri in uri_sans {
         params.subject_alt_names.push(SanType::URI(
             Ia5String::try_from((*uri).to_string()).expect("URI SAN"),
@@ -115,6 +114,15 @@ fn dns_san_match_is_accepted() {
 }
 
 #[test]
+fn dns_san_match_is_case_insensitive() {
+    let ca = generate_ca("dns-case-ca");
+    let leaf = generate_leaf(&ca, "Backend.Test", &["Backend.Test"], &[], &[]);
+    let verifier = verifier_for_ca(&ca, &["backend.test"]);
+
+    verify(&verifier, &leaf, "backend.test").expect("DNS SAN case should not matter");
+}
+
+#[test]
 fn dns_san_mismatch_is_rejected() {
     let ca = generate_ca("dns-mismatch-ca");
     let leaf = generate_leaf(&ca, "backend.test", &["backend.test"], &[], &[]);
@@ -153,6 +161,17 @@ fn uri_spiffe_san_match_is_accepted() {
 }
 
 #[test]
+fn spiffe_uri_trust_domain_match_is_case_insensitive() {
+    let ca = generate_ca("spiffe-case-ca");
+    let cert_spiffe = "SPIFFE://Cluster.Local/ns/default/sa/backend";
+    let allow_spiffe = "spiffe://cluster.local/ns/default/sa/backend";
+    let leaf = generate_leaf(&ca, "backend.test", &["backend.test"], &[cert_spiffe], &[]);
+    let verifier = verifier_for_ca(&ca, &[allow_spiffe]);
+
+    verify(&verifier, &leaf, "backend.test").expect("SPIFFE trust domain case should not matter");
+}
+
+#[test]
 fn ip_san_match_is_accepted() {
     let ca = generate_ca("ip-ca");
     let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -160,6 +179,74 @@ fn ip_san_match_is_accepted() {
     let verifier = verifier_for_ca(&ca, &["127.0.0.1"]);
 
     verify(&verifier, &leaf, "localhost").expect("IP SAN should match");
+}
+
+#[test]
+fn ipv6_san_match_is_accepted() {
+    let ca = generate_ca("ipv6-ca");
+    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let leaf = generate_leaf(&ca, "localhost", &["localhost"], &[], &[ip]);
+    let verifier = verifier_for_ca(&ca, &["::1"]);
+
+    verify(&verifier, &leaf, "localhost").expect("IPv6 SAN should match");
+}
+
+#[test]
+fn ip_allow_list_does_not_match_dns_san_text() {
+    let ca = generate_ca("cross-type-ca");
+    let leaf = generate_leaf(
+        &ca,
+        "backend.test",
+        &["backend.test", "127.0.0.1"],
+        &[],
+        &[],
+    );
+    let verifier = verifier_for_ca(&ca, &["127.0.0.1"]);
+
+    let err = verify(&verifier, &leaf, "backend.test")
+        .expect_err("IP allow-list entry should not match a DNS SAN string");
+    assert!(
+        format!("{err:?}").contains("SAN allow-list"),
+        "expected SAN allow-list rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn mixed_allow_list_accepts_any_matching_type() {
+    let ca = generate_ca("mixed-ca");
+    let leaf = generate_leaf(&ca, "backend.test", &["backend.test"], &[], &[]);
+    let verifier = verifier_for_ca(
+        &ca,
+        &[
+            "spiffe://cluster.local/ns/default/sa/other",
+            "127.0.0.1",
+            "backend.test",
+        ],
+    );
+
+    verify(&verifier, &leaf, "backend.test").expect("matching DNS entry should pass");
+}
+
+#[test]
+fn invalid_allow_list_entries_are_rejected() {
+    let ca = generate_ca("invalid-allow-list-ca");
+    let temp_dir = TempDir::new().expect("temp dir");
+    let ca_path = write_ca(&temp_dir, &ca);
+    let root_store = build_root_cert_store(Some(&ca_path), None).expect("root store");
+    let inner = build_server_verifier_with_crls(root_store, &[]).expect("inner verifier");
+
+    for invalid in [
+        "*.example.com",
+        "spiffe://cluster.local",
+        "https://example.com/id",
+    ] {
+        let err = SanAllowListVerifier::new(inner.clone(), vec![invalid.to_string()])
+            .expect_err("invalid SAN allow-list entry should be rejected");
+        assert!(
+            format!("{err:?}").contains("SAN allow-list"),
+            "expected SAN allow-list parse error for {invalid}, got {err:?}"
+        );
+    }
 }
 
 #[test]
