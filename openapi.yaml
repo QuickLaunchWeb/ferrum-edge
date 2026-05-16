@@ -6774,7 +6774,7 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
       required:
         - spec_url
       properties:
@@ -6792,6 +6792,12 @@ components:
           format: uint64
           default: 300
           description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 26214400
+          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object

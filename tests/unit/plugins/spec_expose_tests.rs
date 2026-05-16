@@ -353,6 +353,34 @@ fn test_creation_accepts_zero_cache_ttl() {
     assert!(plugin.is_ok());
 }
 
+#[test]
+fn test_creation_rejects_non_integer_max_response_body_bytes() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "max_response_body_bytes": "large"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-integer max_response_body_bytes must be rejected");
+    assert!(err.contains("max_response_body_bytes"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_zero_max_response_body_bytes() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "max_response_body_bytes": 0
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("zero max_response_body_bytes must be rejected");
+    assert!(err.contains("greater than zero"), "got: {err}");
+}
+
 #[tokio::test]
 async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
     use wiremock::matchers::{method, path};
@@ -392,6 +420,173 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
             assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
         }
         other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_specz_request_allows_custom_cap_at_exact_body_size() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let body = b"openapi\n".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.clone())
+                .insert_header("content-type", "application/yaml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "max_response_body_bytes": body.len()
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            body: returned_body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(returned_body, bytes::Bytes::from(body));
+            assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_specz_request_rejects_oversized_content_length_spec_body() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_bytes(b"openapi: 3.0.0\ninfo: too large\n".to_vec()),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "max_response_body_bytes": 8
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("too large"), "got: {body}");
+            assert!(!body.contains("max_response_body_bytes"), "got: {body}");
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_specz_request_rejects_oversized_chunked_spec_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // The timeout below guards against this raw fixture hanging if the
+        // request/response plumbing changes.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for chunk in [
+            b"openapi: ".as_slice(),
+            b"3.0.0\n".as_slice(),
+            b"info: too large\n".as_slice(),
+        ] {
+            let head = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(chunk).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
+            if socket.flush().await.is_err() {
+                return;
+            }
+            // Best effort: separate writes make the fixture exercise the
+            // no-Content-Length streaming path even if the OS later coalesces
+            // some chunks before reqwest yields them.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("http://{addr}/openapi.yaml"),
+            "max_response_body_bytes": 16
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    timeout(Duration::from_secs(5), server)
+        .await
+        .expect("raw spec server timed out")
+        .expect("raw spec server panicked");
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("too large"), "got: {body}");
+            assert!(!body.contains("max_response_body_bytes"), "got: {body}");
+        }
+        other => panic!("expected Reject, got {other:?}"),
     }
 }
 
@@ -536,6 +731,61 @@ async fn test_cache_does_not_store_failed_fetches() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn test_cache_does_not_store_oversized_fetches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"too large body".to_vec()))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_bytes(b"ok\n".to_vec()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60,
+            "max_response_body_bytes": 8
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let r1 = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        r1,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+
+    let mut ctx2 = make_ctx("GET", "/api/specz", "/api");
+    let r2 = plugin.on_request_received(&mut ctx2).await;
+    match r2 {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body, bytes::Bytes::from_static(b"ok\n"));
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
 }
 
 // Regression: cold-cache concurrent requests must not all fan out to the

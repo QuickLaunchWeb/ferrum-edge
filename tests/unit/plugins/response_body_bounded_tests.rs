@@ -7,10 +7,57 @@
 //! exhausting gateway memory.
 
 use ferrum_edge::plugins::utils::response_body::{
-    BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
+    BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
+    read_response_body_bounded,
 };
+use serde_json::json;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[test]
+fn test_parse_max_response_body_bytes_defaults_and_validates() {
+    assert_eq!(
+        parse_max_response_body_bytes(&json!({}), "test_plugin", "limit", 4096).unwrap(),
+        4096
+    );
+    assert_eq!(
+        parse_max_response_body_bytes(&json!({ "limit": null }), "test_plugin", "limit", 4096)
+            .unwrap(),
+        4096
+    );
+    assert_eq!(
+        parse_max_response_body_bytes(&json!({ "limit": 8192 }), "test_plugin", "limit", 4096)
+            .unwrap(),
+        8192
+    );
+    assert!(
+        parse_max_response_body_bytes(&json!({ "limit": 0 }), "test_plugin", "limit", 4096)
+            .unwrap_err()
+            .contains("greater than zero")
+    );
+    assert!(
+        parse_max_response_body_bytes(&json!({ "limit": -1 }), "test_plugin", "limit", 4096)
+            .unwrap_err()
+            .contains("non-negative integer")
+    );
+    assert!(
+        parse_max_response_body_bytes(&json!({ "limit": "8192" }), "test_plugin", "limit", 4096)
+            .unwrap_err()
+            .contains("non-negative integer")
+    );
+
+    let max_u64_result =
+        parse_max_response_body_bytes(&json!({ "limit": u64::MAX }), "test_plugin", "limit", 4096);
+    if let Ok(max_usize) = usize::try_from(u64::MAX) {
+        assert_eq!(max_u64_result.unwrap(), max_usize);
+    } else {
+        assert!(
+            max_u64_result
+                .unwrap_err()
+                .contains("too large for this platform")
+        );
+    }
+}
 
 /// 2 KiB body against a 1 KiB limit must error and must NOT allocate the full
 /// 2 KiB.
@@ -62,7 +109,7 @@ async fn test_read_response_body_bounded_within_limit() {
         .await
         .expect("body within limit should succeed");
     assert_eq!(buf.len(), 512);
-    assert_eq!(buf, body);
+    assert_eq!(buf.as_ref(), body.as_slice());
 }
 
 /// Empty body (204) returns Ok with empty bytes.
@@ -92,7 +139,7 @@ async fn test_read_response_body_bounded_exactly_at_limit() {
     let resp = reqwest::get(server.uri()).await.unwrap();
     let buf = read_response_body_bounded(resp, 1024).await.unwrap();
     assert_eq!(buf.len(), 1024);
-    assert_eq!(buf, body);
+    assert_eq!(buf.as_ref(), body.as_slice());
 }
 
 /// `measure_response_body_bounded` returns the size for an in-limit body.
