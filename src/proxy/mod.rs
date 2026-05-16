@@ -1791,6 +1791,11 @@ async fn run_gateway_svid_file_rotation_loop(
                     trust_bundle_path = %paths.trust_bundle.display(),
                     "Gateway SVID files changed but reload failed; keeping current backend identity"
                 );
+                // Record the failing fingerprint so we don't re-warn every
+                // poll while the bad state is stable. The next genuine
+                // change (good or different-bad) will compare unequal and
+                // re-attempt the load.
+                last_fingerprint = Some(next_fingerprint);
                 continue;
             }
         };

@@ -141,6 +141,20 @@ impl SvidGenerationMatcher {
 
 pub type BackendSvidGeneration = Arc<AtomicU64>;
 
+/// Discriminate workload-SVID-driven client certs from operator-supplied ones.
+///
+/// Returns `Some(current_generation)` only when the effective backend client
+/// cert path is byte-equal to the configured workload SVID cert path
+/// (`FERRUM_GATEWAY_SVID_CERT_PATH`). For operator-supplied static material
+/// or when no SVID is configured, returns `None` so the caller emits the
+/// stable `svidg=static` segment and the pool key never partitions on
+/// rotation. The comparison is intentionally byte-equality, not filesystem
+/// canonicalization: callers (DestinationRule ISTIO_MUTUAL projection and the
+/// `ReqwestPoolManager` / H2 / gRPC / H3 pool managers) copy paths from
+/// `EnvConfig` without canonicalization, so both sides see the same string.
+/// Operators who symlink the gateway SVID path under a different name on the
+/// proxy's `resolved_tls.client_cert_path` will get `svidg=static` and miss
+/// the rotation drain — keep both sides pointing at the same path string.
 pub fn backend_svid_generation_for_client_cert(
     effective_client_cert_path: Option<&str>,
     workload_svid_cert_path: Option<&str>,
