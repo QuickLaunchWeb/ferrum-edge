@@ -45,6 +45,9 @@ fn parse_one(name: &str, def: Value) -> NotificationChannel {
 async fn spawn_raw_notification_response_server(
     response: &'static [u8],
 ) -> (SocketAddr, JoinHandle<()>) {
+    // Currently used by the all-channel non-success test. It fully reads the
+    // request headers before responding so future raw fixtures can reuse it
+    // without depending on partial-read timing.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
