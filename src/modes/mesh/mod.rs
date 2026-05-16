@@ -243,6 +243,11 @@ pub struct MeshRuntimeConfig {
     /// in `MeshConfig` but the slice projection ignores them — behavior is
     /// identical to today, preserving safe-rollout semantics.
     pub sidecar_enforced: bool,
+    /// When `true`, and only when `sidecar_enforced` is also true, per-workload
+    /// slices filter `workloads` down to identities referenced by admitted
+    /// services. Sourced from `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
+    /// (default `false`).
+    pub sidecar_identity_narrowing: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -404,6 +409,7 @@ impl MeshRuntimeConfig {
             outbound_traffic_policy,
             outbound_registry_reject_status,
             sidecar_enforced: env_config.mesh_sidecar_enforced,
+            sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
         })
     }
 
@@ -482,6 +488,7 @@ impl MeshRuntimeConfig {
                 .collect(),
             cluster_domain: self.cluster_domain.clone(),
             enforce_sidecar_egress: self.sidecar_enforced,
+            enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
         }
     }
 }
@@ -3060,6 +3067,7 @@ mod tests {
             "FERRUM_MESH_CLUSTER_DOMAIN",
             "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY",
             "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS",
+            "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING",
             "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
@@ -3125,6 +3133,32 @@ mod tests {
                 );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
                 assert_eq!(runtime.outbound_registry_reject_status, 502);
+                assert!(!runtime.sidecar_identity_narrowing);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_parses_sidecar_identity_narrowing_flag() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.sidecar_identity_narrowing);
+                assert!(
+                    !runtime.sidecar_enforced,
+                    "identity narrowing is parsed independently but only takes effect during slicing when Sidecar enforcement is also enabled"
+                );
             },
         );
     }
@@ -3493,6 +3527,7 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_identity_narrowing: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3588,6 +3623,7 @@ mod tests {
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
             sidecar_enforced: false,
+            sidecar_identity_narrowing: false,
         }
     }
 

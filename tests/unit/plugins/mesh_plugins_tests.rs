@@ -879,6 +879,40 @@ async fn mesh_authz_accepts_baggage_in_aliased_trust_domain() {
 }
 
 #[tokio::test]
+async fn mesh_authz_hbone_alias_lookup_does_not_require_source_in_slice_workloads() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": {
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "workloads": [],
+            "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+        },
+        "trust_domain_aliases": ["cluster.local"]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://partner.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.ignored_baggage"),
+        "HBONE baggage trust-domain aliasing is independent of slice.workloads"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_rejected_baggage_mismatch_records_deny_policy() {
     let plugin = MeshAuthz::new(&json!({
         // Policy only allows the baggage workload identity. After we drop

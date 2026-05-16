@@ -588,6 +588,10 @@ pub struct EnvConfig {
     /// happens unconditionally; this flag only gates the slice-narrowing
     /// pass.
     pub mesh_sidecar_enforced: bool,
+    /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
+    /// slice builder also narrows `workloads` to SPIFFE identities referenced
+    /// by admitted services. Default `false` for a one-release rollout window.
+    pub mesh_sidecar_identity_narrowing: bool,
 
     /// Opt-in: emit `mesh_route_dispatch` plugin instances for Istio
     /// VirtualService routes that carry method/header/queryParam predicates.
@@ -1371,6 +1375,7 @@ impl Default for EnvConfig {
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
+            mesh_sidecar_identity_narrowing: false,
             mesh_vs_header_routing_experimental: false,
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
@@ -1672,6 +1677,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
+            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
@@ -2045,6 +2051,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
+            mesh_sidecar_identity_narrowing,
             mesh_vs_header_routing_experimental,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
