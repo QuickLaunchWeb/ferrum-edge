@@ -746,6 +746,65 @@ fn test_upstream_target_path_valid() {
 }
 
 #[test]
+fn test_upstream_target_locality_valid_forms_accepted() {
+    for value in [
+        "us-west",
+        "us-west/us-west-1",
+        "us-west/us-west-1/a",
+        " us-west / us-west-1 / a ",
+    ] {
+        let mut upstream = make_upstream("test");
+        upstream.targets[0].locality = Some(value.into());
+        assert!(
+            upstream.validate_fields().is_ok(),
+            "valid locality '{value}' should pass validation"
+        );
+    }
+}
+
+#[test]
+fn test_upstream_target_locality_rejects_malformed() {
+    for bad in ["", "   ", "/zone/a", "/", "  /  "] {
+        let mut upstream = make_upstream("test");
+        upstream.targets[0].locality = Some(bad.into());
+        let errs = upstream
+            .validate_fields()
+            .expect_err("malformed locality must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("targets[0].locality")),
+            "expected locality rejection for '{bad}', got: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_upstream_target_locality_too_long() {
+    use ferrum_edge::config::types::MAX_LOCALITY_LENGTH;
+
+    let mut upstream = make_upstream("test");
+    upstream.targets[0].locality = Some("a".repeat(MAX_LOCALITY_LENGTH + 1));
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("targets[0].locality") && e.contains("exceed"))
+    );
+}
+
+#[test]
+fn test_upstream_source_locality_rejected_by_admin_api() {
+    let mut upstream = make_upstream("test");
+    upstream.source_locality = Some("us-west/us-west-1/a".into());
+    let errs = upstream
+        .validate_fields()
+        .expect_err("source_locality must be rejected at admit time");
+    assert!(
+        errs.iter().any(|e| e.contains("source_locality")
+            && e.contains("cannot be set directly via the admin API")),
+        "expected source_locality admin-API rejection, got: {errs:?}"
+    );
+}
+
+#[test]
 fn test_upstream_health_check_validated() {
     let mut upstream = make_upstream("test");
     upstream.health_checks = Some(HealthCheckConfig {

@@ -549,17 +549,25 @@ fn project_mesh_source_locality(config: &mut GatewayConfig, mesh_slice: &MeshSli
 }
 
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
+    // SPIFFE-matched workload is authoritative: if the configured workload
+    // identity matches a known workload, that workload's locality is the
+    // answer — even when it is `None`. Falling through to the label-based
+    // heuristic here would pick up a different pod's metadata and silently
+    // disagree with the SPIFFE source of truth.
     if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref()
-        && let Some(locality) = mesh_slice
+        && let Some(workload) = mesh_slice
             .workloads
             .iter()
             .find(|workload| workload.spiffe_id.as_str() == spiffe_id)
-            .and_then(|workload| workload.locality.as_deref())
     {
-        return Some(locality);
+        return workload.locality.as_deref();
     }
 
-    let mut matched_locality = None;
+    // Label-based fallback for native-discovery / non-SPIFFE deployments.
+    // Multi-replica Deployments commonly produce N workloads with identical
+    // labels and identical locality — accept those as a single answer.
+    // Bail out only when two label-matched workloads disagree on locality.
+    let mut matched_locality: Option<&str> = None;
     for workload in &mesh_slice.workloads {
         if workload.namespace != mesh_slice.namespace {
             continue;
@@ -577,8 +585,10 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
         let Some(locality) = workload.locality.as_deref() else {
             continue;
         };
-        if matched_locality.replace(locality).is_some() {
-            return None;
+        match matched_locality {
+            None => matched_locality = Some(locality),
+            Some(prev) if prev == locality => {}
+            Some(_) => return None,
         }
     }
     matched_locality
@@ -5658,6 +5668,69 @@ mod tests {
             Some("us-east/us-east-1/a")
         );
         assert_eq!(config.upstreams[0].updated_at, loaded_at);
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_accepts_multi_replica_same_locality() {
+        let mut first = workload("reviews-1", "reviews");
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        let mut second = workload("reviews-2", "reviews");
+        second.locality = Some("us-west/us-west-1/a".to_string());
+        let mut third = workload("reviews-3", "reviews");
+        third.locality = Some("us-west/us-west-1/a".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: None,
+            workloads: vec![first, second, third],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            mesh_source_workload_locality(&slice),
+            Some("us-west/us-west-1/a")
+        );
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_returns_none_when_label_matches_disagree() {
+        let mut first = workload("reviews-1", "reviews");
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        let mut second = workload("reviews-2", "reviews");
+        second.locality = Some("us-west/us-west-1/b".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: None,
+            workloads: vec![first, second],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(mesh_source_workload_locality(&slice), None);
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_spiffe_match_without_locality_is_authoritative() {
+        // SPIFFE-matched workload has no locality — answer is `None`, even
+        // though another label-matching workload would supply one.
+        let mut source = workload("api", "api");
+        source.locality = None;
+        let spiffe = source.spiffe_id.as_str().to_string();
+
+        let mut sibling = workload("api-noisy", "api");
+        sibling.locality = Some("us-east/us-east-1/a".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            workload_spiffe_id: Some(spiffe),
+            workloads: vec![source, sibling],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(mesh_source_workload_locality(&slice), None);
     }
 
     #[test]

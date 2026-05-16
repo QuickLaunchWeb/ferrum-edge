@@ -1,8 +1,8 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginAssociation,
-    PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, hosts_overlap, validate_host_entry,
-    validate_resource_id, wildcard_matches,
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LocalityPreference,
+    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, hosts_overlap,
+    validate_host_entry, validate_resource_id, wildcard_matches,
 };
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
@@ -2203,4 +2203,89 @@ fn mesh_tracing_config_deserializes_provider_array() {
 
     assert_eq!(config.disable_span_reporting, Some(true));
     assert_eq!(config.providers.len(), 2);
+}
+
+#[test]
+fn locality_preference_parse_handles_empty_input() {
+    assert_eq!(LocalityPreference::parse(""), None);
+    assert_eq!(LocalityPreference::parse("   "), None);
+    assert_eq!(LocalityPreference::parse("/zone/sub"), None);
+    assert_eq!(LocalityPreference::parse("/"), None);
+}
+
+#[test]
+fn locality_preference_parse_strips_whitespace() {
+    let parsed = LocalityPreference::parse(" us-west / us-west-1 / a ").expect("parses");
+    assert_eq!(parsed.region, "us-west");
+    assert_eq!(parsed.zone.as_deref(), Some("us-west-1"));
+    assert_eq!(parsed.sub_zone.as_deref(), Some("a"));
+}
+
+#[test]
+fn locality_preference_parse_region_only() {
+    let parsed = LocalityPreference::parse("us-west").expect("region-only parses");
+    assert_eq!(parsed.region, "us-west");
+    assert_eq!(parsed.zone, None);
+    assert_eq!(parsed.sub_zone, None);
+}
+
+#[test]
+fn locality_preference_parse_empty_middle_segment_skips_zone() {
+    // `region//sub` — empty zone is dropped (lenient), sub_zone preserved.
+    // `same_zone()` against this preference always returns false since
+    // `zone` is None — documents and locks the current behavior.
+    let parsed = LocalityPreference::parse("region//sub").expect("parses");
+    assert_eq!(parsed.region, "region");
+    assert_eq!(parsed.zone, None);
+    assert_eq!(parsed.sub_zone.as_deref(), Some("sub"));
+
+    let other = LocalityPreference::parse("region/zone/sub").expect("normal triple parses");
+    assert!(!parsed.same_zone(&other));
+    assert!(parsed.same_region(&other));
+}
+
+#[test]
+fn locality_preference_parse_glues_extra_slash_into_sub_zone() {
+    // splitn(3) glues any trailing slashes into the third segment — locks
+    // the current behavior so operators see consistent rank-3 fallback for
+    // overlong locality strings rather than silent partial parsing.
+    let parsed = LocalityPreference::parse("region/zone/sub/extra").expect("parses");
+    assert_eq!(parsed.region, "region");
+    assert_eq!(parsed.zone.as_deref(), Some("zone"));
+    assert_eq!(parsed.sub_zone.as_deref(), Some("sub/extra"));
+}
+
+#[test]
+fn locality_preference_tier_helpers_are_consistent() {
+    let source = LocalityPreference::parse("us-west/us-west-1/a").expect("source parses");
+
+    let exact = LocalityPreference::parse("us-west/us-west-1/a").expect("exact");
+    assert!(source.exact_matches(&exact));
+    assert!(source.same_zone(&exact));
+    assert!(source.same_region(&exact));
+
+    let same_zone = LocalityPreference::parse("us-west/us-west-1/b").expect("same-zone");
+    assert!(!source.exact_matches(&same_zone));
+    assert!(source.same_zone(&same_zone));
+    assert!(source.same_region(&same_zone));
+
+    let same_region = LocalityPreference::parse("us-west/us-west-2/a").expect("same-region");
+    assert!(!source.exact_matches(&same_region));
+    assert!(!source.same_zone(&same_region));
+    assert!(source.same_region(&same_region));
+
+    let other = LocalityPreference::parse("eu-central/eu-central-1/a").expect("other");
+    assert!(!source.exact_matches(&other));
+    assert!(!source.same_zone(&other));
+    assert!(!source.same_region(&other));
+}
+
+#[test]
+fn locality_preference_same_zone_requires_zone_present() {
+    // Two region-only preferences are in the same region, but neither is in
+    // a defined zone — `same_zone` must therefore be false.
+    let a = LocalityPreference::parse("us-west").expect("a");
+    let b = LocalityPreference::parse("us-west").expect("b");
+    assert!(a.same_region(&b));
+    assert!(!a.same_zone(&b));
 }

@@ -51,6 +51,8 @@ pub const MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH: usize = 2048;
 pub const MAX_SUBSET_NAME_LENGTH: usize = 255;
 /// Maximum length for a tag key or value.
 pub const MAX_TAG_LENGTH: usize = 255;
+/// Maximum length of an Istio-style `region/zone/subzone` locality string.
+pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 /// Maximum size of consumer credentials JSON in bytes.
@@ -3644,6 +3646,21 @@ impl Upstream {
             );
         }
 
+        // `source_locality` follows the same pattern as `port_overrides`: it
+        // is mesh-derived state populated at slice-apply time by
+        // `project_mesh_source_locality` from the workload's locality. SQL
+        // backends do not persist it (no column), so an admin write would
+        // succeed and silently vanish on the next reload. The canonical place
+        // to express source locality is the mesh `Workload.locality` field.
+        if self.source_locality.is_some() {
+            errors.push(
+                "source_locality is projected from the mesh workload's \
+                 locality and cannot be set directly via the admin API — \
+                 set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
         // Validate individual targets
         for (i, target) in self.targets.iter().enumerate() {
             if let Err(e) = validate_string_field(
@@ -3697,6 +3714,26 @@ impl Upstream {
                 )
             {
                 errors.push(e);
+            }
+            // Target locality — Istio-style `region/zone/subzone`. Validate the
+            // length cap and parse it through `LocalityPreference::parse` so
+            // operators get a clear 400 instead of a silent rank-3 fallback in
+            // the load balancer.
+            if let Some(ref locality) = target.locality {
+                if let Err(e) = validate_string_field(
+                    &format!("targets[{}].locality", i),
+                    locality,
+                    MAX_LOCALITY_LENGTH,
+                ) {
+                    errors.push(e);
+                }
+                if LocalityPreference::parse(locality).is_none() {
+                    errors.push(format!(
+                        "targets[{}].locality '{}' is not a valid \
+                         region[/zone[/subzone]] string",
+                        i, locality
+                    ));
+                }
             }
         }
 
