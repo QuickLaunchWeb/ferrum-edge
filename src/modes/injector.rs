@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::capture::{
     CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, Ip6TablesMode, IptablesPlan, validate_cidr_list,
@@ -32,7 +32,7 @@ use crate::identity::spiffe::TrustDomain;
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
-const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
@@ -175,8 +175,8 @@ impl InjectorConfig {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
         validate_injector_trust_domain(&trust_domain)?;
-        let admission_review_max_body_bytes = parse_injector_admission_review_max_body_bytes(
-            resolve_ferrum_var("FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES").as_deref(),
+        let admission_review_max_body_bytes = parse_injector_admission_review_max_body_size_mib(
+            resolve_ferrum_var("FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB").as_deref(),
         )?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
@@ -221,21 +221,25 @@ impl InjectorConfig {
     }
 }
 
-fn parse_injector_admission_review_max_body_bytes(value: Option<&str>) -> Result<usize, String> {
+fn parse_injector_admission_review_max_body_size_mib(value: Option<&str>) -> Result<usize, String> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES);
+        return Ok(DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024);
     };
     let parsed = raw.parse::<usize>().map_err(|_| {
-        "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES: must be an unsigned integer"
+        "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be an unsigned integer"
             .to_string()
     })?;
     if parsed == 0 {
         return Err(
-            "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES: must be greater than zero"
+            "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be greater than zero"
                 .to_string(),
         );
     }
-    Ok(parsed)
+    parsed.checked_mul(1024 * 1024).ok_or_else(|| {
+        format!(
+            "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: value too large: {raw}"
+        )
+    })
 }
 
 /// Parse a comma-separated CIDR list. Trims whitespace and skips empty tokens.
@@ -581,7 +585,7 @@ async fn serve_injector_connection<S>(
     let io = TokioIo::new(stream);
     let svc = service_fn(move |req| {
         let config = Arc::clone(&config);
-        async move { handle_injector_request(req, config).await }
+        async move { handle_injector_request(req, config, remote_addr).await }
     });
     if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
         debug!(remote_addr = %remote_addr, error = %e, "Injector connection error");
@@ -591,6 +595,7 @@ async fn serve_injector_connection<S>(
 async fn handle_injector_request(
     req: Request<Incoming>,
     config: Arc<InjectorConfig>,
+    remote_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.method() != Method::POST || req.uri().path() != "/mutate" {
         return Ok(response(StatusCode::NOT_FOUND, "not found"));
@@ -604,11 +609,21 @@ async fn handle_injector_request(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             if e.downcast_ref::<LengthLimitError>().is_some() {
+                warn!(
+                    remote_addr = %remote_addr,
+                    max_body_bytes,
+                    "Injector AdmissionReview body exceeded configured limit"
+                );
                 return Ok(response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!("AdmissionReview body too large (max {max_body_bytes} bytes)"),
                 ));
             }
+            warn!(
+                remote_addr = %remote_addr,
+                error = %e,
+                "Injector failed to read AdmissionReview body"
+            );
             return Ok(response(
                 StatusCode::BAD_REQUEST,
                 format!("failed to read AdmissionReview body: {e}"),
@@ -1143,7 +1158,9 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             tls_handshake_timeout_seconds: 10,
-            admission_review_max_body_bytes: DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES,
+            admission_review_max_body_bytes: DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB
+                * 1024
+                * 1024,
         }
     }
 
@@ -1704,26 +1721,26 @@ mod tests {
     }
 
     #[test]
-    fn injector_admission_review_max_body_bytes_defaults_and_validates() {
+    fn injector_admission_review_max_body_size_mib_defaults_and_validates() {
         assert_eq!(
-            parse_injector_admission_review_max_body_bytes(None).unwrap(),
-            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES
+            parse_injector_admission_review_max_body_size_mib(None).unwrap(),
+            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
         );
         assert_eq!(
-            parse_injector_admission_review_max_body_bytes(Some("")).unwrap(),
-            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_BYTES
+            parse_injector_admission_review_max_body_size_mib(Some("")).unwrap(),
+            DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB * 1024 * 1024
         );
         assert_eq!(
-            parse_injector_admission_review_max_body_bytes(Some("1024")).unwrap(),
-            1024
+            parse_injector_admission_review_max_body_size_mib(Some("1")).unwrap(),
+            1024 * 1024
         );
         assert!(
-            parse_injector_admission_review_max_body_bytes(Some("0"))
+            parse_injector_admission_review_max_body_size_mib(Some("0"))
                 .unwrap_err()
                 .contains("greater than zero")
         );
         assert!(
-            parse_injector_admission_review_max_body_bytes(Some("-1"))
+            parse_injector_admission_review_max_body_size_mib(Some("-1"))
                 .unwrap_err()
                 .contains("unsigned integer")
         );
