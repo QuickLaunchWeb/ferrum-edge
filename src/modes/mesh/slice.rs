@@ -206,8 +206,22 @@ pub struct MeshExtensionConfig {
 
 mod extension_value_bytes {
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Encode side stays canonical `STANDARD` (padded). Decode side is lenient
+    /// on padding so an upstream CP that strips trailing `=` characters still
+    /// round-trips correctly. Alphabet stays `STANDARD` (`+/`) — we never
+    /// silently accept the URL-safe alphabet (`-_`) because mixing alphabets
+    /// would corrupt non-text payloads on decode.
+    const DECODE_LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
@@ -215,7 +229,7 @@ mod extension_value_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        STANDARD
+        DECODE_LENIENT
             .decode(encoded.as_bytes())
             .map_err(serde::de::Error::custom)
     }

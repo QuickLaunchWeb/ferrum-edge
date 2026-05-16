@@ -525,4 +525,106 @@ fn ecds_type_url_appears_in_xds_type_urls_inventory() {
         "ECDS_TYPE_URL must be in XDS_TYPE_URLS"
     );
 }
-// trigger
+
+#[test]
+fn translator_round_trips_binary_value_bytes() {
+    // Binary payload with NULs and high bytes — exercises the base64 codec.
+    let binary: Vec<u8> = (0u8..=255).collect();
+    let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
+        name: "binary".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: binary.clone(),
+    }]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let entry = snapshot
+        .resources(ECDS_TYPE_URL)
+        .first()
+        .cloned()
+        .expect("ECDS resource");
+    let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
+        .expect("TypedExtensionConfig decode");
+    assert_eq!(decoded.typed_config.expect("inner Any").value, binary);
+}
+
+#[test]
+fn translator_emits_empty_value_when_extension_has_no_inner_bytes() {
+    let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
+        name: "no-bytes".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: Vec::new(),
+    }]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let entry = snapshot
+        .resources(ECDS_TYPE_URL)
+        .first()
+        .cloned()
+        .expect("ECDS resource");
+    let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
+        .expect("TypedExtensionConfig decode");
+    assert_eq!(decoded.name, "no-bytes");
+    let typed_config = decoded.typed_config.expect("inner Any should be set");
+    assert!(typed_config.value.is_empty());
+}
+
+#[test]
+fn mesh_extension_config_serde_round_trips_base64_value() {
+    // Mixed binary payload — exercises the base64 STANDARD codec inside
+    // `MeshExtensionConfig::value`. CPs and DPs both serialize through serde
+    // (gRPC JSON / native config), so the codec must round-trip arbitrary
+    // bytes without corruption.
+    let original = MeshExtensionConfig {
+        name: "binary".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: vec![0u8, 1, 2, 0xff, 0xfe, 0x7f, 0x00],
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    // value field must be a base64 STANDARD string, not raw bytes / array.
+    assert!(json.contains("\"value\":\"AAEC//5/AA==\""));
+    let parsed: MeshExtensionConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn mesh_extension_config_deserialize_accepts_unpadded_base64() {
+    // Some CPs strip base64 padding; the decoder must accept both forms so
+    // a payload encoded by an upstream Envoy / Istio CP still round-trips.
+    let canonical = serde_json::json!({
+        "name": "pad",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "AAEC//5/AA==",
+    });
+    let stripped = serde_json::json!({
+        "name": "pad",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "AAEC//5/AA",
+    });
+    let from_padded: MeshExtensionConfig =
+        serde_json::from_value(canonical).expect("padded decode");
+    let from_unpadded: MeshExtensionConfig =
+        serde_json::from_value(stripped).expect("unpadded decode");
+    assert_eq!(from_padded.value, from_unpadded.value);
+    assert_eq!(from_padded.value, vec![0u8, 1, 2, 0xff, 0xfe, 0x7f, 0x00]);
+}
+
+#[test]
+fn mesh_extension_config_deserialize_accepts_empty_value() {
+    let json = serde_json::json!({
+        "name": "empty",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "",
+    });
+    let parsed: MeshExtensionConfig = serde_json::from_value(json).expect("empty decode");
+    assert!(parsed.value.is_empty());
+}
+
+#[test]
+fn mesh_extension_config_default_value_when_field_omitted() {
+    // Schema-level default keeps backward compat for callers that build the
+    // type programmatically without the inner bytes.
+    let json = serde_json::json!({
+        "name": "omitted",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+    });
+    let parsed: MeshExtensionConfig = serde_json::from_value(json).expect("omitted decode");
+    assert!(parsed.value.is_empty());
+}
