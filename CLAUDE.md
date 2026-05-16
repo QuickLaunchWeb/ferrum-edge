@@ -171,7 +171,7 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-passthrough TCP proxies (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from ServiceEntries with `location: mesh_external` (egress topology only).
 
-**Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
+**Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). IPv4/IPv6 capture CIDRs are partitioned into `iptables`/`ip6tables` blocks; `FERRUM_MESH_IP6TABLES_ENABLED=auto|true|false` controls IPv6 fan-out, and cleanup scripts must stay best-effort even when `ip6tables` is missing. SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 
 ### Domain Model (`src/config/types.rs`)
 
