@@ -40,15 +40,15 @@ Push to main
 
 ```
 Push tag v* (e.g., v0.2.0)
-        │
-        ├─► Build linux-x86_64
-        ├─► Build linux-aarch64 (ARM)
-        ├─► Build macos-x86_64
-        ├─► Build macos-aarch64 (Apple Silicon)
-        ├─► Build windows-x86_64
-        └─► Push versioned Docker images to Docker Hub and GHCR
-                └─► Create Docker manifest tags
-                        └─► Create GitHub Release with binaries and checksums
+    └─► Five target release builds
+            ├─ linux-x86_64
+            ├─ linux-aarch64 (ARM)
+            ├─ macos-x86_64
+            ├─ macos-aarch64 (Apple Silicon)
+            ├─ windows-x86_64
+            └─► Push versioned Docker images to Docker Hub and GHCR
+                    └─► Create Docker manifest tags
+                            └─► Create GitHub Release with binaries and checksums
 ```
 
 ## CI Pipeline (ci.yml)
@@ -118,7 +118,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs the nightly toolchain, builds `ferrum-ebpf`, runs `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
+The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. When no eBPF files changed, the job no-ops and reports success.
 
 #### 5. Performance Regression Job
 
@@ -343,9 +343,10 @@ sha256sum -c ferrum-edge-*.sha256
 If automatic release fails:
 
 ```bash
-# Build binaries manually with the same release features as CI
+# Build binaries manually with the same release features as CI.
+# Run macOS targets on a macOS host and the Windows MSVC target on Windows.
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
-cargo build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
+cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
 cargo build --features cloud-secrets --release --target x86_64-apple-darwin
 cargo build --features cloud-secrets --release --target aarch64-apple-darwin
 cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
