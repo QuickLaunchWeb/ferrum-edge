@@ -32,7 +32,7 @@ pub struct BpfMaps {
     cidr_include4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_include6: LpmTrie<MapData, CidrKey6, u8>,
     port_exclude: BpfHashMap<MapData, u16, u8>,
-    capture_config: BpfHashMap<MapData, u32, BpfCaptureConfig>,
+    capture_config: Option<BpfHashMap<MapData, u32, BpfCaptureConfig>>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -87,12 +87,18 @@ impl BpfMaps {
         )
         .map_err(|e| format!("FERRUM_PORT_EXCLUDE type mismatch: {e}"))?;
 
-        let capture_config = BpfHashMap::try_from(
-            bpf.map("FERRUM_CAPTURE_CONFIG")
-                .ok_or("FERRUM_CAPTURE_CONFIG map not found")?
-                .clone(),
-        )
-        .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?;
+        let capture_config = match bpf.map("FERRUM_CAPTURE_CONFIG") {
+            Some(map) => Some(
+                BpfHashMap::try_from(map.clone())
+                    .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_CAPTURE_CONFIG map not found; continuing with eBPF program default capture ports"
+                );
+                None
+            }
+        };
 
         Ok(Self {
             pod_ips,
@@ -167,7 +173,13 @@ impl BpfMaps {
     }
 
     pub fn update_capture_config(&self, config: &BpfCaptureConfig) -> Result<(), String> {
-        let mut map = self.capture_config.clone();
+        let Some(capture_config) = self.capture_config.as_ref() else {
+            tracing::warn!(
+                "Skipping capture config update because FERRUM_CAPTURE_CONFIG map is absent"
+            );
+            return Ok(());
+        };
+        let mut map = capture_config.clone();
         map.insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
             .map_err(|e| format!("Failed to update capture config: {e}"))
     }
