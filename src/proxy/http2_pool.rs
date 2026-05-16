@@ -529,6 +529,7 @@ impl Http2ConnectionPool {
     pub fn force_drain_svid_generation(&self, generation: u64) {
         let matcher = SvidGenerationMatcher::new(generation);
         self.pool.invalidate_matching(|key| matcher.matches(key));
+        self.rr_counters.retain(|key, _| !matcher.matches(key));
     }
 
     #[allow(dead_code)] // exercised from integration/unit tests
@@ -1438,6 +1439,33 @@ mod tests {
         assert!(
             key.ends_with("|svidg=17"),
             "workload SVID generation must be represented in the HTTP/2 pool key: {key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_drain_svid_generation_removes_rr_counter_keys() {
+        let pool = Http2ConnectionPool::default();
+
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=17".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=18".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=static".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+
+        pool.force_drain_svid_generation(17);
+
+        assert!(!pool.rr_counters.contains_key("backend|443|fields|svidg=17"));
+        assert!(pool.rr_counters.contains_key("backend|443|fields|svidg=18"));
+        assert!(
+            pool.rr_counters
+                .contains_key("backend|443|fields|svidg=static")
         );
     }
 

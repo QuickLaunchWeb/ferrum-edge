@@ -338,6 +338,7 @@ impl GrpcConnectionPool {
     pub fn force_drain_svid_generation(&self, generation: u64) {
         let matcher = SvidGenerationMatcher::new(generation);
         self.pool.invalidate_matching(|key| matcher.matches(key));
+        self.rr_counters.retain(|key, _| !matcher.matches(key));
     }
 
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
@@ -1865,6 +1866,33 @@ mod tests {
         assert!(
             key.ends_with("|svidg=23"),
             "workload SVID generation must be represented in the gRPC pool key: {key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_drain_svid_generation_removes_rr_counter_keys() {
+        let pool = GrpcConnectionPool::default();
+
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=23".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=24".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=static".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+
+        pool.force_drain_svid_generation(23);
+
+        assert!(!pool.rr_counters.contains_key("backend|443|fields|svidg=23"));
+        assert!(pool.rr_counters.contains_key("backend|443|fields|svidg=24"));
+        assert!(
+            pool.rr_counters
+                .contains_key("backend|443|fields|svidg=static")
         );
     }
 

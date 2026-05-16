@@ -10,7 +10,7 @@
 //! can synchronise on "first SVID is ready" before binding listeners.
 
 use arc_swap::ArcSwap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio::time::sleep;
@@ -32,7 +32,7 @@ pub struct SvidFetchHandle {
     pub current: Arc<ArcSwap<Option<SvidBundle>>>,
     first_ready: Arc<Notify>,
     has_first: Arc<std::sync::atomic::AtomicBool>,
-    revision_tx: Option<watch::Sender<u64>>,
+    revision_tx: Arc<OnceLock<watch::Sender<u64>>>,
 }
 
 impl SvidFetchHandle {
@@ -41,7 +41,7 @@ impl SvidFetchHandle {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            revision_tx: None,
+            revision_tx: Arc::new(OnceLock::new()),
         }
     }
 
@@ -50,8 +50,10 @@ impl SvidFetchHandle {
     /// Once attached, every `install` after the first publishes a fresh
     /// generation on the channel — consumers (the backend pool drain task)
     /// observe the rotation and invalidate stale TLS configs.
-    pub fn with_revision_tx(mut self, revision_tx: watch::Sender<u64>) -> Self {
-        self.revision_tx = Some(revision_tx);
+    pub fn with_revision_tx(self, revision_tx: watch::Sender<u64>) -> Self {
+        if self.revision_tx.set(revision_tx).is_err() {
+            warn!("SVID fetch handle revision channel already configured; keeping existing sender");
+        }
         self
     }
 
@@ -94,7 +96,7 @@ impl SvidFetchHandle {
             .swap(true, std::sync::atomic::Ordering::AcqRel);
         if !was_first {
             self.first_ready.notify_waiters();
-        } else if let Some(tx) = self.revision_tx.as_ref() {
+        } else if let Some(tx) = self.revision_tx.get() {
             // Skip bumping on the very first install: the gateway starts at
             // generation 0 with no traffic in flight, so there is nothing to
             // drain. Every later install reflects a rotation.
