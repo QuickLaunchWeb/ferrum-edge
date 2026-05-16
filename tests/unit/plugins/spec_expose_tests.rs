@@ -456,7 +456,8 @@ async fn test_specz_request_rejects_oversized_content_length_spec_body() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 502);
-            assert!(body.contains("max_response_body_bytes"), "got: {body}");
+            assert!(body.contains("too large"), "got: {body}");
+            assert!(!body.contains("max_response_body_bytes"), "got: {body}");
         }
         other => panic!("expected Reject, got {other:?}"),
     }
@@ -475,6 +476,8 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
         // request/response plumbing changes.
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 1024];
+        // This fixture does not parse request headers. One read is enough to
+        // observe that the client sent a request before we emit the response.
         let _ = socket.read(&mut buf).await.unwrap();
         socket
             .write_all(
@@ -522,7 +525,8 @@ async fn test_specz_request_rejects_oversized_chunked_spec_body() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 502);
-            assert!(body.contains("max_response_body_bytes"), "got: {body}");
+            assert!(body.contains("too large"), "got: {body}");
+            assert!(!body.contains("max_response_body_bytes"), "got: {body}");
         }
         other => panic!("expected Reject, got {other:?}"),
     }

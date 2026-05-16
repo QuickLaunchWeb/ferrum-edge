@@ -47,7 +47,9 @@ use tokio::sync::Mutex;
 
 use crate::dns::DnsCacheResolver;
 
-use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::utils::response_body::{
+    BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Default cache TTL for fetched spec bodies (5 minutes).
@@ -149,27 +151,12 @@ impl SpecExpose {
         };
         let cache_ttl = Duration::from_secs(cache_ttl_seconds);
 
-        let max_response_body_bytes = match config.get("max_response_body_bytes") {
-            None | Some(Value::Null) => DEFAULT_MAX_RESPONSE_BODY_BYTES,
-            Some(v) => {
-                let raw = v.as_u64().ok_or_else(|| {
-                    format!(
-                        "spec_expose: 'max_response_body_bytes' must be an unsigned integer, got: {v}"
-                    )
-                })?;
-                if raw == 0 {
-                    return Err(
-                        "spec_expose: 'max_response_body_bytes' must be greater than zero"
-                            .to_string(),
-                    );
-                }
-                usize::try_from(raw).map_err(|_| {
-                    format!(
-                        "spec_expose: 'max_response_body_bytes' is too large for this platform: {raw}"
-                    )
-                })?
-            }
-        };
+        let max_response_body_bytes = parse_max_response_body_bytes(
+            config,
+            "spec_expose",
+            "max_response_body_bytes",
+            DEFAULT_MAX_RESPONSE_BODY_BYTES,
+        )?;
 
         // Build a dedicated reqwest client for spec fetching.
         // We use a separate client so we can honour the per-plugin tls_no_verify
@@ -290,9 +277,11 @@ impl SpecExpose {
             });
         }
 
+        // Content-Length is an untrusted upstream hint, so this is only a
+        // cooperative fast path. The streaming guard below is authoritative.
         // The plugin HTTP client is built without reqwest auto-decompression
         // features. If that changes, content_length() can become None for
-        // encoded responses and the streaming guard below remains authoritative.
+        // encoded responses and the streaming guard still remains authoritative.
         if let Some(content_length) = response.content_length()
             && content_length > self.max_response_body_bytes as u64
         {
@@ -365,10 +354,7 @@ impl SpecExpose {
         headers.insert("content-type".to_string(), "application/json".to_string());
         PluginResult::Reject {
             status_code: 502,
-            body: format!(
-                r#"{{"error":"API specification response exceeds max_response_body_bytes ({})"}}"#,
-                self.max_response_body_bytes
-            ),
+            body: r#"{"error":"API specification response too large"}"#.to_string(),
             headers,
         }
     }

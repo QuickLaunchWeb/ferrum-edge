@@ -11,13 +11,17 @@
 //!
 //! [`read_response_body_bounded`] streams chunks from the network, enforces
 //! the limit byte-by-byte, and aborts the read as soon as the running total
-//! crosses the threshold — capping memory usage at roughly `max_bytes` plus
-//! one chunk. This mirrors the approach in
+//! crosses the threshold. Successful reads can still return up to `max_bytes`,
+//! but the initial allocation is capped even when an upstream advertises a
+//! huge `Content-Length`. This mirrors the approach in
 //! `proxy::collect_response_with_limit` so plugin-side reads share the same
 //! hardened pattern.
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use serde_json::Value;
+
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 1024 * 1024;
 
 /// Error returned by [`read_response_body_bounded`].
 #[derive(Debug)]
@@ -55,6 +59,29 @@ impl std::fmt::Display for BoundedReadError {
 
 impl std::error::Error for BoundedReadError {}
 
+/// Parse a common `max_response_body_bytes`-style plugin config field.
+pub fn parse_max_response_body_bytes(
+    config: &Value,
+    plugin_name: &str,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let raw = v.as_u64().ok_or_else(|| {
+                format!("{plugin_name}: '{key}' must be an unsigned integer, got: {v}")
+            })?;
+            if raw == 0 {
+                return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
+            }
+            usize::try_from(raw).map_err(|_| {
+                format!("{plugin_name}: '{key}' is too large for this platform: {raw}")
+            })
+        }
+    }
+}
+
 /// Stream a `reqwest::Response` body and accumulate chunks into a `Vec<u8>`,
 /// aborting as soon as the running total exceeds `max_bytes`.
 ///
@@ -63,19 +90,25 @@ impl std::error::Error for BoundedReadError {}
 /// (without finishing the stream). Transport errors are surfaced as
 /// `Err(BoundedReadError::Stream)`.
 ///
-/// The `content-length` hint, when present, is used to pre-size the buffer
-/// (clamped to `max_bytes`) — a single allocation for typical small/medium
-/// responses, no growth churn for larger but bounded ones. When absent, the
-/// buffer grows organically.
+/// The `content-length` hint, when present, is used to pre-size the buffer up
+/// to a small ceiling. This avoids a huge upfront allocation when an operator
+/// configures a high `max_bytes` and the upstream advertises a very large but
+/// still-in-limit body. When absent, the buffer grows organically.
 pub async fn read_response_body_bounded(
     response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, BoundedReadError> {
-    // Pre-size from Content-Length when available, but never larger than the
-    // allowed maximum — a misbehaving sink can advertise CL=10GB.
+    // Pre-size from Content-Length when available, but never larger than a
+    // modest ceiling. A misbehaving sink or oversized operator setting should
+    // not be able to force a huge allocation before streaming starts.
     let initial_capacity = response
         .content_length()
-        .map(|cl| (cl as usize).min(max_bytes))
+        .map(|cl| {
+            usize::try_from(cl)
+                .unwrap_or(usize::MAX)
+                .min(max_bytes)
+                .min(MAX_INITIAL_RESPONSE_BODY_CAPACITY)
+        })
         .unwrap_or(0);
 
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
