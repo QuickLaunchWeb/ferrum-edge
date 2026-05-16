@@ -84,14 +84,18 @@ cargo test --test unit_tests
 cargo test --lib
 cargo test --test integration_tests
 cargo build --bin ferrum-edge
-cargo nextest run --test functional_tests --run-ignored=all --no-fail-fast ...
+cargo nextest run --test functional_tests \
+  --run-ignored=all \
+  --no-fail-fast \
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
+  ...
 ```
 
 **What it tests**:
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Integration tests
-- Functional tests split across harness, admin/routing, data-plane, plugins, protocols, and resilience shards. CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are available for the shards that need them.
+- Functional tests split across harness, admin-routing, data-plane, plugins, protocols, and resilience shards. CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
 
 **Output**:
 - Test pass/fail status
@@ -384,6 +388,7 @@ gh release create v0.2.0 \
 ```
 
 This manual GitHub Release fallback only recreates release assets. If the tag workflow also failed before Docker publishing completed, rerun/fix the release workflow or manually publish the Docker Hub and GHCR images before treating the version release as complete.
+Generated notes are acceptable for this fallback, but they do not include the workflow's curated Docker pull and checksum sections.
 
 ## Binaries and Downloads
 
@@ -563,7 +568,7 @@ Modify build commands in workflows:
 
 ```yaml
 - name: Build with custom features
-  run: cargo build --release --features "cloud-secrets"
+  run: cargo build --release --features "ebpf"
 ```
 
 ### Notification Integration
@@ -619,7 +624,7 @@ gh secret list
 **Test credentials**:
 ```bash
 # Local login test
-docker login -u "$USERNAME" --password-stdin <<< "$PASSWORD"
+printf '%s' "$PASSWORD" | docker login -u "$USERNAME" --password-stdin
 
 # Update secrets if needed
 gh secret set DOCKERHUB_TOKEN --body "new-token"
