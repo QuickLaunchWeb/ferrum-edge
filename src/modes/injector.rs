@@ -34,7 +34,7 @@ use crate::util::body_limit::is_length_limit_error;
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
-const MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB: usize = 1024;
+const MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB: usize = 64;
 const MIB_BYTES: usize = 1024 * 1024;
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
@@ -246,11 +246,7 @@ fn parse_injector_admission_review_max_body_bytes_from_mib(
             "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: must be at most {MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB} MiB"
         ));
     }
-    parsed.checked_mul(MIB_BYTES).ok_or_else(|| {
-        format!(
-            "Invalid FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: value too large: {raw}"
-        )
-    })
+    Ok(parsed * MIB_BYTES)
 }
 
 /// Parse a comma-separated CIDR list. Trims whitespace and skips empty tokens.
@@ -1803,7 +1799,7 @@ mod tests {
         assert!(
             parse_injector_admission_review_max_body_bytes_from_mib(Some(&overflow_mib))
                 .unwrap_err()
-                .contains("must be at most 1024 MiB")
+                .contains("must be at most 64 MiB")
         );
     }
 
