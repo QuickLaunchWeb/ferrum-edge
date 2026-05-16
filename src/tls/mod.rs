@@ -39,8 +39,10 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 use x509_parser::prelude::*;
 
-use crate::config::EnvConfig;
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+use crate::config::EnvConfig;
 
 /// Loaded CRL data shared across all TLS surfaces. Empty when no CRL file is configured.
 pub type CrlList = Arc<Vec<CertificateRevocationListDer<'static>>>;
@@ -494,28 +496,36 @@ pub enum MeshClientAuth {
     None,
 }
 
-/// Load TLS server configuration with the specified mesh client-auth mode.
+/// Server certificate and private key loaded once for mesh frontend TLS.
 ///
-/// This is the mesh-specific variant of [`load_tls_config_with_client_auth`].
-/// The caller passes a [`MeshClientAuth`] that was resolved from the
-/// PeerAuthentication policies via `resolve_effective_mtls_mode()`.
-///
-/// `client_ca_bundle_path` is required for `Required` and `Optional` modes;
-/// `None` mode ignores it.
-#[allow(clippy::too_many_arguments)]
-pub fn load_mesh_tls_config(
+/// PeerAuthentication live reload is allowed to rebuild the mTLS mode and
+/// client-CA verifier, but server cert/key material remains a static
+/// operational input. Holding the parsed DER here prevents a later reload from
+/// incidentally reading changed cert/key files from disk.
+pub struct MeshServerIdentity {
+    cert_path: String,
+    key_path: String,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+impl MeshServerIdentity {
+    pub fn cert_path(&self) -> &str {
+        &self.cert_path
+    }
+
+    pub fn key_path(&self) -> &str {
+        &self.key_path
+    }
+}
+
+/// Load mesh server cert/key material once at startup.
+pub fn load_mesh_server_identity(
     cert_path: &str,
     key_path: &str,
-    client_ca_bundle_path: Option<&str>,
-    client_auth: MeshClientAuth,
-    tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
-    crls: &[CertificateRevocationListDer<'static>],
-) -> Result<Arc<ServerConfig>, anyhow::Error> {
+) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
     check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
-    if let Some(ca_path) = client_ca_bundle_path {
-        check_cert_expiry(ca_path, "mesh client CA bundle", cert_expiry_warning_days)?;
-    }
 
     let cert_file = File::open(cert_path)?;
     let key_file = File::open(key_path)?;
@@ -523,9 +533,37 @@ pub fn load_mesh_tls_config(
     let cert_chain: Vec<_> = certs(&mut BufReader::new(cert_file))
         .filter_map(|r| r.ok())
         .collect();
+    if cert_chain.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No certificates found in mesh server TLS cert {}",
+            cert_path
+        ));
+    }
 
     let key = private_key(&mut BufReader::new(key_file))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+
+    Ok(Arc::new(MeshServerIdentity {
+        cert_path: cert_path.to_string(),
+        key_path: key_path.to_string(),
+        cert_chain,
+        key,
+    }))
+}
+
+/// Build mesh TLS config using startup-cached server cert/key material.
+#[allow(clippy::too_many_arguments)]
+pub fn load_mesh_tls_config_with_identity(
+    identity: &MeshServerIdentity,
+    client_ca_bundle_path: Option<&str>,
+    client_auth: MeshClientAuth,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    if let Some(ca_path) = client_ca_bundle_path {
+        check_cert_expiry(ca_path, "mesh client CA bundle", cert_expiry_warning_days)?;
+    }
 
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
         .with_protocol_versions(&tls_policy.protocol_versions)
@@ -576,21 +614,25 @@ pub fn load_mesh_tls_config(
             info!(
                 mesh_client_auth = ?client_auth,
                 "Mesh TLS configuration loaded with {:?} client auth from cert: {}, key: {}, client CA: {}",
-                client_auth, cert_path, key_path, ca_bundle_path,
+                client_auth,
+                identity.cert_path(),
+                identity.key_path(),
+                ca_bundle_path,
             );
 
             builder
                 .with_client_cert_verifier(verifier)
-                .with_single_cert(cert_chain, key)?
+                .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
         }
         MeshClientAuth::None => {
             info!(
                 "Mesh TLS configuration loaded without client auth from cert: {}, key: {}",
-                cert_path, key_path,
+                identity.cert_path(),
+                identity.key_path(),
             );
             builder
                 .with_no_client_auth()
-                .with_single_cert(cert_chain, key)?
+                .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
         }
     };
 

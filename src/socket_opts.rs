@@ -72,6 +72,58 @@ pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<(
     Ok(()) // No-op on non-Linux
 }
 
+// ── SO_COOKIE ───────────────────────────────────────────────────────────────
+
+/// Read the kernel socket cookie for a TCP stream.
+///
+/// Node-waypoint identity resolution uses this accepted-socket cookie as the
+/// lookup key for metadata captured by the node-agent eBPF programs. The
+/// accepted server-side socket has a different cookie than the source pod's
+/// connecting socket; the GAP-2M sockops/sk_lookup bridge is responsible for
+/// registering records keyed by this accept-side cookie before node-waypoint
+/// traffic is admitted. Non-Linux platforms do not expose `SO_COOKIE`, so
+/// node-waypoint topology fails closed there.
+#[cfg(target_os = "linux")]
+pub fn socket_cookie(stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    socket_cookie_from_raw_fd(stream.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+pub fn socket_cookie_from_raw_fd(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
+    // Linux uapi: include/uapi/asm-generic/socket.h
+    const SO_COOKIE: libc::c_int = 57;
+    let mut cookie = 0u64;
+    let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_COOKIE,
+            &mut cookie as *mut u64 as *mut libc::c_void,
+            &mut len as *mut libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<u64>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SO_COOKIE returned an unexpected value size",
+        ));
+    }
+    Ok(cookie)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn socket_cookie(_stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_COOKIE is only available on Linux",
+    ))
+}
+
 // ── TCP_FASTOPEN ────────────────────────────────────────────────────────────
 
 /// Enable `TCP_FASTOPEN` on a server (listening) socket (Linux only).

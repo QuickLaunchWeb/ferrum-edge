@@ -4,13 +4,55 @@
 //! listener and plugin paths can read the latest mesh view without locks.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use tokio::sync::{Notify, watch};
 
+use crate::identity::SpiffeId;
+use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
 use crate::modes::mesh::slice::MeshSlice;
+
+/// Pre-computed per-pod policy scope identity used by node-waypoint mode.
+///
+/// Node-waypoint accepts traffic for many pods through one listener, so policy
+/// scope selection has to be keyed by the source pod identity. This cache keeps
+/// the workload namespace/labels next to the SPIFFE ID and delegates matching
+/// to the canonical mesh helper to avoid drift from sidecar and plugin paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyScopeCache {
+    pub spiffe_id: SpiffeId,
+    pub namespace: String,
+    pub labels: HashMap<String, String>,
+}
+
+impl PolicyScopeCache {
+    pub fn new(
+        spiffe_id: SpiffeId,
+        namespace: impl Into<String>,
+        labels: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            spiffe_id,
+            namespace: namespace.into(),
+            labels,
+        }
+    }
+
+    pub fn from_workload(workload: &Workload) -> Self {
+        Self {
+            spiffe_id: workload.spiffe_id.clone(),
+            namespace: workload.namespace.clone(),
+            labels: workload.selector.labels.clone(),
+        }
+    }
+
+    pub fn policy_applies(&self, policy: &MeshPolicy) -> bool {
+        policy_scope_applies_to_workload(policy, &self.namespace, &self.labels)
+    }
+}
 
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]
@@ -83,6 +125,7 @@ impl Default for MeshRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::mesh::config::{PolicyScope, WorkloadSelector};
 
     #[tokio::test]
     async fn wait_for_first_slice_resolves_after_install() {
@@ -123,5 +166,33 @@ mod tests {
         )
         .await
         .expect("already-installed slice should not block");
+    }
+
+    #[test]
+    fn policy_scope_cache_delegates_to_canonical_helper() {
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "reviews".to_string());
+        let cache = PolicyScopeCache::new(
+            SpiffeId::new("spiffe://td/ns/default/sa/reviews").expect("test SPIFFE ID is valid"),
+            "default",
+            labels.clone(),
+        );
+        let policy = MeshPolicy {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels,
+                    namespace: Some("default".to_string()),
+                },
+            },
+            rules: Vec::new(),
+        };
+
+        assert!(cache.policy_applies(&policy));
+        assert_eq!(
+            cache.policy_applies(&policy),
+            policy_scope_applies_to_workload(&policy, "default", &cache.labels)
+        );
     }
 }

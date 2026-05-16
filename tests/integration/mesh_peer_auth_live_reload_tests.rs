@@ -6,7 +6,9 @@ use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_mesh_inbound_tls_and_signal};
-use ferrum_edge::tls::{MeshClientAuth, TlsPolicy, load_mesh_tls_config};
+use ferrum_edge::tls::{
+    MeshClientAuth, TlsPolicy, load_mesh_server_identity, load_mesh_tls_config_with_identity,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -42,9 +44,11 @@ fn strict_mesh_tls_config() -> Arc<rustls::ServerConfig> {
     ensure_crypto_provider();
     let env = test_env_config();
     let tls_policy = TlsPolicy::from_env_config(&env).expect("TLS policy");
-    load_mesh_tls_config(
-        "tests/certs/server.crt",
-        "tests/certs/server.key",
+    let identity =
+        load_mesh_server_identity("tests/certs/server.crt", "tests/certs/server.key", 30)
+            .expect("mesh server identity");
+    load_mesh_tls_config_with_identity(
+        &identity,
         // Test fixture certificate is self-signed, so it doubles as the CA
         // anchor for client-certificate verification in this narrow test.
         Some("tests/certs/server.crt"),
@@ -111,8 +115,8 @@ async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap
         String::from_utf8_lossy(&rejected_response)
     );
     assert!(
-        rejected_response.is_empty() || rejected_response.len() < 64,
-        "plaintext rejection should close during TLS admission, not return a routed response; got {} bytes",
+        rejected_response.is_empty() || rejected_response.first() == Some(&0x15),
+        "plaintext rejection should close during TLS admission or emit a TLS alert, not return a routed response; got {} bytes",
         rejected_response.len()
     );
 
