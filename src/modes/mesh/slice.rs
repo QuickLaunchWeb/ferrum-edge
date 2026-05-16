@@ -634,7 +634,7 @@ impl MeshSlice {
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
-            extension_configs: Vec::new(),
+            extension_configs: mesh.extension_configs.clone(),
         }
     }
 }

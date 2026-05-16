@@ -157,6 +157,25 @@ fn translators_emit_all_phase_b_type_urls() {
 }
 
 #[test]
+fn mesh_config_extension_configs_are_served_as_ecds_resources() {
+    let mut config = gateway_config();
+    config.mesh.as_mut().expect("mesh config").extension_configs = vec![MeshExtensionConfig {
+        name: "dr-carrier-api".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: b"{\"name\":\"api\"}".to_vec(),
+    }];
+
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    assert_eq!(slice.extension_configs.len(), 1);
+
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let ecds = snapshot.resources(ECDS_TYPE_URL);
+    assert_eq!(ecds.len(), 1);
+    assert_eq!(ecds[0].name, "dr-carrier-api");
+}
+
+#[test]
 fn translators_deduplicate_colliding_cluster_resources() {
     let mut mesh = mesh_config();
     mesh.service_entries.push(ServiceEntry {

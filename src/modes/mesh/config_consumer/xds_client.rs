@@ -884,6 +884,9 @@ fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> 
         SDS_TYPE_URL => proto::Secret::decode(value)
             .map(|resource| resource.name)
             .map_err(|e| format!("failed to decode Secret resource: {e}")),
+        ECDS_TYPE_URL => proto::TypedExtensionConfig::decode(value)
+            .map(|resource| resource.name)
+            .map_err(|e| format!("failed to decode TypedExtensionConfig resource: {e}")),
         other => Err(format!("unknown xDS type_url '{other}'")),
     }
 }
@@ -1041,6 +1044,14 @@ mod tests {
             .encode_to_vec(),
             SDS_TYPE_URL => proto::Secret {
                 name: name.to_string(),
+            }
+            .encode_to_vec(),
+            ECDS_TYPE_URL => proto::TypedExtensionConfig {
+                name: name.to_string(),
+                typed_config: Some(proto::Any {
+                    type_url: "type.googleapis.com/ferrum.test.Ecds".to_string(),
+                    value: b"opaque".to_vec(),
+                }),
             }
             .encode_to_vec(),
             other => panic!("unknown test type_url: {other}"),
@@ -1491,6 +1502,22 @@ mod tests {
             .expect_err("non-empty response with empty version must be rejected");
 
         assert!(err.contains("empty version_info"));
+    }
+
+    #[test]
+    fn accumulator_accepts_ecds_typed_extension_config_resources() {
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[any_resource(ECDS_TYPE_URL, "dr-carrier-api")],
+                "v1",
+            )
+            .expect("ECDS response applies");
+
+        let resources = accumulator.resources(ECDS_TYPE_URL);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "dr-carrier-api");
     }
 
     #[test]
