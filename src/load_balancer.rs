@@ -1072,6 +1072,9 @@ fn locality_match_for_distribute(to: &LocalityPreference, target: &LocalityPrefe
 /// wildcard forms such as `region/zone/*` match the corresponding source tier.
 #[inline]
 fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPreference) -> bool {
+    if from.region == "*" && from.zone.is_none() && from.sub_zone.is_none() {
+        return true;
+    }
     if from.region != "*" && from.region != source.region {
         return false;
     }

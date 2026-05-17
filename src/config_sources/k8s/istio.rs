@@ -975,6 +975,7 @@ fn is_valid_failover_region(raw: &str) -> bool {
         return false;
     };
     raw == raw.trim()
+        && !raw.contains('/')
         && locality.region != "*"
         && locality.zone.is_none()
         && locality.sub_zone.is_none()

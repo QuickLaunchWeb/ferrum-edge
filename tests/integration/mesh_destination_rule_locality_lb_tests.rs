@@ -213,6 +213,8 @@ fn k8s_translator_rejects_failover_regions_with_slashes_or_whitespace() {
     for (field, value) in [
         ("from", "us-west/us-west-1"),
         ("to", "us-east/us-east-1"),
+        ("from", "us-west/"),
+        ("to", "us-east/"),
         ("from", " us-west "),
         ("to", " us-east "),
     ] {
