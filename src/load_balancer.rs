@@ -272,6 +272,10 @@ const LATENCY_WARMUP_THRESHOLD: u64 = 5;
 /// Sentinel value indicating no latency has been recorded yet.
 const LATENCY_UNSET: u64 = u64::MAX;
 
+/// Fixed-point scale used when splitting locality-level distribute weights
+/// across endpoints in the same matching locality.
+const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
+
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
@@ -929,9 +933,21 @@ fn build_locality_lb_state(
         });
     };
 
-    // distribute[]: first matching `from` wins. Compute per-target weight
-    // by parsing each target's locality and looking it up in the `to` map.
-    let mut distribute_weights: Option<Vec<u32>> = None;
+    let target_localities: Vec<Option<LocalityPreference>> = targets
+        .iter()
+        .map(|target| {
+            target
+                .locality
+                .as_deref()
+                .and_then(LocalityPreference::parse)
+        })
+        .collect();
+
+    // distribute[]: first matching `from` wins. Each `to` entry is a
+    // locality-level percentage, so split that weight across endpoints in the
+    // matching locality instead of copying the full locality weight onto each
+    // endpoint.
+    let mut distribute_weights: Option<Vec<u64>> = None;
     let mut distribute_total: u64 = 0;
     for entry in &setting.distribute {
         let Some(entry_from) = LocalityPreference::parse(&entry.from) else {
@@ -940,30 +956,37 @@ fn build_locality_lb_state(
         if !locality_from_matches_source(&entry_from, &source) {
             continue;
         }
-        let mut weights = vec![0u32; targets.len()];
+        let mut weights = vec![0u64; targets.len()];
         let mut total: u64 = 0;
-        for (idx, target) in targets.iter().enumerate() {
-            let Some(target_locality) = target.locality.as_deref() else {
+        for (to_locality, to_weight) in &entry.to {
+            let Some(to_pref) = LocalityPreference::parse(to_locality) else {
                 continue;
             };
-            // Match either the exact locality key or any prefix entry the
-            // operator declared (e.g. `to: { "us-west": 80, "us-east": 20 }`
-            // applies to any target locality in `us-west/...`).
-            let Some(target_pref) = LocalityPreference::parse(target_locality) else {
+            let matching_targets: Vec<usize> = target_localities
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, target_pref)| {
+                    target_pref
+                        .as_ref()
+                        .filter(|target_pref| locality_match_for_distribute(&to_pref, target_pref))
+                        .map(|_| idx)
+                })
+                .collect();
+            if matching_targets.is_empty() {
                 continue;
-            };
-            let mut weight: u32 = 0;
-            for (to_locality, to_weight) in &entry.to {
-                let Some(to_pref) = LocalityPreference::parse(to_locality) else {
-                    continue;
-                };
-                if locality_match_for_distribute(&to_pref, &target_pref) {
-                    weight = weight.saturating_add(*to_weight);
-                }
             }
-            if weight > 0 {
-                weights[idx] = weight;
-                total = total.saturating_add(u64::from(weight));
+            let scaled_weight =
+                u64::from(*to_weight).saturating_mul(LOCALITY_DISTRIBUTE_WEIGHT_SCALE);
+            let target_count = matching_targets.len() as u64;
+            let per_target = scaled_weight / target_count;
+            let remainder = scaled_weight % target_count;
+            for (offset, idx) in matching_targets.into_iter().enumerate() {
+                let share = per_target + if (offset as u64) < remainder { 1 } else { 0 };
+                if share == 0 {
+                    continue;
+                }
+                weights[idx] = weights[idx].saturating_add(share);
+                total = total.saturating_add(share);
             }
         }
         // Only honour the match if at least one target was reachable;
@@ -1161,12 +1184,13 @@ struct LocalityLbState {
     /// AND the existing priority-tier preference (matches Istio semantics
     /// of `enabled: false`).
     enabled: bool,
-    /// Per-target distribute weight, index-aligned with `LoadBalancer.targets`.
+    /// Per-target fixed-point distribute weight, index-aligned with
+    /// `LoadBalancer.targets`.
     /// `None` when no `distribute[]` entry matched the source locality.
     /// Targets with weight 0 are excluded from distribute-mode selection.
     /// Present + non-empty values trigger weighted random selection that
     /// overrides the upstream / port / subset algorithm.
-    distribute_weights: Option<Vec<u32>>,
+    distribute_weights: Option<Vec<u64>>,
     /// Pre-computed total of `distribute_weights` (for selection rng modulo).
     distribute_total: u64,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
@@ -1993,8 +2017,7 @@ impl LoadBalancer {
             if !healthy.contains(idx) {
                 continue;
             }
-            healthy_total =
-                healthy_total.saturating_add(u64::from(weights.get(idx).copied().unwrap_or(0)));
+            healthy_total = healthy_total.saturating_add(weights.get(idx).copied().unwrap_or(0));
         }
         if healthy_total == 0 {
             return None;
@@ -2008,7 +2031,7 @@ impl LoadBalancer {
             if !healthy.contains(idx) {
                 continue;
             }
-            let weight = u64::from(weights.get(idx).copied().unwrap_or(0));
+            let weight = weights.get(idx).copied().unwrap_or(0);
             if weight == 0 {
                 continue;
             }
@@ -2034,8 +2057,7 @@ impl LoadBalancer {
         }
         let mut healthy_total: u64 = 0;
         for (idx, _) in candidates {
-            healthy_total =
-                healthy_total.saturating_add(u64::from(weights.get(*idx).copied().unwrap_or(0)));
+            healthy_total = healthy_total.saturating_add(weights.get(*idx).copied().unwrap_or(0));
         }
         if healthy_total == 0 {
             return None;
@@ -2044,7 +2066,7 @@ impl LoadBalancer {
         let pick = golden_ratio_hash(raw) % healthy_total;
         let mut acc: u64 = 0;
         for (idx, target) in candidates {
-            let weight = u64::from(weights.get(*idx).copied().unwrap_or(0));
+            let weight = weights.get(*idx).copied().unwrap_or(0);
             if weight == 0 {
                 continue;
             }

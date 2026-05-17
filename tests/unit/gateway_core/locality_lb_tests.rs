@@ -621,24 +621,24 @@ fn locality_distribute_overrides_priority_tier_with_weights() {
     let total = west_a + west_b + east;
     assert_eq!(total, 2000);
 
-    // `us-west` matches both west-a and west-b, each weighted 80; `us-east`
-    // matches only east, weighted 20. Effective weights are 80 / 80 / 20,
-    // so expected ratios are 0.444 / 0.444 / 0.111. Allow ±6% slack for the
-    // golden-ratio PRNG.
+    // `us-west` is the 80% locality share, split across west-a and west-b;
+    // `us-east` is the 20% locality share with one endpoint. Effective
+    // endpoint ratios are therefore 0.4 / 0.4 / 0.2. Allow ±6% slack for
+    // the golden-ratio PRNG.
     let west_a_ratio = f64::from(west_a) / f64::from(total);
     let west_b_ratio = f64::from(west_b) / f64::from(total);
     let east_ratio = f64::from(east) / f64::from(total);
     assert!(
-        (west_a_ratio - 0.444).abs() < 0.06,
-        "west-a ratio {west_a_ratio:.3} outside ±0.06 of 0.444"
+        (west_a_ratio - 0.4).abs() < 0.06,
+        "west-a ratio {west_a_ratio:.3} outside ±0.06 of 0.4"
     );
     assert!(
-        (west_b_ratio - 0.444).abs() < 0.06,
-        "west-b ratio {west_b_ratio:.3} outside ±0.06 of 0.444"
+        (west_b_ratio - 0.4).abs() < 0.06,
+        "west-b ratio {west_b_ratio:.3} outside ±0.06 of 0.4"
     );
     assert!(
-        (east_ratio - 0.111).abs() < 0.04,
-        "east ratio {east_ratio:.3} outside ±0.04 of 0.111"
+        (east_ratio - 0.2).abs() < 0.04,
+        "east ratio {east_ratio:.3} outside ±0.04 of 0.2"
     );
 }
 
