@@ -10,26 +10,32 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-# The cross-rs container lacks sccache, mold, and standalone `clang` (only
-# clang-6.0 from the LLVM apt repo). It DOES have `cc` (symlink to gcc) and
-# `aarch64-linux-gnu-gcc` (cross toolchain). We override both the target
-# triple (aarch64, for the final binary) AND the host triple (x86_64, used
-# when building build-scripts/proc-macros) so neither path tries to spawn
-# a missing tool.
+# The cross-rs container lacks sccache, mold, standalone `clang`, and a
+# gcc new enough to understand `-fuse-ld=`. We use three forms of override
+# (one per kind of cargo setting) to make `.cargo/config.toml` agnostic:
 #
-# Empty env values like `RUSTC_WRAPPER=` reliably clear the corresponding
-# config-file entry, but the same trick is unreliable for CARGO_TARGET_*_LINKER
-# (cargo treats it as "use empty string as linker name" in some paths,
-# which then errors). So LINKER is overridden with a real binary that
-# exists in the container, and RUSTFLAGS is overridden with a harmless
-# custom cfg so the no-op shows up as a non-empty (and therefore
-# unambiguous) env value.
+# 1. `RUSTC_WRAPPER=` (empty) — cargo reliably treats empty as "no wrapper",
+#    cleanly clearing `[build] rustc-wrapper`. Same for CARGO_BUILD_RUSTC_WRAPPER.
+#
+# 2. `RUSTFLAGS=` (empty) — per cargo docs, when RUSTFLAGS is set (even to
+#    empty), cargo skips `[target.<triple>] rustflags` entirely. This is
+#    the only env-var form that REPLACES (rather than merges with) target-
+#    specific rustflags. CARGO_TARGET_<TRIPLE>_RUSTFLAGS merges, which is
+#    why an earlier fix using it left `-fuse-ld=mold` still on the linker
+#    cmdline.
+#
+# 3. `CARGO_TARGET_<TRIPLE>_LINKER=<real binary>` — cargo doesn't honor
+#    empty values for the LINKER key, so we point each to a real binary
+#    that exists in the container:
+#      - x86_64-linux-gnu (host, used for build scripts/proc-macros): `cc`
+#        (gcc symlink, always present on Debian/Ubuntu).
+#      - aarch64-linux-gnu (cross target): `aarch64-linux-gnu-gcc`
+#        (the cross toolchain shipped in the container).
 passthrough = [
     "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
     "RUSTC_WRAPPER=",
     "CARGO_BUILD_RUSTC_WRAPPER=",
+    "RUSTFLAGS=",
     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc",
-    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=cross_rs_build",
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=cross_rs_build",
 ]

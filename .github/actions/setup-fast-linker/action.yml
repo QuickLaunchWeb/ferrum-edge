@@ -15,12 +15,15 @@ description: >-
   Windows is intentionally not touched — rustup ships lld-link.exe but
   switching MSVC's default link.exe adds risk without measurable benefit.
 
-  Why non-empty fallbacks: cargo reliably honors empty `RUSTC_WRAPPER=`
-  to clear `[build] rustc-wrapper`, but `CARGO_TARGET_<TRIPLE>_LINKER=`
-  empty doesn't always clear `[target.<triple>] linker = ...` — cargo
-  has been observed reading the config-file value anyway. Setting the
-  fallback to a real binary (`cc`) and a harmless custom cfg flag side-
-  steps the ambiguity.
+  Fallback semantics (verified empirically against cargo's actual
+  behavior, not just docs):
+    - `RUSTFLAGS=` (empty) — REPLACES target.<triple>.rustflags from
+      config.toml (cargo skips target rustflags entirely once RUSTFLAGS
+      is set, even to empty). This is the only env-var form that works;
+      CARGO_TARGET_<TRIPLE>_RUSTFLAGS MERGES with the config value.
+    - `CARGO_TARGET_<TRIPLE>_LINKER=cc` — empty doesn't reliably clear
+      the LINKER config, so we point at a real binary (`cc` is a symlink
+      to the default C compiler on every Linux distro).
 
 runs:
   using: composite
@@ -46,20 +49,19 @@ runs:
       shell: bash
       run: |
         fallback_linux() {
-          # cc is universally a symlink to the default C compiler on Linux.
-          # The --cfg flag is a no-op (no code in this repo checks it).
+          # RUSTFLAGS= (empty) makes cargo skip target.<triple>.rustflags
+          # entirely — the only env-var form that REPLACES rather than
+          # merges. LINKER=cc points at the universal symlink to gcc.
+          echo "RUSTFLAGS=" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
         }
 
         fallback_macos() {
           # macOS config.toml has no `linker = ` line for darwin targets;
-          # only rustflags. Override with a harmless cfg so cargo doesn't
-          # try to pass `-fuse-ld=lld` to the default linker without lld.
-          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
+          # only rustflags. RUSTFLAGS= replaces them — cargo uses the
+          # default Apple linker.
+          echo "RUSTFLAGS=" >> "$GITHUB_ENV"
         }
 
         case "${RUNNER_OS}" in
