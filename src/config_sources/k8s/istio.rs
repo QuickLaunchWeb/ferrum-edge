@@ -737,6 +737,17 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
+        if entry
+            .get("loadBalancer")
+            .and_then(|lb| lb.get("localityLbSetting"))
+            .is_some()
+        {
+            return Err(invalid_resource(
+                object,
+                "trafficPolicy.portLevelSettings[].loadBalancer.localityLbSetting is not supported",
+            ));
+        }
+
         let policy = translate_traffic_policy(acc, object, entry)?;
 
         if out.insert(port, policy).is_some() {
@@ -767,7 +778,12 @@ fn translate_traffic_policy(
 
     let load_balancer = value
         .get("loadBalancer")
-        .map(|lb| translate_load_balancer(acc, object, lb))
+        .and_then(|lb| {
+            (lb.get("simple").is_some()
+                || lb.get("consistentHash").is_some()
+                || lb.get("localityLbSetting").is_none())
+            .then(|| translate_load_balancer(acc, object, lb))
+        })
         .transpose()?;
 
     // `localityLbSetting` lives under `trafficPolicy.loadBalancer.localityLbSetting`

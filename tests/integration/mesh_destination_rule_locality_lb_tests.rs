@@ -388,6 +388,77 @@ fn k8s_translator_honors_enabled_false() {
 }
 
 #[test]
+fn locality_only_destination_rule_preserves_existing_upstream_algorithm() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failover": [
+                            { "from": "us-west", "to": "us-east" }
+                        ]
+                    }
+                }
+            }
+        }),
+    );
+    let result = translate_k8s_objects(&[object], k8s_options()).expect("translation");
+    let mut config = result.config;
+    let mut upstream = matching_upstream("reviews-u", "reviews.default.svc.cluster.local");
+    upstream.algorithm = LoadBalancerAlgorithm::LeastConnections;
+    config.upstreams.push(upstream);
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh apply");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream projected");
+
+    assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::LeastConnections);
+    assert!(
+        upstream.locality_lb_setting.is_some(),
+        "locality policy should still project without changing LB algorithm"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_port_level_locality_lb_setting() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "portLevelSettings": [
+                    {
+                        "port": { "number": 8080 },
+                        "loadBalancer": {
+                            "localityLbSetting": {
+                                "failover": [
+                                    { "from": "us-west", "to": "us-east" }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("port-level locality LB must be rejected until projected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("portLevelSettings[].loadBalancer.localityLbSetting is not supported"),
+        "expected port-level locality rejection, got: {msg}"
+    );
+}
+
+#[test]
 fn distribute_projects_through_mesh_apply_onto_upstream_locality_lb_setting() {
     // End-to-end: K8s DR → mesh slice → cold-path apply → Upstream field.
     let object = istio_object(
