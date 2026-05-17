@@ -320,6 +320,8 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
+The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. In mesh mode it includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics.
+
 ### Runtime Metrics
 
 ```bash
@@ -672,6 +674,48 @@ Field semantics:
 - `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
 
 `services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
+
+## Mesh Service Graph (mesh mode)
+
+`GET /mesh/service-graph` returns the live HTTP-family mesh service graph aggregated from the auto-injected `workload_metrics` plugin. It is JWT-authenticated and contains only identity, workload, protocol, and RED-counter metadata; request bodies, headers, and credentials are never stored.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/service-graph
+```
+
+Response:
+
+```json
+{
+  "generated_at": "2026-05-17T16:30:00Z",
+  "generated_at_unix_ms": 1779035400000,
+  "edge_count": 1,
+  "edges": [
+    {
+      "source_principal": "spiffe://cluster.local/ns/default/sa/frontend",
+      "source_workload": "frontend",
+      "source_namespace": "default",
+      "source_app": "frontend",
+      "source_service": "frontend",
+      "destination_principal": "spiffe://cluster.local/ns/default/sa/reviews",
+      "destination_workload": "reviews",
+      "destination_namespace": "default",
+      "destination_app": "reviews",
+      "destination_service": "reviews",
+      "request_protocol": "http",
+      "connection_security_policy": "mutual_tls",
+      "requests_total": 1250,
+      "errors_total": 3,
+      "duration_ms_total": 8420.5,
+      "duration_ms_avg": 6.7364,
+      "last_seen": "2026-05-17T16:29:58Z",
+      "last_seen_unix_ms": 1779035398000
+    }
+  ]
+}
+```
+
+The graph is node-local. In CP/DP or multi-replica mesh deployments, query each data plane and aggregate externally. The admin read path serves an `ArcSwap` snapshot, so frequent polling does not iterate live request counters.
 
 ## Mesh Egress Scope (mesh mode)
 

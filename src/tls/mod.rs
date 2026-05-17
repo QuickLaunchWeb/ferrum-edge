@@ -66,6 +66,9 @@ where
         match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
             Ok(result) => result,
             Err(_) => {
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
+                    "timeout",
+                );
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
                     peer.ip(),
@@ -84,6 +87,9 @@ where
     match result {
         Ok(stream) => Ok(stream),
         Err(e) => {
+            crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
+                "error",
+            );
             warn!("Frontend TLS handshake failed from {}: {}", peer.ip(), e);
             Err(e)
         }

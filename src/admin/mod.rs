@@ -851,6 +851,9 @@ pub async fn handle_admin_request(
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
 
+        // Mesh service graph
+        (Method::GET, ["mesh", "service-graph"]) => handle_mesh_service_graph_get().await,
+
         // Mesh egress-scope operability
         (Method::GET, ["mesh", "egress-scope"]) => handle_mesh_egress_scope_get(&state).await,
         (Method::POST, ["mesh", "egress-scope", "test"]) => {
@@ -941,6 +944,11 @@ async fn handle_mesh_egress_scope_get(
             "health": egress.health(),
         }),
     ))
+}
+
+async fn handle_mesh_service_graph_get() -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let snapshot = crate::plugins::mesh::service_graph::global_service_graph().snapshot();
+    Ok(json_response(StatusCode::OK, &json!(snapshot.as_ref())))
 }
 
 async fn handle_mesh_egress_scope_test(

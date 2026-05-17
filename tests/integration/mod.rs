@@ -4,6 +4,7 @@ mod admin_cached_config_tests;
 mod admin_cross_namespace_refs_tests;
 mod admin_db_api_specs_tests;
 mod admin_mesh_egress_scope_tests;
+mod admin_mesh_service_graph_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_runtime_metrics_tests;
 mod apply_incremental_outcome_tests;

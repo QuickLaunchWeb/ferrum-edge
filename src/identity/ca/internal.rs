@@ -139,6 +139,7 @@ impl InternalCa {
             trust_domain = %config.trust_domain,
             "internal CA initialised"
         );
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
 
         Ok(Self {
             trust_domain: config.trust_domain,
@@ -291,6 +292,10 @@ impl CertificateAuthority for InternalCa {
 
                 let leaf_der = cert.der().to_vec();
                 let not_after = issued_cert_not_after(&leaf_der)?;
+                crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+                    &spiffe_id, "internal", &not_after,
+                );
+                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
                 Ok(SignedSvid {
                     spiffe_id,
                     cert_chain_der: vec![leaf_der, self.root_cert_der.clone()],
@@ -311,6 +316,12 @@ impl CertificateAuthority for InternalCa {
 
                 let mut svid = self.sign_with_keypair(&spiffe_id, ttl, &key_pair)?;
                 svid.private_key_pkcs8_der = serialized_key;
+                crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+                    &svid.spiffe_id,
+                    "internal",
+                    &svid.not_after,
+                );
+                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
 
                 debug!(
                     spiffe_id = %spiffe_id,
@@ -326,11 +337,14 @@ impl CertificateAuthority for InternalCa {
         if td != &self.trust_domain {
             return Err(CaError::UnknownTrustDomain(td.to_string()));
         }
-        Ok(PublishedTrustBundle {
+        let bundle = PublishedTrustBundle {
             trust_domain: self.trust_domain.clone(),
             roots_der: vec![self.root_cert_der.clone()],
             refresh_hint_secs: self.bundle_refresh_hint_secs,
-        })
+        };
+        crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle(&bundle, "internal");
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
+        Ok(bundle)
     }
 
     async fn jwt_authorities(

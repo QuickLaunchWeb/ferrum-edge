@@ -65,6 +65,8 @@ tags:
     description: Unauthenticated health and readiness probes
   - name: Metrics
     description: Observability and monitoring endpoints
+  - name: Mesh Observability
+    description: Mesh service graph and identity health telemetry
   - name: Proxies
     description: Manage proxy route definitions
   - name: Consumers
@@ -182,6 +184,9 @@ paths:
       description: |
         Returns gateway metrics in Prometheus exposition format.
         Unauthenticated so it can be scraped by Prometheus without credentials.
+        Mesh mode adds identity and control-plane telemetry families for
+        certificate expiry, rotation failures, CA health, trust-bundle
+        versions, config freshness, and mTLS handshake failures.
       tags: [Metrics]
       security: []
       responses:
@@ -647,6 +652,132 @@ paths:
                 no_slice:
                   value:
                     error: "no mesh slice available yet"
+
+  # ── Mesh service graph (mesh mode) ───────────────────────────────────
+  /mesh/service-graph:
+    get:
+      operationId: getMeshServiceGraph
+      summary: Inspect the live mesh service graph for this data plane
+      description: |
+        Returns a node-local source-workload to destination-workload graph
+        aggregated from the auto-injected `workload_metrics` plugin. The
+        endpoint exposes identity, workload, protocol, and RED-counter
+        metadata only; request bodies, headers, and credentials are not stored.
+
+        In CP/DP or horizontally scaled mesh deployments, query each data
+        plane and aggregate externally.
+      tags: [Mesh Observability]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Mesh service graph snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [generated_at_unix_ms, generated_at, edge_count, edges]
+                properties:
+                  generated_at_unix_ms:
+                    type: integer
+                    format: int64
+                  generated_at:
+                    type: string
+                    format: date-time
+                  edge_count:
+                    type: integer
+                    format: int64
+                  edges:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - source_principal
+                        - source_workload
+                        - source_namespace
+                        - source_app
+                        - source_service
+                        - destination_principal
+                        - destination_workload
+                        - destination_namespace
+                        - destination_app
+                        - destination_service
+                        - request_protocol
+                        - connection_security_policy
+                        - requests_total
+                        - errors_total
+                        - duration_ms_total
+                        - duration_ms_avg
+                        - last_seen_unix_ms
+                        - last_seen
+                      properties:
+                        source_principal:
+                          type: string
+                        source_workload:
+                          type: string
+                        source_namespace:
+                          type: string
+                        source_app:
+                          type: string
+                        source_service:
+                          type: string
+                        destination_principal:
+                          type: string
+                        destination_workload:
+                          type: string
+                        destination_namespace:
+                          type: string
+                        destination_app:
+                          type: string
+                        destination_service:
+                          type: string
+                        request_protocol:
+                          type: string
+                        connection_security_policy:
+                          type: string
+                        requests_total:
+                          type: integer
+                          format: int64
+                        errors_total:
+                          type: integer
+                          format: int64
+                        duration_ms_total:
+                          type: number
+                          format: double
+                        duration_ms_avg:
+                          type: number
+                          format: double
+                        last_seen_unix_ms:
+                          type: integer
+                          format: int64
+                        last_seen:
+                          type: string
+                          format: date-time
+              example:
+                generated_at_unix_ms: 1779035400000
+                generated_at: "2026-05-17T16:30:00Z"
+                edge_count: 1
+                edges:
+                  - source_principal: "spiffe://cluster.local/ns/default/sa/frontend"
+                    source_workload: "frontend"
+                    source_namespace: "default"
+                    source_app: "frontend"
+                    source_service: "frontend"
+                    destination_principal: "spiffe://cluster.local/ns/default/sa/reviews"
+                    destination_workload: "reviews"
+                    destination_namespace: "default"
+                    destination_app: "reviews"
+                    destination_service: "reviews"
+                    request_protocol: "http"
+                    connection_security_policy: "mutual_tls"
+                    requests_total: 1250
+                    errors_total: 3
+                    duration_ms_total: 8420.5
+                    duration_ms_avg: 6.7364
+                    last_seen_unix_ms: 1779035398000
+                    last_seen: "2026-05-17T16:29:58Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ── Mesh egress scope (mesh mode) ────────────────────────────────────
   /mesh/egress-scope:

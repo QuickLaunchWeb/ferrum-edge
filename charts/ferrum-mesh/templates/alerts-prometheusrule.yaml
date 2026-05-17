@@ -1,0 +1,75 @@
+{{- if and .Values.observability.enabled .Values.observability.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ferrum-mesh-alerts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-observability
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    prometheus: ferrum-mesh
+spec:
+  groups:
+    - name: ferrum.mesh.identity
+      rules:
+        - alert: FerrumMeshCertificateExpiringSoon
+          expr: min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < {{ .Values.observability.alerts.certExpiringSeconds }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh certificate is expiring soon
+            description: "SVID {{ "{{ $labels.spiffe_id }}" }} from {{ "{{ $labels.source }}" }} expires in {{ "{{ $value }}" }} seconds."
+        - alert: FerrumMeshCertificateRotationFailures
+          expr: sum by (spiffe_id, source) (increase(ferrum_mesh_cert_rotation_failures_total[10m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Ferrum mesh certificate rotation is failing
+            description: "SVID rotation or fetch failures observed for {{ "{{ $labels.spiffe_id }}" }} from {{ "{{ $labels.source }}" }}."
+        - alert: FerrumMeshCaUnhealthy
+          expr: min by (ca_type) (ferrum_mesh_ca_health) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Ferrum mesh CA backend is unhealthy
+            description: "CA backend {{ "{{ $labels.ca_type }}" }} is reporting unhealthy."
+    - name: ferrum.mesh.control-plane
+      rules:
+        - alert: FerrumMeshControlPlaneConfigStale
+          expr: time() - max by (namespace) (ferrum_mesh_config_last_received_timestamp_seconds) > {{ .Values.observability.alerts.cpStaleConfigSeconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh data plane has stale control-plane config
+            description: "No fresh mesh config has been observed for namespace {{ "{{ $labels.namespace }}" }} within the configured freshness window."
+    - name: ferrum.mesh.security
+      rules:
+        - alert: FerrumMeshMtlsHandshakeFailureSpike
+          expr: sum(rate(ferrum_mesh_mtls_handshake_failures_total[5m])) > {{ .Values.observability.alerts.mtlsHandshakeFailureRatePerSecond }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh mTLS handshake failures increased
+            description: "mTLS handshake failures are above the configured threshold."
+        - alert: FerrumMeshPolicyDenySpike
+          expr: sum(rate(ferrum_mesh_requests_total{response_code="403"}[5m])) > {{ .Values.observability.alerts.policyDenyRatePerSecond }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh policy denies increased
+            description: "HTTP 403 responses on mesh traffic are above the configured threshold."
+        - alert: FerrumMeshInjectorWebhookFailureSpike
+          expr: sum(rate(apiserver_admission_webhook_rejection_count{name=~"sidecar-injector\\.ferrum\\.io.*"}[5m])) > {{ .Values.observability.alerts.injectorFailureRatePerSecond }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh injector webhook failures increased
+            description: "Kubernetes admission webhook rejections for the Ferrum injector are above the configured threshold."
+{{- end }}

@@ -2,10 +2,29 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+
+use crate::identity::ca::PublishedTrustBundle;
+use crate::identity::spiffe::SpiffeId;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
+
+static MESH_CERT_EXPIRY_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_CERT_ROTATION_FAILURES: LazyLock<DashMap<MeshCertRotationFailureKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_CA_HEALTH: LazyLock<DashMap<MeshCaHealthKey, AtomicU64>> = LazyLock::new(DashMap::new);
+static MESH_TRUST_BUNDLE_VERSIONS: LazyLock<
+    DashMap<MeshTrustBundleVersionKey, TrustBundleVersionGauge>,
+> = LazyLock::new(DashMap::new);
+static MESH_CONFIG_LAST_RECEIVED: LazyLock<DashMap<Arc<str>, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_MTLS_HANDSHAKE_FAILURES: LazyLock<DashMap<MeshMtlsHandshakeFailureKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
 
 /// Istio/GAMMA-style RED metric key for mesh HTTP-family requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,6 +43,242 @@ pub struct MeshRequestKey {
     pub response_code: u16,
     pub response_flags: Arc<str>,
     pub connection_security_policy: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshCertExpiryKey {
+    spiffe_id: Arc<str>,
+    source: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshCertRotationFailureKey {
+    spiffe_id: Arc<str>,
+    source: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshCaHealthKey {
+    ca_type: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshTrustBundleVersionKey {
+    trust_domain: Arc<str>,
+    source: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshMtlsHandshakeFailureKey {
+    reason: Arc<str>,
+}
+
+struct TrustBundleVersionGauge {
+    fingerprint: AtomicU64,
+    version: AtomicU64,
+}
+
+impl TrustBundleVersionGauge {
+    fn new(fingerprint: u64) -> Self {
+        Self {
+            fingerprint: AtomicU64::new(fingerprint),
+            version: AtomicU64::new(1),
+        }
+    }
+
+    fn observe(&self, fingerprint: u64) {
+        let mut current = self.fingerprint.load(Ordering::Relaxed);
+        while current != fingerprint {
+            match self.fingerprint.compare_exchange_weak(
+                current,
+                fingerprint,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.version.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+pub fn record_mesh_cert_expiry_seconds(
+    spiffe_id: impl AsRef<str>,
+    source: impl AsRef<str>,
+    seconds_until_expiry: u64,
+) {
+    let key = MeshCertExpiryKey {
+        spiffe_id: Arc::from(spiffe_id.as_ref()),
+        source: Arc::from(source.as_ref()),
+    };
+    MESH_CERT_EXPIRY_SECONDS
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(seconds_until_expiry, Ordering::Relaxed);
+}
+
+pub fn record_mesh_cert_expiry_at(
+    spiffe_id: &SpiffeId,
+    source: impl AsRef<str>,
+    not_after: &DateTime<Utc>,
+) {
+    let seconds_until_expiry = not_after
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    record_mesh_cert_expiry_seconds(spiffe_id, source, seconds_until_expiry);
+}
+
+pub fn increment_mesh_cert_rotation_failure(spiffe_id: impl AsRef<str>, source: impl AsRef<str>) {
+    let key = MeshCertRotationFailureKey {
+        spiffe_id: Arc::from(spiffe_id.as_ref()),
+        source: Arc::from(source.as_ref()),
+    };
+    MESH_CERT_ROTATION_FAILURES
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_mesh_ca_health(ca_type: impl AsRef<str>, healthy: bool) {
+    let key = MeshCaHealthKey {
+        ca_type: Arc::from(ca_type.as_ref()),
+    };
+    MESH_CA_HEALTH
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(u64::from(healthy), Ordering::Relaxed);
+}
+
+pub fn record_mesh_trust_bundle(bundle: &PublishedTrustBundle, source: impl AsRef<str>) {
+    record_mesh_trust_bundle_roots(
+        bundle.trust_domain.as_str(),
+        source,
+        bundle.roots_der.as_slice(),
+    );
+}
+
+pub fn record_mesh_trust_bundle_roots(
+    trust_domain: impl AsRef<str>,
+    source: impl AsRef<str>,
+    roots_der: &[Vec<u8>],
+) {
+    let fingerprint = trust_bundle_fingerprint(roots_der);
+    let key = MeshTrustBundleVersionKey {
+        trust_domain: Arc::from(trust_domain.as_ref()),
+        source: Arc::from(source.as_ref()),
+    };
+    MESH_TRUST_BUNDLE_VERSIONS
+        .entry(key)
+        .or_insert_with(|| TrustBundleVersionGauge::new(fingerprint))
+        .observe(fingerprint);
+}
+
+pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
+    MESH_CONFIG_LAST_RECEIVED
+        .entry(Arc::from(namespace.as_ref()))
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+}
+
+pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
+    let key = MeshMtlsHandshakeFailureKey {
+        reason: Arc::from(reason.as_ref()),
+    };
+    MESH_MTLS_HANDSHAKE_FAILURES
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn render_mesh_cert_metrics(output: &mut String) {
+    if !MESH_CERT_EXPIRY_SECONDS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_cert_expiry_seconds Seconds until mesh X.509-SVID expiry.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_cert_expiry_seconds gauge\n");
+        for entry in MESH_CERT_EXPIRY_SECONDS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_cert_expiry_seconds{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().spiffe_id),
+                escape_label_value(&entry.key().source),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_CERT_ROTATION_FAILURES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_cert_rotation_failures_total Mesh certificate rotation failures.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_cert_rotation_failures_total counter\n");
+        for entry in MESH_CERT_ROTATION_FAILURES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_cert_rotation_failures_total{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().spiffe_id),
+                escape_label_value(&entry.key().source),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_CA_HEALTH.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_ca_health Mesh CA backend health, 1 healthy and 0 unhealthy.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_ca_health gauge\n");
+        for entry in MESH_CA_HEALTH.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_ca_health{{ca_type=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().ca_type),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_TRUST_BUNDLE_VERSIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_trust_bundle_version Monotonic version of observed mesh trust bundles.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_trust_bundle_version gauge\n");
+        for entry in MESH_TRUST_BUNDLE_VERSIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_trust_bundle_version{{trust_domain=\"{}\",source=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().trust_domain),
+                escape_label_value(&entry.key().source),
+                entry.value().version.load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_CONFIG_LAST_RECEIVED.is_empty() {
+        output.push_str("# HELP ferrum_mesh_config_last_received_timestamp_seconds Unix timestamp of the last installed mesh config slice.\n");
+        output.push_str("# TYPE ferrum_mesh_config_last_received_timestamp_seconds gauge\n");
+        for entry in MESH_CONFIG_LAST_RECEIVED.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_config_last_received_timestamp_seconds{{namespace=\"{}\"}} {}\n",
+                escape_label_value(entry.key()),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_MTLS_HANDSHAKE_FAILURES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_mtls_handshake_failures_total Frontend mesh TLS/mTLS handshake failures.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_mtls_handshake_failures_total counter\n");
+        for entry in MESH_MTLS_HANDSHAKE_FAILURES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_mtls_handshake_failures_total{{reason=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().reason),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
 }
 
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
@@ -94,6 +349,19 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
 
 fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
     Arc::from(metadata.get(key).map(String::as_str).unwrap_or(default))
+}
+
+fn trust_bundle_fingerprint(roots_der: &[Vec<u8>]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for root in roots_der {
+        hash ^= root.len() as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        for byte in root {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
 }
 
 fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: &str) -> Arc<str> {
