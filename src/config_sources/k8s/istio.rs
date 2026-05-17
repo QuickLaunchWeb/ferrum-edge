@@ -3027,6 +3027,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -8958,6 +8959,7 @@ extensionProviders:
                 metadata: K8sMetadata {
                     name: "mesh-default".to_string(),
                     namespace: "istio-config".to_string(),
+                    generation: None,
                     labels: HashMap::new(),
                     creation_timestamp: None,
                     deletion_timestamp: None,
@@ -8996,6 +8998,7 @@ extensionProviders:
                 metadata: K8sMetadata {
                     name: "mesh-api".to_string(),
                     namespace: "istio-config".to_string(),
+                    generation: None,
                     labels: HashMap::new(),
                     creation_timestamp: None,
                     deletion_timestamp: None,
@@ -9127,6 +9130,7 @@ extensionProviders:
                     metadata: K8sMetadata {
                         name: "api-overrides".to_string(),
                         namespace: "default".to_string(),
+                        generation: None,
                         labels: HashMap::new(),
                         creation_timestamp: None,
                         deletion_timestamp: None,
@@ -9686,6 +9690,7 @@ extensionProviders:
             metadata: K8sMetadata {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -9703,6 +9708,7 @@ extensionProviders:
             metadata: K8sMetadata {
                 name: name.to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -9896,6 +9902,7 @@ extensionProviders:
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -9946,6 +9953,7 @@ extensionProviders:
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,

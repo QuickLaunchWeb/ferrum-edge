@@ -1677,6 +1677,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1691,6 +1692,7 @@ mod tests {
         K8sObject {
             metadata: K8sMetadata {
                 namespace: namespace.to_string(),
+                generation: None,
                 ..object(kind, Value::Null).metadata
             },
             spec,

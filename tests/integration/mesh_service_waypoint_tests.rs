@@ -67,6 +67,7 @@ fn meta_full(
     K8sMetadata {
         name: name.to_string(),
         namespace: namespace.to_string(),
+        generation: None,
         labels,
         annotations,
         creation_timestamp: None,

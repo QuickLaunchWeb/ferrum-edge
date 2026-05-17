@@ -17,6 +17,7 @@ pub fn dynamic_object_to_k8s_object(
                 .clone()
                 .unwrap_or_else(|| "default".to_string())
         },
+        generation: obj.metadata.generation,
         labels: obj
             .metadata
             .labels
@@ -94,6 +95,7 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 namespace: Some(namespace.to_string()),
+                generation: Some(11),
                 ..Default::default()
             },
             types: None,
@@ -113,6 +115,7 @@ mod tests {
         assert_eq!(result.api_version, "security.istio.io/v1");
         assert_eq!(result.metadata.name, "my-policy");
         assert_eq!(result.metadata.namespace, "prod");
+        assert_eq!(result.metadata.generation, Some(11));
         assert_eq!(result.spec, spec);
     }
 

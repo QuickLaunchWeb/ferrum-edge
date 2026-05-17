@@ -25,6 +25,7 @@ fn k8s_object(
         metadata: K8sMetadata {
             name: name.to_string(),
             namespace: namespace.to_string(),
+            generation: None,
             labels: Default::default(),
             creation_timestamp: None,
             deletion_timestamp: None,

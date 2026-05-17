@@ -31,6 +31,8 @@ pub struct K8sMetadata {
     pub name: String,
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     /// Object annotations. Required to read Istio waypoint bindings
@@ -1480,6 +1482,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 creation_timestamp: None,
