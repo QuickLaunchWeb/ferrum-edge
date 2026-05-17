@@ -685,6 +685,46 @@ fn locality_distribute_excludes_targets_with_zero_weight() {
 }
 
 #[test]
+fn locality_distribute_treats_all_zero_endpoint_weight_locality_as_ineligible() {
+    // The only endpoint in the weighted distribute locality is drained via
+    // weight=0, so distribute must not synthesize a fallback share for it.
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-west/us-west-1/a",
+        vec![
+            target("west.local", Some("us-west/us-west-1/a")),
+            weighted_target("east-drained.local", Some("us-east/us-east-1/a"), 0),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..100 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("drained-{i}"),
+            no_health(),
+        )
+        .expect("selection should fall through to healthy locality priority");
+        assert_eq!(
+            selection.target.host, "west.local",
+            "drained distribute locality must not receive synthetic traffic"
+        );
+    }
+}
+
+#[test]
 fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
     let mut to = BTreeMap::new();
     to.insert("us-east".to_string(), 100);

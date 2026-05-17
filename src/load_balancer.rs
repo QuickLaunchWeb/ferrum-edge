@@ -948,7 +948,8 @@ fn build_locality_lb_state(
     // distribute[]: first matching `from` wins. Each `to` entry is a
     // locality-level percentage, so split that weight across endpoints in the
     // matching locality according to their endpoint weights instead of copying
-    // the full locality weight onto each endpoint.
+    // the full locality weight onto each endpoint. Endpoints with weight 0 stay
+    // drained; an all-zero locality is treated as ineligible for distribute.
     let mut distribute_weights: Option<Vec<u64>> = None;
     let mut distribute_groups: Option<Vec<LocalityDistributeGroup>> = None;
     for entry in &setting.distribute {
@@ -986,27 +987,6 @@ fn build_locality_lb_state(
                 .sum();
             let Some(endpoint_weight_total) = std::num::NonZeroU128::new(endpoint_weight_total)
             else {
-                let target_count = matching_targets.len() as u64;
-                let per_target = scaled_weight / target_count;
-                let remainder = scaled_weight % target_count;
-                let mut group_indices = Vec::new();
-                let mut group_total = 0u64;
-                for (offset, (idx, _)) in matching_targets.into_iter().enumerate() {
-                    let share = per_target + if (offset as u64) < remainder { 1 } else { 0 };
-                    if share == 0 {
-                        continue;
-                    }
-                    group_indices.push(idx);
-                    group_total = group_total.saturating_add(share);
-                    weights[idx] = weights[idx].saturating_add(share);
-                    total = total.saturating_add(share);
-                }
-                if group_total > 0 {
-                    groups.push(LocalityDistributeGroup {
-                        weight: group_total,
-                        target_indices: group_indices,
-                    });
-                }
                 continue;
             };
             let endpoint_weight_total = endpoint_weight_total.get();
