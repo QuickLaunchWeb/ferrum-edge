@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 pub mod authz;
+pub mod bpf_metrics;
 pub mod outbound_registry;
 pub mod prometheus_helpers;
 pub mod spiffe_identity;

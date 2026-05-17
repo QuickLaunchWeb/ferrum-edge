@@ -10,12 +10,13 @@ use ferrum_edge::modes::mesh::config::{
     PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
 use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
-    AckOutcome, CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, MeshSlice, MeshSliceRequest,
-    RDS_TYPE_URL, SDS_TYPE_URL, XdsNonceTracker, XdsSnapshotCache,
-    translate_mesh_slice_to_snapshot,
+    AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+    LDS_TYPE_URL, MeshSlice, MeshSliceRequest, RDS_TYPE_URL, SDS_TYPE_URL, XdsNonceTracker,
+    XdsSnapshotCache, translate_mesh_slice_to_snapshot,
 };
 
 fn workload(name: &str, app: &str) -> Workload {
@@ -153,6 +154,25 @@ fn translators_emit_all_phase_b_type_urls() {
     let listener = proto::Listener::decode(listener_resource.value.as_slice())
         .expect("minimal listener should decode");
     assert_eq!(listener.name, "listener/default/api/8080");
+}
+
+#[test]
+fn mesh_config_extension_configs_are_served_as_ecds_resources() {
+    let mut config = gateway_config();
+    config.mesh.as_mut().expect("mesh config").extension_configs = vec![MeshExtensionConfig {
+        name: "dr-carrier-api".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: b"{\"name\":\"api\"}".to_vec(),
+    }];
+
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    assert_eq!(slice.extension_configs.len(), 1);
+
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let ecds = snapshot.resources(ECDS_TYPE_URL);
+    assert_eq!(ecds.len(), 1);
+    assert_eq!(ecds[0].name, "dr-carrier-api");
 }
 
 #[test]
@@ -417,4 +437,212 @@ fn phase_b_conformance_stubs_cover_known_xds_edges() {
     assert!(cases.contains(&XdsConformanceCase::PartialNackPerTypeUrl));
     assert!(cases.contains(&XdsConformanceCase::VersionDriftRejected));
     assert!(cases.contains(&XdsConformanceCase::DeltaSubscribeUnsubscribe));
+}
+
+// ── GAP-2L.3: ECDS (Extension Config Discovery Service) ──
+//
+// Operators ship typed extension configs through xDS by populating
+// `MeshSlice.extension_configs`. The translator emits one ECDS resource per
+// entry; downstream xDS consumers subscribe under `ECDS_TYPE_URL` and
+// dispatch on the inner `typed_config.type_url`. The DR-carrier path
+// (GAP-2K) uses `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` to wrap the original
+// DestinationRule JSON when full DR semantics are required across xDS.
+
+fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice {
+    let request = MeshSliceRequest {
+        node_id: "node-a".to_string(),
+        namespace: "default".to_string(),
+        workload_spiffe_id: None,
+        labels: BTreeMap::new(),
+        cluster_domain: "cluster.local".to_string(),
+        enforce_sidecar_egress: false,
+        sidecar_egress_dry_run: false,
+        enforce_sidecar_identity_narrowing: false,
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig::default())),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let mut slice = MeshSlice::from_gateway_config(&config, request);
+    slice.extension_configs = configs;
+    slice
+}
+
+#[test]
+fn translator_emits_no_ecds_resources_when_slice_has_no_extension_configs() {
+    let slice = slice_with_extension_configs(Vec::new());
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    assert!(snapshot.resources(ECDS_TYPE_URL).is_empty());
+}
+
+#[test]
+fn translator_emits_one_ecds_resource_per_extension_config() {
+    let slice = slice_with_extension_configs(vec![
+        MeshExtensionConfig {
+            name: "dr-carrier-api".to_string(),
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"api\"}".to_vec(),
+        },
+        MeshExtensionConfig {
+            name: "dr-carrier-admin".to_string(),
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"admin\"}".to_vec(),
+        },
+    ]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let names: Vec<_> = snapshot
+        .resources(ECDS_TYPE_URL)
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+    assert_eq!(names, vec!["dr-carrier-admin", "dr-carrier-api"]);
+}
+
+#[test]
+fn translator_skips_duplicate_extension_config_names() {
+    let slice = slice_with_extension_configs(vec![
+        MeshExtensionConfig {
+            name: "dup".to_string(),
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"first\"}".to_vec(),
+        },
+        MeshExtensionConfig {
+            name: "dup".to_string(),
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"second\"}".to_vec(),
+        },
+    ]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    assert_eq!(snapshot.resources(ECDS_TYPE_URL).len(), 1);
+}
+
+#[test]
+fn translator_round_trips_typed_extension_config_payload() {
+    let inner_value = b"{\"trafficPolicy\":{\"tls\":{\"mode\":\"ISTIO_MUTUAL\"}}}";
+    let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
+        name: "dr-carrier-reviews".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: inner_value.to_vec(),
+    }]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let resources = snapshot.resources(ECDS_TYPE_URL);
+    let entry = resources.first().expect("ECDS resource");
+    let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
+        .expect("ECDS payload should decode as TypedExtensionConfig");
+    assert_eq!(decoded.name, "dr-carrier-reviews");
+    let typed_config = decoded.typed_config.expect("inner Any should be set");
+    assert_eq!(typed_config.type_url, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL);
+    assert_eq!(typed_config.value, inner_value.to_vec());
+}
+
+#[test]
+fn ecds_type_url_appears_in_xds_type_urls_inventory() {
+    let inventory: Vec<&str> = ferrum_edge::xds::XDS_TYPE_URLS.to_vec();
+    assert!(
+        inventory.contains(&ECDS_TYPE_URL),
+        "ECDS_TYPE_URL must be in XDS_TYPE_URLS"
+    );
+}
+#[test]
+fn translator_round_trips_binary_value_bytes() {
+    // Binary payload with NULs and high bytes — exercises the base64 codec.
+    let binary: Vec<u8> = (0u8..=255).collect();
+    let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
+        name: "binary".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: binary.clone(),
+    }]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let entry = snapshot
+        .resources(ECDS_TYPE_URL)
+        .first()
+        .cloned()
+        .expect("ECDS resource");
+    let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
+        .expect("TypedExtensionConfig decode");
+    assert_eq!(decoded.typed_config.expect("inner Any").value, binary);
+}
+
+#[test]
+fn translator_emits_empty_value_when_extension_has_no_inner_bytes() {
+    let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
+        name: "no-bytes".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: Vec::new(),
+    }]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let entry = snapshot
+        .resources(ECDS_TYPE_URL)
+        .first()
+        .cloned()
+        .expect("ECDS resource");
+    let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
+        .expect("TypedExtensionConfig decode");
+    assert_eq!(decoded.name, "no-bytes");
+    let typed_config = decoded.typed_config.expect("inner Any should be set");
+    assert!(typed_config.value.is_empty());
+}
+
+#[test]
+fn mesh_extension_config_serde_round_trips_base64_value() {
+    // Mixed binary payload — exercises the base64 STANDARD codec inside
+    // `MeshExtensionConfig::value`. CPs and DPs both serialize through serde
+    // (gRPC JSON / native config), so the codec must round-trip arbitrary
+    // bytes without corruption.
+    let original = MeshExtensionConfig {
+        name: "binary".to_string(),
+        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        value: vec![0u8, 1, 2, 0xff, 0xfe, 0x7f, 0x00],
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    // value field must be a base64 STANDARD string, not raw bytes / array.
+    assert!(json.contains("\"value\":\"AAEC//5/AA==\""));
+    let parsed: MeshExtensionConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn mesh_extension_config_deserialize_accepts_unpadded_base64() {
+    // Some CPs strip base64 padding; the decoder must accept both forms so
+    // a payload encoded by an upstream Envoy / Istio CP still round-trips.
+    let canonical = serde_json::json!({
+        "name": "pad",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "AAEC//5/AA==",
+    });
+    let stripped = serde_json::json!({
+        "name": "pad",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "AAEC//5/AA",
+    });
+    let from_padded: MeshExtensionConfig =
+        serde_json::from_value(canonical).expect("padded decode");
+    let from_unpadded: MeshExtensionConfig =
+        serde_json::from_value(stripped).expect("unpadded decode");
+    assert_eq!(from_padded.value, from_unpadded.value);
+    assert_eq!(from_padded.value, vec![0u8, 1, 2, 0xff, 0xfe, 0x7f, 0x00]);
+}
+
+#[test]
+fn mesh_extension_config_deserialize_accepts_empty_value() {
+    let json = serde_json::json!({
+        "name": "empty",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+        "value": "",
+    });
+    let parsed: MeshExtensionConfig = serde_json::from_value(json).expect("empty decode");
+    assert!(parsed.value.is_empty());
+}
+
+#[test]
+fn mesh_extension_config_default_value_when_field_omitted() {
+    // Schema-level default keeps backward compat for callers that build the
+    // type programmatically without the inner bytes.
+    let json = serde_json::json!({
+        "name": "omitted",
+        "type_url": FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+    });
+    let parsed: MeshExtensionConfig = serde_json::from_value(json).expect("omitted decode");
+    assert!(parsed.value.is_empty());
 }

@@ -878,6 +878,16 @@ pub async fn handle_admin_request(
             handle_backend_capabilities_refresh(&state).await
         }
 
+        // Node-waypoint enrolled identities (GAP-2M).
+        //
+        // JWT-authenticated (falls through the admin auth gate above). The
+        // resolver is only constructed in mesh-mode `NodeWaypoint` topology;
+        // other modes return 404 so unrelated operators don't see a stub
+        // empty list and assume node-waypoint is active.
+        (Method::GET, ["node-waypoint", "identities"]) => {
+            handle_node_waypoint_identities_get(&state).await
+        }
+
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
@@ -2684,6 +2694,57 @@ fn protocol_support_label(
         ProtocolSupport::Supported => "supported",
         ProtocolSupport::Unsupported => "unsupported",
     }
+}
+
+async fn handle_node_waypoint_identities_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let proxy_state = match &state.proxy_state {
+        Some(ps) => ps,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "proxy_state unavailable in this mode"}),
+            ));
+        }
+    };
+    let Some(resolver) = proxy_state.node_waypoint_identity_resolver.as_ref() else {
+        // 404 (not 503) because node-waypoint topology is opt-in. Other
+        // mesh topologies and non-mesh modes don't have a resolver and the
+        // endpoint is meaningless there.
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "node-waypoint topology not enabled"}),
+        ));
+    };
+    // Single pass over `cookie_records` returns both the per-identity
+    // summaries and the (v4, v6) totals; this honors the documented
+    // "iterates each shard of three DashMaps once" cold-path contract.
+    let (snapshot, (cookies_v4, cookies_v6)) = resolver.identities_snapshot_with_cookie_totals();
+    let entries: Vec<serde_json::Value> = snapshot
+        .iter()
+        .map(|summary| {
+            json!({
+                "pod_uid": summary.pod_uid_string(),
+                "spiffe_id": summary.spiffe_id,
+                "workload_spiffe_hash": summary.workload_spiffe_hash,
+                "orig_dst4_cookies": summary.orig_dst4_cookies,
+                "orig_dst6_cookies": summary.orig_dst6_cookies,
+                "has_policy_scope": summary.has_policy_scope,
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "identity_count": entries.len(),
+            "cookies": {
+                "orig_dst4": cookies_v4,
+                "orig_dst6": cookies_v6,
+            },
+            "identities": entries,
+        }),
+    ))
 }
 
 #[cfg(test)]

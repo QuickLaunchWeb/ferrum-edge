@@ -13,14 +13,23 @@
 //! namespace-scoped ALLOW in `A` would raise the implicit-deny floor for
 //! unrelated namespaces.
 //!
-//! The plugin pre-filters `slice.mesh_policies` at construction time using
-//! [`crate::modes::mesh::config::policy_scope_applies_to_workload`]. The hot path
-//! ([`evaluate_mesh_authorization`]) then sees only the policies that apply
-//! to **this** proxy's workload, so the per-request cost stays at the same
+//! In normal mesh topologies, the plugin pre-filters `slice.mesh_policies` at
+//! construction time using
+//! [`crate::modes::mesh::config::policy_scope_applies_to_workload`]. The hot
+//! path ([`evaluate_mesh_authorization`]) then sees only the policies that
+//! apply to **this** proxy's workload, so the per-request cost stays at the same
 //! O(policies × rules) it was before — minus any policies the scope filter
-//! discarded. Filtering is keyed on `(proxy_namespace, proxy_labels)`
-//! supplied either by the embedded `mesh_slice` (mesh mode injection) or by
-//! explicit `namespace` / `labels` config fields (direct-config / test).
+//! discarded. Filtering is keyed on `(proxy_namespace, proxy_labels)` supplied
+//! either by the embedded `mesh_slice` (mesh mode injection) or by explicit
+//! `namespace` / `labels` config fields (direct-config / test).
+//!
+//! Node-waypoint mode is different because one proxy instance handles many
+//! pods. When `per_pod_policy_scoping` is enabled, construction-time filtering
+//! is skipped and the request path evaluates the `PolicyScopeCache` attached to
+//! `RequestContext::node_waypoint_policy_scope`. If the pod has no installed
+//! scope yet, only mesh-wide policies are retained; namespace and selector
+//! scoped policies are withheld until the resolver has the pod's workload
+//! metadata.
 
 use async_trait::async_trait;
 use serde_json::Value;

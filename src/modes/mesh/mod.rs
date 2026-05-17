@@ -67,6 +67,7 @@ pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
 pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
+pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
@@ -2024,6 +2025,26 @@ fn inject_mesh_global_plugins(
         access_log_config,
         &runtime.namespace,
     );
+
+    // GAP-SC3: `__mesh_bpf_metrics` exposes BPF SOCK_OPS counters as
+    // Prometheus metrics. Auto-inject only on `NodeWaypoint` topology;
+    // other topologies don't run the SOCK_OPS BPF program, and emitting
+    // always-zero counters from them would mislead operator dashboards.
+    // Operators on other topologies can still inject the plugin
+    // explicitly; this just controls the default-inject behavior.
+    if runtime.topology == MeshTopology::NodeWaypoint {
+        ensure_global_plugin(
+            config,
+            MESH_BPF_METRICS_PLUGIN_ID,
+            "__mesh_bpf_metrics",
+            serde_json::json!({}),
+            &runtime.namespace,
+        );
+    } else {
+        config
+            .plugin_configs
+            .retain(|p| p.id != MESH_BPF_METRICS_PLUGIN_ID);
+    }
 }
 
 fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> {
@@ -5004,6 +5025,7 @@ mod tests {
             multi_cluster: None,
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
+            extension_configs: Vec::new(),
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
@@ -5248,6 +5270,90 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_injects_bpf_metrics_on_node_waypoint_topology() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::NodeWaypoint;
+        runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let bpf_plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_BPF_METRICS_PLUGIN_ID)
+            .expect("bpf_metrics plugin auto-injected on NodeWaypoint");
+        assert_eq!(bpf_plugin.plugin_name, "__mesh_bpf_metrics");
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_bpf_metrics_on_non_node_waypoint_topology() {
+        for topology in [
+            MeshTopology::Sidecar,
+            MeshTopology::Ambient,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let mut runtime = test_mesh_runtime_config();
+            runtime.topology = topology;
+            runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+            runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+            runtime.egress_listen_addr = "127.0.0.1:15090".parse().unwrap();
+            let mesh_slice = MeshSlice {
+                namespace: "default".to_string(),
+                ..MeshSlice::default()
+            };
+
+            let prepared =
+                gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            assert!(
+                prepared
+                    .plugin_configs
+                    .iter()
+                    .all(|plugin| plugin.id != MESH_BPF_METRICS_PLUGIN_ID),
+                "bpf_metrics must NOT be auto-injected for topology {topology:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_drops_bpf_metrics_when_topology_changes_away_from_node_waypoint()
+    {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::NodeWaypoint;
+        runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            ..MeshSlice::default()
+        };
+
+        let mut prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|p| p.id == MESH_BPF_METRICS_PLUGIN_ID),
+            "should be present after NodeWaypoint slice apply"
+        );
+
+        // Operator switches the same DP to ambient topology (uncommon in
+        // practice, but verifies the cleanup arm of inject_mesh_global_plugins).
+        runtime.topology = MeshTopology::Ambient;
+        inject_mesh_global_plugins(&mut prepared, &runtime, &mesh_slice);
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|p| p.id != MESH_BPF_METRICS_PLUGIN_ID),
+            "topology change to Ambient must drop the bpf_metrics plugin"
         );
     }
 

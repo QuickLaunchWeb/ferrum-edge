@@ -49,7 +49,8 @@ use crate::proxy::headers::{
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
+    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
+    append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -169,15 +170,31 @@ thread_local! {
 /// The closure must be synchronous -- the underlying `RefCell::borrow_mut`
 /// cannot cross an `.await`. `now_or_never(...)` polling and DashMap
 /// lookups are fine.
-fn with_grpc_pool_key<R>(proxy: &Proxy, f: impl FnOnce(&mut String) -> R) -> R {
+fn with_grpc_pool_key<R>(
+    proxy: &Proxy,
+    svid_generation: Option<u64>,
+    f: impl FnOnce(&mut String) -> R,
+) -> R {
     GRPC_POOL_KEY_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
-        write_grpc_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+        write_grpc_pool_key(
+            &mut buf,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            svid_generation,
+        );
         f(&mut buf)
     })
 }
 
-fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
+fn write_grpc_pool_key(
+    buf: &mut String,
+    host: &str,
+    port: u16,
+    proxy: &Proxy,
+    svid_generation: Option<u64>,
+) {
     use std::fmt::Write;
     buf.clear();
     // TLS intent comes from the backend scheme; flavor (gRPC vs plain HTTP)
@@ -193,12 +210,19 @@ fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
         proxy.resolved_tls.client_cert_path.as_deref(),
         proxy.resolved_tls.client_key_path.as_deref(),
         proxy.resolved_tls.verify_server_cert,
+        svid_generation,
     );
 }
 
-fn grpc_pool_key_owned(proxy: &Proxy) -> String {
+fn grpc_pool_key_owned(proxy: &Proxy, svid_generation: Option<u64>) -> String {
     let mut buf = String::with_capacity(128);
-    write_grpc_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+    write_grpc_pool_key(
+        &mut buf,
+        &proxy.backend_host,
+        proxy.backend_port,
+        proxy,
+        svid_generation,
+    );
     buf
 }
 
@@ -237,6 +261,8 @@ struct GrpcPoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::CrlList,
     tls_configs: BackendTlsConfigCache,
+    backend_svid_generation: BackendSvidGeneration,
+    workload_svid_cert_path: Option<String>,
 }
 
 impl Default for GrpcConnectionPool {
@@ -259,16 +285,37 @@ impl GrpcConnectionPool {
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
     ) -> Self {
+        Self::new_with_svid_generation(
+            global_pool_config,
+            global_env_config,
+            dns_cache,
+            tls_policy,
+            crls,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_svid_generation(
+        global_pool_config: PoolConfig,
+        global_env_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         let cleanup_interval =
             Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
         let shards = crate::util::sharding::pool_shard_amount(global_env_config.pool_shard_amount);
+        let workload_svid_cert_path = global_env_config.gateway_svid_cert_path.clone();
         let manager = Arc::new(GrpcPoolManager {
             global_pool_config: global_pool_config.clone(),
             global_env_config,
             dns_cache,
             tls_policy,
             crls,
-            tls_configs: BackendTlsConfigCache::new(),
+            tls_configs: BackendTlsConfigCache::with_shards(shards),
+            backend_svid_generation,
+            workload_svid_cert_path,
         });
 
         Self {
@@ -280,6 +327,19 @@ impl GrpcConnectionPool {
     /// Number of connections in the pool (for metrics).
     pub fn pool_size(&self) -> usize {
         self.pool.pool_size()
+    }
+
+    pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
+        self.pool
+            .manager()
+            .tls_configs
+            .drain_svid_generation(generation);
+    }
+
+    pub fn force_drain_svid_generation(&self, generation: u64) {
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.pool.invalidate_matching(|key| matcher.matches(key));
+        self.rr_counters.retain(|key, _| !matcher.matches(key));
     }
 
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
@@ -298,7 +358,7 @@ impl GrpcConnectionPool {
     /// but retained for parity with the HTTP2 pool's internal API surface.
     #[allow(dead_code)]
     fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy);
+        write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy, None);
     }
 
     /// Allocating version of the pool key — only used for warmup deduplication
@@ -306,7 +366,7 @@ impl GrpcConnectionPool {
     /// post-refactor (gRPC pool warms lazily); retained for future re-enablement.
     #[allow(dead_code)]
     fn pool_key_owned(proxy: &Proxy) -> String {
-        grpc_pool_key_owned(proxy)
+        grpc_pool_key_owned(proxy, None)
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
@@ -339,7 +399,8 @@ impl GrpcConnectionPool {
         // The closure body is synchronous — `now_or_never(sender.ready())`
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
-        let phase1 = with_grpc_pool_key(proxy, |key_buf| -> GrpcPhase1 {
+        let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
+        let phase1 = with_grpc_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
             let base_len = key_buf.len();
 
             // Round-robin counter is per-host, but on FIRST access we seed it
@@ -415,7 +476,7 @@ impl GrpcConnectionPool {
             .pool
             .create_or_get_existing_owned(selected_key, |key| async move {
                 let _ = key;
-                manager.create_connection(proxy).await
+                manager.create_connection(proxy, svid_generation).await
             })
             .await
         {
@@ -425,7 +486,7 @@ impl GrpcConnectionPool {
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
                 // build is identical to phase 1's prelude.
-                let recovered = with_grpc_pool_key(proxy, |key_buf| {
+                let recovered = with_grpc_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
@@ -462,9 +523,13 @@ enum GrpcPhase1 {
 }
 
 impl GrpcPoolManager {
-    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
+    fn get_tls_config(
+        &self,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+    ) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
         self.tls_configs
-            .get_or_try_build(grpc_pool_key_owned(proxy), || {
+            .get_or_try_build(grpc_pool_key_owned(proxy, svid_generation), || {
                 let mut tls_config = BackendTlsConfigBuilder {
                     proxy,
                     policy: self.tls_policy.as_deref(),
@@ -499,6 +564,7 @@ impl GrpcPoolManager {
     async fn create_connection(
         &self,
         proxy: &Proxy,
+        svid_generation: Option<u64>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
@@ -583,7 +649,7 @@ impl GrpcPoolManager {
                 tcp,
                 host,
                 proxy,
-                &pool_config,
+                svid_generation,
                 connect_started,
                 connect_timeout,
             )
@@ -701,13 +767,13 @@ impl GrpcPoolManager {
         tcp: TcpStream,
         host: &str,
         proxy: &Proxy,
-        pool_config: &PoolConfig,
+        svid_generation: Option<u64>,
         connect_started: Instant,
         connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         use tokio_rustls::TlsConnector;
 
-        let tls_config = self.get_tls_config(proxy)?;
+        let tls_config = self.get_tls_config(proxy, svid_generation)?;
         let connector = TlsConnector::from(tls_config);
         let server_name =
             crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
@@ -737,7 +803,8 @@ impl GrpcPoolManager {
             })?;
 
         let io = TokioIo::new(tls_stream);
-        let builder = Self::build_h2_builder(pool_config);
+        let pool_config = self.global_pool_config.for_proxy(proxy);
+        let builder = Self::build_h2_builder(&pool_config);
 
         let Some(remaining) =
             crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
@@ -772,13 +839,19 @@ impl PoolManager for GrpcPoolManager {
     type Connection = http2::SendRequest<GrpcBody>;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
-        write_grpc_pool_key(buf, host, port, proxy);
+        write_grpc_pool_key(
+            buf,
+            host,
+            port,
+            proxy,
+            self.svid_generation_for_proxy(proxy),
+        );
         let base_len = buf.len();
         write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {
-        self.create_connection(proxy)
+        self.create_connection(proxy, self.svid_generation_for_proxy(proxy))
             .await
             .map_err(anyhow::Error::from)
     }
@@ -793,6 +866,24 @@ impl PoolManager for GrpcPoolManager {
 
     fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
         Some(crate::runtime_metrics::PoolKind::Grpc)
+    }
+}
+
+impl GrpcPoolManager {
+    fn current_svid_generation(&self) -> u64 {
+        self.backend_svid_generation.load(Ordering::Acquire)
+    }
+
+    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
+        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_cert_path
+            .as_deref());
+        backend_svid_generation_for_client_cert(
+            effective_client_cert_path,
+            self.workload_svid_cert_path.as_deref(),
+            self.current_svid_generation(),
+        )
     }
 }
 
@@ -1766,6 +1857,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grpc_pool_key_can_partition_on_svid_generation() {
+        let proxy = grpc_pool_test_proxy();
+        let key = grpc_pool_key_owned(&proxy, Some(23));
+
+        assert!(
+            key.ends_with("|svidg=23"),
+            "workload SVID generation must be represented in the gRPC pool key: {key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_drain_svid_generation_removes_rr_counter_keys() {
+        let pool = GrpcConnectionPool::default();
+
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=23".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=24".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        pool.rr_counters.insert(
+            "backend|443|fields|svidg=static".to_string(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+
+        pool.force_drain_svid_generation(23);
+
+        assert!(!pool.rr_counters.contains_key("backend|443|fields|svidg=23"));
+        assert!(pool.rr_counters.contains_key("backend|443|fields|svidg=24"));
+        assert!(
+            pool.rr_counters
+                .contains_key("backend|443|fields|svidg=static")
+        );
+    }
+
     /// Correctness: the thread-local helper must produce the same byte string
     /// as `grpc_pool_key_owned()`. If these ever diverge the gRPC pool would
     /// silently fragment (one allocation path inserts keys, the other looks
@@ -1773,8 +1902,8 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
         let proxy = grpc_pool_test_proxy();
-        let owned = grpc_pool_key_owned(&proxy);
-        let from_thread_local = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        let owned = grpc_pool_key_owned(&proxy, None);
+        let from_thread_local = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(
             owned, from_thread_local,
             "thread-local key must equal grpc_pool_key_owned bytes — \
@@ -1792,8 +1921,8 @@ mod tests {
         p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
         assert_ne!(
-            grpc_pool_key_owned(&p1),
-            grpc_pool_key_owned(&p2),
+            grpc_pool_key_owned(&p1, None),
+            grpc_pool_key_owned(&p2, None),
             "backend TLS SNI must separate gRPC pool keys"
         );
 
@@ -1801,8 +1930,8 @@ mod tests {
         p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
         p2.resolved_tls.recompute_san_digest();
         assert_ne!(
-            grpc_pool_key_owned(&p1),
-            grpc_pool_key_owned(&p2),
+            grpc_pool_key_owned(&p1, None),
+            grpc_pool_key_owned(&p2, None),
             "backend TLS SAN allow-list must separate gRPC pool keys"
         );
     }
@@ -1815,15 +1944,15 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_is_idempotent_after_buffer_growth() {
         let proxy = grpc_pool_test_proxy();
-        let k1 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        let k1 = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
         // Force the buffer to grow in between by running a different proxy
         // with a longer host through the helper.
         let mut other = grpc_pool_test_proxy();
         other.backend_host =
             "very-long-grpc-backend-hostname-that-grows-the-buffer.subdomain.example.com"
                 .to_string();
-        let _ = with_grpc_pool_key(&other, |buf| buf.clone());
-        let k2 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        let _ = with_grpc_pool_key(&other, None, |buf| buf.clone());
+        let k2 = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(k1, k2, "same proxy must always yield the same key");
     }
 
@@ -1841,7 +1970,7 @@ mod tests {
         // the key. The thread-local was constructed with capacity 128
         // (well above the typical key length), so this should not realloc.
         let (first_ptr, first_capacity) =
-            with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            with_grpc_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
         assert!(
             first_capacity >= 128,
             "expected pre-sized capacity (>=128), got {first_capacity}"
@@ -1852,7 +1981,7 @@ mod tests {
         // the pointer would change on every iteration.
         for i in 0..1024 {
             let (ptr, cap) =
-                with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+                with_grpc_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
             assert_eq!(
                 ptr, first_ptr,
                 "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
@@ -1875,8 +2004,8 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_base_len_is_stable() {
         let proxy = grpc_pool_test_proxy();
-        let len1 = with_grpc_pool_key(&proxy, |buf| buf.len());
-        let len2 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        let len1 = with_grpc_pool_key(&proxy, None, |buf| buf.len());
+        let len2 = with_grpc_pool_key(&proxy, None, |buf| buf.len());
         assert_eq!(
             len1, len2,
             "base_len must be deterministic across calls — \

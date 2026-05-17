@@ -1266,7 +1266,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), access_log (9375) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -1338,6 +1338,13 @@ pub mod priority {
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WORKLOAD_METRICS: u16 = 9360;
+    /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
+    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
+    /// SOCK_OPS event consumer. Auto-injected only when topology is
+    /// `NodeWaypoint`. Lives in the observability band alongside other
+    /// metric-emitter plugins so its `log` hook runs after all
+    /// transaction-summary serialization.
+    pub const MESH_BPF_METRICS: u16 = 9365;
     pub const ACCESS_LOG: u16 = 9375;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
@@ -1966,6 +1973,16 @@ pub fn create_plugin_with_http_client(
         "workload_metrics" => Ok(Some(Arc::new(
             mesh::workload_metrics::WorkloadMetrics::new_with_http_client(config, http_client)?,
         ))),
+        // GAP-SC3: `__mesh_bpf_metrics` is auto-injected on `NodeWaypoint`
+        // topology. Until a `ProxyState` plumbed Arc<BpfMetricsState> is
+        // threaded through create_plugin_with_http_client, the factory
+        // path builds a plugin with a fresh, unattached metrics state.
+        // This keeps the chain valid; the production wiring (passing the
+        // SockOpsConsumer's shared state) lands when the BPF program is
+        // wired in.
+        "__mesh_bpf_metrics" => Ok(Some(Arc::new(mesh::bpf_metrics::MeshBpfMetrics::new(
+            config,
+        )?))),
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
@@ -2082,6 +2099,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "spec_expose",
         "api_chargeback",
         "workload_metrics",
+        "__mesh_bpf_metrics",
         "fault_injection",
         "access_log",
     ];

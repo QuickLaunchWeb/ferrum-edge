@@ -407,6 +407,32 @@ async fn wait_for_first_svid_no_deadlock_under_concurrent_install_storm() {
     }
 }
 
+#[tokio::test]
+async fn revision_tx_attached_after_clone_is_seen_by_installer_clone() {
+    use ferrum_edge::identity::workload_api::fetch_loop::{SvidFetchHandle, install_test_bundle};
+    use tokio::sync::watch;
+
+    let handle = SvidFetchHandle::new();
+    let installer_handle = handle.clone();
+    let (revision_tx, mut revision_rx) = watch::channel(0u64);
+
+    let _configured_handle = handle.with_revision_tx(revision_tx);
+
+    install_test_bundle(&installer_handle, dummy_bundle());
+    assert_eq!(
+        *revision_rx.borrow(),
+        0,
+        "first SVID install should not publish a rotation revision"
+    );
+
+    install_test_bundle(&installer_handle, dummy_bundle());
+    revision_rx
+        .changed()
+        .await
+        .expect("revision sender should remain configured on cloned handle state");
+    assert_eq!(*revision_rx.borrow_and_update(), 1);
+}
+
 // ── Long-lived stream + rotation signal tests ──────────────────────────────
 
 #[tokio::test]
