@@ -31,6 +31,7 @@ mod mesh_hbone_tests;
 mod mesh_k8s_pod_discovery_tests;
 mod mesh_peer_auth_live_reload_tests;
 mod mesh_proxy_config_tests;
+mod mesh_service_waypoint_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod scripted_backend_smoke_tests;

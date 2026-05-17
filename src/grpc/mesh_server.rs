@@ -355,6 +355,11 @@ impl MeshConfigSync for MeshGrpcServer {
             inner.node_id, inner.ferrum_version, inner.namespace
         );
 
+        let waypoint_name = if inner.waypoint_name.trim().is_empty() {
+            None
+        } else {
+            Some(inner.waypoint_name.clone())
+        };
         let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
@@ -365,6 +370,7 @@ impl MeshConfigSync for MeshGrpcServer {
             inner.workload_spiffe_id,
             inner.labels,
         )
+        .with_waypoint_name(waypoint_name)
         .with_cluster_domain(self.cluster_domain.clone())
         .with_enforce_sidecar_egress(self.sidecar_enforced)
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)

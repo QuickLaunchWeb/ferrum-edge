@@ -85,6 +85,8 @@ tags:
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
   - name: Node-Waypoint
     description: Inspect the per-pod identity index used by node-waypoint topology (mesh-only)
+  - name: Service-Waypoint
+    description: Inspect the resolved service binding used by service-waypoint topology (mesh-only)
   - name: API Specs
     description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
 
@@ -586,6 +588,65 @@ paths:
                 properties:
                   error:
                     type: string
+
+  # ── Service-Waypoint services (mesh ServiceWaypoint topology) ───────
+  /service-waypoint/services:
+    get:
+      operationId: getServiceWaypointServices
+      summary: List services admitted for this service-waypoint
+      description: |
+        Returns the installed mesh slice's resolved service binding for the
+        current `ServiceWaypoint` topology. Operators use this to confirm
+        which services a named GAMMA waypoint is actually serving after
+        `FERRUM_MESH_WAYPOINT_NAME` and Gateway API `use-waypoint`
+        labels or annotations have been projected by the control plane.
+
+        Returns `404 Not Found` when service-waypoint topology is not
+        active, when no mesh slice has been installed yet, or when the
+        installed slice has no `waypoint_name`. The payload exposes service
+        names, namespaces, ports, and workload counts, but no request bodies,
+        credentials, or backend TLS material.
+      tags: [Service-Waypoint]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Resolved service-waypoint binding
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceWaypointServicesResponse"
+              example:
+                waypoint_name: api-waypoint
+                namespace: default
+                service_count: 2
+                services:
+                  - namespace: default
+                    name: reviews
+                    ports: [8080]
+                    workload_count: 3
+                  - namespace: default
+                    name: ratings
+                    ports: [8081]
+                    workload_count: 1
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Service-waypoint topology not enabled or no mesh slice installed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+              examples:
+                topology_not_enabled:
+                  value:
+                    error: "service-waypoint topology not enabled"
+                no_slice:
+                  value:
+                    error: "no mesh slice available yet"
 
   # ── Mesh egress scope (mesh mode) ────────────────────────────────────
   /mesh/egress-scope:
@@ -8382,6 +8443,56 @@ components:
             kept — enrolled-but-idle pods are operationally interesting.
           items:
             $ref: "#/components/schemas/NodeWaypointIdentityEntry"
+
+    # ── Service-Waypoint Services ─────────────────────────────────────
+    ServiceWaypointServiceEntry:
+      type: object
+      required: [namespace, name, ports, workload_count]
+      properties:
+        namespace:
+          type: string
+          description: Namespace of the admitted mesh service.
+          example: default
+        name:
+          type: string
+          description: Mesh service name admitted by the waypoint binding.
+          example: reviews
+        ports:
+          type: array
+          description: Service ports exposed by this mesh service.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          example: [8080]
+        workload_count:
+          type: integer
+          format: int64
+          description: Number of workload SPIFFE references behind this service in the installed slice.
+          example: 3
+
+    ServiceWaypointServicesResponse:
+      type: object
+      required: [waypoint_name, namespace, service_count, services]
+      properties:
+        waypoint_name:
+          type: string
+          description: GAMMA waypoint binding name requested by this DP.
+          example: api-waypoint
+        namespace:
+          type: string
+          description: Namespace of the installed mesh slice.
+          example: default
+        service_count:
+          type: integer
+          format: int64
+          description: Number of services admitted into this waypoint slice.
+          example: 2
+        services:
+          type: array
+          description: Services admitted by the installed service-waypoint slice, in slice order.
+          items:
+            $ref: "#/components/schemas/ServiceWaypointServiceEntry"
 
     # ── API Specs ─────────────────────────────────────────────────────
     ApiSpecSummary:

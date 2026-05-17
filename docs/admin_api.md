@@ -621,11 +621,57 @@ Field semantics:
 - `spiffe_id` — SPIFFE ID assigned to that pod's service account (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}` by convention).
 - `workload_spiffe_hash` — first 8 bytes of SHA-256 over the SPIFFE ID, big-endian as `u64`. Matches the value the eBPF `OrigDst{4,6}` map carries for cross-correlation with `node_agent` telemetry.
 - `orig_dst4_cookies` / `orig_dst6_cookies` — number of socket cookies currently mapped to this pod via the IPv4 / IPv6 original-destination map. `0` means the pod is enrolled but has no in-flight outbound connection on that family.
-- `has_policy_scope` — `true` iff a per-pod `PolicyScopeCache` is installed for this pod via `install_policy_scopes`. When `false`, mesh-authz falls back to the shared slice-level scope.
+- `has_policy_scope` — `true` iff a per-pod `PolicyScopeCache` is installed for this pod from the accepted mesh slice's workload metadata. When `false`, mesh-authz retains mesh-wide policies only for this pod; namespace-scoped and selector-scoped policies are withheld until the resolver has the pod's workload scope.
 
 `identities` is sorted by `pod_uid` so polling produces stable output. Entries with zero cookies are kept — enrolled-but-idle pods are operationally interesting (the cookie count answers "is this pod taking traffic?").
 
-The endpoint is cold-path: it iterates each shard of three `DashMap`s once. Don't poll faster than a few times per second on a busy node.
+The endpoint is cold-path: it iterates the unified cookie-record map and identity map, then reads the policy-scope snapshot. Don't poll faster than a few times per second on a busy node.
+
+## Service-Waypoint Services (mesh `ServiceWaypoint` topology)
+
+The service-waypoint topology accepts HBONE traffic for services bound to one GAMMA waypoint. `GET /service-waypoint/services` exposes the currently installed slice projection so operators can answer "which services is this waypoint actually serving?" without inspecting raw Gateway API resources.
+
+The endpoint returns `404 Not Found` when service-waypoint topology is not active, when no mesh slice has been installed yet, or when the installed slice has no `waypoint_name`. This avoids surfacing an empty stub list on unrelated sidecar/ambient/node-waypoint/east-west/egress DPs.
+
+### `GET /service-waypoint/services`
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/service-waypoint/services
+```
+
+Response:
+
+```json
+{
+  "waypoint_name": "api-waypoint",
+  "namespace": "default",
+  "service_count": 2,
+  "services": [
+    {
+      "namespace": "default",
+      "name": "reviews",
+      "ports": [8080],
+      "workload_count": 3
+    },
+    {
+      "namespace": "default",
+      "name": "ratings",
+      "ports": [8081],
+      "workload_count": 1
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- `waypoint_name` — the `FERRUM_MESH_WAYPOINT_NAME` / native `MeshSubscribe` binding name used to build this slice.
+- `namespace` — the namespace of the installed mesh slice.
+- `service_count` — number of services admitted into the slice for this waypoint.
+- `services[].ports` — service ports from the admitted `MeshService`; port protocol metadata is intentionally omitted from this compact operability view.
+- `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
+
+`services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
 
 ## Mesh Egress Scope (mesh mode)
 

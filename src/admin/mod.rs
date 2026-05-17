@@ -888,6 +888,15 @@ pub async fn handle_admin_request(
             handle_node_waypoint_identities_get(&state).await
         }
 
+        // GAMMA Service-Waypoint resolved binding (GAP-GAMMA-WP).
+        //
+        // JWT-authenticated. Returns the services bound to this waypoint in
+        // the active mesh slice. 404 outside `ServiceWaypoint` topology (the
+        // waypoint name and the bound-services projection only exist there).
+        (Method::GET, ["service-waypoint", "services"]) => {
+            handle_service_waypoint_services_get(&state).await
+        }
+
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
@@ -2694,6 +2703,54 @@ fn protocol_support_label(
         ProtocolSupport::Supported => "supported",
         ProtocolSupport::Unsupported => "unsupported",
     }
+}
+
+async fn handle_service_waypoint_services_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "service-waypoint topology not enabled"}),
+        ));
+    };
+    let snapshot = mesh_runtime.snapshot();
+    let Some(slice) = snapshot.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "no mesh slice available yet"}),
+        ));
+    };
+    let Some(waypoint_name) = slice.waypoint_name.as_deref() else {
+        // Slice has no waypoint binding — DP is in a non-service-waypoint
+        // topology. Return 404 so unrelated operators don't see a stub.
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "service-waypoint topology not enabled"}),
+        ));
+    };
+    let services: Vec<serde_json::Value> = slice
+        .services
+        .iter()
+        .map(|svc| {
+            let ports: Vec<u16> = svc.ports.iter().map(|p| p.port).collect();
+            json!({
+                "namespace": svc.namespace,
+                "name": svc.name,
+                "ports": ports,
+                "workload_count": svc.workloads.len(),
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "waypoint_name": waypoint_name,
+            "namespace": slice.namespace,
+            "service_count": services.len(),
+            "services": services,
+        }),
+    ))
 }
 
 async fn handle_node_waypoint_identities_get(

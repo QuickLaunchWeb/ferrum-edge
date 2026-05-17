@@ -632,6 +632,7 @@ mod tests {
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec,
             status: Value::Object(serde_json::Map::new()),
@@ -1015,6 +1016,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "service": "reviews",
@@ -1051,6 +1053,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "service": "reviews.default.svc.cluster.local",
@@ -1087,6 +1090,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "service": "reviews.default",
@@ -1123,6 +1127,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "hosts": ["reviews.default.svc.cluster.local"],
@@ -1157,6 +1162,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "hosts": ["reviews.default"],
@@ -1191,6 +1197,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "hosts": ["reviews.prod.svc.cluster.local"],
@@ -1229,6 +1236,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: json!({
                 "hosts": ["api.external.example.com"],

@@ -2,11 +2,11 @@
 
 Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this mode the gateway consumes mesh configuration from a Ferrum Control Plane (native `MeshSubscribe` gRPC) or a standard xDS ADS server, materializes SPIFFE-identity-aware proxies and authorization policies, and serves traffic with automatic mTLS, identity propagation, and Istio-compatible observability. The mesh subsystem deliberately reuses the existing proxy/plugin chain so all 58+ gateway plugins work unchanged in mesh context.
 
-Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
+Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, service-scoped Ambient waypoints, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
 
 ## Topologies
 
-Mesh mode supports five topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
+Mesh mode supports six topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
 
 ### Sidecar
 
@@ -38,9 +38,11 @@ Node-scoped sidecarless waypoint for pods captured by the node agent. This topol
 |---|---|---|---|
 | HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
 
-At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
+At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops.
 
 Operators inspect the currently enrolled pod identities via the JWT-authenticated admin endpoint `GET /node-waypoint/identities` — see [docs/admin_api.md](admin_api.md#node-waypoint-identities-mesh-nodewaypoint-topology) for the response shape. The endpoint returns 404 outside `NodeWaypoint` topology so unrelated DPs don't surface an empty stub list.
+
+Per-pod authorization scope is published only after a mesh slice is accepted by the proxy config apply path. Slice apply stages the workload SPIFFE scope index, then rebuilds the pod UID scope map from the resolver's current identities under the scope-update lock so rejected slices and identity churn during apply do not leave policy scopes out of sync.
 
 #### BPF SOCK_OPS observability (GAP-SC3)
 
@@ -52,6 +54,25 @@ The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only
 - `ferrum_mesh_bpf_ringbuf_overruns_total` + companion `ferrum_mesh_bpf_ringbuf_in_overrun_regime` gauge — ringbuf health. Non-zero overrun count means userspace fell behind and the kernel dropped events; raise `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` or reduce event rate. The consumer also logs one `warn!` per regime entry and one `info!` on recovery — no per-event spam.
 
 The kernel-side BPF program and the `aya::maps::RingBuf::poll_async` wiring land as separate follow-up PRs; this PR ships the userspace contract (event-decoder enum, consumer state machine, plugin Prometheus surface, auto-injection on `NodeWaypoint`) so dashboards, alerting rules, and tests can be authored against a stable shape.
+
+### Service Waypoint
+
+Service-scoped Ambient waypoint for Istio GAMMA traffic. Set `FERRUM_MESH_TOPOLOGY=service_waypoint` and `FERRUM_MESH_WAYPOINT_NAME=<gateway-name>`; the waypoint name is required so the control plane can project only the services bound to this waypoint.
+
+| Listener | Address | Direction | Kind |
+|---|---|---|---|
+| HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
+
+The Kubernetes translator records `MeshConfig.waypoint_bindings` from Gateway API `Gateway` resources whose `spec.gatewayClassName` is `istio-waypoint` or `ferrum-waypoint`, plus core `Service` labels. The same keys are accepted as annotations for file/native compatibility, but labels match the standard Istio enrollment shape:
+
+- `istio.io/use-waypoint: <name>` binds a Service to the named waypoint.
+- `istio.io/use-waypoint: None` opts that Service out.
+- `istio.io/use-waypoint-namespace: <namespace>` points the binding at a waypoint Gateway outside the Service namespace.
+- `istio.io/waypoint-for` on the Gateway or Service is stored on the binding as `service`, `workload`, `all`, or `none`; `none` produces an empty admitted set.
+
+With the native `MeshSubscribe` protocol, the DP sends `waypoint_name` to the CP and the CP narrows `services`, `service_entries`, `destination_rules`, and dependent `workloads` to the matching binding in the request namespace. If the named binding is not known yet, the slice intentionally fails open for rollout safety; once the binding exists, an empty binding fails closed to zero services. For xDS deployments, use a control plane that already emits waypoint-scoped resources; the local xDS reconstructor can stamp the waypoint name for operability, but standard ADS does not provide Ferrum's native binding request field.
+
+Operators inspect the currently resolved binding via the JWT-authenticated admin endpoint `GET /service-waypoint/services` — see [docs/admin_api.md](admin_api.md#service-waypoint-services-mesh-servicewaypoint-topology). The endpoint returns 404 outside `ServiceWaypoint` topology or before the first mesh slice is installed.
 
 ### East-West Gateway
 
@@ -320,7 +341,7 @@ The slice builder:
 
 ## Authorization
 
-Mesh authorization is evaluated by the auto-injected `mesh_authz` plugin (priority 2075) on every request. The plugin pre-filters applicable policies at construction time (cold path) so the request hot path evaluates only the relevant subset.
+Mesh authorization is evaluated by the auto-injected `mesh_authz` plugin (priority 2075) on every request. In sidecar, ambient, east-west, and egress-gateway topologies, the plugin pre-filters applicable policies at construction time (cold path) so the request hot path evaluates only the relevant subset. In `NodeWaypoint` topology, one proxy instance serves many pods, so policy scope is resolved per pod on the request path from the node-waypoint identity resolver; pods without an installed per-pod scope retain mesh-wide policies only.
 
 ### PolicyScope Filtering
 
@@ -448,6 +469,7 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 | `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
 | `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
 | `NodeWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
+| `ServiceWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
 
@@ -457,13 +479,26 @@ Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of
 
 ### Disable-mode topology guard
 
-`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, or `EgressGateway` workload is rejected. Startup fails closed on an invalid initial slice; with `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, later invalid slices are rejected and the last good inbound TLS config remains active.
+`PeerAuthentication.mode: disable` resolved against an `Ambient`, `NodeWaypoint`, `ServiceWaypoint`, or `EgressGateway` workload is rejected. Startup fails closed on an invalid initial slice; with `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, later invalid slices are rejected and the last good inbound TLS config remains active.
 
 - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
 - **NodeWaypoint**: the shared node listener must resolve pod identity from the node-agent/eBPF socket-cookie record before admitting HBONE traffic. Use `permissive` or `strict`.
+- **ServiceWaypoint**: service-scoped Ambient waypoint traffic arrives as HBONE over mTLS. Use `permissive` or `strict`.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
 
 Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
+
+### NodeWaypoint cgroup-inode lifecycle binding
+
+In NodeWaypoint topology one HBONE listener serves many pods. The node-agent enrolls each pod's identity into the proxy via `NodeWaypointIdentityResolver`. When the agent supplies the pod's cgroup v2 directory at enrollment time (`upsert_identity_with_cgroup`), the resolver captures the directory inode plus a small Unix metadata fingerprint, and a periodic sweep (`FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS`, default 30s) re-stats the path:
+
+- Inode/fingerprint unchanged → identity kept.
+- Inode or fingerprint changed → pod restarted under the same UID; identity (and its per-pod policy scope) is evicted so a fresh enrollment is required before traffic for the new instance is honoured. The fingerprint prevents missed restarts when the filesystem reuses the old inode number.
+- Path gone → pod removed; identity and policy scope are evicted.
+
+Set the sweep interval to `0` to disable. Identities enrolled without a cgroup path are opt-out from the sweep — they remain until explicitly removed via the resolver API. The sweep is best-effort GC, not a security boundary: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.
+
+Picking an interval is a tradeoff between eviction lag (worst-case time a stale identity remains after pod removal/restart) and per-sweep stat cost. Each enrolled cgroup-bound identity costs one `stat(2)` per sweep — on the order of tens of microseconds on a warm dentry cache, so even at thousands of pods per node a sweep finishes in a few milliseconds and the work runs on a dedicated background task off the accept path. Shorten the interval to tighten the eviction window on heavy pod churn; lengthen it (or set `0`) if the operator already drives identity removal explicitly from the node-agent and treats the sweep as a defence-in-depth backstop.
 
 ## Transparent DNS Proxy
 
@@ -1132,7 +1167,8 @@ Mesh-specific environment variables are listed below. For the full reference of 
 |---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native` or `xds` |
 | `FERRUM_MESH_NODE_ID` | `$HOSTNAME` or `ferrum-mesh-node` | Node identifier sent to the CP |
-| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `east_west_gateway`, `egress_gateway` |
+| `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `service_waypoint`, `east_west_gateway`, `egress_gateway` |
+| `FERRUM_MESH_WAYPOINT_NAME` | (none) | Required when `FERRUM_MESH_TOPOLOGY=service_waypoint`; names the GAMMA waypoint binding requested from the CP |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
@@ -1140,6 +1176,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` | `false` | Enables Istio `VirtualService` method/header/queryParam predicate capture through proxy-scoped `mesh_route_dispatch` plugins; unsupported predicate-only candidates fail closed through proxy-scoped `request_termination`, and destination-only collapse rejects route-local policy that cannot be carried per rule |
+| `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
 
 ### Listeners
 

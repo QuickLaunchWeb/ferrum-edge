@@ -1317,6 +1317,17 @@ pub struct MeshConfig {
     /// but slice narrowing is skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<MeshSidecar>,
+    /// GAMMA Waypoint bindings: a list mapping waypoint names to the set
+    /// of services routed through that waypoint. Populated by the K8s
+    /// translator from `Gateway` resources whose `gatewayClassName` is
+    /// `istio-waypoint` / `ferrum-waypoint` plus `Service` objects
+    /// annotated with `istio.io/use-waypoint`. The slice builder consumes
+    /// this map when `MeshSliceRequest.waypoint_name == Some(name)` to
+    /// narrow `services` / `service_entries` / `destination_rules` /
+    /// `workloads` to entries bound to the named waypoint. Empty default
+    /// keeps non-mesh and non-waypoint deployments at zero overhead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waypoint_bindings: Vec<MeshWaypointBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1355,12 +1366,65 @@ impl Default for MeshConfig {
             destination_rules: Vec::new(),
             proxy_configs: Vec::new(),
             sidecars: Vec::new(),
+            waypoint_bindings: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
         }
     }
+}
+
+/// One GAMMA Waypoint → services binding. Produced by the K8s translator
+/// from Gateway resources with `gatewayClassName: istio-waypoint` /
+/// `ferrum-waypoint` plus `Service` annotations
+/// (`istio.io/use-waypoint: <name>`). `waypoint_for` mirrors Istio's
+/// `istio.io/waypoint-for` annotation: `service` (default) means the
+/// waypoint terminates traffic targeted at the listed services;
+/// `workload` means it terminates traffic addressed directly to the
+/// workload IPs; `all` means both. `none` opts out and yields no binding.
+///
+/// `services` is the list of `MeshService` references (namespace + name)
+/// the operator has bound to this waypoint. The slice builder uses the
+/// list as the authoritative narrowing key when
+/// `MeshSliceRequest.waypoint_name == Some(name)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshWaypointBinding {
+    /// Waypoint name. Matches the `metadata.name` of the Gateway resource
+    /// in the K8s flow, and the `istio.io/use-waypoint` annotation value
+    /// on bound Services.
+    pub name: String,
+    /// Namespace the waypoint is scoped to (the Gateway resource's
+    /// namespace). Bound services normally live in the same namespace;
+    /// `istio.io/use-waypoint-namespace` can override, in which case the
+    /// translator emits the cross-namespace ref directly.
+    pub namespace: String,
+    /// `service` (default), `workload`, `all`, or `none`. Persisted as a
+    /// string to keep the schema forward-compatible with future Istio
+    /// enum values without requiring a Ferrum-side migration.
+    #[serde(default = "default_waypoint_for")]
+    pub waypoint_for: String,
+    /// Bound services. Empty when the Gateway resource exists but no
+    /// `Service` annotation references it; the slice builder treats an
+    /// empty binding as "no services pass through this waypoint" and
+    /// fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<MeshWaypointServiceRef>,
+}
+
+fn default_waypoint_for() -> String {
+    "service".to_string()
+}
+
+/// A `(namespace, service)` reference inside a `MeshWaypointBinding`.
+/// Kept as plain strings rather than a `WorkloadRef`-style typed handle
+/// so the binding survives slice round-trips through CP→DP gRPC and
+/// xDS ECDS without needing a separate per-service lookup table at apply
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MeshWaypointServiceRef {
+    pub namespace: String,
+    pub name: String,
 }
 
 /// Istio mesh-wide outbound traffic policy. Mirrors

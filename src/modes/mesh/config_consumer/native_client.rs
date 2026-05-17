@@ -23,6 +23,7 @@ pub struct NativeMeshClientConfig {
     pub node_id: String,
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
+    pub waypoint_name: Option<String>,
     pub labels: HashMap<String, String>,
 }
 
@@ -34,6 +35,7 @@ impl NativeMeshClientConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone().unwrap_or_default(),
             labels: self.labels.clone(),
+            waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
         }
     }
 }

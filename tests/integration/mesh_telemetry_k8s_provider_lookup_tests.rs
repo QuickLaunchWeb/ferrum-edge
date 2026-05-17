@@ -27,6 +27,7 @@ fn k8s_object(
             namespace: namespace.to_string(),
             labels: Default::default(),
             deletion_timestamp: None,
+            annotations: Default::default(),
         },
         spec,
         status: Value::Object(serde_json::Map::new()),
