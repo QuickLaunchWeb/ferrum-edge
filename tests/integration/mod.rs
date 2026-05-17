@@ -29,6 +29,7 @@ mod mesh_destination_rule_port_policy_tests;
 mod mesh_destination_rule_tls_tests;
 mod mesh_hbone_tests;
 mod mesh_k8s_pod_discovery_tests;
+mod mesh_l7_routing_tests;
 mod mesh_peer_auth_live_reload_tests;
 mod mesh_proxy_config_tests;
 mod mesh_service_waypoint_tests;

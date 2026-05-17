@@ -79,7 +79,9 @@ pub const MAX_ACL_GROUP_LENGTH: usize = 255;
 /// Maximum length for hash_on field in upstream.
 pub const MAX_HASH_ON_LENGTH: usize = 255;
 /// Maximum number of status codes in circuit breaker / retry / health check lists.
-pub const MAX_STATUS_CODES: usize = 50;
+/// Allows a full 5xx retry range (500-599) emitted by Istio VirtualService
+/// translation while still bounding operator-provided lists.
+pub const MAX_STATUS_CODES: usize = 100;
 /// Maximum number of retryable methods.
 pub const MAX_RETRYABLE_METHODS: usize = 9;
 /// Maximum length for file path fields (TLS cert/key paths).
@@ -973,7 +975,7 @@ fn default_trip_on_connection_errors() -> bool {
 }
 
 /// Retry backoff strategy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackoffStrategy {
     Fixed { delay_ms: u64 },
@@ -987,7 +989,7 @@ impl Default for BackoffStrategy {
 }
 
 /// Retry configuration for a proxy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,

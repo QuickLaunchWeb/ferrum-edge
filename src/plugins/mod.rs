@@ -91,7 +91,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, Proxy, ResolvedPortOverride, Upstream,
+    BackendScheme, BackendTlsConfig, Consumer, Proxy, ResolvedPortOverride, RetryConfig, Upstream,
 };
 use crate::consumer_index::ConsumerIndex;
 
@@ -372,6 +372,15 @@ pub struct RequestContext {
     /// override a direct backend host/port can set this field explicitly when
     /// the destination uses different mTLS materials.
     pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    /// Plugin-set override for the proxy's backend response/read timeout.
+    /// Used by mesh L7 route dispatch so route-local policy follows the
+    /// matched predicate even when the hot router selected a later fallback
+    /// proxy for the same public path.
+    pub route_override_backend_read_timeout_ms: Option<u64>,
+    /// Plugin-set override for the proxy's retry policy. Outer `None` means
+    /// no override; `Some(None)` intentionally clears the selected proxy's
+    /// retry policy for this route.
+    pub route_override_retry: Option<Option<RetryConfig>>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -422,6 +431,8 @@ impl RequestContext {
             route_override_backend_host: None,
             route_override_backend_port: None,
             route_override_resolved_tls: None,
+            route_override_backend_read_timeout_ms: None,
+            route_override_retry: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
         }
@@ -466,6 +477,8 @@ impl RequestContext {
             || self.route_override_backend_host.is_some()
             || self.route_override_backend_port.is_some()
             || self.route_override_resolved_tls.is_some()
+            || self.route_override_backend_read_timeout_ms.is_some()
+            || self.route_override_retry.is_some()
     }
 
     /// Build a `Proxy` Arc with any plugin-set route overrides applied. If no
@@ -572,12 +585,21 @@ impl RequestContext {
         let dispatch_port_overrides_changed = dispatch_port_overrides_override
             .as_ref()
             .is_some_and(|overrides| *overrides != proxy.dispatch_port_overrides);
+        let backend_read_timeout_changed = self
+            .route_override_backend_read_timeout_ms
+            .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
+        let retry_changed = self
+            .route_override_retry
+            .as_ref()
+            .is_some_and(|retry| proxy.retry != *retry);
 
         if !upstream_id_changed
             && !backend_host_changed
             && !backend_port_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
+            && !backend_read_timeout_changed
+            && !retry_changed
         {
             return proxy;
         }
@@ -603,6 +625,12 @@ impl RequestContext {
         }
         if let Some(dispatch_port_overrides) = dispatch_port_overrides_override {
             overridden.dispatch_port_overrides = dispatch_port_overrides;
+        }
+        if let Some(timeout) = self.route_override_backend_read_timeout_ms {
+            overridden.backend_read_timeout_ms = timeout;
+        }
+        if let Some(retry) = &self.route_override_retry {
+            overridden.retry = retry.clone();
         }
         Arc::new(overridden)
     }

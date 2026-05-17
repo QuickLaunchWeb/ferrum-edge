@@ -9,11 +9,14 @@ pub fn dynamic_object_to_k8s_object(
 ) -> K8sObject {
     let metadata = K8sMetadata {
         name: obj.metadata.name.clone().unwrap_or_default(),
-        namespace: obj
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        namespace: if is_cluster_scoped(api_version, kind) {
+            String::new()
+        } else {
+            obj.metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string())
+        },
         labels: obj
             .metadata
             .labels
@@ -28,6 +31,11 @@ pub fn dynamic_object_to_k8s_object(
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        creation_timestamp: obj
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|ts| ts.0.to_string()),
         deletion_timestamp: obj
             .metadata
             .deletion_timestamp
@@ -49,6 +57,13 @@ pub fn dynamic_object_to_k8s_object(
         spec,
         status,
     }
+}
+
+fn is_cluster_scoped(api_version: &str, kind: &str) -> bool {
+    matches!(
+        (api_version, kind),
+        ("v1", "Node") | ("gateway.networking.k8s.io/v1", "GatewayClass")
+    )
 }
 
 fn dynamic_object_spec(data: &serde_json::Value) -> serde_json::Value {
@@ -143,6 +158,31 @@ mod tests {
         assert_eq!(result.metadata.namespace, "default");
         assert!(result.metadata.labels.is_empty());
         assert!(result.spec.is_object());
+    }
+
+    #[test]
+    fn gateway_class_is_converted_as_cluster_scoped() {
+        let dyn_obj = DynamicObject {
+            metadata: ObjectMeta {
+                name: Some("ferrum".to_string()),
+                namespace: Some("should-not-survive".to_string()),
+                ..Default::default()
+            },
+            types: None,
+            data: json!({
+                "spec": {"controllerName": "ferrum.io/gateway-controller"}
+            }),
+        };
+
+        let result =
+            dynamic_object_to_k8s_object(&dyn_obj, "gateway.networking.k8s.io/v1", "GatewayClass");
+
+        assert_eq!(result.metadata.name, "ferrum");
+        assert_eq!(result.metadata.namespace, "");
+        assert_eq!(
+            result.spec["controllerName"].as_str(),
+            Some("ferrum.io/gateway-controller")
+        );
     }
 
     #[test]

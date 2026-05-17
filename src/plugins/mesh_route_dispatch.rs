@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::types::{
-    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
@@ -105,6 +105,19 @@ impl MeshRouteDispatchConfig {
                     "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
                      a direct backend override (backend_host and backend_port); backend_tls \
                      may only accompany a direct backend"
+                ));
+            }
+            if rule.retry.is_some() && rule.retry_disabled {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}] cannot set both retry and retry_disabled"
+                ));
+            }
+            if let Some(retry) = &rule.retry
+                && let Err(errors) = retry.validate_fields()
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].retry: {}",
+                    errors.join("; ")
                 ));
             }
             if let Some(port) = rule.destination.backend_port
@@ -222,6 +235,19 @@ pub struct RouteRule {
     /// What to override on a matching request. At least one override field
     /// MUST be set; otherwise the rule would be a no-op.
     pub destination: RouteDestination,
+    /// Override the proxy's backend response/read timeout for this rule.
+    /// Istio `VirtualService.http[].timeout` is projected here when route
+    /// candidates are collapsed into a shared Ferrum proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Override the proxy's retry policy for this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
+    /// Explicitly clear the selected proxy's retry policy for this rule.
+    /// Translator-generated collapsed rules use this to prevent a later
+    /// fallback route's retry policy from leaking onto an earlier route.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retry_disabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,6 +383,12 @@ impl Plugin for MeshRouteDispatch {
                 ctx.route_override_backend_host = rule.destination.backend_host.clone();
                 ctx.route_override_backend_port = rule.destination.backend_port;
                 ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
+                ctx.route_override_backend_read_timeout_ms = rule.timeout_ms;
+                ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
+                    Some(rule.retry.clone())
+                } else {
+                    None
+                };
                 return PluginResult::Continue;
             }
         }
@@ -375,6 +407,10 @@ impl Plugin for MeshRouteDispatch {
         }
         PluginResult::Continue
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn rule_matches(

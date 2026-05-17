@@ -28,6 +28,7 @@ fn object(kind: &str, namespace: &str, name: &str, spec: Value) -> K8sObject {
             name: name.to_string(),
             namespace: namespace.to_string(),
             labels: HashMap::new(),
+            creation_timestamp: None,
             deletion_timestamp: None,
             annotations: HashMap::new(),
         },

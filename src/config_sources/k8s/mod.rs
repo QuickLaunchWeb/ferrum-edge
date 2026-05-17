@@ -41,6 +41,12 @@ pub struct K8sMetadata {
     pub annotations: HashMap<String, String>,
     #[serde(
         default,
+        rename = "creationTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub creation_timestamp: Option<String>,
+    #[serde(
+        default,
         rename = "deletionTimestamp",
         skip_serializing_if = "Option::is_none"
     )]
@@ -67,12 +73,6 @@ pub struct K8sTranslationOptions {
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
     pub cluster_domain: String,
-    /// When `true`, the Istio VirtualService translator emits a
-    /// `mesh_route_dispatch` plugin instance for routes with method/header/
-    /// query-param predicates. When `false` (default), those predicates are
-    /// silently dropped — preserving existing behavior. Operator opts in via
-    /// `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`.
-    pub vs_header_routing_experimental: bool,
     /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
     /// false for the first rollout so operators can enable it deliberately.
     pub pod_discovery_enabled: bool,
@@ -88,15 +88,9 @@ impl K8sTranslationOptions {
             prefer_istio_on_overlap: true,
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
-            vs_header_routing_experimental: false,
             pod_discovery_enabled: false,
             source_namespaces: Some(source_namespaces),
         }
-    }
-
-    pub fn with_vs_header_routing_experimental(mut self, enabled: bool) -> Self {
-        self.vs_header_routing_experimental = enabled;
-        self
     }
 
     pub fn with_pod_discovery_enabled(mut self, enabled: bool) -> Self {
@@ -189,6 +183,40 @@ pub struct K8sTranslation {
 pub(crate) enum SourceKind {
     Istio,
     GatewayApi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct K8sResourceKey {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+impl K8sResourceKey {
+    pub fn from_object(object: &K8sObject) -> Self {
+        Self {
+            api_version: object.api_version.clone(),
+            kind: object.kind.clone(),
+            namespace: object.metadata.namespace.clone(),
+            name: object.metadata.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GatewayApiRouteConflictKey {
+    pub route_family: String,
+    pub parent_ref: String,
+    pub hostname: String,
+    pub listen_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiRouteConflict {
+    pub key: GatewayApiRouteConflictKey,
+    pub winner: K8sResourceKey,
+    pub loser: K8sResourceKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -406,6 +434,13 @@ pub fn translate_k8s_objects(
     translate_k8s_objects_with_filter(objects, options, |_| true)
 }
 
+pub fn gateway_api_route_conflicts(
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+) -> Vec<GatewayApiRouteConflict> {
+    gateway_api::route_conflicts(objects, options)
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -439,11 +474,35 @@ where
         }
     }
 
+    let gateway_api_route_conflicts = gateway_api::route_conflicts(objects, &acc.options);
+    let gateway_api_conflict_losers: HashMap<K8sResourceKey, GatewayApiRouteConflict> =
+        gateway_api_route_conflicts
+            .into_iter()
+            .map(|conflict| (conflict.loser.clone(), conflict))
+            .collect();
+
     for object in objects.iter().filter(|object| include(object)) {
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
         observe_object_namespace(&mut acc, object);
+
+        if let Some(conflict) =
+            gateway_api_conflict_losers.get(&K8sResourceKey::from_object(object))
+        {
+            acc.warnings.push(format!(
+                "Gateway API {} {}/{} conflicted on parent={} host={} path={} and was skipped; winner is {}/{}",
+                object.kind,
+                object.metadata.namespace,
+                object.metadata.name,
+                conflict.key.parent_ref,
+                conflict.key.hostname,
+                conflict.key.listen_path,
+                conflict.winner.namespace,
+                conflict.winner.name
+            ));
+            continue;
+        }
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
@@ -870,6 +929,13 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
     pub upstream_id: Option<&'a str>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MeshRouteDispatchPolicy<'a> {
+    pub timeout_ms: Option<u64>,
+    pub retry: Option<&'a RetryConfig>,
+    pub retry_disabled: bool,
+}
+
 /// Translate a VirtualService `http[]` entry's `match[]` blocks into a
 /// `mesh_route_dispatch` plugin instance for the route's proxy.
 ///
@@ -925,10 +991,11 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     http: &Value,
     listen_path: Option<&str>,
     destination: MeshRouteDispatchDestination<'_>,
+    policy: MeshRouteDispatchPolicy<'_>,
     prepend_rules: &[Value],
 ) -> Option<PluginConfig> {
     let (mut rules, has_uri_only_match) =
-        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, false);
+        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, policy, false);
     if !prepend_rules.is_empty() {
         let mut combined = Vec::with_capacity(prepend_rules.len() + rules.len());
         combined.extend(prepend_rules.iter().cloned());
@@ -949,14 +1016,16 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
 pub(crate) fn mesh_route_dispatch_uri_less_rules(
     http: &Value,
     destination: MeshRouteDispatchDestination<'_>,
+    policy: MeshRouteDispatchPolicy<'_>,
 ) -> Vec<Value> {
-    mesh_route_dispatch_rules_for_proxy(http, None, destination, true).0
+    mesh_route_dispatch_rules_for_proxy(http, None, destination, policy, true).0
 }
 
 pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     http: &Value,
     listen_path: Option<&str>,
     route_destination: MeshRouteDispatchDestination<'_>,
+    route_policy: MeshRouteDispatchPolicy<'_>,
     uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
@@ -1060,6 +1129,17 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         let mut rule = serde_json::Map::new();
         rule.insert("match".to_string(), Value::Object(match_criteria));
         rule.insert("destination".to_string(), Value::Object(destination));
+        if let Some(timeout_ms) = route_policy.timeout_ms {
+            rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        }
+        if let Some(retry) = route_policy.retry {
+            rule.insert(
+                "retry".to_string(),
+                serde_json::to_value(retry).expect("RetryConfig serializes"),
+            );
+        } else if route_policy.retry_disabled {
+            rule.insert("retry_disabled".to_string(), Value::Bool(true));
+        }
         rules.push(Value::Object(rule));
     }
 
@@ -1385,6 +1465,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
             },
             spec,

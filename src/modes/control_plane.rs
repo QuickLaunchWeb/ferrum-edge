@@ -511,7 +511,6 @@ pub async fn run(
             debounce_ms: env_config.k8s_reconcile_debounce_ms,
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
             kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),
-            vs_header_routing_experimental: env_config.mesh_vs_header_routing_experimental,
         };
         match crate::k8s_controller::start_k8s_controller(
             controller_config,

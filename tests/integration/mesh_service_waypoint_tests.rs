@@ -69,6 +69,7 @@ fn meta_full(
         namespace: namespace.to_string(),
         labels,
         annotations,
+        creation_timestamp: None,
         deletion_timestamp: None,
     }
 }
