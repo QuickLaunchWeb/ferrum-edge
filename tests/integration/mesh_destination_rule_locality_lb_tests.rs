@@ -184,6 +184,60 @@ fn k8s_translator_parses_failover_entries() {
 }
 
 #[test]
+fn k8s_translator_rejects_combined_locality_lb_modes() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "distribute": [{
+                            "from": "us-west",
+                            "to": { "us-east": 100 }
+                        }],
+                        "failover": [{ "from": "us-west", "to": "us-east" }]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("combined locality LB modes must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must set only one of distribute, failover, or failoverPriority"),
+        "expected mutually-exclusive locality mode rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_unsupported_failover_priority() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("unsupported failoverPriority must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("localityLbSetting.failoverPriority is not supported"),
+        "expected failoverPriority unsupported rejection, got: {msg}"
+    );
+}
+
+#[test]
 fn k8s_translator_rejects_distribute_failing_over_to_self() {
     let object = istio_object(
         "DestinationRule",

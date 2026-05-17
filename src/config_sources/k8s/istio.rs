@@ -804,6 +804,24 @@ fn translate_locality_lb_setting(
         // Istio's default for `enabled` is true when the block is present.
         .unwrap_or(true);
 
+    let has_distribute = value.get("distribute").is_some();
+    let has_failover = value.get("failover").is_some();
+    let has_failover_priority = value.get("failoverPriority").is_some();
+    let mode_count = has_distribute as u8 + has_failover as u8 + has_failover_priority as u8;
+    if mode_count > 1 {
+        return Err(invalid_resource(
+            object,
+            "trafficPolicy.loadBalancer.localityLbSetting must set only one of \
+             distribute, failover, or failoverPriority",
+        ));
+    }
+    if has_failover_priority {
+        return Err(invalid_resource(
+            object,
+            "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority is not supported",
+        ));
+    }
+
     let distribute = if let Some(entries) = value.get("distribute") {
         let arr = entries.as_array().ok_or_else(|| {
             invalid_resource(
