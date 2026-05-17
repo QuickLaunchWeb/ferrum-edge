@@ -916,6 +916,7 @@ fn build_locality_lb_state(
             enabled: false,
             distribute_weights: None,
             distribute_groups: None,
+            distribute_counter: AtomicU64::new(0),
             failover_target_matches: None,
         });
     }
@@ -929,6 +930,7 @@ fn build_locality_lb_state(
             enabled: true,
             distribute_weights: None,
             distribute_groups: None,
+            distribute_counter: AtomicU64::new(0),
             failover_target_matches: None,
         });
     };
@@ -1090,6 +1092,7 @@ fn build_locality_lb_state(
         enabled: true,
         distribute_weights,
         distribute_groups,
+        distribute_counter: AtomicU64::new(0),
         failover_target_matches,
     })
 }
@@ -1253,6 +1256,9 @@ struct LocalityLbState {
     /// picks one bucket by the configured locality share, then runs the
     /// upstream / port / subset algorithm inside that bucket.
     distribute_groups: Option<Vec<LocalityDistributeGroup>>,
+    /// Independent counter for weighted locality-bucket selection. This keeps
+    /// the endpoint algorithm's own counter cadence unchanged.
+    distribute_counter: AtomicU64,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
     /// `true` when the target's locality region matches the failover `to`
     /// region for this source. `None` when no `failover[]` entry matched
@@ -2065,11 +2071,11 @@ impl LoadBalancer {
         ctx_key: &str,
         total: u64,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        distribute_counter: &AtomicU64,
     ) -> u64 {
         let raw = match algorithm {
             LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
-            _ => rr_counter.fetch_add(1, Ordering::Relaxed),
+            _ => distribute_counter.fetch_add(1, Ordering::Relaxed),
         };
         golden_ratio_hash(raw) % total
     }
@@ -2082,7 +2088,6 @@ impl LoadBalancer {
         healthy: &HealthBitset,
         ctx_key: &str,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
     ) -> Option<HealthBitset> {
         let state = self.locality_lb.as_ref()?;
         let groups = state.distribute_groups.as_ref()?;
@@ -2100,7 +2105,7 @@ impl LoadBalancer {
             return None;
         }
 
-        let pick = self.distribute_pick(ctx_key, total, algorithm, rr_counter);
+        let pick = self.distribute_pick(ctx_key, total, algorithm, &state.distribute_counter);
         let mut acc = 0u64;
         let mut first_eligible = None;
         for group in groups {
@@ -2131,7 +2136,6 @@ impl LoadBalancer {
         candidates: &[(usize, &'a Arc<UpstreamTarget>)],
         ctx_key: &str,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
     ) -> Option<Vec<(usize, &'a Arc<UpstreamTarget>)>> {
         let state = self.locality_lb.as_ref()?;
         let groups = state.distribute_groups.as_ref()?;
@@ -2149,7 +2153,7 @@ impl LoadBalancer {
             return None;
         }
 
-        let pick = self.distribute_pick(ctx_key, total, algorithm, rr_counter);
+        let pick = self.distribute_pick(ctx_key, total, algorithm, &state.distribute_counter);
         let mut acc = 0u64;
         let mut first_eligible = None;
         for group in groups {
@@ -2599,8 +2603,7 @@ impl LoadBalancer {
             return None;
         }
         let distributed;
-        let healthy = if let Some(mask) =
-            self.distribute_group_bitset(healthy, ctx_key, algorithm, rr_counter)
+        let healthy = if let Some(mask) = self.distribute_group_bitset(healthy, ctx_key, algorithm)
         {
             distributed = mask;
             &distributed
@@ -2698,7 +2701,7 @@ impl LoadBalancer {
         }
         let distributed;
         let candidates = if let Some(masked) =
-            self.distribute_group_candidates(candidates, ctx_key, algorithm, rr_counter)
+            self.distribute_group_candidates(candidates, ctx_key, algorithm)
         {
             distributed = masked;
             distributed.as_slice()
