@@ -2803,6 +2803,7 @@ mod tests {
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec,
             status: Value::Object(serde_json::Map::new()),
@@ -8635,6 +8636,7 @@ extensionProviders:
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
                     deletion_timestamp: None,
+                    annotations: HashMap::new(),
                 },
                 spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
                 status: Value::Object(serde_json::Map::new()),
@@ -8671,6 +8673,7 @@ extensionProviders:
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
                     deletion_timestamp: None,
+                    annotations: HashMap::new(),
                 },
                 spec: serde_json::json!({
                     "selector": {"matchLabels": {"app": "api"}},
@@ -8800,6 +8803,7 @@ extensionProviders:
                         namespace: "default".to_string(),
                         labels: HashMap::new(),
                         deletion_timestamp: None,
+                        annotations: HashMap::new(),
                     },
                     spec: serde_json::json!({
                         "selector": {"matchLabels": {"app": "api"}},
@@ -8823,6 +8827,7 @@ extensionProviders:
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and
@@ -9356,6 +9361,7 @@ extensionProviders:
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: serde_json::json!({ "ports": ports_json }),
             status: Value::Object(serde_json::Map::new()),
@@ -9371,6 +9377,7 @@ extensionProviders:
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: serde_json::json!({
                 "hosts": ["api.example.com"],
@@ -9562,6 +9569,7 @@ extensionProviders:
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: serde_json::json!({
                 "ports": [
@@ -9610,6 +9618,7 @@ extensionProviders:
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec: serde_json::json!({}),
             status: Value::Object(serde_json::Map::new()),

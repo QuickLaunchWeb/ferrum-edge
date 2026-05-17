@@ -100,6 +100,13 @@ pub enum MeshTopology {
     Sidecar,
     Ambient,
     NodeWaypoint,
+    /// Istio Ambient GAMMA service-scoped waypoint. One process serves L7
+    /// policy for a specific set of services bound to a named waypoint via
+    /// `istio.io/use-waypoint` Service annotation (or the equivalent
+    /// Gateway-API `parentRefs` flow). HBONE inbound on the same port as
+    /// `NodeWaypoint`/`Ambient`; the slice filter narrows services to those
+    /// bound to this waypoint instead of admitting every service on this node.
+    ServiceWaypoint,
     EastWestGateway,
     EgressGateway,
 }
@@ -110,10 +117,11 @@ impl MeshTopology {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
             "node_waypoint" | "node-waypoint" => Ok(Self::NodeWaypoint),
+            "service_waypoint" | "service-waypoint" => Ok(Self::ServiceWaypoint),
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, east_west_gateway, or egress_gateway"
+                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, service_waypoint, east_west_gateway, or egress_gateway"
             )),
         }
     }
@@ -123,9 +131,33 @@ impl MeshTopology {
             Self::Sidecar => "sidecar",
             Self::Ambient => "ambient",
             Self::NodeWaypoint => "node_waypoint",
+            Self::ServiceWaypoint => "service_waypoint",
             Self::EastWestGateway => "east_west_gateway",
             Self::EgressGateway => "egress_gateway",
         }
+    }
+
+    /// Whether this topology terminates HBONE inbound on the shared waypoint
+    /// listener (port 15008 by default). True for `Ambient`, `NodeWaypoint`,
+    /// and `ServiceWaypoint`. Used by listener spawning and by validation
+    /// paths that require HBONE-specific config.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn terminates_hbone(self) -> bool {
+        matches!(
+            self,
+            Self::Ambient | Self::NodeWaypoint | Self::ServiceWaypoint
+        )
+    }
+
+    /// Whether this topology is a waypoint flavor (node or service scope).
+    /// Used by slice-filter and admin-endpoint dispatch to identify the
+    /// shared-listener topologies that need extra scoping beyond Ambient's
+    /// single-workload identity.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_waypoint(self) -> bool {
+        matches!(self, Self::NodeWaypoint | Self::ServiceWaypoint)
     }
 }
 
@@ -173,6 +205,14 @@ pub struct MeshRuntimeConfig {
     /// `FERRUM_MESH_EGRESS_LISTEN_ADDR`, default `0.0.0.0:15090`.
     pub egress_listen_addr: SocketAddr,
     pub workload_spiffe_id: Option<String>,
+    /// Name of the GAMMA Waypoint this process serves. Required when
+    /// `topology == ServiceWaypoint`; ignored for every other topology.
+    /// Sourced from `FERRUM_MESH_WAYPOINT_NAME`. The K8s translator records
+    /// service→waypoint bindings (via `istio.io/use-waypoint` Service
+    /// annotation or `gatewayClassName: istio-waypoint` Gateway resources),
+    /// and the slice builder narrows admitted services to those bound to
+    /// this name at slice-projection time.
+    pub waypoint_name: Option<String>,
     /// xDS node cluster identity sent in DiscoveryRequest.node.cluster.
     /// Defaults to the Ferrum namespace when `FERRUM_MESH_XDS_NODE_CLUSTER`
     /// is unset.
@@ -307,6 +347,17 @@ impl MeshRuntimeConfig {
         )?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
+        let waypoint_name = resolve_ferrum_var("FERRUM_MESH_WAYPOINT_NAME")
+            .filter(|value| !value.trim().is_empty());
+        if matches!(topology, MeshTopology::ServiceWaypoint) && waypoint_name.is_none() {
+            return Err(
+                "FERRUM_MESH_WAYPOINT_NAME is required when FERRUM_MESH_TOPOLOGY=service_waypoint \
+                 (names the GAMMA Waypoint this process serves; bound services match via the \
+                 istio.io/use-waypoint Service annotation or a Gateway resource with \
+                 gatewayClassName=istio-waypoint)"
+                    .into(),
+            );
+        }
         let workload_svid_cert_path = env_config.gateway_svid_cert_path.clone();
         let workload_svid_key_path = env_config.gateway_svid_key_path.clone();
         let workload_svid_trust_bundle_path = env_config.gateway_svid_trust_bundle_path.clone();
@@ -400,6 +451,7 @@ impl MeshRuntimeConfig {
             east_west_listen_port,
             egress_listen_addr,
             workload_spiffe_id,
+            waypoint_name,
             xds_node_cluster,
             xds_stream_channel_capacity: env_config.xds_stream_channel_capacity,
             xds_primary_retry_secs: env_config.dp_cp_failover_primary_retry_secs,
@@ -478,11 +530,13 @@ impl MeshRuntimeConfig {
                     addr: self.hbone_listen_addr,
                 },
             ],
-            MeshTopology::NodeWaypoint => vec![MeshListener {
-                direction: MeshTrafficDirection::Inbound,
-                kind: MeshListenerKind::HboneTermination,
-                addr: self.hbone_listen_addr,
-            }],
+            MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
+                vec![MeshListener {
+                    direction: MeshTrafficDirection::Inbound,
+                    kind: MeshListenerKind::HboneTermination,
+                    addr: self.hbone_listen_addr,
+                }]
+            }
             MeshTopology::EastWestGateway => Vec::new(),
             MeshTopology::EgressGateway => vec![MeshListener {
                 direction: MeshTrafficDirection::Inbound,
@@ -498,6 +552,7 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
+            waypoint_name: self.waypoint_name.clone(),
             labels: self
                 .workload_labels
                 .iter()
@@ -2784,8 +2839,9 @@ fn resolve_inbound_mtls_mode(
 fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
     match runtime.topology {
         MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
-        MeshTopology::Ambient => runtime.hbone_listen_addr.port(),
-        MeshTopology::NodeWaypoint => runtime.hbone_listen_addr.port(),
+        MeshTopology::Ambient
+        | MeshTopology::NodeWaypoint
+        | MeshTopology::ServiceWaypoint => runtime.hbone_listen_addr.port(),
         MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
         // East-west gateways do SNI passthrough — no TLS termination, no port
         // override surface. Use inbound for stability; the resolved mode is
@@ -2814,7 +2870,9 @@ fn validate_inbound_mtls_mode_for_topology(
         return Ok(());
     }
     match runtime.topology {
-        MeshTopology::Ambient | MeshTopology::NodeWaypoint => Err(anyhow::anyhow!(
+        MeshTopology::Ambient
+        | MeshTopology::NodeWaypoint
+        | MeshTopology::ServiceWaypoint => Err(anyhow::anyhow!(
             "Mesh PeerAuthentication resolved to DISABLE on {} topology, but HBONE \
              (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
              workload, or move it to Sidecar topology if plaintext-only is intended.",
@@ -3917,6 +3975,7 @@ mod tests {
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             xds_node_cluster: "ferrum".to_string(),
             xds_stream_channel_capacity: 32,
             xds_primary_retry_secs: 300,
@@ -4014,6 +4073,7 @@ mod tests {
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             xds_node_cluster: "default".to_string(),
             xds_stream_channel_capacity: 32,
             xds_primary_retry_secs: 300,
@@ -4961,6 +5021,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             version: "test".to_string(),
             workloads: Vec::new(),
@@ -6183,6 +6244,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             workload_spiffe_id: Some(source_spiffe),
+            waypoint_name: None,
             workloads: vec![source],
             ..MeshSlice::default()
         };
@@ -6209,6 +6271,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
             workload_spiffe_id: None,
+            waypoint_name: None,
             workloads: vec![first, second, third],
             ..MeshSlice::default()
         };
@@ -6230,6 +6293,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
             workload_spiffe_id: None,
+            waypoint_name: None,
             workloads: vec![first, second],
             ..MeshSlice::default()
         };
@@ -6252,6 +6316,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             workload_spiffe_id: Some(spiffe),
+            waypoint_name: None,
             workloads: vec![source, sibling],
             ..MeshSlice::default()
         };

@@ -945,6 +945,7 @@ fn reverse_translate(
         // alongside CDS via the same wire so this stays empty unless future
         // ADS-side recovery wires it.
         extension_configs: Vec::new(),
+        waypoint_name: None,
     })
 }
 

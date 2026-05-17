@@ -32,6 +32,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         east_west_listen_port: 15443,
         egress_listen_addr: test_addr("0.0.0.0:15090"),
         workload_spiffe_id: None,
+        waypoint_name: None,
         xds_node_cluster: "default".to_string(),
         xds_stream_channel_capacity: 32,
         xds_primary_retry_secs: 300,

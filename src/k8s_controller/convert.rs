@@ -21,6 +21,13 @@ pub fn dynamic_object_to_k8s_object(
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        annotations: obj
+            .metadata
+            .annotations
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
         deletion_timestamp: obj
             .metadata
             .deletion_timestamp

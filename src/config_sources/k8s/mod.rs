@@ -33,6 +33,12 @@ pub struct K8sMetadata {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+    /// Object annotations. Required to read Istio waypoint bindings
+    /// (`istio.io/use-waypoint`, `istio.io/waypoint-for`) and any other
+    /// annotation-driven translation in the future. Optional + default so
+    /// old K8s payload JSON deserializes unchanged.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
     #[serde(
         default,
         rename = "deletionTimestamp",
@@ -524,6 +530,12 @@ pub(crate) fn collect_service(
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_names);
+
+    // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
+    // annotation routes through the named waypoint. We append the binding
+    // to `acc.mesh.waypoint_bindings` so the slice builder can narrow
+    // services per waypoint at projection time.
+    gateway_api::add_service_waypoint_binding(acc, object);
     Ok(())
 }
 
@@ -1371,6 +1383,7 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
                 deletion_timestamp: None,
             },
             spec,
