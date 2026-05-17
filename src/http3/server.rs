@@ -1710,8 +1710,8 @@ async fn handle_h3_request(
             request_path: path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target_url: outcome
-                .backend_target_url
+            backend_target: outcome
+                .backend_target
                 .clone()
                 .or_else(|| Some(strip_query_params(&backend_url).to_string())),
             backend_resolved_ip: outcome
@@ -1731,8 +1731,8 @@ async fn handle_h3_request(
             client_disconnected: outcome.client_disconnected,
             body_error_class: outcome.body_error_class,
             body_completed: outcome.body_completed,
-            request_bytes: outcome.request_bytes,
-            response_bytes: outcome.bytes_streamed,
+            bytes_sent: outcome.bytes_sent,
+            bytes_received: outcome.bytes_streamed,
             error_class: outcome.error_class,
             mirror: false,
             metadata: ctx.metadata.clone(),
@@ -1864,7 +1864,7 @@ async fn handle_h3_request(
                     request_path: path.clone(),
                     proxy_id: Some(proxy.id.clone()),
                     proxy_name: proxy.name.clone(),
-                    backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                    backend_target: Some(strip_query_params(&backend_url).to_string()),
                     backend_resolved_ip: backend_resolved_ip.clone(),
                     response_status_code: 502,
                     latency_total_ms: total_ms,
@@ -2133,7 +2133,7 @@ async fn handle_h3_request(
             request_path: path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_target: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
             latency_total_ms: total_ms,
@@ -2158,11 +2158,11 @@ async fn handle_h3_request(
             // currently surfaced back from the pool. Populating this would
             // require threading an `Arc<AtomicU64>` through the H3 request
             // API; deferred to a follow-up. For streaming-request flows,
-            // `request_bytes` may be 0 even when a non-empty body was sent.
-            request_bytes: 0,
+            // `bytes_sent` may be 0 even when a non-empty body was sent.
+            bytes_sent: 0,
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
-            response_bytes: bytes_streamed,
+            bytes_received: bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -2197,8 +2197,8 @@ async fn handle_h3_request(
     }
 
     // Capture the on-wire request body length BEFORE plugin transforms run.
-    // The buffered-response summary and the streaming-response `request_bytes`
-    // field both use this value, so `request_bytes` reflects bytes actually
+    // The buffered-response summary and the streaming-response `bytes_sent`
+    // field both use this value, so `bytes_sent` reflects bytes actually
     // received from the client — consistent with the pre-transform semantics
     // of the HTTP/1.1, HTTP/2, and gRPC paths.
     let raw_request_body_bytes = body_data.len() as u64;
@@ -2280,7 +2280,7 @@ async fn handle_h3_request(
         // `transform_request_body` loop ran. `body_data` at this point may
         // have been rewritten by a request-body plugin; logging its current
         // length would misreport the on-wire size. `raw_request_body_bytes`
-        // is the canonical `request_bytes` value for the H3 buffered-request
+        // is the canonical `bytes_sent` value for the H3 buffered-request
         // path on both the streaming and buffered response branches.
         let request_body_bytes = raw_request_body_bytes;
         let streaming_result = proxy_to_backend_h3_streaming(
@@ -2404,7 +2404,7 @@ async fn handle_h3_request(
             request_path: path,
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_target: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
             latency_total_ms: total_ms,
@@ -2420,11 +2420,11 @@ async fn handle_h3_request(
             error_class: h3_error_class,
             body_error_class: h3_stream_result.body_error_class,
             body_completed: h3_stream_result.body_completed,
-            request_bytes: request_body_bytes,
+            bytes_sent: request_body_bytes,
             // `bytes_streamed` from the H3 streaming helper is the final
             // count of body bytes pushed to the client's h3 stream. Mirror
-            // it into the unified `response_bytes` field.
-            response_bytes: h3_stream_result.bytes_streamed,
+            // it into the unified `bytes_received` field.
+            bytes_received: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -2780,7 +2780,7 @@ async fn handle_h3_request(
             request_path: path,
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_target: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip,
             response_status_code: response_status,
             latency_total_ms: total_ms,
@@ -2792,8 +2792,8 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             error_class: h3_error_class,
-            request_bytes: raw_request_body_bytes,
-            response_bytes: response_body.len() as u64,
+            bytes_sent: raw_request_body_bytes,
+            bytes_received: response_body.len() as u64,
             metadata: ctx.metadata.clone(),
             ..TransactionSummary::default()
         };

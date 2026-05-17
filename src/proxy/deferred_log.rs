@@ -214,8 +214,8 @@ impl DeferredTransactionLogger {
         summary.client_disconnected = outcome.client_disconnected;
         // Streaming responses only learn their final byte count when the
         // body wrapper finishes or is dropped. Buffered responses populate
-        // `response_bytes` synchronously and never reach the deferred logger.
-        summary.response_bytes = outcome.bytes_streamed;
+        // `bytes_received` synchronously and never reach the deferred logger.
+        summary.bytes_received = outcome.bytes_streamed;
 
         // Re-derive wall-clock latencies so streaming responses report the
         // real body-completion time instead of the header-flush snapshot.
@@ -314,10 +314,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_patches_response_bytes_from_outcome() {
-        // Regression guard for the unified response_bytes field. When
+    async fn fire_patches_bytes_received_from_outcome() {
+        // Regression guard for the unified bytes_received field. When
         // fire() fires with a streaming outcome carrying N bytes,
-        // `response_bytes` should land at N.
+        // `bytes_received` should land at N.
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -331,7 +331,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         let summary = captured.lock().unwrap().clone().expect("log fired");
-        assert_eq!(summary.response_bytes, 12345);
+        assert_eq!(summary.bytes_received, 12345);
         assert!(summary.body_completed);
     }
 

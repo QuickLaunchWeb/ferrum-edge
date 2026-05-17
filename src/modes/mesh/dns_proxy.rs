@@ -862,7 +862,7 @@ async fn read_dns_tcp_payload_with_timeout(
 async fn write_dns_tcp_response(stream: &mut TcpStream, response: &[u8]) -> bool {
     if response.len() > u16::MAX as usize {
         warn!(
-            response_bytes = response.len(),
+            bytes_received = response.len(),
             "DNS TCP response too large"
         );
         return false;

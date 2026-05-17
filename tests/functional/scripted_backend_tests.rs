@@ -457,14 +457,14 @@ async fn h2_alpn_fallback_downgrades_capability() {
     // Respond to *any* request (the H2 pool probe sends none, but reqwest
     // user requests do). The 3-step script runs per connection — adequate
     // for a pool probe handshake that terminates on receiving close_notify.
-    let response_bytes: Vec<u8> =
+    let bytes_received: Vec<u8> =
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
     let backend = ScriptedTlsBackend::builder(
         reservation.into_listener(),
         TlsConfig::new(cert, key).with_alpn(vec![b"http/1.1".to_vec()]),
     )
     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(response_bytes))
+    .step(TcpStep::Write(bytes_received))
     .step(TcpStep::Drop)
     .spawn()
     .expect("spawn backend");

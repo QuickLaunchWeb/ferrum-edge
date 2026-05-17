@@ -1909,7 +1909,7 @@ impl Plugin for AiFederation {
                         "ai_federation: request completed"
                     );
 
-                    let response_bytes = match serde_json::to_vec(&normalized) {
+                    let bytes_received = match serde_json::to_vec(&normalized) {
                         Ok(b) => b,
                         Err(e) => {
                             // Practically unreachable: `normalized` is built from
@@ -1936,7 +1936,7 @@ impl Plugin for AiFederation {
 
                     return PluginResult::RejectBinary {
                         status_code: if status >= 400 { status } else { 200 },
-                        body: Bytes::from(response_bytes),
+                        body: Bytes::from(bytes_received),
                         headers: resp_headers,
                     };
                 }

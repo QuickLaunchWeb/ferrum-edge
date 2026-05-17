@@ -672,7 +672,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `request_path` | String | Request path (query string stripped) |
 | `proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
 | `proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
-| `backend_target_url` | String or null | Backend URL (`host:port/path`); null for rejected requests |
+| `backend_target` | String or null | Backend the request was forwarded to. For HTTP this is the full URL (`scheme://host:port/path`); `null` when the request was rejected before backend selection. Same JSON key as `StreamTransactionSummary.backend_target` (which uses `host:port` form because stream proxies have no path). |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
 | `latency_total_ms` | f64 | Total request-to-response time |
@@ -688,12 +688,14 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `error_class` | String or null | Error classification for pre-body failures (connect, TLS, headers); omitted from JSON when null |
 | `body_error_class` | String or null | Error classification for failures while streaming the response body (e.g., client RST mid-body, backend RST after headers); omitted when null |
 | `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
-| `bytes_streamed` | u64 | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted |
+| `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (request body size). Same JSON key as `StreamTransactionSummary.bytes_sent`. Omitted from JSON when zero (empty / `GET` / `HEAD`) |
+| `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (response body size, unified buffered + streaming counter). Same JSON key as `StreamTransactionSummary.bytes_received`. May be less than the backend's advertised `Content-Length` when streaming was interrupted. Omitted from JSON when zero |
+| `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
 **Notes on conditional fields:** `auth_method`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
 
-**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed` reflect the full client-visible outcome.
+**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
 
 **`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
 
@@ -750,7 +752,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "request_path": "/api/v1/users",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
   "proxy_name": "users-api",
-  "backend_target_url": "10.0.2.10:8080/api/v1/users",
+  "backend_target": "10.0.2.10:8080/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 201,
   "latency_total_ms": 12.45,
@@ -776,7 +778,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "request_path": "/api/v1/events",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440002",
   "proxy_name": "sse-events",
-  "backend_target_url": "10.0.2.15:8080/api/v1/events",
+  "backend_target": "10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
   "latency_total_ms": 4.80,
@@ -805,7 +807,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "request_path": "/api/v2/feed",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440003",
   "proxy_name": "feed-api",
-  "backend_target_url": "10.0.2.20:8080/api/v2/feed",
+  "backend_target": "10.0.2.20:8080/api/v2/feed",
   "backend_resolved_ip": "10.0.2.20",
   "response_status_code": 200,
   "latency_total_ms": 5.30,
@@ -833,7 +835,7 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
   "request_path": "/myapp.UserService/GetUser",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440004",
   "proxy_name": "grpc-users",
-  "backend_target_url": "10.0.2.30:50051/myapp.UserService/GetUser",
+  "backend_target": "10.0.2.30:50051/myapp.UserService/GetUser",
   "backend_resolved_ip": "10.0.2.30",
   "response_status_code": 200,
   "latency_total_ms": 8.12,
@@ -865,7 +867,7 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "request_path": "/ws/chat",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
   "proxy_name": "ws-chat",
-  "backend_target_url": "10.0.2.40:8080/ws/chat",
+  "backend_target": "10.0.2.40:8080/ws/chat",
   "backend_resolved_ip": "10.0.2.40",
   "response_status_code": 101,
   "latency_total_ms": 3.20,
@@ -893,7 +895,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "request_path": "/ws/chat",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
   "proxy_name": "ws-chat",
-  "backend_target_url": "10.0.2.40:8080/ws/chat",
+  "backend_target": "10.0.2.40:8080/ws/chat",
   "response_status_code": 502,
   "latency_total_ms": 5012.30,
   "latency_gateway_processing_ms": 5012.30,
@@ -919,7 +921,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "request_path": "/api/v1/secrets",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
   "proxy_name": "users-api",
-  "backend_target_url": null,
+  "backend_target": null,
   "response_status_code": 401,
   "latency_total_ms": 0.15,
   "latency_gateway_processing_ms": 0.15,
@@ -933,7 +935,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target_url: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
 
 #### Example: TCP Stream
 

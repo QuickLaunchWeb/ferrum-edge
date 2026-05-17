@@ -767,7 +767,7 @@ pub struct TransactionSummary {
     pub request_path: String,
     pub proxy_id: Option<String>,
     pub proxy_name: Option<String>,
-    pub backend_target_url: Option<String>,
+    pub backend_target: Option<String>,
     pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
@@ -786,7 +786,11 @@ pub struct TransactionSummary {
     // `body_error_class` covers failures observed while streaming the body.
     pub body_error_class: Option<ErrorClass>,
     pub body_completed: bool,
-    pub bytes_streamed_to_client: u64,
+    // Same JSON keys as StreamTransactionSummary so logs unify across
+    // HTTP and TCP/UDP transactions. Omitted from output when zero.
+    pub bytes_sent: u64,     // client -> backend (request body size)
+    pub bytes_received: u64, // backend -> client (response body size)
+    pub mirror: bool,
     pub metadata: HashMap<String, String>,
 }
 ```

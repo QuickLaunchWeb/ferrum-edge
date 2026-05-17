@@ -4934,9 +4934,10 @@ components:
                 description: >-
                   `status_class`: `"1xx"`–`"5xx"` from
                   `response_status_code` (stream: `"none"`).
-                  `backend_host`: hostname from `backend_target_url` /
-                  `backend_target`. `summary_kind`: `"http"` or
-                  `"stream"`. `outcome`: `"ok"` / `"error"`.
+                  `backend_host`: hostname from `backend_target`
+                  (port stripped, IPv6 brackets honored).
+                  `summary_kind`: `"http"` or `"stream"`.
+                  `outcome`: `"ok"` / `"error"`.
         metadata:
           type: object
           description: How to render the `metadata` map.

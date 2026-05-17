@@ -123,8 +123,8 @@ use crate::retry::ErrorClass;
 pub struct CrossProtocolOutcome {
     pub response_status: u16,
     pub bytes_streamed: u64,
-    pub request_bytes: u64,
-    pub backend_target_url: Option<String>,
+    pub bytes_sent: u64,
+    pub backend_target: Option<String>,
     pub backend_resolved_ip: Option<String>,
     pub body_completed: bool,
     pub client_disconnected: bool,
@@ -642,7 +642,7 @@ where
             raw_prebuffered_body_bytes,
         )
         .await?;
-        outcome.backend_target_url = Some(strip_query_from_backend_url(backend_url));
+        outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
         outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
         return Ok(outcome);
     }
@@ -709,9 +709,9 @@ where
             requires_response_body_buffering,
         );
 
-    let (response, request_bytes) = match prebuffered_body {
+    let (response, bytes_sent) = match prebuffered_body {
         Some(buffered_body) => {
-            let request_bytes = raw_prebuffered_body_bytes;
+            let bytes_sent = raw_prebuffered_body_bytes;
             let mut attempt = 0u32;
 
             record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
@@ -883,11 +883,10 @@ where
                             StatusCode::BAD_GATEWAY,
                             r#"{"error":"Bad Gateway"}"#,
                             backend_start,
-                            request_bytes,
+                            bytes_sent,
                         )
                         .await?;
-                        outcome.backend_target_url =
-                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                         outcome.connection_error = attempt_result.connection_error;
                         outcome.error_class = attempt_result.error_class;
                         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -895,7 +894,7 @@ where
                     }
                 }
             };
-            (response, request_bytes)
+            (response, bytes_sent)
         }
         None => {
             record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
@@ -1079,7 +1078,7 @@ where
             // ignored), so any inner halts already issued by the
             // reader cost only one extra frame.
             crate::http3::stream_util::halt_request_body(stream);
-            let request_bytes = bytes_read.load(Ordering::Relaxed);
+            let bytes_sent = bytes_read.load(Ordering::Relaxed);
             if oversized.load(Ordering::Relaxed) {
                 record_backend_outcome(
                     state,
@@ -1098,13 +1097,13 @@ where
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     backend_start,
-                    request_bytes,
+                    bytes_sent,
                 )
                 .await;
             }
 
             match send_result {
-                Ok(response) => (response, request_bytes),
+                Ok(response) => (response, bytes_sent),
                 Err(e) => {
                     let final_backend_resolved_ip =
                         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref())
@@ -1137,10 +1136,10 @@ where
                         StatusCode::BAD_GATEWAY,
                         r#"{"error":"Bad Gateway"}"#,
                         backend_start,
-                        request_bytes,
+                        bytes_sent,
                     )
                     .await?;
-                    outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                    outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                     outcome.connection_error = attempt_result.connection_error;
                     outcome.error_class = attempt_result.error_class;
                     outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -1179,10 +1178,10 @@ where
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Backend response body exceeds maximum size"}"#,
             backend_start,
-            request_bytes,
+            bytes_sent,
         )
         .await?;
-        outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
         outcome.body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
         return Ok(outcome);
@@ -1215,10 +1214,10 @@ where
             &reject.body,
             &reject.headers,
             backend_start,
-            request_bytes,
+            bytes_sent,
         )
         .await?;
-        outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
         return Ok(outcome);
     }
@@ -1262,10 +1261,10 @@ where
                     &error_body,
                     &empty_headers,
                     backend_start,
-                    request_bytes,
+                    bytes_sent,
                 )
                 .await?;
-                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 outcome.error_class = error_class;
                 return Ok(outcome);
@@ -1378,8 +1377,8 @@ where
         return Ok(CrossProtocolOutcome {
             response_status,
             bytes_streamed,
-            request_bytes,
-            backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+            bytes_sent,
+            backend_target: Some(strip_query_from_backend_url(&current_url)),
             backend_resolved_ip: final_backend_resolved_ip.clone(),
             body_completed,
             client_disconnected,
@@ -1418,8 +1417,8 @@ where
     Ok(CrossProtocolOutcome {
         response_status: status,
         bytes_streamed,
-        request_bytes,
-        backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+        bytes_sent,
+        backend_target: Some(strip_query_from_backend_url(&current_url)),
         backend_resolved_ip: final_backend_resolved_ip.clone(),
         body_completed,
         client_disconnected,
@@ -1519,7 +1518,7 @@ where
             }
         }
     };
-    let request_bytes = if body_was_prebuffered {
+    let bytes_sent = if body_was_prebuffered {
         raw_prebuffered_body_bytes
     } else {
         body.len() as u64
@@ -1757,7 +1756,7 @@ where
                         headers: reject.headers,
                     },
                     backend_start,
-                    request_bytes,
+                    bytes_sent,
                 )
                 .await?;
                 record_backend_outcome(
@@ -1772,7 +1771,7 @@ where
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
-                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 return Ok(outcome);
             }
@@ -1891,8 +1890,8 @@ where
             Ok(CrossProtocolOutcome {
                 response_status,
                 bytes_streamed: bytes_total,
-                request_bytes,
-                backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+                bytes_sent,
+                backend_target: Some(strip_query_from_backend_url(&current_url)),
                 backend_resolved_ip: final_backend_resolved_ip.clone(),
                 body_completed,
                 client_disconnected,
@@ -1932,7 +1931,7 @@ where
                         headers: reject.headers,
                     },
                     backend_start,
-                    request_bytes,
+                    bytes_sent,
                 )
                 .await?;
                 record_backend_outcome(
@@ -1947,7 +1946,7 @@ where
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
-                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 return Ok(outcome);
             }
@@ -1992,8 +1991,8 @@ where
             Ok(CrossProtocolOutcome {
                 response_status: streaming.status,
                 bytes_streamed,
-                request_bytes,
-                backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+                bytes_sent,
+                backend_target: Some(strip_query_from_backend_url(&current_url)),
                 backend_resolved_ip: final_backend_resolved_ip.clone(),
                 body_completed: final_body_completed,
                 client_disconnected: final_client_disconnected,
@@ -2061,10 +2060,10 @@ where
                 grpc_status_code,
                 grpc_message,
                 backend_start,
-                request_bytes,
+                bytes_sent,
             )
             .await?;
-            outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+            outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
             outcome.connection_error = connection_error;
             outcome.error_class = Some(error_class);
             outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -2532,12 +2531,12 @@ async fn write_error<S>(
     status: StatusCode,
     body: &'static str,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    write_error_with_header(stream, status, body, None, backend_start, request_bytes).await
+    write_error_with_header(stream, status, body, None, backend_start, bytes_sent).await
 }
 
 async fn write_error_with_header<S>(
@@ -2546,7 +2545,7 @@ async fn write_error_with_header<S>(
     body: &'static str,
     extra_header: Option<(&'static str, &'static str)>,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -2569,8 +2568,8 @@ where
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         bytes_streamed: len,
-        request_bytes,
-        backend_target_url: None,
+        bytes_sent,
+        backend_target: None,
         backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
@@ -2591,7 +2590,7 @@ async fn write_reject_with_headers<S>(
     body: &[u8],
     headers: &HashMap<String, String>,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -2625,8 +2624,8 @@ where
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         bytes_streamed: len,
-        request_bytes,
-        backend_target_url: None,
+        bytes_sent,
+        backend_target: None,
         backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
@@ -2647,7 +2646,7 @@ async fn write_final_body_reject<S>(
     ctx: &mut RequestContext,
     reject: PluginResult,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -2660,7 +2659,7 @@ where
                 h3_http_status_to_grpc_status(StatusCode::BAD_GATEWAY),
                 "Plugin rejection normalization failed",
                 backend_start,
-                request_bytes,
+                bytes_sent,
             )
             .await
         } else {
@@ -2669,7 +2668,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 "{\"error\":\"Plugin rejection normalization failed\"}",
                 backend_start,
-                request_bytes,
+                bytes_sent,
             )
             .await
         };
@@ -2678,7 +2677,7 @@ where
     if matches!(flavor, HttpFlavor::Grpc) {
         let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &parts.headers);
         apply_h3_grpc_reject_metadata(ctx, &normalized);
-        write_normalized_grpc_reject(stream, &normalized, backend_start, request_bytes).await
+        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else {
         write_reject_with_headers(
             stream,
@@ -2686,7 +2685,7 @@ where
             &parts.body,
             &parts.headers,
             backend_start,
-            request_bytes,
+            bytes_sent,
         )
         .await
     }
@@ -2717,7 +2716,7 @@ async fn write_normalized_grpc_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     reject: &crate::proxy::NormalizedRejectResponse,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -2754,8 +2753,8 @@ where
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
         bytes_streamed: 0,
-        request_bytes,
-        backend_target_url: None,
+        bytes_sent,
+        backend_target: None,
         backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
@@ -2816,7 +2815,7 @@ async fn write_grpc_error<S>(
     grpc_status: u32,
     grpc_message: &str,
     backend_start: Instant,
-    request_bytes: u64,
+    bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -2838,8 +2837,8 @@ where
     Ok(CrossProtocolOutcome {
         response_status: 200,
         bytes_streamed: 0,
-        request_bytes,
-        backend_target_url: None,
+        bytes_sent,
+        backend_target: None,
         backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
