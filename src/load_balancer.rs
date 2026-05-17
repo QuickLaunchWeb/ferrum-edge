@@ -981,7 +981,8 @@ fn build_locality_lb_state(
                 .iter()
                 .map(|(_, endpoint_weight)| u128::from(*endpoint_weight))
                 .sum();
-            if endpoint_weight_total == 0 {
+            let Some(endpoint_weight_total) = std::num::NonZeroU128::new(endpoint_weight_total)
+            else {
                 let target_count = matching_targets.len() as u64;
                 let per_target = scaled_weight / target_count;
                 let remainder = scaled_weight % target_count;
@@ -993,34 +994,35 @@ fn build_locality_lb_state(
                     weights[idx] = weights[idx].saturating_add(share);
                     total = total.saturating_add(share);
                 }
-            } else {
-                let scaled_weight_u128 = u128::from(scaled_weight);
-                let mut allocated = 0u64;
-                let mut allocations = Vec::with_capacity(matching_targets.len());
-                for (idx, endpoint_weight) in matching_targets {
-                    if endpoint_weight == 0 {
-                        allocations.push((idx, 0u64, 0u128, endpoint_weight));
-                        continue;
-                    }
-                    let numerator = scaled_weight_u128.saturating_mul(u128::from(endpoint_weight));
-                    let share = (numerator / endpoint_weight_total) as u64;
-                    let remainder = numerator % endpoint_weight_total;
-                    allocated = allocated.saturating_add(share);
-                    allocations.push((idx, share, remainder, endpoint_weight));
+                continue;
+            };
+            let endpoint_weight_total = endpoint_weight_total.get();
+            let scaled_weight_u128 = u128::from(scaled_weight);
+            let mut allocated = 0u64;
+            let mut allocations = Vec::with_capacity(matching_targets.len());
+            for (idx, endpoint_weight) in matching_targets {
+                if endpoint_weight == 0 {
+                    allocations.push((idx, 0u64, 0u128, endpoint_weight));
+                    continue;
                 }
-                allocations.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-                let mut leftover = scaled_weight.saturating_sub(allocated);
-                for (idx, mut share, _, endpoint_weight) in allocations {
-                    if endpoint_weight > 0 && leftover > 0 {
-                        share = share.saturating_add(1);
-                        leftover -= 1;
-                    }
-                    if share == 0 {
-                        continue;
-                    }
-                    weights[idx] = weights[idx].saturating_add(share);
-                    total = total.saturating_add(share);
+                let numerator = scaled_weight_u128.saturating_mul(u128::from(endpoint_weight));
+                let share = (numerator / endpoint_weight_total) as u64;
+                let remainder = numerator % endpoint_weight_total;
+                allocated = allocated.saturating_add(share);
+                allocations.push((idx, share, remainder, endpoint_weight));
+            }
+            allocations.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            let mut leftover = scaled_weight.saturating_sub(allocated);
+            for (idx, mut share, _, endpoint_weight) in allocations {
+                if endpoint_weight > 0 && leftover > 0 {
+                    share = share.saturating_add(1);
+                    leftover -= 1;
                 }
+                if share == 0 {
+                    continue;
+                }
+                weights[idx] = weights[idx].saturating_add(share);
+                total = total.saturating_add(share);
             }
         }
         // Only honour the match if at least one target was reachable;
