@@ -899,9 +899,9 @@ pub fn target_host_port_key(target: &UpstreamTarget) -> String {
 /// priority, no distribute, no failover" (matches Istio semantics).
 ///
 /// Pre-computes per-target weights / failover masks once at construction so
-/// the hot path stays branch-light: distribute is a single Vec lookup +
-/// weighted scan, failover is one Vec index check inside the existing tier
-/// preference.
+/// the hot path stays branch-light: distribute is a candidate mask plus a
+/// weighted bucket pick, failover is one Vec index check inside the existing
+/// tier preference.
 fn build_locality_lb_state(
     setting: Option<&UpstreamLocalityLbSetting>,
     source_locality: Option<&str>,

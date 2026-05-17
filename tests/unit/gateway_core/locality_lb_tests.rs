@@ -777,6 +777,52 @@ fn locality_distribute_preserves_consistent_hashing_within_selected_locality() {
 }
 
 #[test]
+fn locality_distribute_vec_fallback_preserves_consistent_hashing_within_selected_locality() {
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let mut targets = Vec::with_capacity(131);
+    targets.push(target("west.local", Some("us-west/us-west-1/a")));
+    for i in 0..130 {
+        targets.push(target(
+            &format!("east-{i}.local"),
+            Some("us-east/us-east-1/a"),
+        ));
+    }
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::ConsistentHashing,
+        Some("us-west/us-west-1/a"),
+        targets,
+    );
+    up.locality_lb_setting = Some(setting);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let first =
+        LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user-vec", no_health())
+            .expect("consistent hash distribute vec selection");
+    assert!(first.target.host.starts_with("east-"));
+
+    for _ in 0..16 {
+        let selection =
+            LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user-vec", no_health())
+                .expect("consistent hash distribute vec selection");
+        assert_eq!(
+            selection.target.host, first.target.host,
+            "Vec fallback distribute must preserve consistent hashing within the selected locality"
+        );
+    }
+}
+
+#[test]
 fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
     let mut to = BTreeMap::new();
     to.insert("us-east".to_string(), 100);
