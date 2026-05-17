@@ -238,6 +238,25 @@ async fn upstream_mutation_writes_queryable_audit_event() {
 }
 
 #[tokio::test]
+async fn audit_list_rejects_offset_above_backend_range() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = get_json(&base, "/audit?offset=4294967296", &admin).await;
+
+    assert_eq!(status, 400, "oversized offset body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("offset"),
+        "unexpected audit offset error body: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn partial_batch_mutation_writes_audit_event() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);

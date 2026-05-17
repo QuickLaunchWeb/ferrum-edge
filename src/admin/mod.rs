@@ -2691,21 +2691,19 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
-        if created.any() {
-            let event = audit::AuditEvent::new(
-                actor,
-                "restore",
-                "gateway_config",
-                namespace,
-                namespace,
-                audit::update_diff(
-                    json!({"replaced_namespace": namespace}),
-                    response["restored"].clone(),
-                ),
-            );
-            if let Err(error) = audit::record(db.clone(), event).await {
-                log_audit_persist_failure(&error);
-            }
+        let event = audit::AuditEvent::new(
+            actor,
+            "restore",
+            "gateway_config",
+            namespace,
+            namespace,
+            audit::update_diff(
+                json!({"replaced_namespace": namespace}),
+                response["restored"].clone(),
+            ),
+        );
+        if let Err(error) = audit::record(db.clone(), event).await {
+            log_audit_persist_failure(&error);
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
@@ -2732,12 +2730,18 @@ fn parse_audit_filter(
     query: Option<&str>,
     pagination: &PaginationParams,
 ) -> Result<audit::AuditListFilter, Box<Response<Full<Bytes>>>> {
+    let offset = u32::try_from(pagination.offset).map_err(|_| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Audit offset exceeds supported range"}),
+        ))
+    })?;
     let mut filter = audit::AuditListFilter {
         limit: pagination
             .limit
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .min(MAX_PAGE_SIZE) as u32,
-        offset: pagination.offset as u32,
+        offset,
         ..Default::default()
     };
 
