@@ -465,6 +465,18 @@ Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of
 
 Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
 
+### NodeWaypoint cgroup-inode lifecycle binding
+
+In NodeWaypoint topology one HBONE listener serves many pods. The node-agent enrolls each pod's identity into the proxy via `NodeWaypointIdentityResolver`. When the agent supplies the pod's cgroup v2 directory at enrollment time (`upsert_identity_with_cgroup`), the resolver captures the directory inode plus a small Unix metadata fingerprint, and a periodic sweep (`FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS`, default 30s) re-stats the path:
+
+- Inode/fingerprint unchanged → identity kept.
+- Inode or fingerprint changed → pod restarted under the same UID; identity (and its per-pod policy scope) is evicted so a fresh enrollment is required before traffic for the new instance is honoured. The fingerprint prevents missed restarts when the filesystem reuses the old inode number.
+- Path gone → pod removed; identity and policy scope are evicted.
+
+Set the sweep interval to `0` to disable. Identities enrolled without a cgroup path are opt-out from the sweep — they remain until explicitly removed via the resolver API. The sweep is best-effort GC, not a security boundary: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.
+
+Picking an interval is a tradeoff between eviction lag (worst-case time a stale identity remains after pod removal/restart) and per-sweep stat cost. Each enrolled cgroup-bound identity costs one `stat(2)` per sweep — on the order of tens of microseconds on a warm dentry cache, so even at thousands of pods per node a sweep finishes in a few milliseconds and the work runs on a dedicated background task off the accept path. Shorten the interval to tighten the eviction window on heavy pod churn; lengthen it (or set `0`) if the operator already drives identity removal explicitly from the node-agent and treats the sweep as a defence-in-depth backstop.
+
 ## Transparent DNS Proxy
 
 The mesh DNS proxy intercepts DNS queries and resolves mesh-internal hostnames from a pre-built resolution table. Non-mesh queries are forwarded to the upstream system resolver.
@@ -1132,6 +1144,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` | `false` | Enables Istio `VirtualService` method/header/queryParam predicate capture through proxy-scoped `mesh_route_dispatch` plugins; unsupported predicate-only candidates fail closed through proxy-scoped `request_termination`, and destination-only collapse rejects route-local policy that cannot be carried per rule |
+| `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
 
 ### Listeners
 
