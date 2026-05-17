@@ -21,20 +21,22 @@ const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
 /// honored so operators migrating from Istio do not have to retag.
 const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoint"];
 
-/// Service annotation naming the GAMMA Waypoint a Service routes through.
+/// Service label naming the GAMMA Waypoint a Service routes through.
 /// `None` (the literal string) opts the Service out of any inherited
-/// namespace-level waypoint binding.
-const ANNOTATION_USE_WAYPOINT: &str = "istio.io/use-waypoint";
+/// namespace-level waypoint binding. Annotations are accepted as a
+/// compatibility fallback for file/native sources that already use them.
+const KEY_USE_WAYPOINT: &str = "istio.io/use-waypoint";
 
-/// Optional Service annotation that points `istio.io/use-waypoint` at a
-/// waypoint Gateway in a namespace other than the Service's namespace.
-const ANNOTATION_USE_WAYPOINT_NAMESPACE: &str = "istio.io/use-waypoint-namespace";
+/// Optional Service label that points `istio.io/use-waypoint` at a waypoint
+/// Gateway in a namespace other than the Service's namespace. Annotations are
+/// accepted as a compatibility fallback.
+const KEY_USE_WAYPOINT_NAMESPACE: &str = "istio.io/use-waypoint-namespace";
 
-/// Service annotation setting which traffic the waypoint handles:
+/// Gateway/Service label setting which traffic the waypoint handles:
 /// `service` (default), `workload`, `all`, or `none`. Stored verbatim on
 /// the binding so future Istio enum additions don't require a Ferrum-side
-/// schema change.
-const ANNOTATION_WAYPOINT_FOR: &str = "istio.io/waypoint-for";
+/// schema change. Annotations are accepted as a compatibility fallback.
+const KEY_WAYPOINT_FOR: &str = "istio.io/waypoint-for";
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -130,16 +132,12 @@ pub(super) fn is_waypoint_gateway(object: &K8sObject) -> bool {
 
 /// Insert (or update) a `MeshWaypointBinding` for this Gateway. Gateway
 /// resources contribute the binding shell — `name` + `namespace` — and
-/// honour an annotation-level `istio.io/waypoint-for` default if present.
+/// honor a label/annotation-level `istio.io/waypoint-for` default if present.
 /// Bound services are added later by `add_service_waypoint_binding` from
 /// `collect_service`.
 pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8sObject) {
-    let waypoint_for = object
-        .metadata
-        .annotations
-        .get(ANNOTATION_WAYPOINT_FOR)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let waypoint_for = metadata_key(object, KEY_WAYPOINT_FOR)
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| "service".to_string());
     if let Some(existing) = acc
         .mesh
@@ -147,7 +145,7 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
         .iter_mut()
         .find(|b| b.name == object.metadata.name && b.namespace == object.metadata.namespace)
     {
-        // Gateway-level annotation always wins over service-supplied
+        // Gateway-level label/annotation always wins over service-supplied
         // defaults because the Gateway is the canonical owner of the
         // waypoint identity.
         existing.waypoint_for = waypoint_for;
@@ -162,33 +160,20 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
 }
 
 /// Append this Service to the matching waypoint binding when the
-/// `istio.io/use-waypoint` annotation is set (and not `None`). Creates the
+/// `istio.io/use-waypoint` label/annotation is set (and not `None`). Creates the
 /// binding shell when the Gateway hasn't been observed yet so service +
 /// gateway translation can land in either order.
 pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8sObject) {
-    let Some(waypoint) = object
-        .metadata
-        .annotations
-        .get(ANNOTATION_USE_WAYPOINT)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+    let Some(waypoint) =
+        metadata_key(object, KEY_USE_WAYPOINT).filter(|s| !s.eq_ignore_ascii_case("none"))
     else {
         return;
     };
     let waypoint_name = waypoint.to_string();
-    let waypoint_namespace = object
-        .metadata
-        .annotations
-        .get(ANNOTATION_USE_WAYPOINT_NAMESPACE)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let waypoint_namespace = metadata_key(object, KEY_USE_WAYPOINT_NAMESPACE)
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| object.metadata.namespace.clone());
-    let waypoint_for_override = object
-        .metadata
-        .annotations
-        .get(ANNOTATION_WAYPOINT_FOR)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let waypoint_for_override = metadata_key(object, KEY_WAYPOINT_FOR).map(ToOwned::to_owned);
 
     let service_ref = MeshWaypointServiceRef {
         namespace: object.metadata.namespace.clone(),
@@ -212,6 +197,17 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
         services: vec![service_ref],
     });
+}
+
+fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
+    object
+        .metadata
+        .labels
+        .get(key)
+        .or_else(|| object.metadata.annotations.get(key))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {

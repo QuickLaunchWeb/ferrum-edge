@@ -102,7 +102,7 @@ pub enum MeshTopology {
     NodeWaypoint,
     /// Istio Ambient GAMMA service-scoped waypoint. One process serves L7
     /// policy for a specific set of services bound to a named waypoint via
-    /// `istio.io/use-waypoint` Service annotation (or the equivalent
+    /// `istio.io/use-waypoint` Service label/annotation (or the equivalent
     /// Gateway-API `parentRefs` flow). HBONE inbound on the same port as
     /// `NodeWaypoint`/`Ambient`; the slice filter narrows services to those
     /// bound to this waypoint instead of admitting every service on this node.
@@ -209,7 +209,7 @@ pub struct MeshRuntimeConfig {
     /// `topology == ServiceWaypoint`; ignored for every other topology.
     /// Sourced from `FERRUM_MESH_WAYPOINT_NAME`. The K8s translator records
     /// service→waypoint bindings (via `istio.io/use-waypoint` Service
-    /// annotation or `gatewayClassName: istio-waypoint` Gateway resources),
+    /// label/annotation or `gatewayClassName: istio-waypoint` Gateway resources),
     /// and the slice builder narrows admitted services to those bound to
     /// this name at slice-projection time.
     pub waypoint_name: Option<String>,
@@ -353,7 +353,7 @@ impl MeshRuntimeConfig {
             return Err(
                 "FERRUM_MESH_WAYPOINT_NAME is required when FERRUM_MESH_TOPOLOGY=service_waypoint \
                  (names the GAMMA Waypoint this process serves; bound services match via the \
-                 istio.io/use-waypoint Service annotation or a Gateway resource with \
+                 istio.io/use-waypoint Service label/annotation or a Gateway resource with \
                  gatewayClassName=istio-waypoint)"
                     .into(),
             );
@@ -482,7 +482,7 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
-            waypoint_name: self.waypoint_name.clone(),
+            waypoint_name: self.service_waypoint_name(),
             labels: self.workload_labels.clone(),
         }
     }
@@ -494,7 +494,7 @@ impl MeshRuntimeConfig {
             cluster: self.xds_node_cluster.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
-            waypoint_name: self.waypoint_name.clone(),
+            waypoint_name: self.service_waypoint_name(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -554,7 +554,7 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
-            waypoint_name: self.waypoint_name.clone(),
+            waypoint_name: self.service_waypoint_name(),
             labels: self
                 .workload_labels
                 .iter()
@@ -564,6 +564,14 @@ impl MeshRuntimeConfig {
             enforce_sidecar_egress: self.sidecar_enforced,
             sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
+        }
+    }
+
+    fn service_waypoint_name(&self) -> Option<String> {
+        if self.topology == MeshTopology::ServiceWaypoint {
+            self.waypoint_name.clone()
+        } else {
+            None
         }
     }
 }
@@ -4099,6 +4107,31 @@ mod tests {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
         }
+    }
+
+    #[test]
+    fn waypoint_name_only_propagates_for_service_waypoint_topology() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.waypoint_name = Some("api-waypoint".to_string());
+
+        assert_eq!(runtime.native_client_config().waypoint_name, None);
+        assert_eq!(runtime.xds_client_config().waypoint_name, None);
+        assert_eq!(runtime.mesh_slice_request().waypoint_name, None);
+
+        runtime.topology = MeshTopology::ServiceWaypoint;
+
+        assert_eq!(
+            runtime.native_client_config().waypoint_name.as_deref(),
+            Some("api-waypoint")
+        );
+        assert_eq!(
+            runtime.xds_client_config().waypoint_name.as_deref(),
+            Some("api-waypoint")
+        );
+        assert_eq!(
+            runtime.mesh_slice_request().waypoint_name.as_deref(),
+            Some("api-waypoint")
+        );
     }
 
     fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {

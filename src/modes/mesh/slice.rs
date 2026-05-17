@@ -657,6 +657,7 @@ impl MeshSlice {
             narrow_for_service_waypoint(
                 waypoint,
                 &request.namespace,
+                &request.cluster_domain,
                 &mesh.waypoint_bindings,
                 waypoint_resources,
             )
@@ -709,6 +710,7 @@ struct ServiceWaypointNarrowingResources {
 fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
+    cluster_domain: &str,
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
     resources: ServiceWaypointNarrowingResources,
 ) -> ServiceWaypointNarrowingResources {
@@ -739,40 +741,28 @@ fn narrow_for_service_waypoint(
         .into_iter()
         .filter(|s| bound.contains(&(s.namespace.clone(), s.name.clone())))
         .collect();
-    let admitted_hosts: BTreeSet<String> = admitted_services
-        .iter()
-        .map(|s| format!("{}.{}", s.name, s.namespace))
-        .collect();
+    let admitted_hosts = admitted_service_hosts(&admitted_services, cluster_domain);
     let admitted_destination_rules: Vec<MeshDestinationRule> = resources
         .destination_rules
         .into_iter()
         .filter(|dr| {
-            // DR is admitted if its host matches an admitted service's
-            // {name}.{namespace} form. Cluster-domain suffixes are handled
-            // by Istio canonicalization upstream; the equality check covers
-            // the most common form (FQDN without the `.svc.cluster.local`
-            // suffix). Phantom DRs unrelated to bound services are dropped.
+            // DR is admitted only when its host is one of the admitted
+            // Service's canonical Kubernetes DNS aliases. Broad prefix
+            // matches can accidentally admit unrelated external hosts.
             let host = dr.host.trim_end_matches('.');
-            admitted_hosts
-                .iter()
-                .any(|admitted| host_matches_admitted_service(host, admitted))
+            host_matches_admitted_service(host, &admitted_hosts)
         })
         .collect();
     let admitted_service_entries: Vec<ServiceEntry> = resources
         .service_entries
         .into_iter()
         .filter(|se| {
-            // ServiceEntry hosts can be arbitrary; admit when the entry's
-            // host (or any of its hosts) matches an admitted service's
-            // `{name}.{namespace}` form. ServiceEntries that target
-            // external resources without a Service binding are admitted
-            // only when the operator explicitly listed the entry's host
-            // in the binding (covered transitively by `admitted_hosts`).
+            // ServiceEntry hosts can be arbitrary; admit only canonical
+            // aliases for bound Services. External-looking hosts that happen
+            // to start with `{service}.{namespace}.` are unrelated.
             se.hosts.iter().any(|h| {
                 let h = h.trim_end_matches('.');
-                admitted_hosts
-                    .iter()
-                    .any(|admitted| host_matches_admitted_service(h, admitted))
+                host_matches_admitted_service(h, &admitted_hosts)
             })
         })
         .collect();
@@ -799,11 +789,25 @@ fn narrow_for_service_waypoint(
     }
 }
 
-fn host_matches_admitted_service(host: &str, admitted: &str) -> bool {
-    host == admitted
-        || host
-            .strip_prefix(admitted)
-            .is_some_and(|suffix| suffix.starts_with('.'))
+fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTreeSet<String> {
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let mut hosts = BTreeSet::new();
+    for service in services {
+        hosts.insert(service.name.clone());
+        hosts.insert(format!("{}.{}", service.name, service.namespace));
+        hosts.insert(format!("{}.{}.svc", service.name, service.namespace));
+        if !cluster_domain.is_empty() {
+            hosts.insert(format!(
+                "{}.{}.svc.{}",
+                service.name, service.namespace, cluster_domain
+            ));
+        }
+    }
+    hosts
+}
+
+fn host_matches_admitted_service(host: &str, admitted_hosts: &BTreeSet<String>) -> bool {
+    admitted_hosts.contains(host.trim_end_matches('.'))
 }
 
 /// Filter `workloads` down to the SPIFFE identities referenced by admitted

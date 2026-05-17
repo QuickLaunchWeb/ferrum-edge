@@ -3,7 +3,7 @@
 //!
 //! - The Kubernetes translator builds `MeshConfig.waypoint_bindings` from
 //!   `Gateway` resources with `gatewayClassName: istio-waypoint` plus
-//!   `Service` objects annotated with `istio.io/use-waypoint`.
+//!   `Service` objects labeled or annotated with `istio.io/use-waypoint`.
 //! - The slice builder narrows `services` / `service_entries` /
 //!   `destination_rules` / `workloads` to the bound set when the request
 //!   carries `waypoint_name`.
@@ -38,15 +38,36 @@ fn meta(name: &str, annotations: HashMap<String, String>) -> K8sMetadata {
     meta_in_namespace("default", name, annotations)
 }
 
+fn meta_with_labels(name: &str, labels: HashMap<String, String>) -> K8sMetadata {
+    meta_in_namespace_with_labels("default", name, labels)
+}
+
 fn meta_in_namespace(
     namespace: &str,
     name: &str,
     annotations: HashMap<String, String>,
 ) -> K8sMetadata {
+    meta_full(namespace, name, HashMap::new(), annotations)
+}
+
+fn meta_in_namespace_with_labels(
+    namespace: &str,
+    name: &str,
+    labels: HashMap<String, String>,
+) -> K8sMetadata {
+    meta_full(namespace, name, labels, HashMap::new())
+}
+
+fn meta_full(
+    namespace: &str,
+    name: &str,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+) -> K8sMetadata {
     K8sMetadata {
         name: name.to_string(),
         namespace: namespace.to_string(),
-        labels: HashMap::new(),
+        labels,
         annotations,
         deletion_timestamp: None,
     }
@@ -81,6 +102,20 @@ fn waypoint_gateway(name: &str, annotations: HashMap<String, String>) -> K8sObje
     )
 }
 
+fn waypoint_gateway_with_labels(name: &str, labels: HashMap<String, String>) -> K8sObject {
+    k8s_object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        meta_with_labels(name, labels),
+        serde_json::json!({
+            "gatewayClassName": "istio-waypoint",
+            "listeners": [
+                {"name": "mesh", "port": 15008, "protocol": "HBONE"}
+            ]
+        }),
+    )
+}
+
 fn service_with_use_waypoint(name: &str, waypoint: &str) -> K8sObject {
     let mut annotations = HashMap::new();
     annotations.insert("istio.io/use-waypoint".to_string(), waypoint.to_string());
@@ -96,10 +131,49 @@ fn service_with_use_waypoint(name: &str, waypoint: &str) -> K8sObject {
     )
 }
 
+fn service_with_use_waypoint_label(name: &str, waypoint: &str) -> K8sObject {
+    let mut labels = HashMap::new();
+    labels.insert("istio.io/use-waypoint".to_string(), waypoint.to_string());
+    k8s_object(
+        "v1",
+        "Service",
+        meta_with_labels(name, labels),
+        serde_json::json!({
+            "ports": [
+                {"name": "http", "port": 8080, "protocol": "TCP", "targetPort": 8080}
+            ]
+        }),
+    )
+}
+
 fn translate_objects(objects: Vec<K8sObject>) -> GatewayConfig {
     translate_k8s_objects(&objects, translation_options())
         .expect("translation succeeds")
         .config
+}
+
+#[test]
+fn k8s_translator_records_waypoint_binding_from_gateway_and_service_labels() {
+    let mut waypoint_labels = HashMap::new();
+    waypoint_labels.insert("istio.io/waypoint-for".to_string(), "workload".to_string());
+
+    let cfg = translate_objects(vec![
+        waypoint_gateway_with_labels("api-waypoint", waypoint_labels),
+        service_with_use_waypoint_label("reviews", "api-waypoint"),
+        service_with_use_waypoint_label("ratings", "api-waypoint"),
+    ]);
+
+    let mesh = cfg.mesh.as_ref().expect("mesh config emitted");
+    let binding = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|b| b.name == "api-waypoint")
+        .expect("api-waypoint binding present");
+    assert_eq!(binding.namespace, "default");
+    assert_eq!(binding.waypoint_for, "workload");
+    let mut bound: Vec<&str> = binding.services.iter().map(|s| s.name.as_str()).collect();
+    bound.sort_unstable();
+    assert_eq!(bound, vec!["ratings", "reviews"]);
 }
 
 #[test]
@@ -169,6 +243,53 @@ fn k8s_translator_honors_use_waypoint_namespace_annotation() {
             "v1",
             "Service",
             meta("reviews", service_annotations),
+            serde_json::json!({
+                "ports": [
+                    {"name": "http", "port": 8080, "protocol": "TCP", "targetPort": 8080}
+                ]
+            }),
+        ),
+    ]);
+
+    let mesh = cfg.mesh.as_ref().expect("mesh config emitted");
+    let binding = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|b| b.name == "shared-waypoint" && b.namespace == "infra")
+        .expect("cross-namespace waypoint binding present");
+    assert_eq!(binding.services.len(), 1);
+    assert_eq!(binding.services[0].namespace, "default");
+    assert_eq!(binding.services[0].name, "reviews");
+}
+
+#[test]
+fn k8s_translator_honors_use_waypoint_namespace_label() {
+    let mut service_labels = HashMap::new();
+    service_labels.insert(
+        "istio.io/use-waypoint".to_string(),
+        "shared-waypoint".to_string(),
+    );
+    service_labels.insert(
+        "istio.io/use-waypoint-namespace".to_string(),
+        "infra".to_string(),
+    );
+
+    let cfg = translate_objects(vec![
+        k8s_object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            meta_in_namespace_with_labels("infra", "shared-waypoint", HashMap::new()),
+            serde_json::json!({
+                "gatewayClassName": "istio-waypoint",
+                "listeners": [
+                    {"name": "mesh", "port": 15008, "protocol": "HBONE"}
+                ]
+            }),
+        ),
+        k8s_object(
+            "v1",
+            "Service",
+            meta_with_labels("reviews", service_labels),
             serde_json::json!({
                 "ports": [
                     {"name": "http", "port": 8080, "protocol": "TCP", "targetPort": 8080}
@@ -390,6 +511,7 @@ fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
         destination_rules: vec![
             destination_rule("reviews", "reviews.default.svc.cluster.local"),
             destination_rule("reviews-shadow", "reviews.defaultx.svc.cluster.local"),
+            destination_rule("reviews-external", "reviews.default.external.example.com"),
         ],
         waypoint_bindings: vec![MeshWaypointBinding {
             name: "api-waypoint".to_string(),

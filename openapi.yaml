@@ -599,7 +599,7 @@ paths:
         current `ServiceWaypoint` topology. Operators use this to confirm
         which services a named GAMMA waypoint is actually serving after
         `FERRUM_MESH_WAYPOINT_NAME` and Gateway API `use-waypoint`
-        annotations have been projected by the control plane.
+        labels or annotations have been projected by the control plane.
 
         Returns `404 Not Found` when service-waypoint topology is not
         active, when no mesh slice has been installed yet, or when the
