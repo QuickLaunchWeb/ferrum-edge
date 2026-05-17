@@ -115,9 +115,11 @@ Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend
 
 ### TLS Rotation
 
-All file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**.
+Most file-based TLS materials are **static operational inputs**. Cert/key changes on disk are NOT picked up live (K8s Secrets, sidecar volumes, etc.). Rotation = **gateway restart / rolling redeploy**, except for the narrow cases below.
 
 Narrow carve-out: when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, mesh inbound `PeerAuthentication` mode changes and the frontend client CA verifier may be rebuilt on mesh slice apply for mesh HTTP/HBONE termination listeners. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config. Frontend cert/key paths still require restart.
+
+Narrow backend carve-out: the `FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH` files are watched for backend client SVID rotation. A validated reload updates the gateway SVID slot, preserves any CP-delivered trust-bundle override, bumps the backend `|svidg=<generation>` marker, drains old backend TLS config caches, restarts active HTTP health probes, and optionally force-drains old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. Lower-level in-memory producers (`RotationConfig.revision_tx` for Ferrum-as-issuer, `SvidFetchHandle::with_revision_tx` for SPIRE-agent workload-API) may also bind to `ProxyState.backend_svid_rotation_tx` in future flows. Backend CA bundles and ordinary operator-supplied backend client cert/key paths remain static startup inputs.
 
 ### Graceful Shutdown
 
@@ -348,10 +350,39 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 ### Code Quality Rules
 
-- **No `.unwrap()` or `.expect()` in production code** — use `?`, `.unwrap_or()`, `.unwrap_or_else()`, match/if-let. OK in tests.
-- **No panics on hot path** — proxy request path must never panic. Return errors.
-- Don't silently swallow errors — log warnings before `.unwrap_or_default()` when appropriate.
-- **Always `validation.validate_exp = true`** on JWT verification.
+**Production Rust:**
+- No `.unwrap()` / `.expect()` in production code. Tests are exempt. Prefer `?`, explicit error handling, or documented invariants.
+- Avoid `unwrap_or`-style fallbacks when they could hide real configuration, parsing, or I/O failures — log a `warn!` before `.unwrap_or_default()` when a fallback is genuinely desired.
+- No panics on the proxy request path. Return errors.
+
+**Hot path:**
+- No `format!()` or avoidable allocation in hot loops.
+- No global `Mutex` / `RwLock` on the proxy hot path.
+- Prefer `ArcSwap` snapshots for read-mostly state.
+- Use `DashMap` only for concurrent mutable maps.
+- New hot-path `DashMap` construction must go through `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`.
+
+**Schemas:**
+- Backward-compatible optional field additions must use `#[serde(default, skip_serializing_if = "<pred>")]`.
+- Required new fields need a migration/versioning plan.
+- Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
+
+**Configuration:**
+- New `FERRUM_*` env vars require updates to `docs/configuration.md` and `ferrum.conf`.
+- Update config tests/examples where applicable.
+
+**Pool keys:**
+- Use `|` as the delimiter, never `:`.
+- Ensure key components cannot contain `|`, or escape/encode them before joining.
+
+**Admin API / OpenAPI parity:**
+- Admin API request/response changes (new endpoints, fields, status codes) and any new plugin must be reflected in `openapi.yaml`. UI integrations consume that spec — drift silently breaks downstream tooling.
+
+**Injector / Kubernetes admission:**
+- Changes touching `src/modes/injector.rs` require review for webhook body-size limits, SSRF exposure, Kubernetes `AdmissionReview` shape, UID echoing, `status` / `allowed` behavior, and JSONPatch correctness.
+
+**Security:**
+- Always set `validation.validate_exp = true` on JWT verification.
 - Escape user input when interpolating into JSON/XML response bodies.
 
 ### TLS Architecture
@@ -414,10 +445,10 @@ Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain,
 
 Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include every field affecting connection identity (destination, TLS trust, client credentials, DNS routing). Missing field = pool poisoning; extra = fragmentation. `|` delimiter (IPv6 colons would be ambiguous).
 
-- **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
-- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
-- **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` (always TLS)
-- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{verify}` — matches `backend_capabilities::capability_key` so probe classification and QUIC reuse stay aligned. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` for the same reason.
+- **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
+- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
+- **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}` + shard `#N` (always TLS)
+- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}`. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` so retry/probe paths include the same backend identity fields. Backend capability keys remain a protocol-classification key and use the static SVID-generation marker; rotation is handled by pool-key partitioning.
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
 
@@ -489,7 +520,7 @@ Tests in `tests/performance/multi_protocol/`. Build once with `cargo build --rel
 3. Override `supported_protocols()` (default HTTP only). Constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, `UDP_ONLY_PROTOCOLS`
 4. Register in `create_plugin_with_http_client()` match arm (use `?` on `new()`) + add name to `available_plugins()`
 5. Unit tests in `tests/unit/plugins/my_plugin_tests.rs` (valid AND invalid configs) + add to `tests/unit/plugins/mod.rs`
-6. Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`
+6. Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, and `openapi.yaml` (plugin schema for UI parity)
 
 ### Plugin Config Validation
 

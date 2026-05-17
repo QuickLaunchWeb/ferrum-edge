@@ -168,6 +168,71 @@ pub struct MeshSlice {
     /// or would have been applied when dry-run is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
+    /// Operator-defined ECDS (Extension Config Discovery Service) entries.
+    /// These flow through xDS as
+    /// `type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig`
+    /// resources. The xDS server emits them verbatim so a CP can hand
+    /// arbitrary typed extension configs to subscribed DPs.
+    ///
+    /// GAP-2K's DR-carrier path uses this surface to ship the original
+    /// DestinationRule JSON across xDS when full DR semantics are needed:
+    /// the CP wraps the DR JSON in a `MeshExtensionConfig` with a
+    /// Ferrum-specific `type_url`, and the DP xDS consumer recognizes the
+    /// `type_url` and applies the DR locally instead of relying on the
+    /// fragmentary CDS/EDS recoverable fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_configs: Vec<MeshExtensionConfig>,
+}
+
+/// One opaque typed extension config, transported through xDS ECDS.
+///
+/// `name` and `type_url` identify the extension; `value` is the
+/// already-serialized inner typed payload. Do not include the protobuf field
+/// tag or length delimiter for `Any.value`; prost adds those when the outer
+/// `Any` is encoded. The DP-side consumer is responsible for recognizing
+/// `type_url` and deserializing `value` into its own representation; the xDS
+/// layer treats everything inside `value` as uninterpreted bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshExtensionConfig {
+    pub name: String,
+    pub type_url: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "extension_value_bytes"
+    )]
+    pub value: Vec<u8>,
+}
+
+mod extension_value_bytes {
+    use base64::Engine as _;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Encode side stays canonical `STANDARD` (padded). Decode side is lenient
+    /// on padding so an upstream CP that strips trailing `=` characters still
+    /// round-trips correctly. Alphabet stays `STANDARD` (`+/`) — we never
+    /// silently accept the URL-safe alphabet (`-_`) because mixing alphabets
+    /// would corrupt non-text payloads on decode.
+    const DECODE_LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        DECODE_LENIENT
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +301,7 @@ impl MeshSlice {
             && self.multi_cluster == other.multi_cluster
             && self.outbound_traffic_policy == other.outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
+            && self.extension_configs == other.extension_configs
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -568,6 +634,7 @@ impl MeshSlice {
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
+            extension_configs: mesh.extension_configs.clone(),
         }
     }
 }
@@ -1797,6 +1864,7 @@ mod tests {
             multi_cluster: Some(make_multi_cluster()),
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
+            extension_configs: Vec::new(),
         };
         assert!(slice.content_eq(&slice.clone()));
     }

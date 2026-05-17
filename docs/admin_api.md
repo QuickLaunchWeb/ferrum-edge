@@ -573,6 +573,60 @@ The registry stores only protocol classifications and probe timestamps — never
 - `FERRUM_POOL_WARMUP_ENABLED` — when `true`, the initial classification runs synchronously during startup; when `false`, the gateway issues the first refresh in the background and reports ready before it completes (DP mode always gates readiness on first-refresh completion regardless).
 - `FERRUM_POOL_WARMUP_CONCURRENCY` — parallelism cap for both startup and refresh probe passes.
 
+## Node-Waypoint Identities (mesh `NodeWaypoint` topology)
+
+The node-waypoint topology accepts traffic on behalf of many pods on the same node. Each pod's identity is enrolled into a per-resolver index keyed by Kubernetes pod UID; the eBPF data path records the socket cookie and original destination per outbound connection. `GET /node-waypoint/identities` exposes the live snapshot of that index so operators can answer "which pods is this waypoint actually serving?" without scraping eBPF maps.
+
+The endpoint returns `404 Not Found` when the node-waypoint resolver is not installed on `ProxyState` — including all non-mesh modes and mesh modes other than `NodeWaypoint` topology. This avoids surfacing an empty stub list that could be mistaken for "no pods enrolled yet" on a sidecar/ambient/east-west/egress-gateway DP.
+
+### `GET /node-waypoint/identities`
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/node-waypoint/identities
+```
+
+Response:
+
+```json
+{
+  "identity_count": 2,
+  "cookies": {
+    "orig_dst4": 17,
+    "orig_dst6": 0
+  },
+  "identities": [
+    {
+      "pod_uid": "11111111-1111-1111-1111-111111111111",
+      "spiffe_id": "spiffe://cluster.local/ns/default/sa/api",
+      "workload_spiffe_hash": 12345678901234567890,
+      "orig_dst4_cookies": 5,
+      "orig_dst6_cookies": 0,
+      "has_policy_scope": true
+    },
+    {
+      "pod_uid": "22222222-2222-2222-2222-222222222222",
+      "spiffe_id": "spiffe://cluster.local/ns/default/sa/billing",
+      "workload_spiffe_hash": 9876543210987654321,
+      "orig_dst4_cookies": 12,
+      "orig_dst6_cookies": 0,
+      "has_policy_scope": false
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- `pod_uid` — hyphenated lowercase UUID matching the Kubernetes `metadata.uid` operators see in `kubectl get pod -o yaml`.
+- `spiffe_id` — SPIFFE ID assigned to that pod's service account (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}` by convention).
+- `workload_spiffe_hash` — first 8 bytes of SHA-256 over the SPIFFE ID, big-endian as `u64`. Matches the value the eBPF `OrigDst{4,6}` map carries for cross-correlation with `node_agent` telemetry.
+- `orig_dst4_cookies` / `orig_dst6_cookies` — number of socket cookies currently mapped to this pod via the IPv4 / IPv6 original-destination map. `0` means the pod is enrolled but has no in-flight outbound connection on that family.
+- `has_policy_scope` — `true` iff a per-pod `PolicyScopeCache` is installed for this pod via `install_policy_scopes`. When `false`, mesh-authz falls back to the shared slice-level scope.
+
+`identities` is sorted by `pod_uid` so polling produces stable output. Entries with zero cookies are kept — enrolled-but-idle pods are operationally interesting (the cookie count answers "is this pod taking traffic?").
+
+The endpoint is cold-path: it iterates each shard of three `DashMap`s once. Don't poll faster than a few times per second on a busy node.
+
 ## Mesh Egress Scope (mesh mode)
 
 Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).

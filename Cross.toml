@@ -10,12 +10,32 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-# `RUSTC_WRAPPER=` (explicit empty) overrides the project-level
-# `[build] rustc-wrapper = "sccache"` from `.cargo/config.toml` so the cross
-# container does not try to spawn an sccache binary that isn't installed
-# inside it. Local `cargo build` outside the container still uses sccache.
+# The cross-rs container lacks sccache, mold, standalone `clang`, and a
+# gcc new enough to understand `-fuse-ld=`. We use three forms of override
+# (one per kind of cargo setting) to make `.cargo/config.toml` agnostic:
+#
+# 1. `RUSTC_WRAPPER=` (empty) — cargo reliably treats empty as "no wrapper",
+#    cleanly clearing `[build] rustc-wrapper`. Same for CARGO_BUILD_RUSTC_WRAPPER.
+#
+# 2. `RUSTFLAGS=` (empty) — per cargo docs, when RUSTFLAGS is set (even to
+#    empty), cargo skips `[target.<triple>] rustflags` entirely. This is
+#    the only env-var form that REPLACES (rather than merges with) target-
+#    specific rustflags. CARGO_TARGET_<TRIPLE>_RUSTFLAGS merges, which is
+#    why an earlier fix using it left `-fuse-ld=mold` still on the linker
+#    cmdline.
+#
+# 3. `CARGO_TARGET_<TRIPLE>_LINKER=<real binary>` — cargo doesn't honor
+#    empty values for the LINKER key, so we point each to a real binary
+#    that exists in the container:
+#      - x86_64-linux-gnu (host, used for build scripts/proc-macros): `cc`
+#        (gcc symlink, always present on Debian/Ubuntu).
+#      - aarch64-linux-gnu (cross target): `aarch64-linux-gnu-gcc`
+#        (the cross toolchain shipped in the container).
 passthrough = [
     "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
     "RUSTC_WRAPPER=",
     "CARGO_BUILD_RUSTC_WRAPPER=",
+    "RUSTFLAGS=",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
 ]

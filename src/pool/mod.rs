@@ -214,6 +214,15 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
+    pub fn invalidate_matching(&self, predicate: impl Fn(&str) -> bool) {
+        let keys = self.keys_snapshot();
+        for key in keys {
+            if predicate(&key) {
+                self.invalidate(&key);
+            }
+        }
+    }
+
     pub fn cached_with<F>(&self, build_key: F) -> Option<M::Connection>
     where
         F: FnOnce(&mut String),

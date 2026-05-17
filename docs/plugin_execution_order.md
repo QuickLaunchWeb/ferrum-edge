@@ -228,7 +228,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `workload_metrics` (9360), `access_log` (9375) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365), `access_log` (9375) |
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
@@ -307,7 +307,8 @@ Given all built-in plugins enabled, the execution order is:
 | 63 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 | 64 | `api_chargeback` | 9350 | log |
 | 65 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 66 | `access_log` | 9375 | log, on_stream_disconnect |
+| 66 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 67 | `access_log` | 9375 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
