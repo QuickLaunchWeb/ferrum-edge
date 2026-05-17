@@ -137,6 +137,12 @@ pub struct NodeWaypointIdentity {
     pub cgroup_fingerprint: Option<CgroupFingerprint>,
 }
 
+/// `ctime` (inode-metadata change time) is used rather than `mtime` because
+/// kubelet writes to files *inside* the cgroup directory (`cgroup.procs`,
+/// thresholds, etc.) update the directory's `mtime` without indicating a
+/// new pod incarnation. `ctime` only advances when the directory's own
+/// metadata changes — which for a kubelet-managed cgroup means
+/// creation/replacement, exactly the signal the sweep needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CgroupFingerprint {
     pub device: u64,
@@ -240,6 +246,11 @@ pub struct NodeWaypointIdentityResolver {
     cookie_records: DashMap<u64, CookieRecord>,
     identities_by_pod_uid: DashMap<[u8; 16], Arc<NodeWaypointIdentity>>,
     policy_scopes_by_pod_uid: Arc<ArcSwap<HashMap<[u8; 16], Arc<PolicyScopeCache>>>>,
+    // Sweep counters below are intentionally NOT `CachePadded` (unlike the
+    // accept-path `node_waypoint_*_drops` atomics in `OverloadState`). They
+    // are written at most once per sweep tick (default 30s) on a single
+    // background task and read only via cold-path admin endpoints, so no
+    // hot writer/reader pair can land on the same cache line.
     /// Monotonic count of identities evicted because their cgroup path was
     /// gone at sweep time. Operator/admin endpoints can read this to
     /// surface pod-churn signal.
@@ -317,9 +328,12 @@ impl NodeWaypointIdentityResolver {
     ///
     /// On stat error the identity is still inserted but without inode
     /// binding — sweep treats it like a non-cgroup enrollment (kept until
-    /// explicit removal). The caller decides whether to warn; a control
-    /// plane that requires lifecycle binding can check the returned
-    /// identity's `cgroup_inode` and reject when `None`.
+    /// explicit removal). The recorded `cgroup_path` in that case is
+    /// informational only: with `cgroup_inode == None` and
+    /// `cgroup_fingerprint == None` the sweep's candidate filter rejects
+    /// the entry and never re-stats the path. The caller decides whether
+    /// to warn; a control plane that requires lifecycle binding can check
+    /// the returned identity's `cgroup_inode` and reject when `None`.
     pub fn upsert_identity_with_cgroup(
         &self,
         mut identity: NodeWaypointIdentity,
