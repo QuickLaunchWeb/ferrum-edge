@@ -59,6 +59,7 @@ fn upstream_with_overrides(
         subsets: None,
         port_overrides,
         source_locality: None,
+        locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,

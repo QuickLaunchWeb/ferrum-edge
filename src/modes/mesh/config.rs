@@ -1054,6 +1054,14 @@ pub struct MeshTrafficPolicy {
     /// `None`); new DPs reading old slices behave identically to today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<MeshTrafficPolicyTls>,
+    /// Optional `DestinationRule.trafficPolicy.localityLbSetting`. When
+    /// present, the mesh apply layer projects this onto the resolved
+    /// `Upstream.locality_lb_setting`; the load balancer then honours
+    /// `distribute` weights and `failover` region overrides on top of the
+    /// existing priority-tier (exact/zone/region) preference. Old DPs
+    /// reading new slices see this as a no-op via the serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality_lb_setting: Option<MeshLocalityLbSetting>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
@@ -1190,6 +1198,72 @@ pub struct MeshConsistentHash {
     pub http_cookie_name: Option<String>,
     #[serde(default)]
     pub use_source_ip: bool,
+}
+
+/// Istio `DestinationRule.trafficPolicy.localityLbSetting` mapped onto
+/// Ferrum primitives.
+///
+/// `enabled` defaults to `true` when the block is present (matches Istio
+/// semantics — an explicit `enabled: false` disables locality-aware LB
+/// entirely, including the priority-tier preference projected by
+/// `Upstream.source_locality`). `distribute` and `failover` are mutually
+/// exclusive at evaluation time: when a `distribute` entry matches the
+/// source locality the load balancer uses per-locality weights and ignores
+/// the priority-tier preference; otherwise `failover` (when configured)
+/// adds a fourth tier consulted after `region` and before the unfiltered
+/// fallback set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshLocalityLbSetting {
+    /// When `false`, disables all locality preference (priority tier,
+    /// distribute weighting, and failover override). Defaults to `true`.
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+    /// Per-source-locality weighted distribution to target localities.
+    /// Each entry's `to` map values are integer weights (Istio specifies
+    /// 0-100 as a percentage). Targets in localities not named by any
+    /// matching `to` map are excluded from selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distribute: Vec<MeshLocalityDistribute>,
+    /// Per-source-region failover targets. Consulted when no healthy
+    /// target exists in the source's exact/zone/region tiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover: Vec<MeshLocalityFailover>,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+impl Default for MeshLocalityLbSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            distribute: Vec::new(),
+            failover: Vec::new(),
+        }
+    }
+}
+
+/// One `localityLbSetting.distribute[]` entry.
+///
+/// `from` is an Istio-style `region/zone/subzone` locality string. `to`
+/// maps target localities (same syntax) to integer weights. Istio's API
+/// treats the values as percentages summing to 100; we propagate the
+/// integers verbatim and use them as ratios so non-summing operator
+/// configurations still produce a deterministic ratio split.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshLocalityDistribute {
+    pub from: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub to: std::collections::BTreeMap<String, u32>,
+}
+
+/// One `localityLbSetting.failover[]` entry. `from` and `to` are Istio
+/// region names (the first `region/zone/subzone` segment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshLocalityFailover {
+    pub from: String,
+    pub to: String,
 }
 
 /// Named subset of targets with label selectors and optional policy override.

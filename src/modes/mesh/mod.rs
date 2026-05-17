@@ -963,6 +963,7 @@ fn build_east_west_service_proxies_and_upstreams(
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -1353,6 +1354,32 @@ fn apply_traffic_policy_to_upstream(
         apply_traffic_policy_tls_to_upstream(upstream, tls, runtime)?;
     }
 
+    // localityLbSetting projection. The current traffic policy owns this
+    // mesh-derived slot, so a later matching DestinationRule with no
+    // localityLbSetting clears an earlier value instead of leaving stale
+    // distribute/failover state behind.
+    upstream.locality_lb_setting = policy.locality_lb_setting.as_ref().map(|locality| {
+        crate::config::types::UpstreamLocalityLbSetting {
+            enabled: locality.enabled,
+            distribute: locality
+                .distribute
+                .iter()
+                .map(|entry| crate::config::types::LocalityDistribute {
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                })
+                .collect(),
+            failover: locality
+                .failover
+                .iter()
+                .map(|entry| crate::config::types::LocalityFailover {
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                })
+                .collect(),
+        }
+    });
+
     Ok(())
 }
 
@@ -1712,6 +1739,7 @@ fn build_egress_proxies_and_upstreams(
                     subsets: None,
                     port_overrides: HashMap::new(),
                     source_locality: None,
+                    locality_lb_setting: None,
                     backend_tls_client_cert_path: None,
                     backend_tls_client_key_path: None,
                     backend_tls_verify_server_cert: true,
@@ -4221,6 +4249,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -4337,6 +4366,67 @@ mod tests {
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
+    #[test]
+    fn later_destination_rule_without_locality_lb_clears_earlier_projection() {
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut distribute_to = BTreeMap::new();
+        distribute_to.insert("us-west".to_string(), 100);
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "a-locality".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        locality_lb_setting: Some(
+                            crate::modes::mesh::config::MeshLocalityLbSetting {
+                                enabled: true,
+                                distribute: vec![
+                                    crate::modes::mesh::config::MeshLocalityDistribute {
+                                        from: "us-west/us-west-1/a".to_string(),
+                                        to: distribute_to,
+                                    },
+                                ],
+                                failover: Vec::new(),
+                            },
+                        ),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "z-no-locality".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert!(
+            config.upstreams[0].locality_lb_setting.is_none(),
+            "later trafficPolicy without localityLbSetting must clear stale locality LB"
+        );
     }
 
     // ── DestinationRule trafficPolicy.tls cold-path apply ──────────────
@@ -6301,6 +6391,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,

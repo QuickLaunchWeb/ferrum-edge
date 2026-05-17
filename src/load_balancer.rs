@@ -5,7 +5,7 @@
 
 use crate::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
-    UpstreamPortOverride, UpstreamTarget,
+    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
@@ -158,6 +158,16 @@ fn bitset_for_indices(indices: &[usize]) -> HealthBitset {
     bitset
 }
 
+fn membership_mask_for_indices(len: usize, indices: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; len];
+    for &idx in indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -271,6 +281,10 @@ const LATENCY_WARMUP_THRESHOLD: u64 = 5;
 
 /// Sentinel value indicating no latency has been recorded yet.
 const LATENCY_UNSET: u64 = u64::MAX;
+
+/// Fixed-point scale used when splitting locality-level distribute weights
+/// across endpoints in the same matching locality.
+const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
@@ -386,6 +400,7 @@ impl LoadBalancerCache {
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
+                    upstream.locality_lb_setting.as_ref(),
                 )),
             );
         }
@@ -443,6 +458,7 @@ impl LoadBalancerCache {
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
+                    upstream.locality_lb_setting.as_ref(),
                 )),
             );
         }
@@ -521,6 +537,10 @@ impl LoadBalancerCache {
             .upstreams
             .get(upstream_id)
             .and_then(|upstream| upstream.source_locality.clone());
+        let existing_locality_lb_setting = current
+            .upstreams
+            .get(upstream_id)
+            .and_then(|upstream| upstream.locality_lb_setting.clone());
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::with_subsets_and_port_overrides(
@@ -531,6 +551,7 @@ impl LoadBalancerCache {
                 existing_subsets.as_deref(),
                 Some(&existing_port_overrides),
                 existing_source_locality.as_deref(),
+                existing_locality_lb_setting.as_ref(),
             )),
         );
 
@@ -878,6 +899,288 @@ pub fn target_host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
+/// Build the pre-computed locality-LB state from an operator's
+/// `UpstreamLocalityLbSetting` against the upstream's `source_locality`.
+///
+/// Returns `None` when no setting applies — the load balancer then skips
+/// every locality-aware path beyond the existing priority-tier preference.
+/// Returns `Some(LocalityLbState { enabled: false, .. })` when the operator
+/// explicitly disabled locality LB; the request path treats that as "no
+/// priority, no distribute, no failover" (matches Istio semantics).
+///
+/// Pre-computes per-target weights / failover masks once at construction so
+/// the hot path stays branch-light: distribute is a candidate mask plus a
+/// weighted bucket pick, failover is one Vec index check inside the existing
+/// tier preference.
+fn build_locality_lb_state(
+    setting: Option<&UpstreamLocalityLbSetting>,
+    source_locality: Option<&str>,
+    targets: &[UpstreamTarget],
+) -> Option<LocalityLbState> {
+    let setting = setting?;
+    // When the operator disabled the block we still surface the state so
+    // `preferred_locality_bitset` can short-circuit priority-tier preference
+    // alongside distribute / failover.
+    if !setting.enabled {
+        return Some(LocalityLbState {
+            enabled: false,
+            distribute_weights: None,
+            distribute_groups: None,
+            distribute_counter: AtomicU64::new(0),
+            failover_target_matches: None,
+        });
+    }
+
+    let source = source_locality.and_then(LocalityPreference::parse);
+    let Some(source) = source else {
+        // No source locality means no distribute/failover entry can match;
+        // the priority-tier preference is also empty in that case. We still
+        // record `enabled: true` so existing tests stay deterministic.
+        return Some(LocalityLbState {
+            enabled: true,
+            distribute_weights: None,
+            distribute_groups: None,
+            distribute_counter: AtomicU64::new(0),
+            failover_target_matches: None,
+        });
+    };
+
+    let target_localities: Vec<Option<LocalityPreference>> = targets
+        .iter()
+        .map(|target| {
+            target
+                .locality
+                .as_deref()
+                .and_then(LocalityPreference::parse)
+        })
+        .collect();
+
+    // distribute[]: first matching `from` wins. Each `to` entry is a
+    // locality-level percentage, so split that weight across endpoints in the
+    // matching locality according to their endpoint weights instead of copying
+    // the full locality weight onto each endpoint. Endpoints with weight 0 stay
+    // drained; an all-zero locality is treated as ineligible for distribute.
+    let mut distribute_weights: Option<Vec<u64>> = None;
+    let mut distribute_groups: Option<Vec<LocalityDistributeGroup>> = None;
+    for entry in &setting.distribute {
+        let Some(entry_from) = LocalityPreference::parse(&entry.from) else {
+            continue;
+        };
+        if !locality_from_matches_source(&entry_from, &source) {
+            continue;
+        }
+        let mut weights = vec![0u64; targets.len()];
+        let mut total: u64 = 0;
+        let mut groups = Vec::new();
+        let to_entries: Vec<(LocalityPreference, u32)> = entry
+            .to
+            .iter()
+            .filter_map(|(to_locality, to_weight)| {
+                LocalityPreference::parse(to_locality).map(|to_pref| (to_pref, *to_weight))
+            })
+            .collect();
+        let best_to_entry_by_target: Vec<Option<usize>> = target_localities
+            .iter()
+            .map(|target_pref| {
+                let target_pref = target_pref.as_ref()?;
+                let mut best = None;
+                for (to_idx, (to_pref, _)) in to_entries.iter().enumerate() {
+                    if !locality_match_for_distribute(to_pref, target_pref) {
+                        continue;
+                    }
+                    let specificity = locality_distribute_specificity(to_pref);
+                    if best.is_none_or(|(_, best_specificity)| specificity > best_specificity) {
+                        best = Some((to_idx, specificity));
+                    }
+                }
+                best.map(|(to_idx, _)| to_idx)
+            })
+            .collect();
+        for (to_idx, (_, to_weight)) in to_entries.iter().enumerate() {
+            let matching_targets: Vec<(usize, u64)> = target_localities
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, target_pref)| {
+                    (target_pref.is_some() && best_to_entry_by_target[idx] == Some(to_idx))
+                        .then_some((idx, u64::from(targets[idx].weight)))
+                })
+                .collect();
+            if matching_targets.is_empty() {
+                continue;
+            }
+            let scaled_weight =
+                u64::from(*to_weight).saturating_mul(LOCALITY_DISTRIBUTE_WEIGHT_SCALE);
+            let endpoint_weight_total: u128 = matching_targets
+                .iter()
+                .map(|(_, endpoint_weight)| u128::from(*endpoint_weight))
+                .sum();
+            let Some(endpoint_weight_total) = std::num::NonZeroU128::new(endpoint_weight_total)
+            else {
+                continue;
+            };
+            let endpoint_weight_total = endpoint_weight_total.get();
+            let scaled_weight_u128 = u128::from(scaled_weight);
+            let mut allocated = 0u64;
+            let mut allocations = Vec::with_capacity(matching_targets.len());
+            for (idx, endpoint_weight) in matching_targets {
+                if endpoint_weight == 0 {
+                    allocations.push((idx, 0u64, 0u128, endpoint_weight));
+                    continue;
+                }
+                let numerator = scaled_weight_u128.saturating_mul(u128::from(endpoint_weight));
+                let share = (numerator / endpoint_weight_total) as u64;
+                let remainder = numerator % endpoint_weight_total;
+                allocated = allocated.saturating_add(share);
+                allocations.push((idx, share, remainder, endpoint_weight));
+            }
+            allocations.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            let mut leftover = scaled_weight.saturating_sub(allocated);
+            let mut group_indices = Vec::new();
+            let mut group_total = 0u64;
+            for (idx, mut share, _, endpoint_weight) in allocations {
+                if endpoint_weight > 0 && leftover > 0 {
+                    share = share.saturating_add(1);
+                    leftover -= 1;
+                }
+                if share == 0 {
+                    continue;
+                }
+                group_indices.push(idx);
+                group_total = group_total.saturating_add(share);
+                weights[idx] = weights[idx].saturating_add(share);
+                total = total.saturating_add(share);
+            }
+            if group_total > 0 {
+                let target_membership = membership_mask_for_indices(targets.len(), &group_indices);
+                groups.push(LocalityDistributeGroup {
+                    weight: group_total,
+                    target_indices: group_indices,
+                    target_membership,
+                });
+            }
+        }
+        // Only honour the match if at least one target was reachable;
+        // otherwise an operator typo (e.g. `to` regions naming no real
+        // target) would strand the upstream. Fall through to the next
+        // distribute entry, or to the rest of the locality LB path.
+        if total > 0 {
+            distribute_weights = Some(weights);
+            distribute_groups = Some(groups);
+            break;
+        }
+    }
+
+    // failover[]: only consulted when distribute did not match (Istio
+    // semantics — distribute takes priority). First matching `from` wins.
+    let mut failover_target_matches: Option<Vec<bool>> = None;
+    if distribute_weights.is_none() {
+        for entry in &setting.failover {
+            if entry.from != source.region {
+                continue;
+            }
+            let mut matches = vec![false; targets.len()];
+            let mut any_match = false;
+            for (idx, target) in targets.iter().enumerate() {
+                let Some(locality) = target.locality.as_deref() else {
+                    continue;
+                };
+                let Some(target_pref) = LocalityPreference::parse(locality) else {
+                    continue;
+                };
+                if target_pref.region == entry.to {
+                    matches[idx] = true;
+                    any_match = true;
+                }
+            }
+            if any_match {
+                failover_target_matches = Some(matches);
+                break;
+            }
+        }
+    }
+
+    Some(LocalityLbState {
+        enabled: true,
+        distribute_weights,
+        distribute_groups,
+        distribute_counter: AtomicU64::new(0),
+        failover_target_matches,
+    })
+}
+
+/// True when `to` (a distribute key, e.g. `us-west` or `us-west/us-west-1`)
+/// applies to `target` (a target locality, e.g. `us-west/us-west-1/a`).
+///
+/// Istio matches at every prefix component: a region-only `to` entry
+/// applies to every target in that region; a `region/zone` entry applies
+/// to every target in that zone; an exact `region/zone/subzone` requires
+/// an exact match. Subzone is therefore optional in both directions —
+/// only the components the operator declared have to align.
+#[inline]
+fn locality_match_for_distribute(to: &LocalityPreference, target: &LocalityPreference) -> bool {
+    if to.region != "*" && to.region != target.region {
+        return false;
+    }
+    if let Some(ref to_zone) = to.zone {
+        if to_zone == "*" {
+            return true;
+        }
+        if target.zone.as_ref() != Some(to_zone) {
+            return false;
+        }
+        if let Some(ref to_sub) = to.sub_zone
+            && to_sub != "*"
+            && target.sub_zone.as_ref() != Some(to_sub)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn locality_distribute_specificity(to: &LocalityPreference) -> u8 {
+    if to.region == "*" {
+        return 0;
+    }
+    let Some(zone) = to.zone.as_deref() else {
+        return 1;
+    };
+    if zone == "*" {
+        return 1;
+    }
+    let Some(sub_zone) = to.sub_zone.as_deref() else {
+        return 2;
+    };
+    if sub_zone == "*" { 2 } else { 3 }
+}
+
+/// True when a `distribute[].from` pattern matches the concrete source
+/// locality. Region-only and region/zone values match the corresponding source
+/// tier, and Istio wildcard forms such as `region/zone/*` match that tier.
+#[inline]
+fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPreference) -> bool {
+    if from.region == "*" && from.zone.is_none() && from.sub_zone.is_none() {
+        return true;
+    }
+    if from.region != "*" && from.region != source.region {
+        return false;
+    }
+    let Some(from_zone) = from.zone.as_deref() else {
+        return from.sub_zone.is_none();
+    };
+    if from_zone == "*" {
+        return true;
+    }
+    if source.zone.as_deref() != Some(from_zone) {
+        return false;
+    }
+    let Some(from_sub_zone) = from.sub_zone.as_deref() else {
+        return true;
+    };
+    from_sub_zone == "*" || source.sub_zone.as_deref() == Some(from_sub_zone)
+}
+
 /// Per-upstream load balancer with algorithm-specific state.
 pub struct LoadBalancer {
     targets: Vec<Arc<UpstreamTarget>>,
@@ -956,6 +1259,45 @@ pub struct LoadBalancer {
     /// destination port, initial selection can safely use that port lane before
     /// a concrete target is chosen. Zero means mixed/unknown.
     initial_dispatch_port_override: u16,
+    /// Pre-computed pieces of `UpstreamLocalityLbSetting` resolved against
+    /// `Upstream.source_locality`. `None` when no DR `localityLbSetting`
+    /// applies — the hot path then short-circuits to the existing priority
+    /// tier preference. Computed at construction so request-time work is
+    /// limited to bitset masks and a small weighted bucket pick.
+    locality_lb: Option<LocalityLbState>,
+}
+
+/// Per-target state derived from `UpstreamLocalityLbSetting` so the hot
+/// path doesn't re-parse / re-match localities on every selection.
+struct LocalityLbState {
+    /// `true` when the operator left the block enabled. When `false`, the
+    /// load balancer skips both distribute weighting and failover override
+    /// AND the existing priority-tier preference (matches Istio semantics
+    /// of `enabled: false`).
+    enabled: bool,
+    /// Per-target fixed-point distribute weight, index-aligned with
+    /// `LoadBalancer.targets`.
+    /// `None` when no `distribute[]` entry matched the source locality.
+    /// Targets with weight 0 are excluded from distribute-mode candidate sets.
+    distribute_weights: Option<Vec<u64>>,
+    /// Locality buckets for a matching `distribute[]` entry. Runtime selection
+    /// picks one bucket by the configured locality share, then runs the
+    /// upstream / port / subset algorithm inside that bucket.
+    distribute_groups: Option<Vec<LocalityDistributeGroup>>,
+    /// Independent counter for weighted locality-bucket selection. This keeps
+    /// the endpoint algorithm's own counter cadence unchanged.
+    distribute_counter: AtomicU64,
+    /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
+    /// `true` when the target's locality region matches the failover `to`
+    /// region for this source. `None` when no `failover[]` entry matched
+    /// the source region. Consulted as a fourth tier after exact/zone/region.
+    failover_target_matches: Option<Vec<bool>>,
+}
+
+struct LocalityDistributeGroup {
+    weight: u64,
+    target_indices: Vec<usize>,
+    target_membership: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -997,11 +1339,13 @@ impl LoadBalancer {
             subsets,
             None,
             None,
+            None,
         )
     }
 
     /// Create a new load balancer with optional subset definitions and
     /// per-port override state.
+    #[allow(clippy::too_many_arguments)]
     fn with_subsets_and_port_overrides(
         upstream_id: &str,
         algorithm: LoadBalancerAlgorithm,
@@ -1010,6 +1354,7 @@ impl LoadBalancer {
         subsets: Option<&[SubsetDefinition]>,
         port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
         source_locality: Option<&str>,
+        locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
@@ -1202,6 +1547,13 @@ impl LoadBalancer {
             "at most one destination port can cover every target in one upstream"
         );
 
+        // Pre-compute per-target distribute weights and failover-region matches
+        // against the source locality so the request path stays branch-light.
+        // `enabled: false` disables every locality-aware path; `distribute`
+        // and `failover` are mutually exclusive at evaluation time so the
+        // pre-compute below is allowed to populate one, the other, or neither.
+        let locality_lb = build_locality_lb_state(locality_lb_setting, source_locality, targets);
+
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
@@ -1224,6 +1576,7 @@ impl LoadBalancer {
             subset_hash_rings,
             port_overrides: port_states,
             initial_dispatch_port_override,
+            locality_lb,
         }
     }
 
@@ -1582,6 +1935,41 @@ impl LoadBalancer {
 
     #[inline]
     fn preferred_locality_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
+        // Operator-disabled locality LB short-circuits the priority tier
+        // preference entirely (Istio `localityLbSetting.enabled: false`).
+        if self
+            .locality_lb
+            .as_ref()
+            .is_some_and(|state| !state.enabled)
+        {
+            return *candidates;
+        }
+
+        // distribute-mode: restrict the candidate set to targets the
+        // operator put weight on. Algorithm dispatch later picks one weighted
+        // distribute bucket inside this union and runs the configured endpoint
+        // algorithm there. We do this before priority-tier preference because
+        // Istio treats distribute and priority as mutually exclusive.
+        if let Some(weights) = self
+            .locality_lb
+            .as_ref()
+            .and_then(|state| state.distribute_weights.as_ref())
+        {
+            let mut masked = HealthBitset::empty();
+            for idx in 0..self.targets.len() {
+                if candidates.contains(idx) && weights.get(idx).copied().unwrap_or(0) > 0 {
+                    masked.set(idx);
+                }
+            }
+            if !masked.is_empty() {
+                return masked;
+            }
+            // Operator typo or every weighted target unhealthy: keep
+            // evaluating the normal locality tiers below so exact/zone/region
+            // preference still applies before the final residual candidate
+            // fallback.
+        }
+
         // No source locality → no tier preference; return the input unchanged.
         if self.target_locality_ranks.is_empty() {
             return *candidates;
@@ -1603,20 +1991,69 @@ impl LoadBalancer {
         }
 
         if !exact.is_empty() {
-            exact
-        } else if !zone.is_empty() {
-            zone
-        } else if !region.is_empty() {
-            region
-        } else {
-            *candidates
+            return exact;
         }
+        if !zone.is_empty() {
+            return zone;
+        }
+        if !region.is_empty() {
+            return region;
+        }
+
+        // Failover override sits between the region tier and the unfiltered
+        // candidate set: when the source region is exhausted, prefer the
+        // operator-configured failover region before falling through.
+        if let Some(matches) = self
+            .locality_lb
+            .as_ref()
+            .and_then(|state| state.failover_target_matches.as_ref())
+        {
+            let mut failover = HealthBitset::empty();
+            for idx in 0..self.targets.len() {
+                if candidates.contains(idx) && matches.get(idx).copied().unwrap_or(false) {
+                    failover.set(idx);
+                }
+            }
+            if !failover.is_empty() {
+                return failover;
+            }
+        }
+
+        *candidates
     }
 
     fn preferred_locality_candidates<'a>(
         &self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
     ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+        // Mirror `preferred_locality_bitset` semantics on the Vec path so the
+        // > 128-target fallback agrees with the bitset path.
+        if self
+            .locality_lb
+            .as_ref()
+            .is_some_and(|state| !state.enabled)
+        {
+            return candidates;
+        }
+
+        // distribute-mode: restrict to operator-weighted targets when any are
+        // available. If every weighted target is missing, continue into the
+        // normal locality tiers below.
+        if let Some(weights) = self
+            .locality_lb
+            .as_ref()
+            .and_then(|state| state.distribute_weights.as_ref())
+        {
+            let masked: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+                .iter()
+                .copied()
+                .filter(|(idx, _)| weights.get(*idx).copied().unwrap_or(0) > 0)
+                .collect();
+            if !masked.is_empty() {
+                return masked;
+            }
+        }
+
         if self.target_locality_ranks.is_empty() {
             return candidates;
         }
@@ -1637,21 +2074,140 @@ impl LoadBalancer {
             }
         }
 
-        if preferred.is_empty() {
-            candidates
-        } else {
-            preferred
+        if !preferred.is_empty() {
+            return preferred;
         }
+
+        if let Some(matches) = self
+            .locality_lb
+            .as_ref()
+            .and_then(|state| state.failover_target_matches.as_ref())
+        {
+            let failover: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+                .iter()
+                .copied()
+                .filter(|(idx, _)| matches.get(*idx).copied().unwrap_or(false))
+                .collect();
+            if !failover.is_empty() {
+                return failover;
+            }
+        }
+
+        candidates
+    }
+
+    fn distribute_pick(
+        &self,
+        ctx_key: &str,
+        total: u64,
+        algorithm: LoadBalancerAlgorithm,
+        distribute_counter: &AtomicU64,
+    ) -> u64 {
+        let raw = match algorithm {
+            LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
+            _ => distribute_counter.fetch_add(1, Ordering::Relaxed),
+        };
+        golden_ratio_hash(raw) % total
+    }
+
+    /// Pick one distribute locality bucket that has at least one candidate,
+    /// then return that bucket as a bitset. The caller still runs the configured
+    /// endpoint algorithm inside the returned set.
+    fn distribute_group_bitset(
+        &self,
+        healthy: &HealthBitset,
+        ctx_key: &str,
+        algorithm: LoadBalancerAlgorithm,
+    ) -> Option<HealthBitset> {
+        let state = self.locality_lb.as_ref()?;
+        let groups = state.distribute_groups.as_ref()?;
+        let mut total = 0u64;
+        for group in groups {
+            if group
+                .target_indices
+                .iter()
+                .any(|idx| healthy.contains(*idx))
+            {
+                total = total.saturating_add(group.weight);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+
+        let pick = self.distribute_pick(ctx_key, total, algorithm, &state.distribute_counter);
+        let mut acc = 0u64;
+        let mut first_eligible = None;
+        for group in groups {
+            let mut masked = HealthBitset::empty();
+            for &idx in &group.target_indices {
+                if healthy.contains(idx) {
+                    masked.set(idx);
+                }
+            }
+            if masked.is_empty() {
+                continue;
+            }
+            if first_eligible.is_none() {
+                first_eligible = Some(masked);
+            }
+            acc = acc.saturating_add(group.weight);
+            if pick < acc {
+                return Some(masked);
+            }
+        }
+        first_eligible
+    }
+
+    /// Vec-path counterpart of `distribute_group_bitset` for the >128-target
+    /// fallback. Returns candidates from one weighted locality bucket.
+    fn distribute_group_candidates<'a>(
+        &self,
+        candidates: &[(usize, &'a Arc<UpstreamTarget>)],
+        ctx_key: &str,
+        algorithm: LoadBalancerAlgorithm,
+    ) -> Option<Vec<(usize, &'a Arc<UpstreamTarget>)>> {
+        let state = self.locality_lb.as_ref()?;
+        let groups = state.distribute_groups.as_ref()?;
+
+        let mut total = 0u64;
+        for group in groups {
+            if candidates
+                .iter()
+                .any(|(idx, _)| group.target_membership.get(*idx).copied().unwrap_or(false))
+            {
+                total = total.saturating_add(group.weight);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+
+        let pick = self.distribute_pick(ctx_key, total, algorithm, &state.distribute_counter);
+        let mut acc = 0u64;
+        let mut first_eligible = None;
+        for group in groups {
+            let masked: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+                .iter()
+                .copied()
+                .filter(|(idx, _)| group.target_membership.get(*idx).copied().unwrap_or(false))
+                .collect();
+            if masked.is_empty() {
+                continue;
+            }
+            if first_eligible.is_none() {
+                first_eligible = Some(masked.clone());
+            }
+            acc = acc.saturating_add(group.weight);
+            if pick < acc {
+                return Some(masked);
+            }
+        }
+        first_eligible
     }
 
     fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
-        let mut mask = vec![false; self.targets.len()];
-        for &idx in subset_indices {
-            if let Some(slot) = mask.get_mut(idx) {
-                *slot = true;
-            }
-        }
-        mask
+        membership_mask_for_indices(self.targets.len(), subset_indices)
     }
 
     pub fn select(
@@ -2070,6 +2626,14 @@ impl LoadBalancer {
         if healthy.is_empty() {
             return None;
         }
+        let distributed;
+        let healthy = if let Some(mask) = self.distribute_group_bitset(healthy, ctx_key, algorithm)
+        {
+            distributed = mask;
+            &distributed
+        } else {
+            healthy
+        };
         let all = healthy.is_all(self.targets.len());
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
@@ -2159,6 +2723,15 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
+        let distributed;
+        let candidates = if let Some(masked) =
+            self.distribute_group_candidates(candidates, ctx_key, algorithm)
+        {
+            distributed = masked;
+            distributed.as_slice()
+        } else {
+            candidates
+        };
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
@@ -3251,6 +3824,7 @@ mod tests {
             None,
             None,
             Some(&port_overrides),
+            None,
             None,
         );
 

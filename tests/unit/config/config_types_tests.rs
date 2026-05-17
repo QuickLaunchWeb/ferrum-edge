@@ -104,6 +104,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -149,6 +150,7 @@ fn upstream_backend_tls_new_fields_default_when_absent() {
     assert!(upstream.backend_tls_sni.is_none());
     assert!(upstream.backend_tls_san_allow_list.is_empty());
     assert!(upstream.source_locality.is_none());
+    assert!(upstream.locality_lb_setting.is_none());
     assert!(upstream.targets[0].locality.is_none());
 
     let json = serde_json::to_value(&upstream).expect("serialize upstream");
@@ -157,11 +159,73 @@ fn upstream_backend_tls_new_fields_default_when_absent() {
     assert!(!object.contains_key("backend_tls_san_allow_list"));
     assert!(!object.contains_key("source_locality"));
     assert!(
+        !object.contains_key("locality_lb_setting"),
+        "locality_lb_setting must be omitted from serialized JSON when None"
+    );
+    assert!(
         !object["targets"][0]
             .as_object()
             .expect("target object")
             .contains_key("locality")
     );
+}
+
+#[test]
+fn upstream_locality_lb_setting_round_trips_through_serde() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::config::types::{
+        LocalityDistribute, LocalityFailover, UpstreamLocalityLbSetting,
+    };
+
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "u",
+        "targets": [{"host": "reviews", "port": 8080}]
+    }))
+    .expect("upstream deserialize");
+    let mut to = BTreeMap::new();
+    to.insert("us-west".to_string(), 80u32);
+    to.insert("us-east".to_string(), 20u32);
+    upstream.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: vec![LocalityFailover {
+            from: "us-west".to_string(),
+            to: "us-east".to_string(),
+        }],
+    });
+
+    let json = serde_json::to_value(&upstream).expect("serialize upstream");
+    let setting = json
+        .as_object()
+        .expect("object")
+        .get("locality_lb_setting")
+        .expect("locality_lb_setting present in JSON")
+        .as_object()
+        .expect("locality_lb_setting object");
+    assert_eq!(setting.get("enabled"), Some(&serde_json::json!(true)));
+    let distribute = setting
+        .get("distribute")
+        .expect("distribute key")
+        .as_array();
+    assert_eq!(distribute.map(|a| a.len()), Some(1));
+
+    let round_tripped: Upstream = serde_json::from_value(json).expect("round-trip");
+    let setting = round_tripped
+        .locality_lb_setting
+        .as_ref()
+        .expect("setting round-trips");
+    assert!(setting.enabled);
+    assert_eq!(setting.distribute.len(), 1);
+    assert_eq!(setting.distribute[0].from, "us-west/us-west-1/a");
+    assert_eq!(setting.distribute[0].to.get("us-west"), Some(&80u32));
+    assert_eq!(setting.distribute[0].to.get("us-east"), Some(&20u32));
+    assert_eq!(setting.failover.len(), 1);
+    assert_eq!(setting.failover[0].from, "us-west");
+    assert_eq!(setting.failover[0].to, "us-east");
 }
 
 #[test]

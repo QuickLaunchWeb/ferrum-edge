@@ -107,6 +107,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -801,6 +802,36 @@ fn test_upstream_source_locality_rejected_by_admin_api() {
         errs.iter().any(|e| e.contains("source_locality")
             && e.contains("cannot be set directly via the admin API")),
         "expected source_locality admin-API rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::config::types::{
+        LocalityDistribute, LocalityFailover, UpstreamLocalityLbSetting,
+    };
+
+    let mut upstream = make_upstream("test");
+    upstream.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to: BTreeMap::from([("us-west".to_string(), 100u32)]),
+        }],
+        failover: vec![LocalityFailover {
+            from: "us-west".to_string(),
+            to: "us-east".to_string(),
+        }],
+    });
+    let errs = upstream
+        .validate_fields()
+        .expect_err("locality_lb_setting must be rejected at admit time");
+    assert!(
+        errs.iter().any(|e| e.contains("locality_lb_setting")
+            && e.contains("cannot be set directly via the admin API")),
+        "expected locality_lb_setting admin-API rejection, got: {errs:?}"
     );
 }
 
@@ -1986,6 +2017,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,

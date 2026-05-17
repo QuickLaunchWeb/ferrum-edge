@@ -5527,6 +5527,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // backends do not persist it (no column), and `Upstream::validate_fields`
         // rejects operator writes via the admin API. SQL rows always start `None`.
         source_locality: None,
+        locality_lb_setting: None,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,

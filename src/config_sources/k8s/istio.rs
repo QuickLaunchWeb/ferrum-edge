@@ -6,13 +6,14 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
-    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
-    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction,
-    PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload,
-    WorkloadPort, WorkloadSelector,
+    MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting, MeshMetricsConfig,
+    MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
+    MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
+    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
+    MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
+    WorkloadSelector,
 };
 
 use super::{
@@ -736,6 +737,17 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
+        if entry
+            .get("loadBalancer")
+            .and_then(|lb| lb.get("localityLbSetting"))
+            .is_some()
+        {
+            return Err(invalid_resource(
+                object,
+                "trafficPolicy.portLevelSettings[].loadBalancer.localityLbSetting is not supported",
+            ));
+        }
+
         let policy = translate_traffic_policy(acc, object, entry)?;
 
         if out.insert(port, policy).is_some() {
@@ -766,7 +778,22 @@ fn translate_traffic_policy(
 
     let load_balancer = value
         .get("loadBalancer")
-        .map(|lb| translate_load_balancer(acc, object, lb))
+        .and_then(|lb| {
+            (lb.get("simple").is_some()
+                || lb.get("consistentHash").is_some()
+                || lb.get("localityLbSetting").is_none())
+            .then(|| translate_load_balancer(acc, object, lb))
+        })
+        .transpose()?;
+
+    // `localityLbSetting` lives under `trafficPolicy.loadBalancer.localityLbSetting`
+    // in the Istio v1beta1 schema. Parse it independently of the algorithm so
+    // operators that configure only `localityLbSetting` (no simple/consistentHash
+    // change) still get weighted distribution and failover semantics.
+    let locality_lb_setting = value
+        .get("loadBalancer")
+        .and_then(|lb| lb.get("localityLbSetting"))
+        .map(|setting| translate_locality_lb_setting(object, setting))
         .transpose()?;
 
     let tls = value
@@ -779,7 +806,227 @@ fn translate_traffic_policy(
         outlier_detection,
         load_balancer,
         tls,
+        locality_lb_setting,
     })
+}
+
+fn translate_locality_lb_setting(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshLocalityLbSetting, K8sTranslateError> {
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        // Istio's default for `enabled` is true when the block is present.
+        .unwrap_or(true);
+
+    let has_distribute = value.get("distribute").is_some();
+    let has_failover = value.get("failover").is_some();
+    let has_failover_priority = value.get("failoverPriority").is_some();
+    let mode_count = has_distribute as u8 + has_failover as u8 + has_failover_priority as u8;
+    if mode_count > 1 {
+        return Err(invalid_resource(
+            object,
+            "trafficPolicy.loadBalancer.localityLbSetting must set only one of \
+             distribute, failover, or failoverPriority",
+        ));
+    }
+    if has_failover_priority {
+        return Err(invalid_resource(
+            object,
+            "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority is not supported",
+        ));
+    }
+
+    let distribute = if let Some(entries) = value.get("distribute") {
+        let arr = entries.as_array().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.loadBalancer.localityLbSetting.distribute must be an array",
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for (idx, entry) in arr.iter().enumerate() {
+            let from = string_field(entry, "from")
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].from is required"
+                        ),
+                    )
+                })?
+                .to_string();
+            if !is_valid_locality_pattern(&from) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].from \
+                         '{from}' is not a valid region[/zone[/subzone]] locality"
+                    ),
+                ));
+            }
+            let to_obj = entry.get("to").and_then(Value::as_object).ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to is required"
+                    ),
+                )
+            })?;
+            let mut to = std::collections::BTreeMap::new();
+            for (locality, weight) in to_obj {
+                if !is_valid_locality_pattern(locality) {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
+                             key '{locality}' is not a valid region[/zone[/subzone]] locality"
+                        ),
+                    ));
+                }
+                let weight_u64 = weight.as_u64().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
+                             value for '{locality}' must be a non-negative integer"
+                        ),
+                    )
+                })?;
+                if weight_u64 > u64::from(u32::MAX) {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
+                             value for '{locality}' exceeds u32::MAX"
+                        ),
+                    ));
+                }
+                to.insert(locality.clone(), weight_u64 as u32);
+            }
+            if to.is_empty() {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
+                         must not be empty"
+                    ),
+                ));
+            }
+            out.push(MeshLocalityDistribute { from, to });
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    let failover = if let Some(entries) = value.get("failover") {
+        let arr = entries.as_array().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.loadBalancer.localityLbSetting.failover must be an array",
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for (idx, entry) in arr.iter().enumerate() {
+            let from = string_field(entry, "from")
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].from is required"
+                        ),
+                    )
+                })?
+                .to_string();
+            if !is_valid_failover_region(&from) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].from \
+                         '{from}' is not a valid region name"
+                    ),
+                ));
+            }
+            let to = string_field(entry, "to")
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].to is required"
+                        ),
+                    )
+                })?
+                .to_string();
+            if !is_valid_failover_region(&to) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].to \
+                         '{to}' is not a valid region name"
+                    ),
+                ));
+            }
+            if from == to {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}] cannot fail \
+                         over a region to itself ('{from}')"
+                    ),
+                ));
+            }
+            out.push(MeshLocalityFailover { from, to });
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    Ok(MeshLocalityLbSetting {
+        enabled,
+        distribute,
+        failover,
+    })
+}
+
+fn is_valid_locality_pattern(raw: &str) -> bool {
+    if !has_valid_locality_segments(raw) {
+        return false;
+    }
+    let Some(locality) = crate::config::types::LocalityPreference::parse(raw) else {
+        return false;
+    };
+    if locality.region == "*" {
+        return locality.zone.is_none() && locality.sub_zone.is_none();
+    }
+    if locality.zone.as_deref() == Some("*") {
+        return locality.sub_zone.is_none();
+    }
+    true
+}
+
+fn has_valid_locality_segments(raw: &str) -> bool {
+    let mut count = 0usize;
+    for segment in raw.split('/') {
+        count += 1;
+        if count > 3 || segment.is_empty() || segment != segment.trim() {
+            return false;
+        }
+    }
+    count > 0
+}
+
+fn is_valid_failover_region(raw: &str) -> bool {
+    let Some(locality) = crate::config::types::LocalityPreference::parse(raw) else {
+        return false;
+    };
+    raw == raw.trim()
+        && !raw.contains('/')
+        && locality.region != "*"
+        && locality.zone.is_none()
+        && locality.sub_zone.is_none()
 }
 
 /// Translate Istio `DestinationRule.trafficPolicy.tls` (a.k.a.
