@@ -10,14 +10,26 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-# Explicit empty values override the host's `.cargo/config.toml` so the
-# cross container doesn't try to spawn binaries (sccache, mold) that
-# aren't installed inside it. Local `cargo build` outside the container
-# still uses sccache + mold as configured.
+# The cross-rs container lacks sccache, mold, and standalone `clang` (only
+# clang-6.0 from the LLVM apt repo). It DOES have `cc` (symlink to gcc) and
+# `aarch64-linux-gnu-gcc` (cross toolchain). We override both the target
+# triple (aarch64, for the final binary) AND the host triple (x86_64, used
+# when building build-scripts/proc-macros) so neither path tries to spawn
+# a missing tool.
+#
+# Empty env values like `RUSTC_WRAPPER=` reliably clear the corresponding
+# config-file entry, but the same trick is unreliable for CARGO_TARGET_*_LINKER
+# (cargo treats it as "use empty string as linker name" in some paths,
+# which then errors). So LINKER is overridden with a real binary that
+# exists in the container, and RUSTFLAGS is overridden with a harmless
+# custom cfg so the no-op shows up as a non-empty (and therefore
+# unambiguous) env value.
 passthrough = [
     "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
     "RUSTC_WRAPPER=",
     "CARGO_BUILD_RUSTC_WRAPPER=",
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=",
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=cross_rs_build",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=cross_rs_build",
 ]

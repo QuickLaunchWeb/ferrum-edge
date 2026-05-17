@@ -1,18 +1,26 @@
 name: Setup fast linker
 description: >-
   Installs a fast linker (mold on Linux, lld on macOS) and pairs it with
-  the per-target rustflags already pinned in `.cargo/config.toml`. The
-  config file uses explicit triples (not cfg() forms) so that the env-var
-  override here actually clears the rustflags if install fails.
+  the per-target rustflags pinned in `.cargo/config.toml`. The config file
+  uses explicit triples (not cfg() forms) so that the env-var overrides
+  below can actually replace the rustflags if install fails.
 
   Speedup is significant on Linux (mold is 2-5x faster than the system ld
   for our crate graph) and modest on macOS (ld64.lld vs Apple's ld). If
-  the linker fails to install, this action clears the matching
-  CARGO_TARGET_<TRIPLE>_RUSTFLAGS so cargo falls back to the platform
-  default linker. Build still proceeds, just at default link speed.
+  the linker fails to install, this action overrides the matching
+  CARGO_TARGET_<TRIPLE>_LINKER / _RUSTFLAGS with safe, non-empty fallback
+  values so cargo uses the default linker. Build still proceeds, just at
+  default link speed.
 
   Windows is intentionally not touched — rustup ships lld-link.exe but
   switching MSVC's default link.exe adds risk without measurable benefit.
+
+  Why non-empty fallbacks: cargo reliably honors empty `RUSTC_WRAPPER=`
+  to clear `[build] rustc-wrapper`, but `CARGO_TARGET_<TRIPLE>_LINKER=`
+  empty doesn't always clear `[target.<triple>] linker = ...` — cargo
+  has been observed reading the config-file value anyway. Setting the
+  fallback to a real binary (`cc`) and a harmless custom cfg flag side-
+  steps the ambiguity.
 
 runs:
   using: composite
@@ -37,19 +45,21 @@ runs:
     - name: Configure fast linker
       shell: bash
       run: |
-        clear_linux_rustflags() {
-          # Match the explicit triples pinned in .cargo/config.toml. Empty
-          # values override the config-file rustflags so cargo uses the
-          # default linker for the target.
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
+        fallback_linux() {
+          # cc is universally a symlink to the default C compiler on Linux.
+          # The --cfg flag is a no-op (no code in this repo checks it).
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
         }
 
-        clear_macos_rustflags() {
-          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=" >> "$GITHUB_ENV"
+        fallback_macos() {
+          # macOS config.toml has no `linker = ` line for darwin targets;
+          # only rustflags. Override with a harmless cfg so cargo doesn't
+          # try to pass `-fuse-ld=lld` to the default linker without lld.
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=--cfg=fast_linker_unavailable" >> "$GITHUB_ENV"
         }
 
         case "${RUNNER_OS}" in
@@ -58,8 +68,8 @@ runs:
               echo "mold + clang available — using fast linker"
               mold --version
             else
-              echo "mold/clang unavailable — clearing linker rustflags"
-              clear_linux_rustflags
+              echo "mold/clang unavailable — falling back to cc + default linker"
+              fallback_linux
             fi
             ;;
           macOS)
@@ -67,8 +77,8 @@ runs:
               echo "ld64.lld available — using fast linker"
               ld64.lld --version || true
             else
-              echo "ld64.lld unavailable — clearing linker rustflags"
-              clear_macos_rustflags
+              echo "ld64.lld unavailable — falling back to default linker"
+              fallback_macos
             fi
             ;;
           Windows)
