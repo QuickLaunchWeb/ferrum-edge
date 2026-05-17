@@ -273,6 +273,46 @@ fn k8s_translator_rejects_invalid_distribute_from_locality() {
 }
 
 #[test]
+fn k8s_translator_rejects_malformed_distribute_locality_patterns() {
+    for (field, value) in [
+        ("from", "us-west/"),
+        ("from", "us-west//"),
+        ("from", " us-west"),
+        ("to", "us-east/"),
+        ("to", "us-east//"),
+        ("to", "us-east/us-east-1/a/b"),
+    ] {
+        let to_key = if field == "to" { value } else { "us-east" };
+        let mut to = serde_json::Map::new();
+        to.insert(to_key.to_string(), serde_json::json!(100));
+        let object = istio_object(
+            "DestinationRule",
+            "reviews",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "trafficPolicy": {
+                    "loadBalancer": {
+                        "localityLbSetting": {
+                            "distribute": [{
+                                "from": if field == "from" { value } else { "us-west" },
+                                "to": serde_json::Value::Object(to)
+                            }]
+                        }
+                    }
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[object], k8s_options())
+            .expect_err("malformed distribute locality must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a valid region[/zone[/subzone]] locality"),
+            "expected invalid distribute-locality rejection for {field}={value:?}, got: {msg}"
+        );
+    }
+}
+
+#[test]
 fn k8s_translator_honors_enabled_false() {
     let (_, setting) = translate_dr_locality(serde_json::json!({
         "host": "reviews.default.svc.cluster.local",

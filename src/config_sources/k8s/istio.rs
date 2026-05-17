@@ -958,6 +958,9 @@ fn translate_locality_lb_setting(
 }
 
 fn is_valid_locality_pattern(raw: &str) -> bool {
+    if !has_valid_locality_segments(raw) {
+        return false;
+    }
     let Some(locality) = crate::config::types::LocalityPreference::parse(raw) else {
         return false;
     };
@@ -968,6 +971,17 @@ fn is_valid_locality_pattern(raw: &str) -> bool {
         return locality.sub_zone.is_none();
     }
     true
+}
+
+fn has_valid_locality_segments(raw: &str) -> bool {
+    let mut count = 0usize;
+    for segment in raw.split('/') {
+        count += 1;
+        if count > 3 || segment.is_empty() || segment != segment.trim() {
+            return false;
+        }
+    }
+    count > 0
 }
 
 fn is_valid_failover_region(raw: &str) -> bool {
