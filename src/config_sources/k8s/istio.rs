@@ -4203,7 +4203,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_skips_explicit_pathless_matches() {
+    fn virtual_service_emits_catch_all_for_explicit_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -4222,12 +4222,23 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert!(result.config.proxies.is_empty());
-        assert!(result.config.upstreams.is_empty());
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some(URI_LESS_MATCH_LISTEN_PATH)
+        );
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "mesh_route_dispatch emitted for pathless multi-predicate match"
+        );
     }
 
     #[test]
-    fn virtual_service_ignores_pathless_match_in_mixed_rule() {
+    fn virtual_service_keeps_pathless_predicate_in_mixed_rule() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -4246,8 +4257,24 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        let listen_paths: HashSet<_> = result
+            .config
+            .proxies
+            .iter()
+            .filter_map(|p| p.listen_path.as_deref())
+            .collect();
+        assert_eq!(
+            listen_paths,
+            HashSet::from(["/v1", URI_LESS_MATCH_LISTEN_PATH])
+        );
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "mesh_route_dispatch emitted for pathless predicate in mixed rule"
+        );
     }
 
     #[test]
