@@ -679,6 +679,44 @@ fn locality_distribute_excludes_targets_with_zero_weight() {
 }
 
 #[test]
+fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/*".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-west/us-west-1/a",
+        vec![
+            target("west.local", Some("us-west/us-west-1/a")),
+            target("east.local", Some("us-east/us-east-1/a")),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..16 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("wild-{i}"),
+            no_health(),
+        )
+        .expect("wildcard distribute selection");
+        assert_eq!(
+            selection.target.host, "east.local",
+            "terminal wildcard in distribute.from must activate distribute weighting"
+        );
+    }
+}
+
+#[test]
 fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
     // distribute weights east at 100. If the only east target is unhealthy
     // selection MUST fall through to the rest of the candidate set instead

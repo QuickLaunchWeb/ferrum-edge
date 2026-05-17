@@ -209,6 +209,41 @@ fn k8s_translator_rejects_distribute_failing_over_to_self() {
 }
 
 #[test]
+fn k8s_translator_rejects_failover_regions_with_slashes_or_whitespace() {
+    for (field, value) in [
+        ("from", "us-west/us-west-1"),
+        ("to", "us-east/us-east-1"),
+        ("from", " us-west "),
+        ("to", " us-east "),
+    ] {
+        let object = istio_object(
+            "DestinationRule",
+            "reviews",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "trafficPolicy": {
+                    "loadBalancer": {
+                        "localityLbSetting": {
+                            "failover": [{
+                                "from": if field == "from" { value } else { "us-west" },
+                                "to": if field == "to" { value } else { "us-east" }
+                            }]
+                        }
+                    }
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[object], k8s_options())
+            .expect_err("malformed failover region must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is not a valid region name"),
+            "expected invalid failover-region rejection for {field}={value:?}, got: {msg}"
+        );
+    }
+}
+
+#[test]
 fn k8s_translator_rejects_invalid_distribute_from_locality() {
     let object = istio_object(
         "DestinationRule",

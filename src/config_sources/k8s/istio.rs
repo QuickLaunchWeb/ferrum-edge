@@ -823,7 +823,7 @@ fn translate_locality_lb_setting(
                     )
                 })?
                 .to_string();
-            if crate::config::types::LocalityPreference::parse(&from).is_none() {
+            if !is_valid_locality_pattern(&from) {
                 return Err(invalid_resource(
                     object,
                     format!(
@@ -842,7 +842,7 @@ fn translate_locality_lb_setting(
             })?;
             let mut to = std::collections::BTreeMap::new();
             for (locality, weight) in to_obj {
-                if crate::config::types::LocalityPreference::parse(locality).is_none() {
+                if !is_valid_locality_pattern(locality) {
                     return Err(invalid_resource(
                         object,
                         format!(
@@ -906,6 +906,15 @@ fn translate_locality_lb_setting(
                     )
                 })?
                 .to_string();
+            if !is_valid_failover_region(&from) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].from \
+                         '{from}' is not a valid region name"
+                    ),
+                ));
+            }
             let to = string_field(entry, "to")
                 .ok_or_else(|| {
                     invalid_resource(
@@ -916,6 +925,15 @@ fn translate_locality_lb_setting(
                     )
                 })?
                 .to_string();
+            if !is_valid_failover_region(&to) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].to \
+                         '{to}' is not a valid region name"
+                    ),
+                ));
+            }
             if from == to {
                 return Err(invalid_resource(
                     object,
@@ -937,6 +955,29 @@ fn translate_locality_lb_setting(
         distribute,
         failover,
     })
+}
+
+fn is_valid_locality_pattern(raw: &str) -> bool {
+    let Some(locality) = crate::config::types::LocalityPreference::parse(raw) else {
+        return false;
+    };
+    if locality.region == "*" {
+        return locality.zone.is_none() && locality.sub_zone.is_none();
+    }
+    if locality.zone.as_deref() == Some("*") {
+        return locality.sub_zone.is_none();
+    }
+    true
+}
+
+fn is_valid_failover_region(raw: &str) -> bool {
+    let Some(locality) = crate::config::types::LocalityPreference::parse(raw) else {
+        return false;
+    };
+    raw == raw.trim()
+        && locality.region != "*"
+        && locality.zone.is_none()
+        && locality.sub_zone.is_none()
 }
 
 /// Translate Istio `DestinationRule.trafficPolicy.tls` (a.k.a.

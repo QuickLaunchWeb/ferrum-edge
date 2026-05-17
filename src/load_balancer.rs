@@ -937,7 +937,7 @@ fn build_locality_lb_state(
         let Some(entry_from) = LocalityPreference::parse(&entry.from) else {
             continue;
         };
-        if !entry_from.exact_matches(&source) {
+        if !locality_from_matches_source(&entry_from, &source) {
             continue;
         }
         let mut weights = vec![0u32; targets.len()];
@@ -1024,20 +1024,47 @@ fn build_locality_lb_state(
 /// only the components the operator declared have to align.
 #[inline]
 fn locality_match_for_distribute(to: &LocalityPreference, target: &LocalityPreference) -> bool {
-    if to.region != target.region {
+    if to.region != "*" && to.region != target.region {
         return false;
     }
     if let Some(ref to_zone) = to.zone {
+        if to_zone == "*" {
+            return true;
+        }
         if target.zone.as_ref() != Some(to_zone) {
             return false;
         }
         if let Some(ref to_sub) = to.sub_zone
+            && to_sub != "*"
             && target.sub_zone.as_ref() != Some(to_sub)
         {
             return false;
         }
     }
     true
+}
+
+/// True when a `distribute[].from` pattern matches the concrete source
+/// locality. Unlike `to` entries, a non-wildcard `from` remains exact; Istio
+/// wildcard forms such as `region/zone/*` match the corresponding source tier.
+#[inline]
+fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPreference) -> bool {
+    if from.region != "*" && from.region != source.region {
+        return false;
+    }
+    let Some(from_zone) = from.zone.as_deref() else {
+        return source.zone.is_none() && source.sub_zone.is_none();
+    };
+    if from_zone == "*" {
+        return true;
+    }
+    if source.zone.as_deref() != Some(from_zone) {
+        return false;
+    }
+    let Some(from_sub_zone) = from.sub_zone.as_deref() else {
+        return source.sub_zone.is_none();
+    };
+    from_sub_zone == "*" || source.sub_zone.as_deref() == Some(from_sub_zone)
 }
 
 /// Per-upstream load balancer with algorithm-specific state.
