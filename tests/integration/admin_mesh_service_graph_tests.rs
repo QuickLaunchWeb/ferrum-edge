@@ -5,6 +5,8 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
+use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::TransactionSummary;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -54,6 +56,13 @@ fn generate_test_token(config: &TestConfig) -> String {
 }
 
 fn admin_state(jwt: JwtManager) -> AdminState {
+    admin_state_with_mesh_runtime(jwt, None)
+}
+
+fn admin_state_with_mesh_runtime(
+    jwt: JwtManager,
+    mesh_runtime_state: Option<MeshRuntimeState>,
+) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt,
@@ -73,9 +82,20 @@ fn admin_state(jwt: JwtManager) -> AdminState {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
-        mesh_runtime_state: None,
+        mesh_runtime_state,
         admin_tls_handshake_timeout_seconds: 10,
     }
+}
+
+fn active_mesh_runtime() -> MeshRuntimeState {
+    let runtime = MeshRuntimeState::new();
+    runtime.install_slice(MeshSlice {
+        node_id: "test-node".to_string(),
+        namespace: "default".to_string(),
+        version: "test".to_string(),
+        ..MeshSlice::default()
+    });
+    runtime
 }
 
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -171,7 +191,8 @@ async fn mesh_service_graph_endpoint_requires_jwt() {
 async fn mesh_service_graph_endpoint_returns_seeded_topology_json() {
     let tc = TestConfig::default();
     let token = generate_test_token(&tc);
-    let state = admin_state(create_test_jwt_manager(&tc));
+    let state =
+        admin_state_with_mesh_runtime(create_test_jwt_manager(&tc), Some(active_mesh_runtime()));
     let (base_url, _shutdown) = start_test_admin(state).await;
 
     let edge_id = uuid::Uuid::new_v4();
@@ -218,4 +239,17 @@ async fn mesh_service_graph_endpoint_returns_seeded_topology_json() {
     assert!(edge["errors_total"].as_u64().unwrap_or(0) >= 1);
     assert!(edge["duration_ms_total"].as_f64().unwrap_or(0.0) >= 7.5);
     assert!(edge["last_seen"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn mesh_service_graph_endpoint_requires_active_mesh_runtime() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let state = admin_state(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    let (status, body) = fetch_service_graph(&base_url, &token).await;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "No active mesh service graph");
 }

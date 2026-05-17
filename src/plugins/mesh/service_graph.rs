@@ -119,6 +119,18 @@ impl Default for ServiceGraphRegistry {
     }
 }
 
+struct SnapshotWorkerGuard {
+    registry: Arc<ServiceGraphRegistry>,
+}
+
+impl Drop for SnapshotWorkerGuard {
+    fn drop(&mut self) {
+        self.registry
+            .snapshot_worker_started
+            .store(false, Ordering::Release);
+    }
+}
+
 impl ServiceGraphRegistry {
     pub fn record_transaction(&self, summary: &TransactionSummary) {
         if summary.mirror {
@@ -170,6 +182,9 @@ impl ServiceGraphRegistry {
 
         let registry = Arc::clone(self);
         handle.spawn(async move {
+            let _worker_guard = SnapshotWorkerGuard {
+                registry: Arc::clone(&registry),
+            };
             let mut interval =
                 tokio::time::interval(Duration::from_millis(SNAPSHOT_REFRESH_MIN_MS));
             loop {
@@ -403,6 +418,44 @@ mod tests {
 
         registry.clear_for_tests();
         assert_eq!(registry.snapshot().edge_count, 0);
+    }
+
+    #[test]
+    fn snapshot_worker_can_restart_after_runtime_teardown() {
+        let registry = Arc::new(ServiceGraphRegistry::default());
+
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                registry.ensure_snapshot_worker();
+                tokio::task::yield_now().await;
+            });
+            assert!(registry.snapshot_worker_started.load(Ordering::Acquire));
+        }
+
+        for _ in 0..50 {
+            if !registry.snapshot_worker_started.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !registry.snapshot_worker_started.load(Ordering::Acquire),
+            "dropping the runtime should let the next caller spawn a fresh worker"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("replacement test runtime");
+        runtime.block_on(async {
+            registry.ensure_snapshot_worker();
+            tokio::task::yield_now().await;
+        });
+        assert!(registry.snapshot_worker_started.load(Ordering::Acquire));
     }
 
     fn summary(
