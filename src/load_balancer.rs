@@ -158,6 +158,16 @@ fn bitset_for_indices(indices: &[usize]) -> HealthBitset {
     bitset
 }
 
+fn membership_mask_for_indices(len: usize, indices: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; len];
+    for &idx in indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -1041,9 +1051,11 @@ fn build_locality_lb_state(
                 total = total.saturating_add(share);
             }
             if group_total > 0 {
+                let target_membership = membership_mask_for_indices(targets.len(), &group_indices);
                 groups.push(LocalityDistributeGroup {
                     weight: group_total,
                     target_indices: group_indices,
+                    target_membership,
                 });
             }
         }
@@ -1285,6 +1297,7 @@ struct LocalityLbState {
 struct LocalityDistributeGroup {
     weight: u64,
     target_indices: Vec<usize>,
+    target_membership: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -2161,7 +2174,7 @@ impl LoadBalancer {
         for group in groups {
             if candidates
                 .iter()
-                .any(|(idx, _)| group.target_indices.contains(idx))
+                .any(|(idx, _)| group.target_membership.get(*idx).copied().unwrap_or(false))
             {
                 total = total.saturating_add(group.weight);
             }
@@ -2177,7 +2190,7 @@ impl LoadBalancer {
             let masked: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
                 .iter()
                 .copied()
-                .filter(|(idx, _)| group.target_indices.contains(idx))
+                .filter(|(idx, _)| group.target_membership.get(*idx).copied().unwrap_or(false))
                 .collect();
             if masked.is_empty() {
                 continue;
@@ -2194,13 +2207,7 @@ impl LoadBalancer {
     }
 
     fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
-        let mut mask = vec![false; self.targets.len()];
-        for &idx in subset_indices {
-            if let Some(slot) = mask.get_mut(idx) {
-                *slot = true;
-            }
-        }
-        mask
+        membership_mask_for_indices(self.targets.len(), subset_indices)
     }
 
     pub fn select(
