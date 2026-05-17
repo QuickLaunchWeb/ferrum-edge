@@ -3226,9 +3226,7 @@ fn start_mesh_slice_apply_task(
                                     && let Some(resolver) =
                                         proxy_state.node_waypoint_identity_resolver.as_ref()
                                 {
-                                    let scopes = resolver
-                                        .build_per_pod_scopes_from_workloads(&slice.workloads);
-                                    resolver.install_policy_scopes(scopes);
+                                    resolver.install_policy_scopes_from_workloads(&slice.workloads);
                                 }
                                 if applied {
                                     info!(

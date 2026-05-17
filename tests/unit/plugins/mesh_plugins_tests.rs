@@ -1647,7 +1647,7 @@ async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
     );
 }
 
-// GAP-2M.4 — per-pod policy scoping for node-waypoint topology.
+// GAP-2M.4 - per-pod policy scoping for node-waypoint topology.
 //
 // When `per_pod_policy_scoping: true`, MeshAuthz skips the construction-time
 // slice-level scope filter (one listener serves many pods, so the slice's
@@ -1656,9 +1656,9 @@ async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
 // by the node-waypoint accept path. These tests cover:
 //   1. Namespace-scoped policy applies only to pods in that namespace.
 //   2. Workload-selector ALLOW gates implicit-deny by source-pod labels.
-//   3. Cow::Borrowed fast path when all policies apply.
-//   4. Missing scope cache + per_pod_policy_scoping=true falls back to the
-//      full unfiltered slice (fail open on filter, not on auth itself).
+//   3. Missing scope cache + per_pod_policy_scoping=true falls back to
+//      mesh-wide policies only, so scoped policies cannot leak across pods.
+//   4. Disabled path preserves the construction-time filter.
 
 #[tokio::test]
 async fn mesh_authz_per_pod_scoping_namespace_scope_filters_by_source_pod() {
@@ -1679,7 +1679,7 @@ async fn mesh_authz_per_pod_scoping_namespace_scope_filters_by_source_pod() {
     }))
     .expect("plugin config");
 
-    // Source pod in team-b — team-a's namespace-scoped DENY must not apply.
+    // Source pod in team-b: team-a's namespace-scoped DENY must not apply.
     let mut ctx_team_b = request_context(Some("spiffe://cluster.local/ns/team-b/sa/client"));
     ctx_team_b.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
         SpiffeId::new("spiffe://cluster.local/ns/team-b/sa/client").expect("spiffe"),
@@ -1692,7 +1692,7 @@ async fn mesh_authz_per_pod_scoping_namespace_scope_filters_by_source_pod() {
         "team-b traffic must not be denied by a team-a-scoped DENY, got {result_b:?}"
     );
 
-    // Source pod in team-a — team-a's namespace-scoped DENY must apply.
+    // Source pod in team-a: team-a's namespace-scoped DENY must apply.
     let mut ctx_team_a = request_context(Some("spiffe://cluster.local/ns/team-a/sa/client"));
     ctx_team_a.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
         SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").expect("spiffe"),
@@ -1712,7 +1712,7 @@ async fn mesh_authz_per_pod_scoping_workload_selector_filter_blocks_implicit_den
     use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
     use std::sync::Arc;
 
-    // ALLOW scoped to (app=reviews) — must not raise implicit-deny for
+    // ALLOW scoped to (app=reviews) must not raise implicit-deny for
     // pods that don't match that selector.
     let selector_for_reviews = WorkloadSelector {
         labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
@@ -1748,19 +1748,24 @@ async fn mesh_authz_per_pod_scoping_workload_selector_filter_blocks_implicit_den
 }
 
 #[tokio::test]
-async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_full_slice() {
+async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_mesh_wide_only() {
     // Per-pod scoping is enabled but the accept path didn't enroll a scope
     // for this pod (race during enrollment, or pod removed). The plugin
-    // should fall back to the full slice so requests still authorize —
-    // node-waypoint already enforces that no scope cache means unknown
-    // identity at the accept-time check upstream; the plugin must not also
-    // accidentally implicit-deny here.
+    // should keep mesh-wide policies but drop namespace/selector-scoped
+    // policies because it cannot prove they apply to this source pod.
     let plugin = MeshAuthz::new(&json!({
-        "mesh_policies": [policy_with_scope(
-            "mesh-wide-allow",
-            PolicyScope::MeshWide,
-            PolicyAction::Allow,
-        )],
+        "mesh_policies": [
+            policy_with_scope(
+                "team-a-deny",
+                PolicyScope::Namespace { namespace: "team-a".to_string() },
+                PolicyAction::Deny,
+            ),
+            policy_with_scope(
+                "mesh-wide-allow",
+                PolicyScope::MeshWide,
+                PolicyAction::Allow,
+            ),
+        ],
         "per_pod_policy_scoping": true,
     }))
     .expect("plugin config");
@@ -1771,7 +1776,7 @@ async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_full_slice() {
 
     assert!(
         matches!(result, PluginResult::Continue),
-        "per_pod_policy_scoping with no scope cache should use full slice, got {result:?}"
+        "per_pod_policy_scoping with no scope cache should keep mesh-wide policies only, got {result:?}"
     );
 }
 
