@@ -1,9 +1,10 @@
 name: Setup Rust CI environment
 description: >-
-  Installs the stable Rust toolchain (optional components), sccache with the
-  Mozilla GHA cache, Swatinem/rust-cache, and the protoc + libcurl native
-  deps required by every Linux test/lint/perf job. Centralizes the setup
-  block so individual jobs only declare their cache key and any extra rustup
+  Installs the stable Rust toolchain (optional components), wires sccache
+  via setup-sccache, installs a fast linker via setup-fast-linker, sets up
+  the Swatinem rust-cache, and installs protoc + libcurl native deps
+  required by every Linux test/lint/perf job. Centralizes the setup block
+  so individual jobs only declare their cache key and any extra rustup
   components.
 
 inputs:
@@ -29,20 +30,9 @@ runs:
         toolchain: stable
         components: ${{ inputs.components }}
 
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
-      continue-on-error: true
+    - uses: ./.github/actions/setup-sccache
 
-    - name: Configure sccache
-      shell: bash
-      run: |
-        if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          echo "sccache enabled"
-        else
-          echo "sccache unavailable, building without cache"
-        fi
+    - uses: ./.github/actions/setup-fast-linker
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2

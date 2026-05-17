@@ -377,6 +377,12 @@ jobs:
         if: steps.changes.outputs.ebpf_changed == 'true'
         uses: dtolnay/rust-toolchain@stable
 
+      - if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: ./.github/actions/setup-sccache
+
+      - if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: ./.github/actions/setup-fast-linker
+
       - name: Install bpf-linker
         if: steps.changes.outputs.ebpf_changed == 'true'
         run: cargo install bpf-linker --locked
@@ -543,17 +549,9 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
+      - uses: ./.github/actions/setup-sccache
 
-      - name: Configure sccache
-        shell: bash
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          fi
+      - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

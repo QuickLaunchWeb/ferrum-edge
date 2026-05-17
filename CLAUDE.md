@@ -577,6 +577,8 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 ### PR Checklist
 
+When a task is complete (changes made, targeted tests green, docs updated), push the branch and open the PR without waiting for explicit instruction — opening the PR is part of finishing the work, not a separate ask. Skip only if the user said otherwise, the work is genuinely incomplete, or the change is purely exploratory/local.
+
 Use "Local testing" above for validation and record what ran in the PR. New features need normal/edge/error coverage. No `.unwrap()`/`.expect()` in prod, no dead code, and no silent behavior changes. PR description must include summary + changes + test plan. Docs updated when behavior changes (`FEATURES.md`, `README.md`, `docs/`, `openapi.yaml`); new `FERRUM_*` vars need `docs/configuration.md` + `ferrum.conf` commented defaults.
 
 ### Commit Style / Branch Naming
