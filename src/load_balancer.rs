@@ -1912,12 +1912,13 @@ impl LoadBalancer {
                     masked.set(idx);
                 }
             }
-            // Operator typo or every weighted target unhealthy → fall through
-            // to the unfiltered candidate set so the upstream still serves.
             if !masked.is_empty() {
                 return masked;
             }
-            return *candidates;
+            // Operator typo or every weighted target unhealthy: keep
+            // evaluating the normal locality tiers below so exact/zone/region
+            // preference still applies before the final residual candidate
+            // fallback.
         }
 
         // No source locality → no tier preference; return the input unchanged.
@@ -1986,8 +1987,9 @@ impl LoadBalancer {
             return candidates;
         }
 
-        // distribute-mode: restrict to operator-weighted targets, falling
-        // through to the unfiltered set if every weighted target is missing.
+        // distribute-mode: restrict to operator-weighted targets when any are
+        // available. If every weighted target is missing, continue into the
+        // normal locality tiers below.
         if let Some(weights) = self
             .locality_lb
             .as_ref()
@@ -2001,7 +2003,6 @@ impl LoadBalancer {
             if !masked.is_empty() {
                 return masked;
             }
-            return candidates;
         }
 
         if self.target_locality_ranks.is_empty() {

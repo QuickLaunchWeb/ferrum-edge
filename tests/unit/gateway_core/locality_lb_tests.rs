@@ -979,8 +979,8 @@ fn locality_distribute_from_global_wildcard_matches_any_source_locality() {
 #[test]
 fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
     // distribute weights east at 100. If the only east target is unhealthy
-    // selection MUST fall through to the rest of the candidate set instead
-    // of returning None (operators expect resilience, not silent outage).
+    // selection MUST continue through locality priority before the residual
+    // candidate set instead of jumping directly to arbitrary candidates.
     let east = target("east.local", Some("us-east/us-east-1/a"));
     let mut to = BTreeMap::new();
     to.insert("us-east".to_string(), 100);
@@ -997,6 +997,7 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
         vec![
             target("west.local", Some("us-west/us-west-1/a")),
             east.clone(),
+            target("eu.local", Some("eu-central/eu-central-1/a")),
         ],
         setting,
     );
@@ -1010,9 +1011,67 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
         max_ejection_percent: None,
     };
 
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "fb", Some(&health))
+    for i in 0..16 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("fb-{i}"),
+            Some(&health),
+        )
         .expect("fallthrough selection");
-    assert_eq!(selection.target.host, "west.local");
+        assert_eq!(
+            selection.target.host, "west.local",
+            "empty distribute mask must preserve locality priority before residual fallback"
+        );
+    }
+}
+
+#[test]
+fn locality_distribute_vec_fallback_empty_mask_preserves_priority_tier() {
+    let east = target("east.local", Some("us-east/us-east-1/a"));
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let mut targets = Vec::with_capacity(132);
+    targets.push(target("west.local", Some("us-west/us-west-1/a")));
+    targets.push(east.clone());
+    for i in 0..130 {
+        targets.push(target(
+            &format!("eu-{i}.local"),
+            Some("eu-central/eu-central-1/a"),
+        ));
+    }
+    let up = upstream_with_locality_lb("us-west/us-west-1/a", targets, setting);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &east), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..16 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("vec-fb-{i}"),
+            Some(&health),
+        )
+        .expect("vec fallthrough selection");
+        assert_eq!(
+            selection.target.host, "west.local",
+            "Vec empty distribute mask must preserve locality priority before residual fallback"
+        );
+    }
 }
 
 #[test]
