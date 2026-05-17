@@ -560,12 +560,6 @@ impl MeshSlice {
             .service_entries
             .iter()
             .filter(|entry| {
-                if service_waypoint_namespaces
-                    .as_ref()
-                    .is_some_and(|namespaces| namespaces.contains(&entry.namespace))
-                {
-                    return true;
-                }
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
             })
             .flat_map(|entry| {

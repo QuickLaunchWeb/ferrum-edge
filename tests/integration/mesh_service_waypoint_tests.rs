@@ -553,6 +553,20 @@ fn slice_filter_cross_namespace_waypoint_binding_admits_bound_services() {
             workload_in_namespace("default", reviews_sa),
             workload_in_namespace("infra", local_sa),
         ],
+        service_entries: vec![
+            service_entry_in_namespace(
+                "default",
+                "reviews-exported",
+                vec!["reviews.default.svc.cluster.local"],
+                vec!["infra"],
+            ),
+            service_entry_in_namespace(
+                "default",
+                "reviews-private",
+                vec!["reviews.default.svc.cluster.local"],
+                vec!["."],
+            ),
+        ],
         destination_rules: vec![
             destination_rule_in_namespace(
                 "default",
@@ -587,6 +601,9 @@ fn slice_filter_cross_namespace_waypoint_binding_admits_bound_services() {
     assert_eq!(slice.workloads.len(), 1);
     assert_eq!(slice.workloads[0].namespace, "default");
     assert_eq!(slice.workloads[0].spiffe_id.as_str(), reviews_sa);
+    assert_eq!(slice.service_entries.len(), 1);
+    assert_eq!(slice.service_entries[0].namespace, "default");
+    assert_eq!(slice.service_entries[0].name, "reviews-exported");
     assert_eq!(slice.destination_rules.len(), 1);
     assert_eq!(slice.destination_rules[0].namespace, "default");
     assert_eq!(slice.destination_rules[0].name, "reviews");
