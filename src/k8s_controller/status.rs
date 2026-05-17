@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
@@ -32,18 +33,27 @@ impl GatewayApiStatusWriter {
         &self,
         updates: &[GatewayApiStatusUpdate],
     ) -> Result<(), kube::Error> {
-        for update in updates {
-            let Some(ar) = api_resource_for_update(update) else {
-                continue;
-            };
+        let futures = updates.iter().filter_map(|update| {
+            let ar = api_resource_for_update(update)?;
             let api: Api<DynamicObject> = if update.kind == "GatewayClass" {
                 Api::all_with(self.client.clone(), &ar)
             } else {
                 Api::namespaced_with(self.client.clone(), &update.namespace, &ar)
             };
             let patch = json!({ "status": update.status });
-            api.patch_status(&update.name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await?;
+            let name = update.name.clone();
+            Some(async move {
+                api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                    .map(|_| ())
+            })
+        });
+        // Patch each Gateway API status in parallel. The Kubernetes API server
+        // serializes mutations through resourceVersion conflicts; this only
+        // pipelines independent objects so each round-trip's RTT does not
+        // serialize the reconciler loop on large clusters.
+        for result in join_all(futures).await {
+            result?;
         }
         Ok(())
     }
@@ -410,11 +420,24 @@ fn route_parent_refs(object: &K8sObject) -> Vec<Value> {
 }
 
 fn gateway_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
-    config.mesh.as_ref().is_some_and(|mesh| {
-        let service_prefix = format!("{}-", object.metadata.name);
+    // Mesh services derived from this Gateway are named `{gateway.name}-{listener.name}`
+    // (see `mesh_services_from_gateway` in `gateway_api.rs`). Use exact match against
+    // each listener name to avoid a false positive when another Gateway's name is a
+    // prefix of this one (e.g. `edge` matching `edge-internal-http`).
+    let Some(mesh) = config.mesh.as_ref() else {
+        return false;
+    };
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        return false;
+    };
+    listeners.iter().any(|listener| {
+        let listener_name = listener
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("listener");
+        let expected = format!("{}-{}", object.metadata.name, listener_name);
         mesh.services.iter().any(|service| {
-            service.namespace == object.metadata.namespace
-                && service.name.starts_with(&service_prefix)
+            service.namespace == object.metadata.namespace && service.name == expected
         })
     })
 }
