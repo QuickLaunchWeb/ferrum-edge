@@ -226,8 +226,8 @@ fn k8s_translator_rejects_invalid_distribute_from_locality() {
             }
         }),
     );
-    let err = translate_k8s_objects(&[object], k8s_options())
-        .expect_err("empty from must be rejected");
+    let err =
+        translate_k8s_objects(&[object], k8s_options()).expect_err("empty from must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains("not a valid region"),
