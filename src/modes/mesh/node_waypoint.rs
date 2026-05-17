@@ -22,6 +22,11 @@
 //! `node_waypoint_*_drops` counters in `OverloadState`) are `CachePadded` —
 //! see `src/overload.rs`.
 //!
+//! Per-pod policy scope lookup is a separate HTTP request-path read:
+//! one `ArcSwap::load` plus one `HashMap::get` when mesh authz stamps
+//! node-waypoint request context. Scope rebuilds happen on slice apply and
+//! identity enrollment, not in the accept loop.
+//!
 //! Linux socket cookies are unique across the IPv4/IPv6 protocol families, so
 //! both address families share a single cookie record map; this avoids the
 //! wasted IPv4 lookup that a dual-map design imposed on every IPv6 accept.
@@ -55,6 +60,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -68,6 +74,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
 use crate::identity::SpiffeId;
+use crate::modes::mesh::config::Workload;
 use crate::modes::mesh::runtime::PolicyScopeCache;
 
 /// Address family stamp on a cookie record.
@@ -183,6 +190,65 @@ impl NodeWaypointIdentity {
     }
 }
 
+struct PolicyScopeAccumulator {
+    spiffe_id: SpiffeId,
+    namespace: Option<String>,
+    labels: HashMap<String, String>,
+}
+
+impl PolicyScopeAccumulator {
+    fn new(workload: &Workload) -> Self {
+        Self {
+            spiffe_id: workload.spiffe_id.clone(),
+            namespace: Some(workload.namespace.clone()),
+            labels: workload.selector.labels.clone(),
+        }
+    }
+
+    fn merge(&mut self, workload: &Workload) {
+        match self.namespace.as_ref() {
+            Some(namespace) if namespace == &workload.namespace => {}
+            _ => self.namespace = None,
+        }
+        self.labels.retain(|key, value| {
+            workload
+                .selector
+                .labels
+                .get(key)
+                .is_some_and(|candidate| candidate == value)
+        });
+    }
+
+    fn into_scope(self) -> PolicyScopeCache {
+        PolicyScopeCache::new(
+            self.spiffe_id,
+            self.namespace.unwrap_or_default(),
+            self.labels,
+        )
+    }
+}
+
+fn workload_policy_scope_index<'a, I>(workloads: I) -> HashMap<String, Arc<PolicyScopeCache>>
+where
+    I: IntoIterator<Item = &'a Workload>,
+{
+    let mut accumulators: HashMap<String, PolicyScopeAccumulator> = HashMap::new();
+    for workload in workloads {
+        accumulators
+            .entry(workload.spiffe_id.as_str().to_string())
+            .and_modify(|accumulator| accumulator.merge(workload))
+            .or_insert_with(|| PolicyScopeAccumulator::new(workload));
+    }
+    accumulators
+        .into_iter()
+        .map(|(spiffe_id, accumulator)| (spiffe_id, Arc::new(accumulator.into_scope())))
+        .collect()
+}
+
+pub struct NodeWaypointPolicyScopeSnapshot {
+    workload_policy_scopes_by_spiffe: HashMap<String, Arc<PolicyScopeCache>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeWaypointIdentityError {
     SocketCookieUnavailable(String),
@@ -246,6 +312,8 @@ pub struct NodeWaypointIdentityResolver {
     cookie_records: DashMap<u64, CookieRecord>,
     identities_by_pod_uid: DashMap<[u8; 16], Arc<NodeWaypointIdentity>>,
     policy_scopes_by_pod_uid: Arc<ArcSwap<HashMap<[u8; 16], Arc<PolicyScopeCache>>>>,
+    workload_policy_scopes_by_spiffe: Arc<ArcSwap<HashMap<String, Arc<PolicyScopeCache>>>>,
+    policy_scope_update_lock: Mutex<()>,
     // Sweep counters below are intentionally NOT `CachePadded` (unlike the
     // accept-path `node_waypoint_*_drops` atomics in `OverloadState`). They
     // are written at most once per sweep tick (default 30s) on a single
@@ -291,6 +359,8 @@ impl NodeWaypointIdentityResolver {
             cookie_records: DashMap::with_shard_amount(shards),
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
             policy_scopes_by_pod_uid: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            workload_policy_scopes_by_spiffe: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            policy_scope_update_lock: Mutex::new(()),
             cgroup_sweep_path_missing: AtomicU64::new(0),
             cgroup_sweep_inode_changed: AtomicU64::new(0),
             cgroup_sweep_passes: AtomicU64::new(0),
@@ -317,6 +387,7 @@ impl NodeWaypointIdentityResolver {
         let identity = Arc::new(identity);
         self.identities_by_pod_uid
             .insert(identity.pod_uid, identity.clone());
+        self.sync_policy_scope_for_identity(&identity);
         identity
     }
 
@@ -512,25 +583,132 @@ impl NodeWaypointIdentityResolver {
             return;
         }
 
-        self.policy_scopes_by_pod_uid.rcu(|current| {
-            if !pod_uids.iter().any(|pod_uid| current.contains_key(pod_uid)) {
-                return Arc::clone(current);
-            }
+        let _guard = self.lock_policy_scope_update();
+        let current = self.policy_scopes_by_pod_uid.load();
+        if !pod_uids.iter().any(|pod_uid| current.contains_key(pod_uid)) {
+            return;
+        }
 
-            let mut scopes = current.as_ref().clone();
-            for pod_uid in pod_uids {
-                scopes.remove(pod_uid);
-            }
-            Arc::new(scopes)
-        });
+        let mut scopes = current.as_ref().clone();
+        for pod_uid in pod_uids {
+            scopes.remove(pod_uid);
+        }
+        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
     }
 
     pub fn install_policy_scopes(&self, scopes: HashMap<[u8; 16], Arc<PolicyScopeCache>>) {
+        let _guard = self.lock_policy_scope_update();
         self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
     }
 
     pub fn policy_scope_for_pod(&self, pod_uid: &[u8; 16]) -> Option<Arc<PolicyScopeCache>> {
         self.policy_scopes_by_pod_uid.load().get(pod_uid).cloned()
+    }
+
+    /// Install per-pod policy scopes derived from a slice's workload set.
+    ///
+    /// Used by tests and direct resolver callers. Mesh slice apply should
+    /// prefer [`build_policy_scope_snapshot_from_workloads`] and
+    /// [`install_policy_scope_snapshot`] so it can stage scopes before config
+    /// validation while publishing them only after the proxy config is
+    /// accepted.
+    pub fn install_policy_scopes_from_workloads<'a, I>(&self, workloads: I)
+    where
+        I: IntoIterator<Item = &'a Workload>,
+    {
+        let snapshot = self.build_policy_scope_snapshot_from_workloads(workloads);
+        self.install_policy_scope_snapshot(snapshot);
+    }
+
+    pub fn build_policy_scope_snapshot_from_workloads<'a, I>(
+        &self,
+        workloads: I,
+    ) -> NodeWaypointPolicyScopeSnapshot
+    where
+        I: IntoIterator<Item = &'a Workload>,
+    {
+        let workload_policy_scopes_by_spiffe = workload_policy_scope_index(workloads);
+        NodeWaypointPolicyScopeSnapshot {
+            workload_policy_scopes_by_spiffe,
+        }
+    }
+
+    pub fn install_policy_scope_snapshot(&self, snapshot: NodeWaypointPolicyScopeSnapshot) {
+        let _guard = self.lock_policy_scope_update();
+        let workload_policy_scopes_by_spiffe = snapshot.workload_policy_scopes_by_spiffe;
+        let policy_scopes_by_pod_uid =
+            self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
+        self.workload_policy_scopes_by_spiffe
+            .store(Arc::new(workload_policy_scopes_by_spiffe));
+        self.policy_scopes_by_pod_uid
+            .store(Arc::new(policy_scopes_by_pod_uid));
+    }
+
+    pub fn build_per_pod_scopes_from_workloads<'a, I>(
+        &self,
+        workloads: I,
+    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>>
+    where
+        I: IntoIterator<Item = &'a Workload>,
+    {
+        let workload_index = workload_policy_scope_index(workloads);
+        self.build_per_pod_scopes_from_workload_index(&workload_index)
+    }
+
+    fn sync_policy_scope_for_identity(&self, identity: &NodeWaypointIdentity) {
+        let _guard = self.lock_policy_scope_update();
+        let scope = self
+            .workload_policy_scopes_by_spiffe
+            .load()
+            .get(identity.spiffe_id.as_str())
+            .cloned();
+        let current = self.policy_scopes_by_pod_uid.load();
+        let mut scopes = current.as_ref().clone();
+        if let Some(scope) = scope {
+            scopes.insert(identity.pod_uid, scope);
+        } else {
+            scopes.remove(&identity.pod_uid);
+        }
+        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
+    }
+
+    fn lock_policy_scope_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        // Recover from a poisoned lock so a transient panic in a previous
+        // updater cannot wedge slice apply or identity enrollment forever.
+        // We log when the recovery happens because a poisoned mutex means
+        // the prior holder panicked mid-update — the per-pod scope map and
+        // the workload-scope index may be out of sync until the next
+        // accepted slice apply rebuilds both. Silent recovery would hide
+        // that history; the warn! makes it surface in operator logs and
+        // postmortem captures.
+        self.policy_scope_update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    "node-waypoint policy-scope update lock was poisoned by a previous panic; \
+                 recovering and continuing — per-pod scope map may be transiently inconsistent \
+                 with the workload index until the next mesh slice apply"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn build_per_pod_scopes_from_workload_index(
+        &self,
+        workload_index: &HashMap<String, Arc<PolicyScopeCache>>,
+    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>> {
+        if workload_index.is_empty() {
+            return HashMap::new();
+        }
+        self.identities_by_pod_uid
+            .iter()
+            .filter_map(|entry| {
+                let identity = entry.value();
+                workload_index
+                    .get(identity.spiffe_id.as_str())
+                    .map(|scope| (identity.pod_uid, scope.clone()))
+            })
+            .collect()
     }
 
     /// Build an operator-facing snapshot of the currently enrolled identities.
@@ -547,7 +725,8 @@ impl NodeWaypointIdentityResolver {
     ///   - whether a per-pod `PolicyScopeCache` is installed.
     ///
     /// This is a cold-path snapshot — it iterates every entry of each
-    /// `DashMap` once. Not safe to call on a hot accept path.
+    /// hot-path `DashMap` once and reads the policy-scope `ArcSwap`. Not safe
+    /// to call on a hot accept path.
     pub fn identities_snapshot(&self) -> Vec<NodeWaypointIdentitySummary> {
         self.identities_snapshot_with_cookie_totals().0
     }
@@ -555,8 +734,8 @@ impl NodeWaypointIdentityResolver {
     /// Cold-path snapshot that returns both the per-identity summary list and
     /// the grand totals of `(orig_dst4, orig_dst6)` cookie records in a single
     /// pass over the `cookie_records` map. The admin endpoint uses this to
-    /// honor the documented "iterates each shard of three `DashMap`s once"
-    /// contract — invoking [`identities_snapshot`] and [`cookie_count`]
+    /// honor the documented "single cookie-record pass" contract. Invoking
+    /// [`identities_snapshot`] and [`cookie_count`]
     /// separately would walk `cookie_records` twice.
     ///
     /// The totals include cookies whose `pod_uid` has no enrolled identity
@@ -783,8 +962,9 @@ pub fn spawn_cgroup_sweep_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::TrustDomain;
     use crate::modes::mesh::config::{
-        MeshPolicy, PolicyScope, WorkloadSelector, policy_scope_applies_to_workload,
+        MeshPolicy, PolicyScope, Workload, WorkloadSelector, policy_scope_applies_to_workload,
     };
 
     fn spiffe(raw: &str) -> SpiffeId {
@@ -807,6 +987,31 @@ mod tests {
             _pad: 0,
             pod_uid,
             workload_spiffe_hash,
+        }
+    }
+
+    fn workload(
+        spiffe_id: &str,
+        namespace: &str,
+        service_name: &str,
+        labels: HashMap<String, String>,
+    ) -> Workload {
+        Workload {
+            spiffe_id: spiffe(spiffe_id),
+            selector: WorkloadSelector {
+                labels,
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: service_name.to_string(),
+            addresses: Vec::new(),
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("td").expect("td"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }
     }
 
@@ -1149,6 +1354,60 @@ mod tests {
     }
 
     #[test]
+    fn build_per_pod_scopes_from_workloads_indexes_by_pod_uid_via_spiffe() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+
+        let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let pod_b = parse_pod_uid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let pod_orphan = parse_pod_uid("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_a,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_b,
+            spiffe("spiffe://td/ns/default/sa/billing"),
+        ));
+        // pod_orphan has no Workload entry, so it must not appear in the map.
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_orphan,
+            spiffe("spiffe://td/ns/default/sa/orphan"),
+        ));
+
+        let workloads = vec![
+            workload(
+                "spiffe://td/ns/default/sa/api",
+                "default",
+                "api",
+                HashMap::from([("app".to_string(), "api".to_string())]),
+            ),
+            workload(
+                "spiffe://td/ns/default/sa/billing",
+                "default",
+                "billing",
+                HashMap::from([("app".to_string(), "billing".to_string())]),
+            ),
+        ];
+
+        let map = resolver.build_per_pod_scopes_from_workloads(&workloads);
+
+        assert_eq!(map.len(), 2);
+        let scope_a = map.get(&pod_a).expect("api workload scope");
+        assert_eq!(scope_a.namespace, "default");
+        assert_eq!(scope_a.labels.get("app").map(String::as_str), Some("api"));
+        let scope_b = map.get(&pod_b).expect("billing workload scope");
+        assert_eq!(
+            scope_b.labels.get("app").map(String::as_str),
+            Some("billing")
+        );
+        assert!(
+            !map.contains_key(&pod_orphan),
+            "pod with no Workload entry must be omitted"
+        );
+    }
+
+    #[test]
     fn identities_snapshot_lists_enrolled_pods_sorted_by_uid() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_a = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
@@ -1216,7 +1475,7 @@ mod tests {
         let hash_a = identity_a.workload_spiffe_hash;
         resolver.upsert_identity(identity_a);
         // Enrolled pod gets one v4 + one v6 cookie. Orphan pod (not enrolled)
-        // gets one v6 cookie — represents an eBPF capture racing identity
+        // gets one v6 cookie, representing eBPF capture racing identity
         // registration.
         resolver.record_orig_dst4(11, orig_dst4(pod_a, hash_a));
         resolver.record_orig_dst6(12, orig_dst6(pod_a, hash_a));
@@ -1251,18 +1510,203 @@ mod tests {
     }
 
     #[test]
+    fn build_per_pod_scopes_from_workloads_uses_common_labels_for_shared_spiffe() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/shared"),
+        ));
+
+        let workloads = vec![
+            workload(
+                "spiffe://td/ns/default/sa/shared",
+                "default",
+                "api",
+                HashMap::from([
+                    ("app".to_string(), "api".to_string()),
+                    ("version".to_string(), "v1".to_string()),
+                ]),
+            ),
+            workload(
+                "spiffe://td/ns/default/sa/shared",
+                "default",
+                "billing",
+                HashMap::from([
+                    ("app".to_string(), "billing".to_string()),
+                    ("version".to_string(), "v1".to_string()),
+                ]),
+            ),
+        ];
+
+        let map = resolver.build_per_pod_scopes_from_workloads(&workloads);
+
+        let scope = map.get(&pod_uid).expect("shared SPIFFE scope");
+        assert_eq!(scope.namespace, "default");
+        assert_eq!(scope.labels.get("version").map(String::as_str), Some("v1"));
+        assert!(
+            !scope.labels.contains_key("app"),
+            "divergent labels for a shared SPIFFE ID must not leak into the pod scope"
+        );
+    }
+
+    #[test]
+    fn install_policy_scopes_from_workloads_updates_late_enrolled_identity() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        resolver.install_policy_scopes_from_workloads(&workloads);
+
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("late identity should pick up current workload scope");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_does_not_publish_until_installed() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "staging scopes for a candidate slice must not mutate live authz state"
+        );
+
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("accepted slice should publish staged scope");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_includes_identity_enrolled_before_install() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "identity enrolled before accepted slice install must not publish candidate scope early"
+        );
+
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("install should rebuild pod map from current identities");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_excludes_identity_removed_before_install() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        resolver.remove_identity(&pod_uid);
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "install must not resurrect a scope for an identity removed after staging"
+        );
+    }
+
+    #[test]
+    fn remove_identity_removes_policy_scope() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        resolver.install_policy_scopes_from_workloads(&workloads);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
+
+        resolver.remove_identity(&pod_uid);
+
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_none());
+    }
+
+    #[test]
+    fn build_per_pod_scopes_from_workloads_empty_workloads_returns_empty_map() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_a,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let map: HashMap<_, _> = resolver.build_per_pod_scopes_from_workloads(std::iter::empty());
+        assert!(map.is_empty());
+    }
+
+    #[test]
     fn resolve_cookie_path_is_two_dashmap_gets_in_warm_case() {
         // Regression guard for the documented hot-path contract:
-        // - 1× cookie_records.get
-        // - 1× identities_by_pod_uid.get
+        // - 1x cookie_records.get
+        // - 1x identities_by_pod_uid.get
         // - 0 allocations on success
         //
         // We assert the structural shape (two DashMaps, one Arc clone) by
         // making the same call twice and confirming both arms hit warm
         // entries without re-inserting anything. If a future refactor adds
-        // a third DashMap probe or an alloc, this test still passes — but
-        // the module-level rustdoc is the source of truth and any change
-        // here that adds work must update that contract.
+        // a third DashMap probe or an alloc, this test still passes, but the
+        // module-level rustdoc is the source of truth and any change here that
+        // adds work must update that contract.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
@@ -1295,8 +1739,8 @@ mod tests {
             .resolve_cookie(42)
             .expect("v6-only cookie resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
-        // The v4/v6 family stamp is what the admin endpoint reports — verify
-        // we attributed the cookie to v6 not v4 so the snapshot stays honest.
+        // The v4/v6 family stamp is what the admin endpoint reports, so verify
+        // we attributed the cookie to v6 not v4 and the snapshot stays honest.
         let snap = resolver.identities_snapshot();
         assert_eq!(snap[0].orig_dst4_cookies, 0);
         assert_eq!(snap[0].orig_dst6_cookies, 1);

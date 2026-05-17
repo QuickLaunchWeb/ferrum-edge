@@ -1907,6 +1907,7 @@ fn inject_mesh_global_plugins(
         serde_json::json!({
             "mesh_slice": mesh_slice,
             "trust_domain_aliases": trust_domain_aliases,
+            "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
         }),
         &runtime.namespace,
     );
@@ -3216,6 +3217,28 @@ fn start_mesh_slice_apply_task(
                             Ok(config) => {
                                 let previous_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let candidate_loaded_at = config.loaded_at;
+                                // GAP-2M.4: build node-waypoint per-pod policy scopes before
+                                // config apply, but publish them only after update_config accepts
+                                // the candidate. Pre-swapping scopes can pair old policies with a
+                                // rejected slice's workload metadata indefinitely; staging keeps
+                                // rejection side-effect free while making the post-accept swap a
+                                // cheap ArcSwap publish.
+                                let staged_policy_scopes =
+                                    if runtime.topology == MeshTopology::NodeWaypoint {
+                                        proxy_state.node_waypoint_identity_resolver.as_ref().map(
+                                            |resolver| {
+                                                (
+                                                    Arc::clone(resolver),
+                                                    resolver
+                                                        .build_policy_scope_snapshot_from_workloads(
+                                                            &slice.workloads,
+                                                        ),
+                                                )
+                                            },
+                                        )
+                                    } else {
+                                        None
+                                    };
                                 // The TLS reload plan is validated before config apply, but the
                                 // live slot is swapped only after proxy config acceptance. That
                                 // creates a tiny accept window where listeners may still see the
@@ -3237,6 +3260,10 @@ fn start_mesh_slice_apply_task(
                                     slice,
                                     accepted,
                                 );
+                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
+                                {
+                                    resolver.install_policy_scope_snapshot(snapshot);
+                                }
                                 if accepted && let Some((mtls_mode, plan)) = live_reload {
                                     apply_mesh_inbound_tls_reload(
                                         &proxy_state,

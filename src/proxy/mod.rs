@@ -7432,6 +7432,22 @@ async fn handle_proxy_request_inner(
         // SPIFFE identity plugin consume the pod identity instead of baggage or
         // future TLS-peer derivation on this listener.
         ctx.peer_spiffe_id = Some(identity.spiffe_id.clone());
+        ctx.node_waypoint_pod_uid = Some(identity.pod_uid);
+        // GAP-2M.4: also resolve the per-pod PolicyScopeCache so mesh_authz
+        // can filter slice-level policies by the source pod's identity
+        // (namespace + labels) rather than relying on the proxy listener's
+        // shared identity, which is meaningless on a multi-pod listener.
+        //
+        // Cost: one `ArcSwap::load` + one `HashMap::get` on the
+        // node-waypoint admit path. Cheap, paid once per request. If the
+        // pod has no installed scope yet (slice / identity enrollment race)
+        // the field stays `None` and `mesh_authz` falls back to mesh-wide
+        // policies only while emitting `mesh_authz.scope_missing` metadata
+        // so the race window is observable. When mesh_authz is not
+        // configured the stamped field is unused and propagates harmlessly.
+        if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
+            ctx.node_waypoint_policy_scope = resolver.policy_scope_for_pod(&identity.pod_uid);
+        }
     }
     // Store raw query string on ctx for lazy parsing. The local `query_string`
     // is kept for validation + URL building; the ctx copy is consumed by

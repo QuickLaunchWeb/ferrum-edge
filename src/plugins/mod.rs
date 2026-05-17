@@ -372,6 +372,24 @@ pub struct RequestContext {
     /// override a direct backend host/port can set this field explicitly when
     /// the destination uses different mTLS materials.
     pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
+    /// the eBPF socket-cookie record at accept time. Set by the connection
+    /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
+    /// deployments and for mesh topologies other than `NodeWaypoint`.
+    ///
+    /// Plugins use this to disambiguate source-pod identity when one
+    /// listener serves many pods. Pair with `node_waypoint_policy_scope`
+    /// for the pre-resolved per-pod scope cache.
+    pub node_waypoint_pod_uid: Option<[u8; 16]>,
+    /// Pre-resolved per-pod policy scope for node-waypoint mode.
+    ///
+    /// Populated by the connection admit path by looking up the source
+    /// pod's `PolicyScopeCache` from the `NodeWaypointIdentityResolver`.
+    /// `mesh_authz` consults this when filtering policies whose
+    /// `PolicyScope` is namespace- or workload-selector-bound, because
+    /// the shared listener carries no single proxy identity that fits
+    /// the slice-level filter that other topologies use.
+    pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
 }
 
 impl RequestContext {
@@ -404,6 +422,8 @@ impl RequestContext {
             route_override_backend_host: None,
             route_override_backend_port: None,
             route_override_resolved_tls: None,
+            node_waypoint_pod_uid: None,
+            node_waypoint_policy_scope: None,
         }
     }
 

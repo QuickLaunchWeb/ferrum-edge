@@ -1646,3 +1646,251 @@ async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
         "deny rule should not block non-matching JWT, got {result:?}"
     );
 }
+
+// GAP-2M.4 - per-pod policy scoping for node-waypoint topology.
+//
+// When `per_pod_policy_scoping: true`, MeshAuthz skips the construction-time
+// slice-level scope filter (one listener serves many pods, so the slice's
+// namespace/labels don't represent a single workload). Instead, the
+// per-request filter consults the `PolicyScopeCache` set on `RequestContext`
+// by the node-waypoint accept path. These tests cover:
+//   1. Namespace-scoped policy applies only to pods in that namespace.
+//   2. Workload-selector ALLOW gates implicit-deny by source-pod labels.
+//   3. Missing scope cache + per_pod_policy_scoping=true falls back to
+//      mesh-wide policies only, so scoped policies cannot leak across pods.
+//   4. Disabled path preserves the construction-time filter.
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_namespace_scope_filters_by_source_pod() {
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+    use std::sync::Arc;
+
+    let team_a_deny = policy_with_scope(
+        "team-a-deny",
+        PolicyScope::Namespace {
+            namespace: "team-a".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [team_a_deny],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    // Source pod in team-b: team-a's namespace-scoped DENY must not apply.
+    let mut ctx_team_b = request_context(Some("spiffe://cluster.local/ns/team-b/sa/client"));
+    ctx_team_b.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/team-b/sa/client").expect("spiffe"),
+        "team-b",
+        HashMap::new(),
+    )));
+    let result_b = plugin.authorize(&mut ctx_team_b).await;
+    assert!(
+        matches!(result_b, PluginResult::Continue),
+        "team-b traffic must not be denied by a team-a-scoped DENY, got {result_b:?}"
+    );
+
+    // Source pod in team-a: team-a's namespace-scoped DENY must apply.
+    let mut ctx_team_a = request_context(Some("spiffe://cluster.local/ns/team-a/sa/client"));
+    ctx_team_a.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").expect("spiffe"),
+        "team-a",
+        HashMap::new(),
+    )));
+    let result_a = plugin.authorize(&mut ctx_team_a).await;
+    match result_a {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("team-a traffic must be denied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_workload_selector_filter_blocks_implicit_deny_leak() {
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+    use std::sync::Arc;
+
+    // ALLOW scoped to (app=reviews) must not raise implicit-deny for
+    // pods that don't match that selector.
+    let selector_for_reviews = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        namespace: None,
+    };
+    let allow_reviews = policy_with_scope(
+        "reviews-allow",
+        PolicyScope::WorkloadSelector {
+            selector: selector_for_reviews,
+        },
+        PolicyAction::Allow,
+    );
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_reviews],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    // Source pod is `app=billing`. The reviews-allow policy is filtered out
+    // by the per-pod scope, so the authz engine sees an empty policy set
+    // and falls through to allow.
+    let mut ctx_billing = request_context(Some("spiffe://cluster.local/ns/default/sa/billing"));
+    ctx_billing.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/billing").expect("spiffe"),
+        "default",
+        HashMap::from([("app".to_string(), "billing".to_string())]),
+    )));
+    let result = plugin.authorize(&mut ctx_billing).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "workload-selector ALLOW for app=reviews must not implicit-deny app=billing, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_mesh_wide_only() {
+    // Per-pod scoping is enabled but the accept path didn't enroll a scope
+    // for this pod (race during enrollment, or pod removed). The plugin
+    // should keep mesh-wide policies but drop namespace/selector-scoped
+    // policies because it cannot prove they apply to this source pod.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [
+            policy_with_scope(
+                "team-a-deny",
+                PolicyScope::Namespace { namespace: "team-a".to_string() },
+                PolicyAction::Deny,
+            ),
+            policy_with_scope(
+                "mesh-wide-allow",
+                PolicyScope::MeshWide,
+                PolicyAction::Allow,
+            ),
+        ],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    // Intentionally do not set node_waypoint_policy_scope.
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "per_pod_policy_scoping with no scope cache should keep mesh-wide policies only, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_missing_scope_sets_scope_missing_metadata() {
+    // When per_pod_policy_scoping is on and the request has no
+    // node_waypoint_policy_scope, the plugin falls back to mesh-wide
+    // policies only and must surface that state via
+    // `mesh_authz.scope_missing` so transaction logs make the race window
+    // visible to operators.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    // Intentionally do not set node_waypoint_policy_scope.
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.scope_missing")
+            .map(String::as_str),
+        Some("true"),
+        "missing per-pod scope must surface mesh_authz.scope_missing metadata"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_present_scope_does_not_set_scope_missing_metadata() {
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+    use std::sync::Arc;
+
+    // With per_pod_policy_scoping on AND a populated scope cache, the
+    // missing-scope flag must NOT be set — that flag is a race signal,
+    // not a per-request always-on marker.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe"),
+        "default",
+        HashMap::new(),
+    )));
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.scope_missing"),
+        "populated per-pod scope must not set mesh_authz.scope_missing"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_disabled_does_not_set_scope_missing_metadata() {
+    // When per_pod_policy_scoping is off (sidecar/ambient/east-west/egress
+    // topologies), the missing-scope flag must never appear, even when the
+    // request happens to have no node_waypoint_policy_scope.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.scope_missing"),
+        "disabled per_pod_policy_scoping must not surface scope_missing metadata"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_disabled_path_preserves_construction_filter() {
+    // With `per_pod_policy_scoping` defaulting to false (or absent), the
+    // construction-time filter still applies and a namespace-scoped DENY
+    // outside the proxy's namespace is dropped at construction. The
+    // request hot path therefore never sees it, and `node_waypoint_policy_scope`
+    // on the context is a no-op. This locks in the existing behaviour for
+    // sidecar / ambient / east-west / egress-gateway topologies.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "team-a-deny",
+            PolicyScope::Namespace { namespace: "team-a".to_string() },
+            PolicyAction::Deny,
+        )],
+        // Proxy is in team-b — team-a DENY filtered at construction time.
+        "namespace": "team-b",
+    }))
+    .expect("plugin config");
+
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/client"));
+    // Even if a scope cache was set, it should be ignored because the
+    // construction-time filter has already removed the team-a policy.
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "construction filter must drop team-a policy from a team-b proxy, got {result:?}"
+    );
+}
