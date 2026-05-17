@@ -23,6 +23,12 @@ fn target_on_port(host: &str, port: u16, locality: Option<&str>) -> UpstreamTarg
     }
 }
 
+fn weighted_target(host: &str, locality: Option<&str>, weight: u32) -> UpstreamTarget {
+    let mut target = target(host, locality);
+    target.weight = weight;
+    target
+}
+
 fn tagged_target(
     host: &str,
     port: u16,
@@ -679,6 +685,55 @@ fn locality_distribute_excludes_targets_with_zero_weight() {
 }
 
 #[test]
+fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-west/us-west-1/a",
+        vec![
+            target("west.local", Some("us-west/us-west-1/a")),
+            weighted_target("east-heavy.local", Some("us-east/us-east-1/a"), 9),
+            weighted_target("east-light.local", Some("us-east/us-east-1/a"), 1),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let mut by_target: HashMap<String, u32> = HashMap::new();
+    for i in 0..2000 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("endpoint-weight-{i}"),
+            no_health(),
+        )
+        .expect("weighted distribute selection");
+        *by_target.entry(selection.target.host.clone()).or_default() += 1;
+    }
+
+    assert_eq!(by_target.get("west.local").copied().unwrap_or(0), 0);
+    let heavy = by_target.get("east-heavy.local").copied().unwrap_or(0);
+    let light = by_target.get("east-light.local").copied().unwrap_or(0);
+    let total = heavy + light;
+    assert_eq!(total, 2000);
+
+    let heavy_ratio = f64::from(heavy) / f64::from(total);
+    assert!(
+        (heavy_ratio - 0.9).abs() < 0.04,
+        "east-heavy ratio {heavy_ratio:.3} outside +/-0.04 of 0.9"
+    );
+}
+
+#[test]
 fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
     let mut to = BTreeMap::new();
     to.insert("us-east".to_string(), 100);
@@ -712,6 +767,44 @@ fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
         assert_eq!(
             selection.target.host, "east.local",
             "terminal wildcard in distribute.from must activate distribute weighting"
+        );
+    }
+}
+
+#[test]
+fn locality_distribute_from_region_only_matches_zoned_source_locality() {
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-west/us-west-1/a",
+        vec![
+            target("west.local", Some("us-west/us-west-1/a")),
+            target("east.local", Some("us-east/us-east-1/a")),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..16 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("region-only-{i}"),
+            no_health(),
+        )
+        .expect("region-only distribute selection");
+        assert_eq!(
+            selection.target.host, "east.local",
+            "region-only distribute.from must activate for zoned source locality"
         );
     }
 }

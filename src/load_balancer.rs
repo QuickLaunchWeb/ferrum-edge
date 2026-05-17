@@ -945,8 +945,8 @@ fn build_locality_lb_state(
 
     // distribute[]: first matching `from` wins. Each `to` entry is a
     // locality-level percentage, so split that weight across endpoints in the
-    // matching locality instead of copying the full locality weight onto each
-    // endpoint.
+    // matching locality according to their endpoint weights instead of copying
+    // the full locality weight onto each endpoint.
     let mut distribute_weights: Option<Vec<u64>> = None;
     let mut distribute_total: u64 = 0;
     for entry in &setting.distribute {
@@ -962,14 +962,14 @@ fn build_locality_lb_state(
             let Some(to_pref) = LocalityPreference::parse(to_locality) else {
                 continue;
             };
-            let matching_targets: Vec<usize> = target_localities
+            let matching_targets: Vec<(usize, u64)> = target_localities
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, target_pref)| {
                     target_pref
                         .as_ref()
                         .filter(|target_pref| locality_match_for_distribute(&to_pref, target_pref))
-                        .map(|_| idx)
+                        .map(|_| (idx, u64::from(targets[idx].weight)))
                 })
                 .collect();
             if matching_targets.is_empty() {
@@ -977,16 +977,50 @@ fn build_locality_lb_state(
             }
             let scaled_weight =
                 u64::from(*to_weight).saturating_mul(LOCALITY_DISTRIBUTE_WEIGHT_SCALE);
-            let target_count = matching_targets.len() as u64;
-            let per_target = scaled_weight / target_count;
-            let remainder = scaled_weight % target_count;
-            for (offset, idx) in matching_targets.into_iter().enumerate() {
-                let share = per_target + if (offset as u64) < remainder { 1 } else { 0 };
-                if share == 0 {
-                    continue;
+            let endpoint_weight_total: u128 = matching_targets
+                .iter()
+                .map(|(_, endpoint_weight)| u128::from(*endpoint_weight))
+                .sum();
+            if endpoint_weight_total == 0 {
+                let target_count = matching_targets.len() as u64;
+                let per_target = scaled_weight / target_count;
+                let remainder = scaled_weight % target_count;
+                for (offset, (idx, _)) in matching_targets.into_iter().enumerate() {
+                    let share = per_target + if (offset as u64) < remainder { 1 } else { 0 };
+                    if share == 0 {
+                        continue;
+                    }
+                    weights[idx] = weights[idx].saturating_add(share);
+                    total = total.saturating_add(share);
                 }
-                weights[idx] = weights[idx].saturating_add(share);
-                total = total.saturating_add(share);
+            } else {
+                let scaled_weight_u128 = u128::from(scaled_weight);
+                let mut allocated = 0u64;
+                let mut allocations = Vec::with_capacity(matching_targets.len());
+                for (idx, endpoint_weight) in matching_targets {
+                    if endpoint_weight == 0 {
+                        allocations.push((idx, 0u64, 0u128, endpoint_weight));
+                        continue;
+                    }
+                    let numerator = scaled_weight_u128.saturating_mul(u128::from(endpoint_weight));
+                    let share = (numerator / endpoint_weight_total) as u64;
+                    let remainder = numerator % endpoint_weight_total;
+                    allocated = allocated.saturating_add(share);
+                    allocations.push((idx, share, remainder, endpoint_weight));
+                }
+                allocations.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                let mut leftover = scaled_weight.saturating_sub(allocated);
+                for (idx, mut share, _, endpoint_weight) in allocations {
+                    if endpoint_weight > 0 && leftover > 0 {
+                        share = share.saturating_add(1);
+                        leftover -= 1;
+                    }
+                    if share == 0 {
+                        continue;
+                    }
+                    weights[idx] = weights[idx].saturating_add(share);
+                    total = total.saturating_add(share);
+                }
             }
         }
         // Only honour the match if at least one target was reachable;
@@ -1068,8 +1102,8 @@ fn locality_match_for_distribute(to: &LocalityPreference, target: &LocalityPrefe
 }
 
 /// True when a `distribute[].from` pattern matches the concrete source
-/// locality. Unlike `to` entries, a non-wildcard `from` remains exact; Istio
-/// wildcard forms such as `region/zone/*` match the corresponding source tier.
+/// locality. Region-only and region/zone values match the corresponding source
+/// tier, and Istio wildcard forms such as `region/zone/*` match that tier.
 #[inline]
 fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPreference) -> bool {
     if from.region == "*" && from.zone.is_none() && from.sub_zone.is_none() {
@@ -1079,7 +1113,7 @@ fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPref
         return false;
     }
     let Some(from_zone) = from.zone.as_deref() else {
-        return source.zone.is_none() && source.sub_zone.is_none();
+        return from.sub_zone.is_none();
     };
     if from_zone == "*" {
         return true;
@@ -1088,7 +1122,7 @@ fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPref
         return false;
     }
     let Some(from_sub_zone) = from.sub_zone.as_deref() else {
-        return source.sub_zone.is_none();
+        return true;
     };
     from_sub_zone == "*" || source.sub_zone.as_deref() == Some(from_sub_zone)
 }
