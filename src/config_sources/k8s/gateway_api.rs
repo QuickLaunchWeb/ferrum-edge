@@ -26,6 +26,10 @@ const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoi
 /// namespace-level waypoint binding.
 const ANNOTATION_USE_WAYPOINT: &str = "istio.io/use-waypoint";
 
+/// Optional Service annotation that points `istio.io/use-waypoint` at a
+/// waypoint Gateway in a namespace other than the Service's namespace.
+const ANNOTATION_USE_WAYPOINT_NAMESPACE: &str = "istio.io/use-waypoint-namespace";
+
 /// Service annotation setting which traffic the waypoint handles:
 /// `service` (default), `workload`, `all`, or `none`. Stored verbatim on
 /// the binding so future Istio enum additions don't require a Ferrum-side
@@ -172,6 +176,13 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         return;
     };
     let waypoint_name = waypoint.to_string();
+    let waypoint_namespace = object
+        .metadata
+        .annotations
+        .get(ANNOTATION_USE_WAYPOINT_NAMESPACE)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| object.metadata.namespace.clone());
     let waypoint_for_override = object
         .metadata
         .annotations
@@ -188,7 +199,7 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         .mesh
         .waypoint_bindings
         .iter_mut()
-        .find(|b| b.name == waypoint_name && b.namespace == object.metadata.namespace)
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)
     {
         if !existing.services.contains(&service_ref) {
             existing.services.push(service_ref);
@@ -197,7 +208,7 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
     }
     acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
         name: waypoint_name,
-        namespace: object.metadata.namespace.clone(),
+        namespace: waypoint_namespace,
         waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
         services: vec![service_ref],
     });

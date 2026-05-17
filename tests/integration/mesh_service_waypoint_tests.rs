@@ -21,8 +21,8 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
-    Workload, WorkloadRef,
+    MeshConfig, MeshDestinationRule, MeshService, MeshWaypointBinding, MeshWaypointServiceRef,
+    ServicePort, Workload, WorkloadRef,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -35,16 +35,29 @@ fn translation_options() -> K8sTranslationOptions {
 }
 
 fn meta(name: &str, annotations: HashMap<String, String>) -> K8sMetadata {
+    meta_in_namespace("default", name, annotations)
+}
+
+fn meta_in_namespace(
+    namespace: &str,
+    name: &str,
+    annotations: HashMap<String, String>,
+) -> K8sMetadata {
     K8sMetadata {
         name: name.to_string(),
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         labels: HashMap::new(),
         annotations,
         deletion_timestamp: None,
     }
 }
 
-fn k8s_object(api_version: &str, kind: &str, meta: K8sMetadata, spec: serde_json::Value) -> K8sObject {
+fn k8s_object(
+    api_version: &str,
+    kind: &str,
+    meta: K8sMetadata,
+    spec: serde_json::Value,
+) -> K8sObject {
     K8sObject {
         api_version: api_version.to_string(),
         kind: kind.to_string(),
@@ -113,10 +126,7 @@ fn k8s_translator_records_waypoint_binding_from_gateway_and_service_annotations(
 #[test]
 fn k8s_translator_honors_waypoint_for_annotation_on_gateway() {
     let mut annotations = HashMap::new();
-    annotations.insert(
-        "istio.io/waypoint-for".to_string(),
-        "workload".to_string(),
-    );
+    annotations.insert("istio.io/waypoint-for".to_string(), "workload".to_string());
     let cfg = translate_objects(vec![
         waypoint_gateway("api-waypoint", annotations),
         service_with_use_waypoint("reviews", "api-waypoint"),
@@ -132,6 +142,53 @@ fn k8s_translator_honors_waypoint_for_annotation_on_gateway() {
 }
 
 #[test]
+fn k8s_translator_honors_use_waypoint_namespace_annotation() {
+    let mut service_annotations = HashMap::new();
+    service_annotations.insert(
+        "istio.io/use-waypoint".to_string(),
+        "shared-waypoint".to_string(),
+    );
+    service_annotations.insert(
+        "istio.io/use-waypoint-namespace".to_string(),
+        "infra".to_string(),
+    );
+
+    let cfg = translate_objects(vec![
+        k8s_object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            meta_in_namespace("infra", "shared-waypoint", HashMap::new()),
+            serde_json::json!({
+                "gatewayClassName": "istio-waypoint",
+                "listeners": [
+                    {"name": "mesh", "port": 15008, "protocol": "HBONE"}
+                ]
+            }),
+        ),
+        k8s_object(
+            "v1",
+            "Service",
+            meta("reviews", service_annotations),
+            serde_json::json!({
+                "ports": [
+                    {"name": "http", "port": 8080, "protocol": "TCP", "targetPort": 8080}
+                ]
+            }),
+        ),
+    ]);
+
+    let mesh = cfg.mesh.as_ref().expect("mesh config emitted");
+    let binding = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|b| b.name == "shared-waypoint" && b.namespace == "infra")
+        .expect("cross-namespace waypoint binding present");
+    assert_eq!(binding.services.len(), 1);
+    assert_eq!(binding.services[0].namespace, "default");
+    assert_eq!(binding.services[0].name, "reviews");
+}
+
+#[test]
 fn k8s_translator_skips_non_waypoint_gateways() {
     let cfg = translate_objects(vec![k8s_object(
         "gateway.networking.k8s.io/v1",
@@ -144,6 +201,17 @@ fn k8s_translator_skips_non_waypoint_gateways() {
     )]);
     let mesh = cfg.mesh.expect("mesh emitted");
     assert!(mesh.waypoint_bindings.is_empty());
+}
+
+fn destination_rule(name: &str, host: &str) -> MeshDestinationRule {
+    MeshDestinationRule {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        host: host.to_string(),
+        traffic_policy: None,
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+    }
 }
 
 #[test]
@@ -187,9 +255,18 @@ fn service(name: &str, port: u16, workloads: Vec<&str>) -> MeshService {
 
 fn workload(spiffe: &str) -> Workload {
     Workload {
-        namespace: "default".to_string(),
         spiffe_id: SpiffeId::new(spiffe).expect("valid spiffe"),
-        ..Default::default()
+        selector: Default::default(),
+        service_name: String::new(),
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "default".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
     }
 }
 
@@ -253,11 +330,105 @@ fn slice_filter_narrows_services_to_waypoint_binding() {
 }
 
 #[test]
+fn slice_filter_matches_waypoint_binding_in_request_namespace() {
+    let mesh = MeshConfig {
+        services: vec![
+            service(
+                "reviews",
+                8080,
+                vec!["spiffe://cluster.local/ns/default/sa/reviews"],
+            ),
+            service(
+                "billing",
+                9090,
+                vec!["spiffe://cluster.local/ns/default/sa/billing"],
+            ),
+        ],
+        waypoint_bindings: vec![
+            MeshWaypointBinding {
+                name: "shared-name".to_string(),
+                namespace: "other".to_string(),
+                waypoint_for: "service".to_string(),
+                services: vec![MeshWaypointServiceRef {
+                    namespace: "default".to_string(),
+                    name: "billing".to_string(),
+                }],
+            },
+            MeshWaypointBinding {
+                name: "shared-name".to_string(),
+                namespace: "default".to_string(),
+                waypoint_for: "service".to_string(),
+                services: vec![MeshWaypointServiceRef {
+                    namespace: "default".to_string(),
+                    name: "reviews".to_string(),
+                }],
+            },
+        ],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "default".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("shared-name".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].name, "reviews");
+}
+
+#[test]
+fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
+    let mesh = MeshConfig {
+        services: vec![service(
+            "reviews",
+            8080,
+            vec!["spiffe://cluster.local/ns/default/sa/reviews"],
+        )],
+        destination_rules: vec![
+            destination_rule("reviews", "reviews.default.svc.cluster.local"),
+            destination_rule("reviews-shadow", "reviews.defaultx.svc.cluster.local"),
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "api-waypoint".to_string(),
+            namespace: "default".to_string(),
+            waypoint_for: "service".to_string(),
+            services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "default".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("api-waypoint".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.destination_rules.len(), 1);
+    assert_eq!(slice.destination_rules[0].name, "reviews");
+}
+
+#[test]
 fn slice_filter_without_waypoint_name_preserves_full_visibility() {
     let mesh = MeshConfig {
         services: vec![
-            service("reviews", 8080, vec!["spiffe://cluster.local/ns/default/sa/r"]),
-            service("billing", 9090, vec!["spiffe://cluster.local/ns/default/sa/b"]),
+            service(
+                "reviews",
+                8080,
+                vec!["spiffe://cluster.local/ns/default/sa/r"],
+            ),
+            service(
+                "billing",
+                9090,
+                vec!["spiffe://cluster.local/ns/default/sa/b"],
+            ),
         ],
         waypoint_bindings: vec![MeshWaypointBinding {
             name: "api-waypoint".to_string(),

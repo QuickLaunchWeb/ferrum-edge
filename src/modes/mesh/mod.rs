@@ -482,6 +482,7 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
+            waypoint_name: self.waypoint_name.clone(),
             labels: self.workload_labels.clone(),
         }
     }
@@ -493,6 +494,7 @@ impl MeshRuntimeConfig {
             cluster: self.xds_node_cluster.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
+            waypoint_name: self.waypoint_name.clone(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -2839,9 +2841,9 @@ fn resolve_inbound_mtls_mode(
 fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
     match runtime.topology {
         MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
-        MeshTopology::Ambient
-        | MeshTopology::NodeWaypoint
-        | MeshTopology::ServiceWaypoint => runtime.hbone_listen_addr.port(),
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
+            runtime.hbone_listen_addr.port()
+        }
         MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
         // East-west gateways do SNI passthrough — no TLS termination, no port
         // override surface. Use inbound for stability; the resolved mode is
@@ -2870,14 +2872,14 @@ fn validate_inbound_mtls_mode_for_topology(
         return Ok(());
     }
     match runtime.topology {
-        MeshTopology::Ambient
-        | MeshTopology::NodeWaypoint
-        | MeshTopology::ServiceWaypoint => Err(anyhow::anyhow!(
-            "Mesh PeerAuthentication resolved to DISABLE on {} topology, but HBONE \
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
+            Err(anyhow::anyhow!(
+                "Mesh PeerAuthentication resolved to DISABLE on {} topology, but HBONE \
              (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
              workload, or move it to Sidecar topology if plaintext-only is intended.",
-            runtime.topology.as_str()
-        )),
+                runtime.topology.as_str()
+            ))
+        }
         MeshTopology::EgressGateway => Err(anyhow::anyhow!(
             "Mesh PeerAuthentication resolved to DISABLE on EgressGateway topology, but the \
              egress mTLS listener must verify sidecar client certificates. Use PERMISSIVE or \

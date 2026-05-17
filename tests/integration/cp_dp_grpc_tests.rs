@@ -25,8 +25,8 @@ use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, ServicePort, TrustBundle, TrustBundleSet, Workload,
-    WorkloadPort, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
+    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
@@ -684,6 +684,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         namespace: "ferrum".to_string(),
         workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        waypoint_name: String::new(),
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -697,6 +698,88 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
+    let mut cp_config = GatewayConfig {
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    cp_config.mesh = Some(Box::new(MeshConfig {
+        services: vec![
+            MeshService {
+                name: "api".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            },
+            MeshService {
+                name: "billing".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: 9090,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            },
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "api-waypoint".to_string(),
+            namespace: "ferrum".to_string(),
+            waypoint_for: "service".to_string(),
+            services: vec![MeshWaypointServiceRef {
+                namespace: "ferrum".to_string(),
+                name: "api".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    }));
+
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let auth_header = format!("Bearer {token}");
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client =
+        ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut().insert(
+                    "authorization",
+                    tonic::metadata::MetadataValue::try_from(auth_header.as_str()).unwrap(),
+                );
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-node".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: "api-waypoint".to_string(),
+    });
+    let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
+    let update = stream.message().await.unwrap().unwrap();
+    let slice: ferrum_edge::modes::mesh::slice::MeshSlice =
+        serde_json::from_str(&update.mesh_slice_json).unwrap();
+
+    assert_eq!(slice.waypoint_name.as_deref(), Some("api-waypoint"));
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].name, "api");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
     let cp_config = create_test_mesh_config();
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
@@ -706,6 +789,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         node_id: "mesh-node".to_string(),
         namespace: "ferrum".to_string(),
         workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
+        waypoint_name: None,
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
     };
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
@@ -1117,6 +1201,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         namespace: "ferrum".to_string(),
         workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        waypoint_name: String::new(),
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -3171,6 +3256,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         namespace: "staging".to_string(),
         workload_spiffe_id: "spiffe://cluster.local/ns/staging/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        waypoint_name: String::new(),
     });
 
     let result = client.mesh_subscribe(request).await;

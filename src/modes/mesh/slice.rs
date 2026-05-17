@@ -640,26 +640,29 @@ impl MeshSlice {
             })
         });
 
-        let (services, service_entries, destination_rules, workloads, mesh_policies) =
-            if let Some(waypoint) = request.waypoint_name.as_deref() {
-                narrow_for_service_waypoint(
-                    waypoint,
-                    &mesh.waypoint_bindings,
-                    services,
-                    service_entries,
-                    destination_rules,
-                    workloads,
-                    mesh_policies,
-                )
-            } else {
-                (
-                    services,
-                    service_entries,
-                    destination_rules,
-                    workloads,
-                    mesh_policies,
-                )
-            };
+        let waypoint_resources = ServiceWaypointNarrowingResources {
+            services,
+            service_entries,
+            destination_rules,
+            workloads,
+            mesh_policies,
+        };
+        let ServiceWaypointNarrowingResources {
+            services,
+            service_entries,
+            destination_rules,
+            workloads,
+            mesh_policies,
+        } = if let Some(waypoint) = request.waypoint_name.as_deref() {
+            narrow_for_service_waypoint(
+                waypoint,
+                &request.namespace,
+                &mesh.waypoint_bindings,
+                waypoint_resources,
+            )
+        } else {
+            waypoint_resources
+        };
 
         Self {
             node_id: request.node_id,
@@ -695,39 +698,35 @@ impl MeshSlice {
 /// the matching `Gateway` resource lands does not see immediate service
 /// loss). When at least one binding matches, services and dependent
 /// resources are filtered to only those in the binding's `services` list.
-fn narrow_for_service_waypoint(
-    waypoint_name: &str,
-    bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+struct ServiceWaypointNarrowingResources {
     services: Vec<MeshService>,
     service_entries: Vec<ServiceEntry>,
     destination_rules: Vec<MeshDestinationRule>,
     workloads: Vec<Workload>,
     mesh_policies: Vec<MeshPolicy>,
-) -> (
-    Vec<MeshService>,
-    Vec<ServiceEntry>,
-    Vec<MeshDestinationRule>,
-    Vec<Workload>,
-    Vec<MeshPolicy>,
-) {
-    let Some(binding) = bindings.iter().find(|b| b.name == waypoint_name) else {
-        return (
-            services,
-            service_entries,
-            destination_rules,
-            workloads,
-            mesh_policies,
-        );
+}
+
+fn narrow_for_service_waypoint(
+    waypoint_name: &str,
+    waypoint_namespace: &str,
+    bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+    resources: ServiceWaypointNarrowingResources,
+) -> ServiceWaypointNarrowingResources {
+    let Some(binding) = bindings
+        .iter()
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)
+    else {
+        return resources;
     };
     if binding.waypoint_for.eq_ignore_ascii_case("none") {
         // Operator explicitly opted out — narrow to an empty admitted set.
-        return (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            mesh_policies,
-        );
+        return ServiceWaypointNarrowingResources {
+            services: Vec::new(),
+            service_entries: Vec::new(),
+            destination_rules: Vec::new(),
+            workloads: Vec::new(),
+            mesh_policies: resources.mesh_policies,
+        };
     }
 
     let bound: BTreeSet<(String, String)> = binding
@@ -735,7 +734,8 @@ fn narrow_for_service_waypoint(
         .iter()
         .map(|s| (s.namespace.clone(), s.name.clone()))
         .collect();
-    let admitted_services: Vec<MeshService> = services
+    let admitted_services: Vec<MeshService> = resources
+        .services
         .into_iter()
         .filter(|s| bound.contains(&(s.namespace.clone(), s.name.clone())))
         .collect();
@@ -743,7 +743,8 @@ fn narrow_for_service_waypoint(
         .iter()
         .map(|s| format!("{}.{}", s.name, s.namespace))
         .collect();
-    let admitted_destination_rules: Vec<MeshDestinationRule> = destination_rules
+    let admitted_destination_rules: Vec<MeshDestinationRule> = resources
+        .destination_rules
         .into_iter()
         .filter(|dr| {
             // DR is admitted if its host matches an admitted service's
@@ -752,10 +753,13 @@ fn narrow_for_service_waypoint(
             // the most common form (FQDN without the `.svc.cluster.local`
             // suffix). Phantom DRs unrelated to bound services are dropped.
             let host = dr.host.trim_end_matches('.');
-            admitted_hosts.iter().any(|admitted| host.starts_with(admitted))
+            admitted_hosts
+                .iter()
+                .any(|admitted| host_matches_admitted_service(host, admitted))
         })
         .collect();
-    let admitted_service_entries: Vec<ServiceEntry> = service_entries
+    let admitted_service_entries: Vec<ServiceEntry> = resources
+        .service_entries
         .into_iter()
         .filter(|se| {
             // ServiceEntry hosts can be arbitrary; admit when the entry's
@@ -766,11 +770,14 @@ fn narrow_for_service_waypoint(
             // in the binding (covered transitively by `admitted_hosts`).
             se.hosts.iter().any(|h| {
                 let h = h.trim_end_matches('.');
-                admitted_hosts.iter().any(|admitted| h.starts_with(admitted))
+                admitted_hosts
+                    .iter()
+                    .any(|admitted| host_matches_admitted_service(h, admitted))
             })
         })
         .collect();
-    let admitted_workloads: Vec<Workload> = workloads
+    let admitted_workloads: Vec<Workload> = resources
+        .workloads
         .into_iter()
         .filter(|w| {
             // Admit any workload whose addresses or SPIFFE identity is
@@ -778,20 +785,25 @@ fn narrow_for_service_waypoint(
             // preserves the per-pod identity routing fans-out from the
             // narrowed service set without bringing in unrelated pods.
             let spiffe = &w.spiffe_id;
-            admitted_services.iter().any(|svc| {
-                svc.workloads
-                    .iter()
-                    .any(|wref| &wref.spiffe_id == spiffe)
-            })
+            admitted_services
+                .iter()
+                .any(|svc| svc.workloads.iter().any(|wref| &wref.spiffe_id == spiffe))
         })
         .collect();
-    (
-        admitted_services,
-        admitted_service_entries,
-        admitted_destination_rules,
-        admitted_workloads,
-        mesh_policies,
-    )
+    ServiceWaypointNarrowingResources {
+        services: admitted_services,
+        service_entries: admitted_service_entries,
+        destination_rules: admitted_destination_rules,
+        workloads: admitted_workloads,
+        mesh_policies: resources.mesh_policies,
+    }
+}
+
+fn host_matches_admitted_service(host: &str, admitted: &str) -> bool {
+    host == admitted
+        || host
+            .strip_prefix(admitted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 /// Filter `workloads` down to the SPIFFE identities referenced by admitted

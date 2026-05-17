@@ -71,6 +71,9 @@ message MeshSubscribeRequest {
   string workload_spiffe_id = 4;
   // Workload labels used to select workload-scoped policy.
   map<string, string> labels = 5;
+  // Optional GAMMA ServiceWaypoint name. When set, the CP narrows the
+  // returned MeshSlice to services bound to this waypoint.
+  string waypoint_name = 6;
 }
 
 message MeshConfigUpdate {

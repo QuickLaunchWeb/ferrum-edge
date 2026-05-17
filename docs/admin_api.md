@@ -627,6 +627,52 @@ Field semantics:
 
 The endpoint is cold-path: it iterates each shard of three `DashMap`s once. Don't poll faster than a few times per second on a busy node.
 
+## Service-Waypoint Services (mesh `ServiceWaypoint` topology)
+
+The service-waypoint topology accepts HBONE traffic for services bound to one GAMMA waypoint. `GET /service-waypoint/services` exposes the currently installed slice projection so operators can answer "which services is this waypoint actually serving?" without inspecting raw Gateway API resources.
+
+The endpoint returns `404 Not Found` when service-waypoint topology is not active, when no mesh slice has been installed yet, or when the installed slice has no `waypoint_name`. This avoids surfacing an empty stub list on unrelated sidecar/ambient/node-waypoint/east-west/egress DPs.
+
+### `GET /service-waypoint/services`
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/service-waypoint/services
+```
+
+Response:
+
+```json
+{
+  "waypoint_name": "api-waypoint",
+  "namespace": "default",
+  "service_count": 2,
+  "services": [
+    {
+      "namespace": "default",
+      "name": "reviews",
+      "ports": [8080],
+      "workload_count": 3
+    },
+    {
+      "namespace": "default",
+      "name": "ratings",
+      "ports": [8081],
+      "workload_count": 1
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- `waypoint_name` — the `FERRUM_MESH_WAYPOINT_NAME` / native `MeshSubscribe` binding name used to build this slice.
+- `namespace` — the namespace of the installed mesh slice.
+- `service_count` — number of services admitted into the slice for this waypoint.
+- `services[].ports` — service ports from the admitted `MeshService`; port protocol metadata is intentionally omitted from this compact operability view.
+- `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
+
+`services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
+
 ## Mesh Egress Scope (mesh mode)
 
 Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).
