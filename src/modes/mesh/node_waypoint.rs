@@ -170,6 +170,11 @@ where
         .collect()
 }
 
+pub struct NodeWaypointPolicyScopeSnapshot {
+    workload_policy_scopes_by_spiffe: HashMap<String, Arc<PolicyScopeCache>>,
+    policy_scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeWaypointIdentityError {
     SocketCookieUnavailable(String),
@@ -296,28 +301,41 @@ impl NodeWaypointIdentityResolver {
 
     /// Install per-pod policy scopes derived from a slice's workload set.
     ///
-    /// **Ordering contract**: callers in `start_mesh_slice_apply_task` invoke
-    /// this BEFORE `proxy_state.update_config(...)` publishes the new plugin
-    /// cache. `mesh_authz`'s per-pod path filters policies against the cache
-    /// returned by [`policy_scope_for_pod`] at request time, so the scope map
-    /// must reflect the same slice's workload metadata that the new policies
-    /// were authored against. Installing after `update_config` would leave a
-    /// brief window where new policies are evaluated against stale per-pod
-    /// scopes — for namespace- or selector-scoped DENYs, that means a
-    /// transient mis-enforcement. The scope install is cheap and idempotent,
-    /// so installing first even when `update_config` ends up rejecting the
-    /// candidate config is acceptable: the next accepted slice apply
-    /// rebuilds the map.
+    /// Used by tests and direct resolver callers. Mesh slice apply should
+    /// prefer [`build_policy_scope_snapshot_from_workloads`] and
+    /// [`install_policy_scope_snapshot`] so it can stage scopes before config
+    /// validation while publishing them only after the proxy config is
+    /// accepted.
     pub fn install_policy_scopes_from_workloads<'a, I>(&self, workloads: I)
     where
         I: IntoIterator<Item = &'a Workload>,
     {
-        let workload_index = workload_policy_scope_index(workloads);
+        let snapshot = self.build_policy_scope_snapshot_from_workloads(workloads);
+        self.install_policy_scope_snapshot(snapshot);
+    }
+
+    pub fn build_policy_scope_snapshot_from_workloads<'a, I>(
+        &self,
+        workloads: I,
+    ) -> NodeWaypointPolicyScopeSnapshot
+    where
+        I: IntoIterator<Item = &'a Workload>,
+    {
+        let workload_policy_scopes_by_spiffe = workload_policy_scope_index(workloads);
+        let policy_scopes_by_pod_uid =
+            self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
+        NodeWaypointPolicyScopeSnapshot {
+            workload_policy_scopes_by_spiffe,
+            policy_scopes_by_pod_uid,
+        }
+    }
+
+    pub fn install_policy_scope_snapshot(&self, snapshot: NodeWaypointPolicyScopeSnapshot) {
         let _guard = self.lock_policy_scope_update();
         self.workload_policy_scopes_by_spiffe
-            .store(Arc::new(workload_index));
-        let scopes = self.build_per_pod_scopes_from_current_workload_index();
-        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
+            .store(Arc::new(snapshot.workload_policy_scopes_by_spiffe));
+        self.policy_scopes_by_pod_uid
+            .store(Arc::new(snapshot.policy_scopes_by_pod_uid));
     }
 
     pub fn build_per_pod_scopes_from_workloads<'a, I>(
@@ -367,13 +385,6 @@ impl NodeWaypointIdentityResolver {
                 );
                 poisoned.into_inner()
             })
-    }
-
-    fn build_per_pod_scopes_from_current_workload_index(
-        &self,
-    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>> {
-        let workload_index = self.workload_policy_scopes_by_spiffe.load();
-        self.build_per_pod_scopes_from_workload_index(workload_index.as_ref())
     }
 
     fn build_per_pod_scopes_from_workload_index(
@@ -973,6 +984,36 @@ mod tests {
         let scope = resolver
             .policy_scope_for_pod(&pod_uid)
             .expect("late identity should pick up current workload scope");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_does_not_publish_until_installed() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "staging scopes for a candidate slice must not mutate live authz state"
+        );
+
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("accepted slice should publish staged scope");
         assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
     }
 
