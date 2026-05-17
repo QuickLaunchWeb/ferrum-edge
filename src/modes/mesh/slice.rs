@@ -462,10 +462,17 @@ impl MeshSlice {
         let cluster_domain = request.cluster_domain.clone();
         let sidecar_enforced = request.enforce_sidecar_egress;
         let sidecar_dry_run = request.sidecar_egress_dry_run;
+        let service_waypoint_namespaces = service_waypoint_resource_namespaces(
+            mesh,
+            request.waypoint_name.as_deref(),
+            &namespace,
+        );
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
-            .filter(|w| w.namespace == namespace)
+            .filter(|w| {
+                resource_namespace_visible(&service_waypoint_namespaces, &w.namespace, &namespace)
+            })
             .cloned()
             .collect();
         let effective_namespace = namespace.as_str();
@@ -518,7 +525,12 @@ impl MeshSlice {
             .iter()
             .filter_map(|service| {
                 let Some(sidecar) = applicable_sidecar else {
-                    return (service.namespace == namespace).then(|| service.clone());
+                    return resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &service.namespace,
+                        &namespace,
+                    )
+                    .then(|| service.clone());
                 };
                 narrow_service_ports(service, sidecar, &cluster_domain)
             })
@@ -548,6 +560,13 @@ impl MeshSlice {
             .service_entries
             .iter()
             .filter(|entry| {
+                if resource_namespace_visible(
+                    &service_waypoint_namespaces,
+                    &entry.namespace,
+                    &namespace,
+                ) {
+                    return true;
+                }
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
             })
             .flat_map(|entry| {
@@ -576,7 +595,11 @@ impl MeshSlice {
             .iter()
             .filter(|dr| {
                 let Some(sidecar) = applicable_sidecar else {
-                    return dr.namespace == namespace;
+                    return resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &dr.namespace,
+                        &namespace,
+                    );
                 };
                 let (resource_namespace, host_candidates) = destination_rule_host_scope(
                     dr,
@@ -705,6 +728,39 @@ struct ServiceWaypointNarrowingResources {
     destination_rules: Vec<MeshDestinationRule>,
     workloads: Vec<Workload>,
     mesh_policies: Vec<MeshPolicy>,
+}
+
+fn service_waypoint_resource_namespaces(
+    mesh: &MeshConfig,
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> Option<BTreeSet<String>> {
+    let waypoint_name = waypoint_name?;
+    let binding = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)?;
+    let mut namespaces = BTreeSet::new();
+    namespaces.insert(waypoint_namespace.to_string());
+    namespaces.extend(
+        binding
+            .services
+            .iter()
+            .map(|service| service.namespace.clone()),
+    );
+    Some(namespaces)
+}
+
+fn resource_namespace_visible(
+    service_waypoint_namespaces: &Option<BTreeSet<String>>,
+    resource_namespace: &str,
+    request_namespace: &str,
+) -> bool {
+    service_waypoint_namespaces
+        .as_ref()
+        .map_or(resource_namespace == request_namespace, |namespaces| {
+            namespaces.contains(resource_namespace)
+        })
 }
 
 fn narrow_for_service_waypoint(

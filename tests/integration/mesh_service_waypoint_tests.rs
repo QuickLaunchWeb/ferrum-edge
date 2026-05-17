@@ -325,9 +325,13 @@ fn k8s_translator_skips_non_waypoint_gateways() {
 }
 
 fn destination_rule(name: &str, host: &str) -> MeshDestinationRule {
+    destination_rule_in_namespace("default", name, host)
+}
+
+fn destination_rule_in_namespace(namespace: &str, name: &str, host: &str) -> MeshDestinationRule {
     MeshDestinationRule {
         name: name.to_string(),
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         host: host.to_string(),
         traffic_policy: None,
         port_level_settings: HashMap::new(),
@@ -356,9 +360,18 @@ fn k8s_translator_ignores_use_waypoint_none_annotation() {
 // ── Slice filter ─────────────────────────────────────────────────────────
 
 fn service(name: &str, port: u16, workloads: Vec<&str>) -> MeshService {
+    service_in_namespace("default", name, port, workloads)
+}
+
+fn service_in_namespace(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    workloads: Vec<&str>,
+) -> MeshService {
     MeshService {
         name: name.to_string(),
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         ports: vec![ServicePort {
             port,
             protocol: Default::default(),
@@ -375,6 +388,10 @@ fn service(name: &str, port: u16, workloads: Vec<&str>) -> MeshService {
 }
 
 fn workload(spiffe: &str) -> Workload {
+    workload_in_namespace("default", spiffe)
+}
+
+fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
     Workload {
         spiffe_id: SpiffeId::new(spiffe).expect("valid spiffe"),
         selector: Default::default(),
@@ -382,7 +399,7 @@ fn workload(spiffe: &str) -> Workload {
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         network: None,
         cluster: None,
         weight: None,
@@ -498,6 +515,58 @@ fn slice_filter_matches_waypoint_binding_in_request_namespace() {
 
     assert_eq!(slice.services.len(), 1);
     assert_eq!(slice.services[0].name, "reviews");
+}
+
+#[test]
+fn slice_filter_cross_namespace_waypoint_binding_admits_bound_services() {
+    let reviews_sa = "spiffe://cluster.local/ns/default/sa/reviews";
+    let local_sa = "spiffe://cluster.local/ns/infra/sa/local";
+    let mesh = MeshConfig {
+        services: vec![
+            service_in_namespace("default", "reviews", 8080, vec![reviews_sa]),
+            service_in_namespace("infra", "local", 9090, vec![local_sa]),
+        ],
+        workloads: vec![
+            workload_in_namespace("default", reviews_sa),
+            workload_in_namespace("infra", local_sa),
+        ],
+        destination_rules: vec![
+            destination_rule_in_namespace(
+                "default",
+                "reviews",
+                "reviews.default.svc.cluster.local",
+            ),
+            destination_rule_in_namespace("infra", "local", "local.infra.svc.cluster.local"),
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "shared-waypoint".to_string(),
+            namespace: "infra".to_string(),
+            waypoint_for: "service".to_string(),
+            services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "infra".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("shared-waypoint".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].namespace, "default");
+    assert_eq!(slice.services[0].name, "reviews");
+    assert_eq!(slice.workloads.len(), 1);
+    assert_eq!(slice.workloads[0].namespace, "default");
+    assert_eq!(slice.workloads[0].spiffe_id.as_str(), reviews_sa);
+    assert_eq!(slice.destination_rules.len(), 1);
+    assert_eq!(slice.destination_rules[0].namespace, "default");
+    assert_eq!(slice.destination_rules[0].name, "reviews");
 }
 
 #[test]
