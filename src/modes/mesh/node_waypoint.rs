@@ -172,7 +172,6 @@ where
 
 pub struct NodeWaypointPolicyScopeSnapshot {
     workload_policy_scopes_by_spiffe: HashMap<String, Arc<PolicyScopeCache>>,
-    policy_scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,20 +321,20 @@ impl NodeWaypointIdentityResolver {
         I: IntoIterator<Item = &'a Workload>,
     {
         let workload_policy_scopes_by_spiffe = workload_policy_scope_index(workloads);
-        let policy_scopes_by_pod_uid =
-            self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
         NodeWaypointPolicyScopeSnapshot {
             workload_policy_scopes_by_spiffe,
-            policy_scopes_by_pod_uid,
         }
     }
 
     pub fn install_policy_scope_snapshot(&self, snapshot: NodeWaypointPolicyScopeSnapshot) {
         let _guard = self.lock_policy_scope_update();
+        let workload_policy_scopes_by_spiffe = snapshot.workload_policy_scopes_by_spiffe;
+        let policy_scopes_by_pod_uid =
+            self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
         self.workload_policy_scopes_by_spiffe
-            .store(Arc::new(snapshot.workload_policy_scopes_by_spiffe));
+            .store(Arc::new(workload_policy_scopes_by_spiffe));
         self.policy_scopes_by_pod_uid
-            .store(Arc::new(snapshot.policy_scopes_by_pod_uid));
+            .store(Arc::new(policy_scopes_by_pod_uid));
     }
 
     pub fn build_per_pod_scopes_from_workloads<'a, I>(
@@ -1015,6 +1014,62 @@ mod tests {
             .policy_scope_for_pod(&pod_uid)
             .expect("accepted slice should publish staged scope");
         assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_includes_identity_enrolled_before_install() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "identity enrolled before accepted slice install must not publish candidate scope early"
+        );
+
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("install should rebuild pod map from current identities");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
+    }
+
+    #[test]
+    fn staged_policy_scope_snapshot_excludes_identity_removed_before_install() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+
+        let workloads = vec![workload(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::from([("app".to_string(), "api".to_string())]),
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+
+        resolver.remove_identity(&pod_uid);
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "install must not resurrect a scope for an identity removed after staging"
+        );
     }
 
     #[test]

@@ -42,6 +42,8 @@ At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corr
 
 Operators inspect the currently enrolled pod identities via the JWT-authenticated admin endpoint `GET /node-waypoint/identities` — see [docs/admin_api.md](admin_api.md#node-waypoint-identities-mesh-nodewaypoint-topology) for the response shape. The endpoint returns 404 outside `NodeWaypoint` topology so unrelated DPs don't surface an empty stub list.
 
+Per-pod authorization scope is published only after a mesh slice is accepted by the proxy config apply path. Slice apply stages the workload SPIFFE scope index, then rebuilds the pod UID scope map from the resolver's current identities under the scope-update lock so rejected slices and identity churn during apply do not leave policy scopes out of sync.
+
 #### BPF SOCK_OPS observability (GAP-SC3)
 
 The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces the TCP-layer counters published by the `BPF_PROG_TYPE_SOCK_OPS` program. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState` that the plugin reads on each `/metrics` scrape. Metrics emitted (Prometheus text format):
