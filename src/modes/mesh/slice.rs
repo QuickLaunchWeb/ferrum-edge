@@ -560,11 +560,10 @@ impl MeshSlice {
             .service_entries
             .iter()
             .filter(|entry| {
-                if resource_namespace_visible(
-                    &service_waypoint_namespaces,
-                    &entry.namespace,
-                    &namespace,
-                ) {
+                if service_waypoint_namespaces
+                    .as_ref()
+                    .is_some_and(|namespaces| namespaces.contains(&entry.namespace))
+                {
                     return true;
                 }
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
@@ -805,8 +804,7 @@ fn narrow_for_service_waypoint(
             // DR is admitted only when its host is one of the admitted
             // Service's canonical Kubernetes DNS aliases. Broad prefix
             // matches can accidentally admit unrelated external hosts.
-            let host = dr.host.trim_end_matches('.');
-            host_matches_admitted_service(host, &admitted_hosts)
+            destination_rule_matches_admitted_service(dr, &admitted_services, &admitted_hosts)
         })
         .collect();
     let admitted_service_entries: Vec<ServiceEntry> = resources
@@ -849,7 +847,6 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
     let cluster_domain = cluster_domain.trim().trim_end_matches('.');
     let mut hosts = BTreeSet::new();
     for service in services {
-        hosts.insert(service.name.clone());
         hosts.insert(format!("{}.{}", service.name, service.namespace));
         hosts.insert(format!("{}.{}.svc", service.name, service.namespace));
         if !cluster_domain.is_empty() {
@@ -860,6 +857,18 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
         }
     }
     hosts
+}
+
+fn destination_rule_matches_admitted_service(
+    dr: &MeshDestinationRule,
+    admitted_services: &[MeshService],
+    admitted_hosts: &BTreeSet<String>,
+) -> bool {
+    let host = dr.host.trim_end_matches('.');
+    host_matches_admitted_service(host, admitted_hosts)
+        || admitted_services
+            .iter()
+            .any(|service| host == service.name && dr.namespace == service.namespace)
 }
 
 fn host_matches_admitted_service(host: &str, admitted_hosts: &BTreeSet<String>) -> bool {

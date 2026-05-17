@@ -22,7 +22,7 @@ use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshService, MeshWaypointBinding, MeshWaypointServiceRef,
-    ServicePort, Workload, WorkloadRef,
+    ServiceEntry, ServicePort, Workload, WorkloadRef,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -339,6 +339,29 @@ fn destination_rule_in_namespace(namespace: &str, name: &str, host: &str) -> Mes
     }
 }
 
+fn service_entry_in_namespace(
+    namespace: &str,
+    name: &str,
+    hosts: Vec<&str>,
+    export_to: Vec<&str>,
+) -> ServiceEntry {
+    ServiceEntry {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        hosts: hosts.into_iter().map(ToString::to_string).collect(),
+        endpoints: Vec::new(),
+        resolution: Default::default(),
+        location: Default::default(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: Default::default(),
+            name: Some("http".to_string()),
+        }],
+        export_to: export_to.into_iter().map(ToString::to_string).collect(),
+        workload_selector: None,
+    }
+}
+
 #[test]
 fn k8s_translator_ignores_use_waypoint_none_annotation() {
     let cfg = translate_objects(vec![
@@ -570,6 +593,46 @@ fn slice_filter_cross_namespace_waypoint_binding_admits_bound_services() {
 }
 
 #[test]
+fn slice_filter_cross_namespace_waypoint_resolves_short_destination_rule_hosts_by_rule_namespace() {
+    let reviews_sa = "spiffe://cluster.local/ns/default/sa/reviews";
+    let mesh = MeshConfig {
+        services: vec![service_in_namespace(
+            "default",
+            "reviews",
+            8080,
+            vec![reviews_sa],
+        )],
+        workloads: vec![workload_in_namespace("default", reviews_sa)],
+        destination_rules: vec![
+            destination_rule_in_namespace("default", "reviews-short", "reviews"),
+            destination_rule_in_namespace("infra", "wrong-short", "reviews"),
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "shared-waypoint".to_string(),
+            namespace: "infra".to_string(),
+            waypoint_for: "service".to_string(),
+            services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "infra".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("shared-waypoint".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.destination_rules.len(), 1);
+    assert_eq!(slice.destination_rules[0].namespace, "default");
+    assert_eq!(slice.destination_rules[0].name, "reviews-short");
+}
+
+#[test]
 fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
     let mesh = MeshConfig {
         services: vec![service(
@@ -645,6 +708,32 @@ fn slice_filter_without_waypoint_name_preserves_full_visibility() {
         "Sidecar/Ambient topology (no waypoint_name) must see every visible service"
     );
     assert!(slice.waypoint_name.is_none());
+}
+
+#[test]
+fn slice_filter_without_waypoint_name_preserves_service_entry_export_scope() {
+    let mesh = MeshConfig {
+        service_entries: vec![
+            service_entry_in_namespace("default", "visible", vec!["visible.example.com"], vec![]),
+            service_entry_in_namespace(
+                "default",
+                "hidden",
+                vec!["hidden.example.com"],
+                vec!["other"],
+            ),
+        ],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "default".to_string(),
+        ..Default::default()
+    };
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.service_entries.len(), 1);
+    assert_eq!(slice.service_entries[0].name, "visible");
 }
 
 #[test]
