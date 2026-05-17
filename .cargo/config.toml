@@ -1,38 +1,53 @@
-# ── Local development build configuration ────────────────────────────────
+# ── Build configuration shared by local and CI ─────────────────────────────
 #
-# These settings speed up compile-edit-run cycles on your workstation.
-# CI workflows set their own env vars so these are primarily for localhost.
+# This file is the single source of truth for build speedups. Both local
+# `cargo` invocations and remote CI use the same settings. CI installs the
+# required tools via `.github/actions/setup-sccache` and
+# `.github/actions/setup-fast-linker`; if a tool's install fails, those
+# actions clear the corresponding env vars so cargo falls back to the
+# platform default. Local developers bootstrap the same tools once via
+# `scripts/install-build-deps.sh`.
+#
+# Why explicit triples (not cfg() forms): env-var overrides like
+# CARGO_TARGET_<TRIPLE>_RUSTFLAGS only apply to explicit triple sections —
+# cargo does not merge them with cfg()-based sections. Keeping the
+# sections explicit keeps the CI fallback working.
 
-# ── Linker optimisations (optional) ──────────────────────────────────────
-# Using a faster linker can cut link times by 2-5x. Uncomment the section
-# that matches your platform after installing the required linker.
-# Keep host-specific linker choices in ~/.cargo/config.toml rather than this
-# checked-in file so GitHub-hosted macOS runners keep using their default linker.
-#
-# macOS local example — install LLD with `brew install lld`
-# [target.aarch64-apple-darwin]
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-#
-# [target.x86_64-apple-darwin]
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-#
-# Linux — install mold: `sudo apt-get install mold` (fastest linker)
-# [target.x86_64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-#
-# [target.aarch64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-# ── sccache (optional) ──────────────────────────────────────────────────
-# sccache caches compiled crates across branches and clean builds.
-# Install locally with: cargo install sccache
-# CI workflows that compile Rust install/start sccache explicitly.
+# ── sccache ─────────────────────────────────────────────────────────────
+# Compiler cache. ~100% hit rate on clean rebuilds. Honors $SCCACHE_DIR if
+# set in the shell environment (local custom cache location).
+# Install: `cargo install sccache` (local) or `setup-sccache` action (CI).
 [build]
 rustc-wrapper = "sccache"
 
-# ── Network settings ────────────────────────────────────────────────────
+# ── Fast linkers (per-platform) ─────────────────────────────────────────
+# 2-5x faster link times on Linux (mold), modest improvement on macOS (lld).
+# Windows uses the default link.exe (changing it adds risk without proven
+# benefit at our crate count).
+# Install: `brew install lld` (macOS) / `apt-get install -y mold clang` (Linux)
+# or run `scripts/install-build-deps.sh`.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+# Native aarch64 Linux uses mold like x86_64. The CI cross-compile path
+# runs inside cross-rs's container, which clears these via Cross.toml
+# passthrough so the container's default linker is used.
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-apple-darwin]
+# `-fuse-ld=lld` resolves to ld64.lld for Mach-O targets when the binary
+# is on PATH (Homebrew installs it at /opt/homebrew/bin/ld64.lld).
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# ── Network ─────────────────────────────────────────────────────────────
 [net]
-# Speed up cargo by using git CLI for fetching (uses your SSH agent)
+# Use the git CLI for fetching — honors the user's SSH agent and is
+# notably faster on large/private dependency updates.
 git-fetch-with-cli = true
