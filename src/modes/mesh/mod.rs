@@ -2456,9 +2456,17 @@ async fn serve_mesh_runtime(
     )?;
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
-        proxy_state.with_node_waypoint_identity_resolver(Arc::new(
-            node_waypoint::NodeWaypointIdentityResolver::new(env_config.pool_shard_amount),
-        ))
+        let resolver = Arc::new(node_waypoint::NodeWaypointIdentityResolver::new(
+            env_config.pool_shard_amount,
+        ));
+        if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
+            resolver.clone(),
+            env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
+            shutdown_tx.subscribe(),
+        ) {
+            mesh_background_handles.push(handle);
+        }
+        proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
     };
