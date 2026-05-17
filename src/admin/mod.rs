@@ -1,6 +1,7 @@
 //! Admin API for Ferrum Edge.
 
 pub mod api_specs;
+pub mod audit;
 mod backup;
 pub(crate) mod crud;
 pub mod jwt_auth;
@@ -23,11 +24,12 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
+use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
     BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
     parse_backup_resources, parse_restore_confirm,
 };
-use crate::admin::jwt_auth::{JwtError, JwtManager};
+use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -373,6 +375,31 @@ fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
     PaginationParams { offset, limit }
 }
 
+fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Response<Full<Bytes>>> {
+    if actor.role.allows(required) {
+        return None;
+    }
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({
+            "error": format!(
+                "Admin role '{}' cannot access this endpoint; required role is '{}'",
+                actor.role.as_str(),
+                required.as_str()
+            )
+        }),
+    ))
+}
+
+pub(crate) fn audit_persist_failed_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": format!("Admin mutation persisted but audit write failed: {}", error)
+        }),
+    )
+}
+
 /// Apply pagination to a serializable collection.
 /// Always wraps the response in an envelope with metadata.
 fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
@@ -605,14 +632,20 @@ pub async fn handle_admin_request(
     }
 
     // Authenticate
-    match state.jwt_manager.verify_request(
+    let auth = match state.jwt_manager.verify_request(
         req.headers()
             .get("authorization")
             .and_then(|h| h.to_str().ok()),
     ) {
-        Ok(_) => {
-            // Token is valid, continue processing
-        }
+        Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
+            Ok(actor) => actor,
+            Err(message) => {
+                return Ok(json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": message}),
+                ));
+            }
+        },
         Err(JwtError::MissingHeader) => {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
@@ -631,7 +664,7 @@ pub async fn handle_admin_request(
                 &json!({"error": format!("Token verification failed: {}", msg)}),
             ));
         }
-    }
+    };
 
     // API chargeback endpoint. Chargeback output contains customer/business data,
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
@@ -677,14 +710,21 @@ pub async fn handle_admin_request(
     let segments_peek: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (method.clone(), segments_peek.as_slice()) {
         (Method::POST, ["api-specs"]) => {
-            return api_specs::handlers::handle_post_api_spec(req, &state, &namespace).await;
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            return api_specs::handlers::handle_post_api_spec(req, &state, &auth, &namespace).await;
         }
         (Method::PUT, ["api-specs", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             if let Err(e) = crate::config::types::validate_resource_id(id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
             }
             let id = id.to_string();
-            return api_specs::handlers::handle_put_api_spec(req, &state, &namespace, &id).await;
+            return api_specs::handlers::handle_put_api_spec(req, &state, &auth, &namespace, &id)
+                .await;
         }
         (Method::GET, ["api-specs"]) => {
             return api_specs::handlers::handle_list_api_specs(req, &state, &namespace).await;
@@ -707,6 +747,9 @@ pub async fn handle_admin_request(
             return api_specs::handlers::handle_get_api_spec(req, &state, &namespace, &id).await;
         }
         (Method::DELETE, ["api-specs", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             if let Err(e) = crate::config::types::validate_resource_id(id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
             }
@@ -714,7 +757,8 @@ pub async fn handle_admin_request(
             // DELETE should have no body. Drop the receiver so hyper discards
             // any remaining bytes via Drop without buffering them in userspace.
             drop(req.into_body());
-            return api_specs::handlers::handle_delete_api_spec(&state, &namespace, &id).await;
+            return api_specs::handlers::handle_delete_api_spec(&state, &auth, &namespace, &id)
+                .await;
         }
         _ => {}
     }
@@ -759,14 +803,23 @@ pub async fn handle_admin_request(
             crud::handle_list::<Proxy>(&state, &pagination, &namespace).await
         }
         (Method::POST, ["proxies"]) => {
-            crud::handle_create::<Proxy>(&state, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_create::<Proxy>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["proxies", id]) => crud::handle_get::<Proxy>(&state, id, &namespace).await,
         (Method::PUT, ["proxies", id]) => {
-            crud::handle_update::<Proxy>(&state, id, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_update::<Proxy>(&state, &auth, id, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["proxies", id]) => {
-            crud::handle_delete::<Proxy>(&state, id, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace).await
         }
 
         // Consumers CRUD
@@ -774,31 +827,75 @@ pub async fn handle_admin_request(
             crud::handle_list::<Consumer>(&state, &pagination, &namespace).await
         }
         (Method::POST, ["consumers"]) => {
-            crud::handle_create::<Consumer>(&state, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_create::<Consumer>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["consumers", id]) => {
             crud::handle_get::<Consumer>(&state, id, &namespace).await
         }
         (Method::PUT, ["consumers", id]) => {
-            crud::handle_update::<Consumer>(&state, id, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_update::<Consumer>(&state, &auth, id, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["consumers", id]) => {
-            crud::handle_delete::<Consumer>(&state, id, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace).await
         }
 
         // Consumer credentials
         (Method::PUT, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_update_credentials(&state, consumer_id, cred_type, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_update_credentials(
+                &state,
+                &auth,
+                consumer_id,
+                cred_type,
+                &body_bytes,
+                &namespace,
+            )
+            .await
         }
         (Method::POST, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_append_credential(&state, consumer_id, cred_type, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_append_credential(
+                &state,
+                &auth,
+                consumer_id,
+                cred_type,
+                &body_bytes,
+                &namespace,
+            )
+            .await
         }
         (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type, index]) => {
-            handle_delete_credential_by_index(&state, consumer_id, cred_type, index, &namespace)
-                .await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_delete_credential_by_index(
+                &state,
+                &auth,
+                consumer_id,
+                cred_type,
+                index,
+                &namespace,
+            )
+            .await
         }
         (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_delete_credentials(&state, consumer_id, cred_type, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_delete_credentials(&state, &auth, consumer_id, cred_type, &namespace).await
         }
 
         // Plugins
@@ -807,16 +904,25 @@ pub async fn handle_admin_request(
             crud::handle_list::<PluginConfig>(&state, &pagination, &namespace).await
         }
         (Method::POST, ["plugins", "config"]) => {
-            crud::handle_create::<PluginConfig>(&state, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_create::<PluginConfig>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["plugins", "config", id]) => {
             crud::handle_get::<PluginConfig>(&state, id, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
-            crud::handle_update::<PluginConfig>(&state, id, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_update::<PluginConfig>(&state, &auth, id, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["plugins", "config", id]) => {
-            crud::handle_delete::<PluginConfig>(&state, id, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace).await
         }
 
         // Upstreams CRUD
@@ -824,25 +930,50 @@ pub async fn handle_admin_request(
             crud::handle_list::<Upstream>(&state, &pagination, &namespace).await
         }
         (Method::POST, ["upstreams"]) => {
-            crud::handle_create::<Upstream>(&state, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_create::<Upstream>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["upstreams", id]) => {
             crud::handle_get::<Upstream>(&state, id, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
-            crud::handle_update::<Upstream>(&state, id, &body_bytes, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_update::<Upstream>(&state, &auth, id, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["upstreams", id]) => {
-            crud::handle_delete::<Upstream>(&state, id, &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace).await
         }
 
         // Batch create
-        (Method::POST, ["batch"]) => handle_batch_create(&state, &body_bytes, &namespace).await,
+        (Method::POST, ["batch"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_batch_create(&state, &auth, &body_bytes, &namespace).await
+        }
 
         // Backup & Restore
         (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref(), &namespace).await,
         (Method::POST, ["restore"]) => {
-            handle_restore(&state, &body_bytes, query.as_deref(), &namespace).await
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
+        }
+
+        // Audit log
+        (Method::GET, ["audit"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_audit_list(&state, &pagination, query.as_deref(), &namespace).await
         }
 
         // Namespaces
@@ -858,6 +989,9 @@ pub async fn handle_admin_request(
         // Mesh egress-scope operability
         (Method::GET, ["mesh", "egress-scope"]) => handle_mesh_egress_scope_get(&state).await,
         (Method::POST, ["mesh", "egress-scope", "test"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
             handle_mesh_egress_scope_test(&state, &body_bytes).await
         }
 
@@ -879,6 +1013,9 @@ pub async fn handle_admin_request(
         // endpoints in its H3 acceptance tests.
         (Method::GET, ["backend-capabilities"]) => handle_backend_capabilities_get(&state).await,
         (Method::POST, ["backend-capabilities", "refresh"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
             handle_backend_capabilities_refresh(&state).await
         }
 
@@ -1277,6 +1414,7 @@ pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
 
 async fn handle_update_credentials(
     state: &AdminState,
+    actor: &AuditActor,
     consumer_id: &str,
     cred_type: &str,
     body: &[u8],
@@ -1318,6 +1456,7 @@ async fn handle_update_credentials(
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
     };
+    let before = consumer.clone();
     consumer
         .credentials
         .insert(cred_type.to_string(), cred_value);
@@ -1326,11 +1465,29 @@ async fn handle_update_credentials(
         return Ok(invalid_credential_fields_response(&field_errors));
     }
 
-    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
+    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    if response.status().is_success() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "update_credentials",
+            "consumer_credentials",
+            consumer_id,
+            namespace,
+            audit::update_diff(
+                crud::consumer_response_body(&before),
+                crud::consumer_response_body(&consumer),
+            ),
+        );
+        if let Err(error) = audit::record(db.clone(), event).await {
+            return Ok(audit_persist_failed_response(&error));
+        }
+    }
+    Ok(response)
 }
 
 async fn handle_delete_credentials(
     state: &AdminState,
+    actor: &AuditActor,
     consumer_id: &str,
     cred_type: &str,
     namespace: &str,
@@ -1352,13 +1509,33 @@ async fn handle_delete_credentials(
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
     };
+    let before = consumer.clone();
     consumer.credentials.remove(cred_type);
-    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::NO_CONTENT).await)
+    let response =
+        persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::NO_CONTENT).await;
+    if response.status().is_success() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "delete_credentials",
+            "consumer_credentials",
+            consumer_id,
+            namespace,
+            audit::update_diff(
+                crud::consumer_response_body(&before),
+                crud::consumer_response_body(&consumer),
+            ),
+        );
+        if let Err(error) = audit::record(db.clone(), event).await {
+            return Ok(audit_persist_failed_response(&error));
+        }
+    }
+    Ok(response)
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
 async fn handle_append_credential(
     state: &AdminState,
+    actor: &AuditActor,
     consumer_id: &str,
     cred_type: &str,
     body: &[u8],
@@ -1407,6 +1584,7 @@ async fn handle_append_credential(
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
     };
+    let before = consumer.clone();
     let new_value = match consumer.credentials.get(cred_type) {
         Some(Value::Array(arr)) => {
             let mut new_arr = arr.clone();
@@ -1436,13 +1614,31 @@ async fn handle_append_credential(
         return Ok(invalid_credential_fields_response(&field_errors));
     }
 
-    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
+    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    if response.status().is_success() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "append_credential",
+            "consumer_credentials",
+            consumer_id,
+            namespace,
+            audit::update_diff(
+                crud::consumer_response_body(&before),
+                crud::consumer_response_body(&consumer),
+            ),
+        );
+        if let Err(error) = audit::record(db.clone(), event).await {
+            return Ok(audit_persist_failed_response(&error));
+        }
+    }
+    Ok(response)
 }
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
 ///
 async fn handle_delete_credential_by_index(
     state: &AdminState,
+    actor: &AuditActor,
     consumer_id: &str,
     cred_type: &str,
     index_str: &str,
@@ -1475,6 +1671,7 @@ async fn handle_delete_credential_by_index(
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
     };
+    let before = consumer.clone();
     let cred_value = match consumer.credentials.get_mut(cred_type) {
         Some(value) => value,
         None => {
@@ -1509,7 +1706,24 @@ async fn handle_delete_credential_by_index(
         }
     }
 
-    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
+    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    if response.status().is_success() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "delete_credential",
+            "consumer_credentials",
+            consumer_id,
+            namespace,
+            audit::update_diff(
+                crud::consumer_response_body(&before),
+                crud::consumer_response_body(&consumer),
+            ),
+        );
+        if let Err(error) = audit::record(db.clone(), event).await {
+            return Ok(audit_persist_failed_response(&error));
+        }
+    }
+    Ok(response)
 }
 
 // ---- Plugin CRUD ----
@@ -1842,6 +2056,7 @@ fn build_metrics(state: &AdminState) -> Value {
 /// Batch create endpoint for proxies, consumers, plugin configs, and upstreams.
 async fn handle_batch_create(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -2144,6 +2359,18 @@ async fn handle_batch_create(
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
+    let event = audit::AuditEvent::new(
+        actor,
+        "batch_create",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::create_diff(response["created"].clone()),
+    );
+    if let Err(error) = audit::record(db.clone(), event).await {
+        return Ok(audit_persist_failed_response(&error));
+    }
+
     Ok(json_response(StatusCode::CREATED, &response))
 }
 
@@ -2277,6 +2504,7 @@ async fn handle_backup(
 /// Restore the gateway configuration from a backup payload.
 async fn handle_restore(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     query: Option<&str>,
     namespace: &str,
@@ -2441,7 +2669,115 @@ async fn handle_restore(
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            response["restored"].clone(),
+        ),
+    );
+    if let Err(error) = audit::record(db.clone(), event).await {
+        return Ok(audit_persist_failed_response(&error));
+    }
+
     Ok(json_response(StatusCode::OK, &response))
+}
+
+fn parse_audit_filter(
+    query: Option<&str>,
+    pagination: &PaginationParams,
+) -> Result<audit::AuditListFilter, Box<Response<Full<Bytes>>>> {
+    let mut filter = audit::AuditListFilter {
+        limit: pagination
+            .limit
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE) as u32,
+        offset: pagination.offset as u32,
+        ..Default::default()
+    };
+
+    if let Some(query) = query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "actor" => filter.actor = Some(value.into_owned()),
+                "action" => filter.action = Some(value.into_owned()),
+                "resource_type" => filter.resource_type = Some(value.into_owned()),
+                "resource_id" => filter.resource_id = Some(value.into_owned()),
+                "start" => {
+                    filter.start = Some(
+                        chrono::DateTime::parse_from_rfc3339(&value)
+                            .map_err(|e| {
+                                Box::new(json_response(
+                                    StatusCode::BAD_REQUEST,
+                                    &json!({"error": format!("Invalid audit start timestamp: {}", e)}),
+                                ))
+                            })?
+                            .with_timezone(&Utc),
+                    );
+                }
+                "end" => {
+                    filter.end = Some(
+                        chrono::DateTime::parse_from_rfc3339(&value)
+                            .map_err(|e| {
+                                Box::new(json_response(
+                                    StatusCode::BAD_REQUEST,
+                                    &json!({"error": format!("Invalid audit end timestamp: {}", e)}),
+                                ))
+                            })?
+                            .with_timezone(&Utc),
+                    );
+                }
+                "limit" | "offset" => {}
+                _ => {}
+            }
+        }
+    }
+
+    Ok(filter)
+}
+
+async fn handle_audit_list(
+    state: &AdminState,
+    pagination: &PaginationParams,
+    query: Option<&str>,
+    namespace: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(*resp),
+    };
+    let filter = match parse_audit_filter(query, pagination) {
+        Ok(filter) => filter,
+        Err(resp) => return Ok(*resp),
+    };
+
+    match db.list_audit_events(namespace, &filter).await {
+        Ok(result) => {
+            let next_offset = if (filter.offset as i64 + result.items.len() as i64) < result.total {
+                Some(filter.offset + result.items.len() as u32)
+            } else {
+                None
+            };
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "items": result.items,
+                    "limit": filter.limit,
+                    "offset": filter.offset,
+                    "next_offset": next_offset,
+                    "total": result.total,
+                }),
+            ))
+        }
+        Err(error) => Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        )),
+    }
 }
 
 // ---- Namespaces ----

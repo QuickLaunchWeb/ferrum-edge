@@ -8,6 +8,12 @@ info:
     require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
+    Admin JWTs may include a string `role` claim. `viewer` can call read-only
+    endpoints, `operator` can also mutate proxies, upstreams, plugin configs,
+    and operational refresh/test endpoints, and `admin` has full access
+    including consumers, credentials, API specs, batch/restore, and audit logs.
+    Tokens without `role` currently default to `admin` during build-out.
+
     ## Namespaces
 
     Every authenticated endpoint is scoped by the `X-Ferrum-Namespace` request
@@ -79,6 +85,8 @@ tags:
     description: Bulk resource creation for high-throughput provisioning
   - name: Backup & Restore
     description: Full configuration backup and restore for disaster recovery and migration
+  - name: Audit
+    description: Query database-backed admin mutation history
   - name: Namespaces
     description: Multi-tenant namespace discovery
   - name: Monitoring
@@ -938,6 +946,70 @@ paths:
                 properties:
                   error:
                     type: string
+
+  # ── Audit ────────────────────────────────────────────────────────────
+  /audit:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: listAuditEvents
+      summary: List admin audit events
+      description: |
+        Returns successful admin API mutation events for the selected namespace.
+        Requires an admin-role JWT. Each event includes actor, action, resource
+        identity, timestamp, and a JSON diff. Consumer credential data is
+        redacted before it is written to the audit log.
+      tags: [Audit]
+      parameters:
+        - name: actor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: resource_type
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: resource_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Paginated audit events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEventListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ── Batch ────────────────────────────────────────────────────────────
   /batch:
@@ -2499,6 +2571,9 @@ components:
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
 
+        Optional `role` claim values are `viewer`, `operator`, and `admin`.
+        Missing `role` defaults to `admin` during build-out.
+
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
     ResourceId:
@@ -2582,8 +2657,14 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Authenticated token lacks the required admin role
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     ReadOnly:
-      description: Admin API is in read-only mode
+      description: Admin API is in read-only mode or the token role cannot perform this mutation
       content:
         application/json:
           schema:
@@ -2618,6 +2699,62 @@ components:
         error:
           type: [string, "null"]
           description: Human-readable error message
+
+    AuditEvent:
+      type: object
+      required:
+        - id
+        - ts
+        - actor
+        - action
+        - resource_type
+        - resource_id
+        - namespace
+        - diff
+      properties:
+        id:
+          type: string
+          description: Audit event UUID
+        ts:
+          type: string
+          format: date-time
+          description: Event timestamp
+        actor:
+          type: string
+          description: JWT `sub` claim of the admin actor
+        action:
+          type: string
+          description: Mutation action, such as `create`, `update`, `delete`, or `restore`
+        resource_type:
+          type: string
+          description: Mutated resource category
+        resource_id:
+          type: string
+          description: Mutated resource ID
+        namespace:
+          type: string
+          description: Namespace selected by `X-Ferrum-Namespace`
+        diff:
+          type: object
+          additionalProperties: true
+          description: Redacted JSON before/after diff for the successful mutation
+
+    AuditEventListResponse:
+      type: object
+      required: [items, limit, offset, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        limit:
+          type: integer
+        offset:
+          type: integer
+        next_offset:
+          type: [integer, "null"]
+        total:
+          type: integer
 
     # ── Proxy ───────────────────────────────────────────────────────
     Proxy:

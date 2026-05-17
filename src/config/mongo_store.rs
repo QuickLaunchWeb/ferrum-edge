@@ -610,6 +610,10 @@ mod inner {
             self.db().collection("api_specs")
         }
 
+        fn audit_events(&self) -> Collection<Document> {
+            self.db().collection("audit_events")
+        }
+
         // -------------------------------------------------------------------
         // Internal helpers
         // -------------------------------------------------------------------
@@ -1144,6 +1148,21 @@ mod inner {
             }),
         );
         Ok(doc)
+    }
+
+    fn audit_event_to_doc(
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<Document, anyhow::Error> {
+        let mut doc = mongodb::bson::to_document(event)?;
+        doc.insert("_id", event.id.as_str());
+        Ok(doc)
+    }
+
+    fn doc_to_audit_event(
+        mut doc: Document,
+    ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
+        doc.remove("_id");
+        Ok(mongodb::bson::from_document(doc)?)
     }
 
     fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
@@ -2745,6 +2764,25 @@ mod inner {
                 )
                 .await?;
 
+            // audit_events indexes (admin-only mutation log).
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "ts": -1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(IndexModel::builder().keys(doc! { "actor": 1 }).build())
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+
             info!("MongoDB indexes ensured");
             Ok(())
         }
@@ -3549,6 +3587,70 @@ mod inner {
 
             self.check_slow_query("delete_api_spec", start);
             Ok(true)
+        }
+
+        async fn insert_audit_event(
+            &self,
+            event: &crate::admin::audit::AuditEvent,
+        ) -> Result<(), anyhow::Error> {
+            let start = std::time::Instant::now();
+            self.audit_events()
+                .insert_one(audit_event_to_doc(event)?)
+                .await?;
+            self.check_slow_query("insert_audit_event", start);
+            Ok(())
+        }
+
+        async fn list_audit_events(
+            &self,
+            namespace: &str,
+            filter: &crate::admin::audit::AuditListFilter,
+        ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let mut filter_doc = doc! { "namespace": namespace };
+            if let Some(ref value) = filter.actor {
+                filter_doc.insert("actor", value.as_str());
+            }
+            if let Some(ref value) = filter.action {
+                filter_doc.insert("action", value.as_str());
+            }
+            if let Some(ref value) = filter.resource_type {
+                filter_doc.insert("resource_type", value.as_str());
+            }
+            if let Some(ref value) = filter.resource_id {
+                filter_doc.insert("resource_id", value.as_str());
+            }
+            let mut ts_range = Document::new();
+            if let Some(ref value) = filter.start {
+                ts_range.insert("$gte", value.to_rfc3339());
+            }
+            if let Some(ref value) = filter.end {
+                ts_range.insert("$lte", value.to_rfc3339());
+            }
+            if !ts_range.is_empty() {
+                filter_doc.insert("ts", ts_range);
+            }
+
+            let total = self
+                .audit_events()
+                .count_documents(filter_doc.clone())
+                .await? as i64;
+            let options = FindOptions::builder()
+                .sort(doc! { "ts": -1, "_id": -1 })
+                .skip(Some(filter.offset as u64))
+                .limit(Some(filter.limit as i64))
+                .build();
+            let mut cursor = self
+                .audit_events()
+                .find(filter_doc)
+                .with_options(options)
+                .await?;
+            let mut items = Vec::new();
+            while cursor.advance().await? {
+                items.push(doc_to_audit_event(cursor.deserialize_current()?)?);
+            }
+            self.check_slow_query("list_audit_events", start);
+            Ok(PaginatedResult { items, total })
         }
     }
 

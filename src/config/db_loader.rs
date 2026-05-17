@@ -4617,6 +4617,118 @@ impl DatabaseStore {
         self.check_slow_query("list_spec_owned_upstreams", start);
         Ok(upstreams)
     }
+
+    pub async fn insert_audit_event(
+        &self,
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<(), anyhow::Error> {
+        let start = std::time::Instant::now();
+        let diff = serde_json::to_string(&event.diff)?;
+        sqlx::query(&self.q("INSERT INTO audit_events \
+             (id, ts, actor, action, resource_type, resource_id, namespace, diff) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+        .bind(&event.id)
+        .bind(event.ts.to_rfc3339())
+        .bind(&event.actor)
+        .bind(&event.action)
+        .bind(&event.resource_type)
+        .bind(&event.resource_id)
+        .bind(&event.namespace)
+        .bind(diff)
+        .execute(&self.pool())
+        .await?;
+        self.check_slow_query("insert_audit_event", start);
+        Ok(())
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
+
+        if filter.actor.is_some() {
+            conditions.push("actor = ?");
+        }
+        if filter.action.is_some() {
+            conditions.push("action = ?");
+        }
+        if filter.resource_type.is_some() {
+            conditions.push("resource_type = ?");
+        }
+        if filter.resource_id.is_some() {
+            conditions.push("resource_id = ?");
+        }
+        if filter.start.is_some() {
+            conditions.push("ts >= ?");
+        }
+        if filter.end.is_some() {
+            conditions.push("ts <= ?");
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let count_sql = self.q(&format!(
+            "SELECT COUNT(*) AS cnt FROM audit_events WHERE {where_clause}"
+        ));
+        let mut count_query = sqlx::query(&count_sql).bind(namespace);
+        if let Some(ref value) = filter.actor {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.action {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_type {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_id {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.start {
+            count_query = count_query.bind(value.to_rfc3339());
+        }
+        if let Some(ref value) = filter.end {
+            count_query = count_query.bind(value.to_rfc3339());
+        }
+        let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
+
+        let sql = self.q(&format!(
+            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
+             FROM audit_events WHERE {where_clause} \
+             ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        ));
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(ref value) = filter.actor {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.action {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_type {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_id {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.start {
+            query = query.bind(value.to_rfc3339());
+        }
+        if let Some(ref value) = filter.end {
+            query = query.bind(value.to_rfc3339());
+        }
+        let rows = query
+            .bind(filter.limit as i64)
+            .bind(filter.offset as i64)
+            .fetch_all(&self.rpool())
+            .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(row_to_audit_event(row)?);
+        }
+        self.check_slow_query("list_audit_events", start);
+        Ok(PaginatedResult { items, total })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5066,6 +5178,21 @@ impl DatabaseBackend for DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         DatabaseStore::list_spec_owned_upstreams(self, namespace, spec_id).await
+    }
+
+    async fn insert_audit_event(
+        &self,
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::insert_audit_event(self, event).await
+    }
+
+    async fn list_audit_events(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        DatabaseStore::list_audit_events(self, namespace, filter).await
     }
 }
 
@@ -5650,6 +5777,20 @@ fn row_to_api_spec_with_content(
         resource_hash,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
+    })
+}
+
+fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
+    let diff: String = row.try_get("diff")?;
+    Ok(crate::admin::audit::AuditEvent {
+        id: row.try_get("id")?,
+        ts: parse_datetime_column(row, "ts"),
+        actor: row.try_get("actor")?,
+        action: row.try_get("action")?,
+        resource_type: row.try_get("resource_type")?,
+        resource_id: row.try_get("resource_id")?,
+        namespace: row.try_get("namespace")?,
+        diff: serde_json::from_str(&diff).unwrap_or_else(|_| serde_json::json!({})),
     })
 }
 

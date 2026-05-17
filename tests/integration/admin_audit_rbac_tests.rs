@@ -1,0 +1,199 @@
+use arc_swap::ArcSwap;
+use chrono::Utc;
+use ferrum_edge::{
+    admin::{
+        AdminState,
+        jwt_auth::{JwtConfig, JwtManager},
+        serve_admin_on_listener,
+    },
+    config::db_loader::{DatabaseStore, DbPoolConfig},
+};
+use jsonwebtoken::{EncodingKey, Header, encode};
+use serde_json::{Value, json};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+const JWT_SECRET: &str = "test-secret-key-for-admin-audit-rbac-32chars";
+const JWT_ISSUER: &str = "test-ferrum-edge";
+
+fn jwt_manager() -> JwtManager {
+    JwtManager::new(JwtConfig {
+        secret: JWT_SECRET.to_string(),
+        issuer: JWT_ISSUER.to_string(),
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    })
+}
+
+fn token(subject: &str, role: Option<&str>) -> String {
+    let now = Utc::now();
+    let mut claims = json!({
+        "iss": JWT_ISSUER,
+        "sub": subject,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(role) = role {
+        claims["role"] = json!(role);
+    }
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn test_pool_config() -> DbPoolConfig {
+    DbPoolConfig {
+        max_connections: 2,
+        min_connections: 0,
+        acquire_timeout_seconds: 5,
+        idle_timeout_seconds: 60,
+        max_lifetime_seconds: 300,
+        connect_timeout_seconds: 5,
+        statement_timeout_seconds: 0,
+    }
+}
+
+async fn make_store(dir: &TempDir) -> DatabaseStore {
+    let db_path = dir
+        .path()
+        .join(format!("audit-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    DatabaseStore::connect_with_pool_config("sqlite", &url, test_pool_config())
+        .await
+        .expect("connect sqlite store")
+}
+
+fn admin_state(db: DatabaseStore) -> AdminState {
+    AdminState {
+        db: Some(Arc::new(db)),
+        jwt_manager: jwt_manager(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+    }
+}
+
+async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let actual = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_admin_on_listener(listener, state, shutdown_rx, None).await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(actual).await.is_ok() {
+            return (format!("http://{}", actual), shutdown_tx);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("admin listener at {} never became ready", actual);
+}
+
+fn upstream_payload(id: &str) -> Value {
+    json!({
+        "id": id,
+        "name": format!("upstream-{id}"),
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin"
+    })
+}
+
+async fn post_json(base: &str, path: &str, bearer: &str, body: &Value) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .json(body)
+        .send()
+        .await
+        .expect("POST request");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+async fn get_json(base: &str, path: &str, bearer: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .expect("GET request");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+#[tokio::test]
+async fn viewer_role_is_rejected_on_admin_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) =
+        post_json(&base, "/upstreams", &viewer, &upstream_payload("rbac-u1")).await;
+
+    assert_eq!(status, 403, "viewer mutation body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'operator'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_mutation_writes_queryable_audit_event() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let operator = token("mesh-operator", Some("operator"));
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = post_json(
+        &base,
+        "/upstreams",
+        &operator,
+        &upstream_payload("audit-u1"),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, audit_body) = get_json(&base, "/audit?resource_type=upstream", &admin).await;
+    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
+    assert_eq!(audit_body["total"], 1);
+
+    let items = audit_body["items"].as_array().expect("audit items");
+    let event = &items[0];
+    assert_eq!(event["actor"], "mesh-operator");
+    assert_eq!(event["action"], "create");
+    assert_eq!(event["resource_type"], "upstream");
+    assert_eq!(event["resource_id"], "audit-u1");
+    assert_eq!(event["namespace"], "ferrum");
+    assert_eq!(event["diff"]["after"]["id"], "audit-u1");
+}

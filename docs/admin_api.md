@@ -13,6 +13,16 @@ See also:
 
 All endpoints (except `/health`, `/status`, `/overload`, and exact `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/metrics/runtime` requires JWT authentication because it exposes process and host diagnostics. `/charges` also requires JWT authentication because it exposes customer and billing data.
 
+Admin JWTs may include a string `role` claim:
+
+| Role | Access |
+| --- | --- |
+| `viewer` | Read-only endpoints |
+| `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, and mesh egress-scope test operations |
+| `admin` | Full access, including consumers, credentials, API specs, batch/restore, and audit logs |
+
+Tokens without a `role` claim are treated as `admin` during the build-out phase so existing externally minted admin tokens continue to work.
+
 Generate a token:
 ```bash
 # Using any JWT library; payload can be minimal
@@ -220,6 +230,17 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
+
+## Audit Log
+
+Successful admin mutations are written to the database-backed audit log before the mutation response is returned. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+
+`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/audit?resource_type=proxy&resource_id=PROXY_ID"
+```
 
 ## Cluster Status
 

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
+use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
@@ -259,23 +260,26 @@ pub(crate) async fn handle_get<R: AdminResource>(
 
 pub(crate) async fn handle_create<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, body, namespace, WriteAction::Create).await
+    handle_write::<R>(state, actor, body, namespace, WriteAction::Create).await
 }
 
 pub(crate) async fn handle_update<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     id: &str,
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, body, namespace, WriteAction::Update { id }).await
+    handle_write::<R>(state, actor, body, namespace, WriteAction::Update { id }).await
 }
 
 pub(crate) async fn handle_delete<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     id: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -283,8 +287,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(response);
     }
 
-    let db = match state.db.as_ref() {
-        Some(db) => db.as_ref(),
+    let db_arc = match state.db.as_ref() {
+        Some(db) => db.clone(),
         None => {
             return Ok(super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -292,8 +296,9 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             ));
         }
     };
+    let db = db_arc.as_ref();
 
-    match R::db_get(db, id).await {
+    let existing = match R::db_get(db, id).await {
         Ok(Some(resource)) if resource.namespace() != namespace => {
             return Ok(not_found_response::<R>());
         }
@@ -303,11 +308,24 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Err(error) => {
             return Ok(R::map_precheck_db_error(&error));
         }
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(resource)) => resource,
+    };
 
     match R::db_delete(db, id).await {
-        Ok(true) => Ok(super::json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            let event = AuditEvent::new(
+                actor,
+                "delete",
+                R::RESOURCE_NAME.replace(' ', "_"),
+                id,
+                namespace,
+                audit::delete_diff(R::response_body(&existing)),
+            );
+            if let Err(error) = audit::record(db_arc, event).await {
+                return Ok(super::audit_persist_failed_response(&error));
+            }
+            Ok(super::json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
@@ -1255,6 +1273,7 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
 
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     namespace: &str,
     action: WriteAction<'_>,
@@ -1263,8 +1282,8 @@ async fn handle_write<R: AdminResource>(
         return Ok(response);
     }
 
-    let db = match state.db.as_ref() {
-        Some(db) => db.as_ref(),
+    let db_arc = match state.db.as_ref() {
+        Some(db) => db.clone(),
         None => {
             return Ok(super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1272,6 +1291,7 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    let db = db_arc.as_ref();
 
     if let Err(message) = R::validate_raw_body(body) {
         return Ok(super::json_response(
@@ -1416,6 +1436,31 @@ async fn handle_write<R: AdminResource>(
             resource.id(),
             error
         );
+    }
+
+    let (audit_action, diff) = match action {
+        WriteAction::Create => ("create", audit::create_diff(R::response_body(&resource))),
+        WriteAction::Update { .. } => {
+            let before = existing
+                .as_ref()
+                .map(R::response_body)
+                .unwrap_or_else(|| json!(null));
+            (
+                "update",
+                audit::update_diff(before, R::response_body(&resource)),
+            )
+        }
+    };
+    let event = AuditEvent::new(
+        actor,
+        audit_action,
+        R::RESOURCE_NAME.replace(' ', "_"),
+        resource.id(),
+        namespace,
+        diff,
+    );
+    if let Err(error) = audit::record(db_arc, event).await {
+        return Ok(super::audit_persist_failed_response(&error));
     }
 
     let body = R::response_body(&resource);

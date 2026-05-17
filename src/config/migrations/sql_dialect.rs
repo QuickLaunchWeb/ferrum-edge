@@ -104,6 +104,9 @@ impl V001SqlBuilder {
             // the comment block in create_api_specs_sql().  api_specs is
             // admin-only metadata; the gateway runtime never reads this table.
             self.create_api_specs_sql(),
+            // audit_events is admin-only mutation history. It is not loaded into
+            // GatewayConfig and is never touched by proxy/runtime hot paths.
+            self.create_audit_events_sql(),
         ] {
             sqlx::query(sql).execute(pool).await?;
         }
@@ -154,6 +157,9 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts ON audit_events (namespace, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
         ];
 
         for idx_sql in indexes {
@@ -601,6 +607,36 @@ impl V001SqlBuilder {
                 resource_hash TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        }
+    }
+
+    fn create_audit_events_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                ts VARCHAR(50) NOT NULL,
+                actor VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                action VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                resource_type VARCHAR(128) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                resource_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                diff LONGTEXT NOT NULL
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                diff TEXT NOT NULL
             )
             "#
         }

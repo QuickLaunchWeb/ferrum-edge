@@ -5,7 +5,7 @@
 use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
-    jwt_auth::{JwtConfig, JwtManager},
+    jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtManager},
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -109,6 +109,19 @@ fn generate_invalid_token(config: &TestConfig, subject: &str) -> String {
     encode(&header, &claims, &key).unwrap()
 }
 
+fn admin_claims_with_role(role: serde_json::Value) -> AdminClaims {
+    let now = Utc::now();
+    AdminClaims {
+        iss: "test-ferrum-edge".to_string(),
+        sub: "test-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + chrono::Duration::seconds(3600)).timestamp(),
+        jti: Uuid::new_v4().to_string(),
+        additional: role,
+    }
+}
+
 #[tokio::test]
 async fn test_jwt_token_validation() {
     let config = TestConfig::default();
@@ -127,6 +140,43 @@ async fn test_jwt_token_validation() {
     // Test malformed token
     let result = jwt_manager.verify_token("malformed-token");
     assert!(result.is_err(), "Malformed token should fail verification");
+}
+
+#[test]
+fn test_admin_jwt_role_claim_parsing() {
+    assert_eq!(
+        admin_claims_with_role(json!({})).admin_role().unwrap(),
+        AdminRole::Admin,
+        "missing role defaults to admin during build-out"
+    );
+    assert_eq!(
+        admin_claims_with_role(json!({"role": "viewer"}))
+            .admin_role()
+            .unwrap(),
+        AdminRole::Viewer
+    );
+    assert_eq!(
+        admin_claims_with_role(json!({"role": "operator"}))
+            .admin_role()
+            .unwrap(),
+        AdminRole::Operator
+    );
+    assert_eq!(
+        admin_claims_with_role(json!({"role": "admin"}))
+            .admin_role()
+            .unwrap(),
+        AdminRole::Admin
+    );
+    assert!(
+        admin_claims_with_role(json!({"role": 1}))
+            .admin_role()
+            .is_err()
+    );
+    assert!(
+        admin_claims_with_role(json!({"role": "root"}))
+            .admin_role()
+            .is_err()
+    );
 }
 
 #[tokio::test]

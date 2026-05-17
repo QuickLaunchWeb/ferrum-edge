@@ -582,6 +582,22 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         spec_id: &str,
     ) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error>;
+
+    // -----------------------------------------------------------------------
+    // Admin audit log (admin-only — runtime config loading and proxy hot paths
+    // must never read this table/collection).
+    // -----------------------------------------------------------------------
+
+    async fn insert_audit_event(
+        &self,
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<(), anyhow::Error>;
+
+    async fn list_audit_events(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error>;
 }
 
 /// Extract known IDs from a full config (used to seed the incremental poller).
