@@ -29,6 +29,7 @@ fn object(kind: &str, namespace: &str, name: &str, spec: Value) -> K8sObject {
             namespace: namespace.to_string(),
             labels: HashMap::new(),
             deletion_timestamp: None,
+            annotations: HashMap::new(),
         },
         spec,
         status: Value::Object(serde_json::Map::new()),

@@ -72,6 +72,7 @@ pub struct XdsClientConfig {
     pub cluster: String,
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
+    pub waypoint_name: Option<String>,
     pub stream_channel_capacity: usize,
     pub primary_retry_secs: u64,
     /// Client connection timeout. `0` disables tonic's explicit connect timeout.
@@ -900,6 +901,7 @@ fn reverse_translate(
         node_id: config.node_id.clone(),
         namespace: config.namespace.clone(),
         workload_spiffe_id: config.workload_spiffe_id.clone(),
+        waypoint_name: config.waypoint_name.clone(),
         labels: config.labels.clone(),
         version: accumulator
             .versions_by_type
@@ -1098,6 +1100,7 @@ mod tests {
             cluster: "default".to_string(),
             namespace: "default".to_string(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,

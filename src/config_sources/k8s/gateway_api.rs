@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
-use crate::modes::mesh::config::{AppProtocol, MeshService, ServicePort};
+use crate::modes::mesh::config::{
+    AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
+};
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
@@ -14,12 +16,37 @@ use super::{
 const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid";
 const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
 
+/// `Gateway.spec.gatewayClassName` values that mark a GAMMA Waypoint
+/// Gateway. Both the Istio canonical value and a Ferrum-native alias are
+/// honored so operators migrating from Istio do not have to retag.
+const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoint"];
+
+/// Service label naming the GAMMA Waypoint a Service routes through.
+/// `None` (the literal string) opts the Service out of any inherited
+/// namespace-level waypoint binding. Annotations are accepted as a
+/// compatibility fallback for file/native sources that already use them.
+const KEY_USE_WAYPOINT: &str = "istio.io/use-waypoint";
+
+/// Optional Service label that points `istio.io/use-waypoint` at a waypoint
+/// Gateway in a namespace other than the Service's namespace. Annotations are
+/// accepted as a compatibility fallback.
+const KEY_USE_WAYPOINT_NAMESPACE: &str = "istio.io/use-waypoint-namespace";
+
+/// Gateway/Service label setting which traffic the waypoint handles:
+/// `service` (default), `workload`, `all`, or `none`. Stored verbatim on
+/// the binding so future Istio enum additions don't require a Ferrum-side
+/// schema change. Annotations are accepted as a compatibility fallback.
+const KEY_WAYPOINT_FOR: &str = "istio.io/waypoint-for";
+
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
 ) -> Result<bool, K8sTranslateError> {
     match object.kind.as_str() {
         "Gateway" => {
+            if is_waypoint_gateway(object) {
+                add_waypoint_binding(acc, object);
+            }
             for service in mesh_services_from_gateway(object)? {
                 acc.mesh.services.push(service);
             }
@@ -89,6 +116,98 @@ pub(super) fn collect_reference_grant(
         }
     }
     Ok(())
+}
+
+/// True when this Gateway is a GAMMA Waypoint Gateway (gatewayClassName is
+/// one of `istio-waypoint` / `ferrum-waypoint`). Slice projection only
+/// considers waypoint Gateways when computing `MeshConfig.waypoint_bindings`.
+pub(super) fn is_waypoint_gateway(object: &K8sObject) -> bool {
+    let Some(class) = string_field(&object.spec, "gatewayClassName") else {
+        return false;
+    };
+    WAYPOINT_GATEWAY_CLASS_NAMES
+        .iter()
+        .any(|expected| class.eq_ignore_ascii_case(expected))
+}
+
+/// Insert (or update) a `MeshWaypointBinding` for this Gateway. Gateway
+/// resources contribute the binding shell — `name` + `namespace` — and
+/// honor a label/annotation-level `istio.io/waypoint-for` default if present.
+/// Bound services are added later by `add_service_waypoint_binding` from
+/// `collect_service`.
+pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8sObject) {
+    let waypoint_for = metadata_key(object, KEY_WAYPOINT_FOR)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "service".to_string());
+    if let Some(existing) = acc
+        .mesh
+        .waypoint_bindings
+        .iter_mut()
+        .find(|b| b.name == object.metadata.name && b.namespace == object.metadata.namespace)
+    {
+        // Gateway-level label/annotation always wins over service-supplied
+        // defaults because the Gateway is the canonical owner of the
+        // waypoint identity.
+        existing.waypoint_for = waypoint_for;
+    } else {
+        acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
+            name: object.metadata.name.clone(),
+            namespace: object.metadata.namespace.clone(),
+            waypoint_for,
+            services: Vec::new(),
+        });
+    }
+}
+
+/// Append this Service to the matching waypoint binding when the
+/// `istio.io/use-waypoint` label/annotation is set (and not `None`). Creates the
+/// binding shell when the Gateway hasn't been observed yet so service +
+/// gateway translation can land in either order.
+pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8sObject) {
+    let Some(waypoint) =
+        metadata_key(object, KEY_USE_WAYPOINT).filter(|s| !s.eq_ignore_ascii_case("none"))
+    else {
+        return;
+    };
+    let waypoint_name = waypoint.to_string();
+    let waypoint_namespace = metadata_key(object, KEY_USE_WAYPOINT_NAMESPACE)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| object.metadata.namespace.clone());
+    let waypoint_for_override = metadata_key(object, KEY_WAYPOINT_FOR).map(ToOwned::to_owned);
+
+    let service_ref = MeshWaypointServiceRef {
+        namespace: object.metadata.namespace.clone(),
+        name: object.metadata.name.clone(),
+    };
+
+    if let Some(existing) = acc
+        .mesh
+        .waypoint_bindings
+        .iter_mut()
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)
+    {
+        if !existing.services.contains(&service_ref) {
+            existing.services.push(service_ref);
+        }
+        return;
+    }
+    acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
+        name: waypoint_name,
+        namespace: waypoint_namespace,
+        waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
+        services: vec![service_ref],
+    });
+}
+
+fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
+    object
+        .metadata
+        .labels
+        .get(key)
+        .or_else(|| object.metadata.annotations.get(key))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {
@@ -539,6 +658,7 @@ mod tests {
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
                 deletion_timestamp: None,
+                annotations: HashMap::new(),
             },
             spec,
             status: Value::Object(serde_json::Map::new()),

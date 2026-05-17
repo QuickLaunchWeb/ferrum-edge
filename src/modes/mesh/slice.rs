@@ -20,6 +20,13 @@ pub struct MeshSliceRequest {
     pub node_id: String,
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
+    /// Name of the GAMMA Waypoint this consumer serves. `Some` only when the
+    /// DP's `MeshTopology == ServiceWaypoint`; the slice builder narrows
+    /// `services` / `service_entries` (and the workloads / mesh policies that
+    /// hang off them) to entries bound to this waypoint via
+    /// `MeshConfig.waypoint_bindings`. `None` keeps the legacy behavior of
+    /// admitting every resource visible to the workload's namespace.
+    pub waypoint_name: Option<String>,
     pub labels: BTreeMap<String, String>,
     /// Kubernetes cluster DNS domain used when synthesizing MeshService FQDN
     /// aliases for Istio Sidecar host matching.
@@ -47,6 +54,7 @@ impl Default for MeshSliceRequest {
             node_id: String::new(),
             namespace: String::new(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
@@ -67,6 +75,7 @@ impl MeshSliceRequest {
             node_id,
             namespace,
             workload_spiffe_id: non_empty(workload_spiffe_id),
+            waypoint_name: None,
             labels: labels.into_iter().collect(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
@@ -85,6 +94,7 @@ impl MeshSliceRequest {
             node_id,
             namespace,
             workload_spiffe_id,
+            waypoint_name: None,
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
@@ -99,6 +109,14 @@ impl MeshSliceRequest {
     /// that don't care about Sidecar scoping (xDS, tests, future protocols).
     pub fn with_enforce_sidecar_egress(mut self, enforce: bool) -> Self {
         self.enforce_sidecar_egress = enforce;
+        self
+    }
+
+    /// Returns `self` bound to a GAMMA Waypoint name. Used by mesh-mode
+    /// startup when `topology == ServiceWaypoint`; tests use it directly.
+    #[allow(dead_code)]
+    pub fn with_waypoint_name(mut self, name: Option<String>) -> Self {
+        self.waypoint_name = name.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -132,6 +150,11 @@ pub struct MeshSlice {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_spiffe_id: Option<String>,
+    /// GAMMA Waypoint identity for this slice. `Some` only when the DP
+    /// requested a service-scoped waypoint slice; informational on the wire
+    /// so consumers can identify the binding the projection narrowed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waypoint_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     pub version: String,
@@ -287,6 +310,7 @@ impl MeshSlice {
         self.node_id == other.node_id
             && self.namespace == other.namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
+            && self.waypoint_name == other.waypoint_name
             && self.labels == other.labels
             && self.workloads == other.workloads
             && self.services == other.services
@@ -427,6 +451,7 @@ impl MeshSlice {
                 node_id: request.node_id,
                 namespace: request.namespace,
                 workload_spiffe_id: request.workload_spiffe_id,
+                waypoint_name: request.waypoint_name,
                 labels: request.labels,
                 version,
                 ..Self::default()
@@ -437,10 +462,17 @@ impl MeshSlice {
         let cluster_domain = request.cluster_domain.clone();
         let sidecar_enforced = request.enforce_sidecar_egress;
         let sidecar_dry_run = request.sidecar_egress_dry_run;
+        let service_waypoint_namespaces = service_waypoint_resource_namespaces(
+            mesh,
+            request.waypoint_name.as_deref(),
+            &namespace,
+        );
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
-            .filter(|w| w.namespace == namespace)
+            .filter(|w| {
+                resource_namespace_visible(&service_waypoint_namespaces, &w.namespace, &namespace)
+            })
             .cloned()
             .collect();
         let effective_namespace = namespace.as_str();
@@ -493,7 +525,12 @@ impl MeshSlice {
             .iter()
             .filter_map(|service| {
                 let Some(sidecar) = applicable_sidecar else {
-                    return (service.namespace == namespace).then(|| service.clone());
+                    return resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &service.namespace,
+                        &namespace,
+                    )
+                    .then(|| service.clone());
                 };
                 narrow_service_ports(service, sidecar, &cluster_domain)
             })
@@ -551,7 +588,11 @@ impl MeshSlice {
             .iter()
             .filter(|dr| {
                 let Some(sidecar) = applicable_sidecar else {
-                    return dr.namespace == namespace;
+                    return resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &dr.namespace,
+                        &namespace,
+                    );
                 };
                 let (resource_namespace, host_candidates) = destination_rule_host_scope(
                     dr,
@@ -615,10 +656,36 @@ impl MeshSlice {
             })
         });
 
+        let waypoint_resources = ServiceWaypointNarrowingResources {
+            services,
+            service_entries,
+            destination_rules,
+            workloads,
+            mesh_policies,
+        };
+        let ServiceWaypointNarrowingResources {
+            services,
+            service_entries,
+            destination_rules,
+            workloads,
+            mesh_policies,
+        } = if let Some(waypoint) = request.waypoint_name.as_deref() {
+            narrow_for_service_waypoint(
+                waypoint,
+                &request.namespace,
+                &request.cluster_domain,
+                &mesh.waypoint_bindings,
+                waypoint_resources,
+            )
+        } else {
+            waypoint_resources
+        };
+
         Self {
             node_id: request.node_id,
             namespace: request.namespace,
             workload_spiffe_id: request.workload_spiffe_id,
+            waypoint_name: request.waypoint_name,
             labels: effective_labels,
             version,
             workloads,
@@ -637,6 +704,169 @@ impl MeshSlice {
             extension_configs: mesh.extension_configs.clone(),
         }
     }
+}
+
+/// Narrow slice resources to those bound to the named GAMMA Waypoint.
+///
+/// Returns the input vectors unchanged when no binding for `waypoint_name`
+/// exists (the slice falls back to whatever the workload-scope filter
+/// already produced — fail-open is intentional for the rollout window, so
+/// an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint` before
+/// the matching `Gateway` resource lands does not see immediate service
+/// loss). When at least one binding matches, services and dependent
+/// resources are filtered to only those in the binding's `services` list.
+struct ServiceWaypointNarrowingResources {
+    services: Vec<MeshService>,
+    service_entries: Vec<ServiceEntry>,
+    destination_rules: Vec<MeshDestinationRule>,
+    workloads: Vec<Workload>,
+    mesh_policies: Vec<MeshPolicy>,
+}
+
+fn service_waypoint_resource_namespaces(
+    mesh: &MeshConfig,
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> Option<BTreeSet<String>> {
+    let waypoint_name = waypoint_name?;
+    let binding = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)?;
+    let mut namespaces = BTreeSet::new();
+    namespaces.insert(waypoint_namespace.to_string());
+    namespaces.extend(
+        binding
+            .services
+            .iter()
+            .map(|service| service.namespace.clone()),
+    );
+    Some(namespaces)
+}
+
+fn resource_namespace_visible(
+    service_waypoint_namespaces: &Option<BTreeSet<String>>,
+    resource_namespace: &str,
+    request_namespace: &str,
+) -> bool {
+    service_waypoint_namespaces
+        .as_ref()
+        .map_or(resource_namespace == request_namespace, |namespaces| {
+            namespaces.contains(resource_namespace)
+        })
+}
+
+fn narrow_for_service_waypoint(
+    waypoint_name: &str,
+    waypoint_namespace: &str,
+    cluster_domain: &str,
+    bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+    resources: ServiceWaypointNarrowingResources,
+) -> ServiceWaypointNarrowingResources {
+    let Some(binding) = bindings
+        .iter()
+        .find(|b| b.name == waypoint_name && b.namespace == waypoint_namespace)
+    else {
+        return resources;
+    };
+    if binding.waypoint_for.eq_ignore_ascii_case("none") {
+        // Operator explicitly opted out — narrow to an empty admitted set.
+        return ServiceWaypointNarrowingResources {
+            services: Vec::new(),
+            service_entries: Vec::new(),
+            destination_rules: Vec::new(),
+            workloads: Vec::new(),
+            mesh_policies: resources.mesh_policies,
+        };
+    }
+
+    let bound: BTreeSet<(String, String)> = binding
+        .services
+        .iter()
+        .map(|s| (s.namespace.clone(), s.name.clone()))
+        .collect();
+    let admitted_services: Vec<MeshService> = resources
+        .services
+        .into_iter()
+        .filter(|s| bound.contains(&(s.namespace.clone(), s.name.clone())))
+        .collect();
+    let admitted_hosts = admitted_service_hosts(&admitted_services, cluster_domain);
+    let admitted_destination_rules: Vec<MeshDestinationRule> = resources
+        .destination_rules
+        .into_iter()
+        .filter(|dr| {
+            // DR is admitted only when its host is one of the admitted
+            // Service's canonical Kubernetes DNS aliases. Broad prefix
+            // matches can accidentally admit unrelated external hosts.
+            destination_rule_matches_admitted_service(dr, &admitted_services, &admitted_hosts)
+        })
+        .collect();
+    let admitted_service_entries: Vec<ServiceEntry> = resources
+        .service_entries
+        .into_iter()
+        .filter(|se| {
+            // ServiceEntry hosts can be arbitrary; admit only canonical
+            // aliases for bound Services. External-looking hosts that happen
+            // to start with `{service}.{namespace}.` are unrelated.
+            se.hosts.iter().any(|h| {
+                let h = h.trim_end_matches('.');
+                host_matches_admitted_service(h, &admitted_hosts)
+            })
+        })
+        .collect();
+    let admitted_workloads: Vec<Workload> = resources
+        .workloads
+        .into_iter()
+        .filter(|w| {
+            // Admit any workload whose addresses or SPIFFE identity is
+            // referenced by an admitted service's `workloads[]` list. This
+            // preserves the per-pod identity routing fans-out from the
+            // narrowed service set without bringing in unrelated pods.
+            let spiffe = &w.spiffe_id;
+            admitted_services
+                .iter()
+                .any(|svc| svc.workloads.iter().any(|wref| &wref.spiffe_id == spiffe))
+        })
+        .collect();
+    ServiceWaypointNarrowingResources {
+        services: admitted_services,
+        service_entries: admitted_service_entries,
+        destination_rules: admitted_destination_rules,
+        workloads: admitted_workloads,
+        mesh_policies: resources.mesh_policies,
+    }
+}
+
+fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTreeSet<String> {
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let mut hosts = BTreeSet::new();
+    for service in services {
+        hosts.insert(format!("{}.{}", service.name, service.namespace));
+        hosts.insert(format!("{}.{}.svc", service.name, service.namespace));
+        if !cluster_domain.is_empty() {
+            hosts.insert(format!(
+                "{}.{}.svc.{}",
+                service.name, service.namespace, cluster_domain
+            ));
+        }
+    }
+    hosts
+}
+
+fn destination_rule_matches_admitted_service(
+    dr: &MeshDestinationRule,
+    admitted_services: &[MeshService],
+    admitted_hosts: &BTreeSet<String>,
+) -> bool {
+    let host = dr.host.trim_end_matches('.');
+    host_matches_admitted_service(host, admitted_hosts)
+        || admitted_services
+            .iter()
+            .any(|service| host == service.name && dr.namespace == service.namespace)
+}
+
+fn host_matches_admitted_service(host: &str, admitted_hosts: &BTreeSet<String>) -> bool {
+    admitted_hosts.contains(host.trim_end_matches('.'))
 }
 
 /// Filter `workloads` down to the SPIFFE identities referenced by admitted
@@ -1810,6 +2040,7 @@ mod tests {
             node_id: "node-1".into(),
             namespace: namespace.into(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
@@ -1826,6 +2057,7 @@ mod tests {
             node_id: "node-1".into(),
             namespace: namespace.into(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels,
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: false,
@@ -1865,6 +2097,7 @@ mod tests {
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
+            waypoint_name: None,
         };
         assert!(slice.content_eq(&slice.clone()));
     }
@@ -2554,6 +2787,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -2604,6 +2838,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -2675,6 +2910,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -2716,6 +2952,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -3041,6 +3278,7 @@ mod tests {
                 enforce_sidecar_egress: false,
                 sidecar_egress_dry_run: false,
                 enforce_sidecar_identity_narrowing: false,
+                waypoint_name: None,
             },
         );
 
@@ -3764,6 +4002,7 @@ mod tests {
             node_id: "node-1".into(),
             namespace: namespace.into(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels: BTreeMap::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: true,
@@ -3780,6 +4019,7 @@ mod tests {
             node_id: "node-1".into(),
             namespace: namespace.into(),
             workload_spiffe_id: None,
+            waypoint_name: None,
             labels,
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             enforce_sidecar_egress: true,
