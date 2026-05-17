@@ -220,7 +220,7 @@ pub struct WsDisconnectContext {
     pub proxy_name: Option<String>,
     pub client_ip: String,
     /// Backend target URL (scheme://host:port/path) — matches the
-    /// `backend_target_url` field from the original upgrade request.
+    /// `backend_target` field from the original upgrade request.
     pub backend_target: String,
     /// Listener port on the gateway that accepted the upgrade.
     pub listen_port: u16,
@@ -340,11 +340,11 @@ pub struct RequestContext {
     ///    `request_mirror`): copied from the buffered `Bytes::len()`.
     ///
     /// Summary builders read this via `load(Ordering::Acquire)` and populate
-    /// `TransactionSummary.request_bytes`. A zero value is skipped at
+    /// `TransactionSummary.bytes_sent`. A zero value is skipped at
     /// serialization time, so empty/GET/HEAD requests do not inflate logs.
     ///
     /// Clone-safe via `Arc` — all proxy paths share one counter per request.
-    pub request_bytes_observed: Arc<std::sync::atomic::AtomicU64>,
+    pub bytes_sent_observed: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this request arrived via TLS 1.3 0-RTT early data.
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
@@ -416,7 +416,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
-            request_bytes_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             route_override_upstream_id: None,
             route_override_backend_host: None,
@@ -940,7 +940,12 @@ pub struct TransactionSummary {
     /// `StreamTransactionSummary.proxy_name`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_name: Option<String>,
-    pub backend_target_url: Option<String>,
+    /// Backend the request was forwarded to. For HTTP this is the full URL
+    /// (`scheme://host:port/path`); `None` when the request was rejected
+    /// before backend selection. Same JSON key as
+    /// `StreamTransactionSummary.backend_target` (which is always set and
+    /// uses `host:port` form, since stream proxies have no path).
+    pub backend_target: Option<String>,
     /// The DNS-resolved IP address of the backend that was connected to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_resolved_ip: Option<String>,
@@ -1014,7 +1019,9 @@ pub struct TransactionSummary {
     /// body size limit exceeded) or when no streaming occurred.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_completed: bool,
-    /// Total bytes of the request body received from the client.
+    /// Bytes of the request body relayed from the client to the backend
+    /// (gateway-perspective: bytes it sent onward on the client's behalf).
+    /// Same JSON key as `StreamTransactionSummary.bytes_sent`.
     ///
     /// Accuracy by request type:
     /// * **Buffered requests** (plugins required the body, or retries were
@@ -1029,9 +1036,11 @@ pub struct TransactionSummary {
     /// * **Empty / GET / HEAD / size-zero requests**: zero (skipped during
     ///   serialization via `skip_serializing_if = "is_zero_u64"`).
     #[serde(skip_serializing_if = "is_zero_u64")]
-    pub request_bytes: u64,
-    /// Total bytes of the response body delivered to the client (unified
-    /// streaming + buffered counter).
+    pub bytes_sent: u64,
+    /// Bytes of the response body relayed from the backend to the client
+    /// (gateway-perspective: bytes it received and forwarded back). Unified
+    /// streaming + buffered counter. Same JSON key as
+    /// `StreamTransactionSummary.bytes_received`.
     ///
     /// Population sites:
     /// * **Buffered responses** (`ResponseBody::Buffered`, plugin rejects,
@@ -1042,7 +1051,7 @@ pub struct TransactionSummary {
     ///   the body counter. On a client disconnect mid-stream this reflects
     ///   bytes actually flushed before the disconnect.
     #[serde(skip_serializing_if = "is_zero_u64")]
-    pub response_bytes: u64,
+    pub bytes_received: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -1070,7 +1079,7 @@ impl TransactionSummary {
     pub fn as_mirror_entry(&self, result: MirrorResponseMeta) -> Self {
         let mut mirror = self.clone();
         mirror.mirror = true;
-        mirror.backend_target_url = Some(result.mirror_target_url);
+        mirror.backend_target = Some(result.mirror_target_url);
         mirror.response_status_code = result.mirror_response_status_code.unwrap_or(0);
         mirror.backend_resolved_ip = None;
         mirror.latency_total_ms = result.mirror_latency_ms;
@@ -1088,8 +1097,8 @@ impl TransactionSummary {
         // Mirror traffic is fire-and-forget from the client's perspective — body
         // byte counters from the primary transaction are not meaningful on the
         // mirror summary. Mirror response size goes into metadata instead.
-        mirror.request_bytes = 0;
-        mirror.response_bytes = 0;
+        mirror.bytes_sent = 0;
+        mirror.bytes_received = 0;
         if let Some(size) = result.mirror_response_size_bytes {
             mirror
                 .metadata

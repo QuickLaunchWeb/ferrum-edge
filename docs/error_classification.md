@@ -150,7 +150,7 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
   "request_path": "/api/v1/users",
   "proxy_id": "abc123",
   "proxy_name": "users-api",
-  "backend_target_url": "https://upstream.internal:8443/api/v1/users",
+  "backend_target": "https://upstream.internal:8443/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 502,
   "error_class": "connection_timeout",

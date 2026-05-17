@@ -358,7 +358,7 @@ pub(super) async fn handle_hbone_request(
         Err(err) => {
             error!(
                 proxy_id = %proxy.id,
-                backend_target_url = ?err.target_url,
+                backend_target = ?err.target_url,
                 backend_resolved_ip = ?err.resolved_ip,
                 error_kind = retry::error_class_log_kind(err.class),
                 error_class = %err.class,
@@ -421,9 +421,9 @@ pub(super) async fn handle_hbone_request(
         );
     }
 
-    let backend_target_url = backend.target_url.clone();
+    let backend_target = backend.target_url.clone();
     let backend_resolved_ip = backend.resolved_ip.clone();
-    let request_bytes_observed = Arc::clone(&ctx.request_bytes_observed);
+    let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let relay_proxy_id = proxy.id.clone();
     let relay_buffer_proxy_id = proxy.id.clone();
     let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
@@ -450,7 +450,7 @@ pub(super) async fn handle_hbone_request(
                     relay_buffer_size,
                 )
                 .await;
-                request_bytes_observed.fetch_add(result.bytes_client_to_backend, Ordering::Release);
+                bytes_sent_observed.fetch_add(result.bytes_client_to_backend, Ordering::Release);
                 adaptive_buffer.record_connection(
                     &relay_buffer_proxy_id,
                     result
@@ -499,7 +499,7 @@ pub(super) async fn handle_hbone_request(
             request_path: ctx.path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target_url: Some(backend_target_url),
+            backend_target: Some(backend_target),
             backend_resolved_ip,
             response_status_code: StatusCode::OK.as_u16(),
             latency_total_ms: total_ms,

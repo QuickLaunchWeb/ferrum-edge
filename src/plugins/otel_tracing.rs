@@ -65,7 +65,7 @@ pub(crate) struct SpanData {
     pub(crate) user_agent: Option<String>,
     pub(crate) proxy_id: Option<String>,
     pub(crate) matched_route: Option<String>,
-    pub(crate) backend_target_url: Option<String>,
+    pub(crate) backend_target: Option<String>,
     pub(crate) backend_resolved_ip: Option<String>,
     pub(crate) error_class: Option<String>,
     pub(crate) response_streamed: bool,
@@ -131,7 +131,7 @@ impl SpanData {
             user_agent: summary.request_user_agent.clone(),
             proxy_id: summary.proxy_id.clone(),
             matched_route: summary.proxy_name.clone(),
-            backend_target_url: summary.backend_target_url.clone(),
+            backend_target: summary.backend_target.clone(),
             backend_resolved_ip: summary.backend_resolved_ip.clone(),
             error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
             response_streamed: summary.response_streamed,
@@ -178,7 +178,7 @@ impl SpanData {
             user_agent: None,
             proxy_id: Some(summary.proxy_id.clone()),
             matched_route: summary.proxy_name.clone(),
-            backend_target_url: Some(summary.backend_target.clone()),
+            backend_target: Some(summary.backend_target.clone()),
             backend_resolved_ip: summary.backend_resolved_ip.clone(),
             error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
             response_streamed: false,
@@ -1045,7 +1045,7 @@ fn build_otlp_payload(
             if let Some(ref route) = s.matched_route {
                 attributes.push(otlp_attribute("http.route", route));
             }
-            if let Some(ref target) = s.backend_target_url {
+            if let Some(ref target) = s.backend_target {
                 attributes.push(otlp_attribute("server.address", target));
             }
             if let Some(ref resolved) = s.backend_resolved_ip {
@@ -1181,7 +1181,7 @@ fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
             if let Some(ref route) = span.matched_route {
                 insert_tag(&mut tags, "http.route", route);
             }
-            if let Some(ref target) = span.backend_target_url {
+            if let Some(ref target) = span.backend_target {
                 insert_tag(&mut tags, "server.address", target);
             }
             if let Some(ref protocol) = span.stream_protocol {
@@ -1243,7 +1243,7 @@ fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
     if let Some(ref route) = span.matched_route {
         insert_tag(&mut meta, "http.route", route);
     }
-    if let Some(ref target) = span.backend_target_url {
+    if let Some(ref target) = span.backend_target {
         insert_tag(&mut meta, "server.address", target);
     }
     if let Some(ref protocol) = span.stream_protocol {
@@ -1608,7 +1608,7 @@ mod tests {
             user_agent: None,
             proxy_id: Some("proxy-a".to_string()),
             matched_route: Some("api".to_string()),
-            backend_target_url: None,
+            backend_target: None,
             backend_resolved_ip: None,
             error_class: None,
             response_streamed: false,
@@ -1776,7 +1776,7 @@ mod tests {
             user_agent: None,
             proxy_id: Some("proxy-a".to_string()),
             matched_route: Some("payments".to_string()),
-            backend_target_url: None,
+            backend_target: None,
             backend_resolved_ip: None,
             error_class: None,
             response_streamed: false,

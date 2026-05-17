@@ -487,15 +487,15 @@ plugin_configs: []
     // rejected. A leak of even one oversized datagram represents a
     // real regression, so assert each datagram fits inside the
     // configured per-request allowance.
-    let request_bytes = request.len();
+    let bytes_sent = request.len();
     for (i, d) in received.iter().enumerate() {
         assert!(
-            d.len() <= request_bytes,
+            d.len() <= bytes_sent,
             "amplification factor leaked: datagram {i} carries {} bytes, \
              which exceeds the factor=1 × {} request-byte budget. The \
              gateway should have dropped it",
             d.len(),
-            request_bytes,
+            bytes_sent,
         );
     }
 
@@ -503,10 +503,10 @@ plugin_configs: []
     // reply bytes must be ≤ factor × request bytes. Factor=1 here.
     let total_bytes: usize = received.iter().map(|d| d.len()).sum();
     assert!(
-        total_bytes <= request_bytes,
+        total_bytes <= bytes_sent,
         "amplification factor exceeded: received {total_bytes} reply bytes \
-         for a {request_bytes}-byte request (cap=factor × request = \
-         {request_bytes})",
+         for a {bytes_sent}-byte request (cap=factor × request = \
+         {bytes_sent})",
     );
 
     // Give the backend a moment to drain its send loop.
