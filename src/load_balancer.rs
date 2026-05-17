@@ -962,18 +962,37 @@ fn build_locality_lb_state(
         let mut weights = vec![0u64; targets.len()];
         let mut total: u64 = 0;
         let mut groups = Vec::new();
-        for (to_locality, to_weight) in &entry.to {
-            let Some(to_pref) = LocalityPreference::parse(to_locality) else {
-                continue;
-            };
+        let to_entries: Vec<(LocalityPreference, u32)> = entry
+            .to
+            .iter()
+            .filter_map(|(to_locality, to_weight)| {
+                LocalityPreference::parse(to_locality).map(|to_pref| (to_pref, *to_weight))
+            })
+            .collect();
+        let best_to_entry_by_target: Vec<Option<usize>> = target_localities
+            .iter()
+            .map(|target_pref| {
+                let target_pref = target_pref.as_ref()?;
+                let mut best = None;
+                for (to_idx, (to_pref, _)) in to_entries.iter().enumerate() {
+                    if !locality_match_for_distribute(to_pref, target_pref) {
+                        continue;
+                    }
+                    let specificity = locality_distribute_specificity(to_pref);
+                    if best.is_none_or(|(_, best_specificity)| specificity > best_specificity) {
+                        best = Some((to_idx, specificity));
+                    }
+                }
+                best.map(|(to_idx, _)| to_idx)
+            })
+            .collect();
+        for (to_idx, (_, to_weight)) in to_entries.iter().enumerate() {
             let matching_targets: Vec<(usize, u64)> = target_localities
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, target_pref)| {
-                    target_pref
-                        .as_ref()
-                        .filter(|target_pref| locality_match_for_distribute(&to_pref, target_pref))
-                        .map(|_| (idx, u64::from(targets[idx].weight)))
+                    (target_pref.is_some() && best_to_entry_by_target[idx] == Some(to_idx))
+                        .then_some((idx, u64::from(targets[idx].weight)))
                 })
                 .collect();
             if matching_targets.is_empty() {
@@ -1105,6 +1124,23 @@ fn locality_match_for_distribute(to: &LocalityPreference, target: &LocalityPrefe
         }
     }
     true
+}
+
+#[inline]
+fn locality_distribute_specificity(to: &LocalityPreference) -> u8 {
+    if to.region == "*" {
+        return 0;
+    }
+    let Some(zone) = to.zone.as_deref() else {
+        return 1;
+    };
+    if zone == "*" {
+        return 1;
+    }
+    let Some(sub_zone) = to.sub_zone.as_deref() else {
+        return 2;
+    };
+    if sub_zone == "*" { 2 } else { 3 }
 }
 
 /// True when a `distribute[].from` pattern matches the concrete source

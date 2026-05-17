@@ -776,6 +776,59 @@ fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
 }
 
 #[test]
+fn locality_distribute_assigns_overlapping_to_localities_once() {
+    let mut to = BTreeMap::new();
+    to.insert("us-west".to_string(), 50);
+    to.insert("us-west/us-west-1".to_string(), 50);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-east/us-east-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-east/us-east-1/a",
+        vec![
+            target("west-zone-1.local", Some("us-west/us-west-1/a")),
+            target("west-zone-2.local", Some("us-west/us-west-2/a")),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let mut by_target: HashMap<String, u32> = HashMap::new();
+    for i in 0..2000 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("overlap-{i}"),
+            no_health(),
+        )
+        .expect("overlap distribute selection");
+        *by_target.entry(selection.target.host.clone()).or_default() += 1;
+    }
+
+    let zone_1 = by_target.get("west-zone-1.local").copied().unwrap_or(0);
+    let zone_2 = by_target.get("west-zone-2.local").copied().unwrap_or(0);
+    let total = zone_1 + zone_2;
+    assert_eq!(total, 2000);
+
+    let zone_1_ratio = f64::from(zone_1) / f64::from(total);
+    let zone_2_ratio = f64::from(zone_2) / f64::from(total);
+    assert!(
+        (zone_1_ratio - 0.5).abs() < 0.06,
+        "west-zone-1 ratio {zone_1_ratio:.3} outside +/-0.06 of 0.5"
+    );
+    assert!(
+        (zone_2_ratio - 0.5).abs() < 0.06,
+        "west-zone-2 ratio {zone_2_ratio:.3} outside +/-0.06 of 0.5"
+    );
+}
+
+#[test]
 fn locality_distribute_preserves_consistent_hashing_within_selected_locality() {
     let mut to = BTreeMap::new();
     to.insert("us-east".to_string(), 100);
