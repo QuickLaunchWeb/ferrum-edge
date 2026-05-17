@@ -17,13 +17,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::admin::AdminState;
 use crate::admin::api_specs::extractor::{MAX_YAML_EXPANDED_NODES, count_value_nodes};
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
+use crate::admin::{AdminState, log_audit_persist_failure};
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -2089,9 +2089,7 @@ pub async fn handle_post_api_spec(
         audit::create_diff(resp_body.clone()),
     );
     if let Err(error) = audit::record(db.clone(), event).await {
-        return Ok(error_response(ApiSpecError::Internal(format!(
-            "Admin mutation persisted but audit write failed: {error}"
-        ))));
+        log_audit_persist_failure(&error);
     }
 
     // Build the body + standard headers via the shared `json_resp` helper, then
@@ -2258,9 +2256,7 @@ pub async fn handle_put_api_spec(
         audit::update_diff(before, resp_body.clone()),
     );
     if let Err(error) = audit::record(db.clone(), event).await {
-        return Ok(error_response(ApiSpecError::Internal(format!(
-            "Admin mutation persisted but audit write failed: {error}"
-        ))));
+        log_audit_persist_failure(&error);
     }
 
     Ok(json_resp(StatusCode::OK, &resp_body))
@@ -2429,9 +2425,7 @@ pub async fn handle_delete_api_spec(
                 })),
             );
             if let Err(error) = audit::record(db.clone(), event).await {
-                return Ok(error_response(ApiSpecError::Internal(format!(
-                    "Admin mutation persisted but audit write failed: {error}"
-                ))));
+                log_audit_persist_failure(&error);
             }
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)

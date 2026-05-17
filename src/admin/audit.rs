@@ -126,6 +126,10 @@ impl AuditSink {
 }
 
 fn db_key(db: &Arc<dyn DatabaseBackend>) -> usize {
+    // `AdminState` owns the process-lifetime database Arc and all handler
+    // clones share this inner pointer, so the address is a stable per-backend
+    // worker key. If database ownership becomes reloadable, replace this with
+    // an explicit backend instance id.
     Arc::as_ptr(db) as *const () as usize
 }
 

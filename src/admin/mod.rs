@@ -391,13 +391,11 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
     ))
 }
 
-pub(crate) fn audit_persist_failed_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &json!({
-            "error": format!("Admin mutation persisted but audit write failed: {}", error)
-        }),
-    )
+pub(crate) fn log_audit_persist_failure(error: &anyhow::Error) {
+    error!(
+        error = %error,
+        "Admin mutation persisted but audit write failed"
+    );
 }
 
 /// Apply pagination to a serializable collection.
@@ -761,6 +759,14 @@ pub async fn handle_admin_request(
                 .await;
         }
         _ => {}
+    }
+
+    if method == Method::POST
+        && segments_peek.as_slice() == ["restore"]
+        && let Some(resp) = require_admin_role(&auth, AdminRole::Admin)
+    {
+        drop(req.into_body());
+        return Ok(resp);
     }
 
     // Read body with size limit.
@@ -1359,6 +1365,12 @@ struct PersistCounts {
     upstreams: usize,
 }
 
+impl PersistCounts {
+    fn any(&self) -> bool {
+        self.proxies > 0 || self.consumers > 0 || self.plugin_configs > 0 || self.upstreams > 0
+    }
+}
+
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
@@ -1479,7 +1491,7 @@ async fn handle_update_credentials(
             ),
         );
         if let Err(error) = audit::record(db.clone(), event).await {
-            return Ok(audit_persist_failed_response(&error));
+            log_audit_persist_failure(&error);
         }
     }
     Ok(response)
@@ -1526,7 +1538,7 @@ async fn handle_delete_credentials(
             ),
         );
         if let Err(error) = audit::record(db.clone(), event).await {
-            return Ok(audit_persist_failed_response(&error));
+            log_audit_persist_failure(&error);
         }
     }
     Ok(response)
@@ -1628,7 +1640,7 @@ async fn handle_append_credential(
             ),
         );
         if let Err(error) = audit::record(db.clone(), event).await {
-            return Ok(audit_persist_failed_response(&error));
+            log_audit_persist_failure(&error);
         }
     }
     Ok(response)
@@ -1720,7 +1732,7 @@ async fn handle_delete_credential_by_index(
             ),
         );
         if let Err(error) = audit::record(db.clone(), event).await {
-            return Ok(audit_persist_failed_response(&error));
+            log_audit_persist_failure(&error);
         }
     }
     Ok(response)
@@ -2356,6 +2368,19 @@ async fn handle_batch_create(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
+        if created.any() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "batch_create",
+                "gateway_config",
+                namespace,
+                namespace,
+                audit::create_diff(response["created"].clone()),
+            );
+            if let Err(error) = audit::record(db.clone(), event).await {
+                log_audit_persist_failure(&error);
+            }
+        }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
@@ -2368,7 +2393,7 @@ async fn handle_batch_create(
         audit::create_diff(response["created"].clone()),
     );
     if let Err(error) = audit::record(db.clone(), event).await {
-        return Ok(audit_persist_failed_response(&error));
+        log_audit_persist_failure(&error);
     }
 
     Ok(json_response(StatusCode::CREATED, &response))
@@ -2666,6 +2691,22 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
+        if created.any() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "restore",
+                "gateway_config",
+                namespace,
+                namespace,
+                audit::update_diff(
+                    json!({"replaced_namespace": namespace}),
+                    response["restored"].clone(),
+                ),
+            );
+            if let Err(error) = audit::record(db.clone(), event).await {
+                log_audit_persist_failure(&error);
+            }
+        }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
@@ -2681,7 +2722,7 @@ async fn handle_restore(
         ),
     );
     if let Err(error) = audit::record(db.clone(), event).await {
-        return Ok(audit_persist_failed_response(&error));
+        log_audit_persist_failure(&error);
     }
 
     Ok(json_response(StatusCode::OK, &response))

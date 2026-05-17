@@ -135,6 +135,19 @@ async fn post_json(base: &str, path: &str, bearer: &str, body: &Value) -> (u16, 
     (status, body)
 }
 
+async fn post_raw(base: &str, path: &str, bearer: &str, body: Vec<u8>) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .body(body)
+        .send()
+        .await
+        .expect("POST request");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
 async fn get_json(base: &str, path: &str, bearer: &str) -> (u16, Value) {
     let response = reqwest::Client::new()
         .get(format!("{base}{path}"))
@@ -168,6 +181,32 @@ async fn viewer_role_is_rejected_on_admin_mutation() {
 }
 
 #[tokio::test]
+async fn viewer_restore_is_rejected_before_large_body_buffering() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_restore_max_body_size_mib = 0;
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) = post_raw(
+        &base,
+        "/restore?confirm=true",
+        &viewer,
+        br#"{"version":"1","proxies":[]}"#.to_vec(),
+    )
+    .await;
+
+    assert_eq!(status, 403, "viewer restore body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn upstream_mutation_writes_queryable_audit_event() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
@@ -196,4 +235,50 @@ async fn upstream_mutation_writes_queryable_audit_event() {
     assert_eq!(event["resource_id"], "audit-u1");
     assert_eq!(event["namespace"], "ferrum");
     assert_eq!(event["diff"]["after"]["id"], "audit-u1");
+}
+
+#[tokio::test]
+async fn partial_batch_mutation_writes_audit_event() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = post_json(
+        &base,
+        "/upstreams",
+        &admin,
+        &upstream_payload("batch-duplicate-u1"),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream seed failed: {body:?}");
+
+    let batch = json!({
+        "consumers": [{
+            "id": "partial-batch-c1",
+            "username": "partial-batch-user"
+        }],
+        "upstreams": [upstream_payload("batch-duplicate-u1")]
+    });
+    let (status, body) = post_json(&base, "/batch", &admin, &batch).await;
+    assert_eq!(status, 207, "partial batch body: {body:?}");
+    assert_eq!(body["created"]["consumers"], 1);
+    assert_eq!(body["created"]["upstreams"], 0);
+
+    let (status, audit_body) = get_json(
+        &base,
+        "/audit?resource_type=gateway_config&action=batch_create",
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
+    assert_eq!(audit_body["total"], 1);
+
+    let items = audit_body["items"].as_array().expect("audit items");
+    let event = &items[0];
+    assert_eq!(event["actor"], "security-admin");
+    assert_eq!(event["action"], "batch_create");
+    assert_eq!(event["resource_type"], "gateway_config");
+    assert_eq!(event["diff"]["after"]["consumers"], 1);
+    assert_eq!(event["diff"]["after"]["upstreams"], 0);
 }
