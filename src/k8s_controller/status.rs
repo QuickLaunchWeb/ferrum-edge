@@ -470,13 +470,7 @@ fn route_parent_refs(object: &K8sObject) -> Vec<Value> {
         .and_then(Value::as_array)
         .filter(|refs| !refs.is_empty())
         .cloned()
-        .unwrap_or_else(|| {
-            vec![json!({
-                "group": "gateway.networking.k8s.io",
-                "kind": "Gateway",
-                "name": object.metadata.name,
-            })]
-        })
+        .unwrap_or_default()
 }
 
 fn status_target_is_managed_by_ferrum(
@@ -797,6 +791,23 @@ mod tests {
         let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
 
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn route_status_skips_route_without_parent_refs() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("api");
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        assert!(updates.iter().all(|update| update.kind != "HTTPRoute"));
     }
 
     #[test]

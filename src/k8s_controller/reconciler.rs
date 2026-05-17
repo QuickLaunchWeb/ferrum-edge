@@ -345,8 +345,8 @@ async fn do_reconcile(
         .with_istio_root_namespace(ctx.istio_root_namespace.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
-    patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options.clone()).await;
-    let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
+    let Some(translation) = translate_with_skip_retries(&objects, options.clone(), ctx.metrics)
+    else {
         return;
     };
 
@@ -363,6 +363,7 @@ async fn do_reconcile(
         swap_merged_k8s_translation(ctx.config_arc, &translation.config, &managed_namespaces)
     else {
         debug!("No config changes detected, skipping swap");
+        patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options).await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
@@ -378,6 +379,7 @@ async fn do_reconcile(
         new_config.clone(),
         ctx.mesh_registry,
     );
+    patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options).await;
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
