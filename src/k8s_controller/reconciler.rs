@@ -30,10 +30,6 @@ pub struct ReconcilerConfig {
     pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
-    /// When true, the Istio VirtualService translator emits a
-    /// `mesh_route_dispatch` plugin instance for routes with method/header/
-    /// query-param predicates. Default false (existing behavior).
-    pub vs_header_routing_experimental: bool,
     pub pod_discovery_enabled: bool,
 }
 
@@ -99,7 +95,6 @@ pub fn spawn_reconcile_loop(
                 istio_root_namespace: &reconciler_config.istio_root_namespace,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
-                vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                 pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                 metrics: &metrics,
             },
@@ -131,7 +126,6 @@ pub fn spawn_reconcile_loop(
                             istio_root_namespace: &reconciler_config.istio_root_namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
-                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             metrics: &metrics,
                         },
@@ -157,7 +151,6 @@ pub fn spawn_reconcile_loop(
                             istio_root_namespace: &reconciler_config.istio_root_namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
-                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             metrics: &metrics,
                         },
@@ -320,7 +313,6 @@ struct ReconcileContext<'a> {
     istio_root_namespace: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
-    vs_header_routing_experimental: bool,
     pod_discovery_enabled: bool,
     metrics: &'a ControllerMetrics,
 }
@@ -346,7 +338,6 @@ async fn do_reconcile(
         .with_cluster_domain(ctx.cluster_domain.to_string())
         .with_istio_root_namespace(ctx.istio_root_namespace.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec())
-        .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental)
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
