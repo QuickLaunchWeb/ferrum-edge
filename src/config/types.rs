@@ -349,6 +349,62 @@ fn default_weight() -> u32 {
     1
 }
 
+/// Resolved projection of Istio
+/// `DestinationRule.trafficPolicy.localityLbSetting` onto an `Upstream`.
+///
+/// `enabled` defaults to `true` (matches Istio semantics — an explicit
+/// `enabled: false` disables locality preference, distribute weighting,
+/// and failover override entirely). `distribute` and `failover` are
+/// mutually exclusive at evaluation time: when a `distribute` entry
+/// matches the source locality the load balancer uses per-locality
+/// weights and skips the priority tier preference; otherwise `failover`
+/// (when configured) supplies a fourth tier consulted after `region`
+/// and before the unfiltered fallback set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpstreamLocalityLbSetting {
+    #[serde(default = "default_true_locality_lb_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distribute: Vec<LocalityDistribute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover: Vec<LocalityFailover>,
+}
+
+fn default_true_locality_lb_enabled() -> bool {
+    true
+}
+
+impl Default for UpstreamLocalityLbSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            distribute: Vec::new(),
+            failover: Vec::new(),
+        }
+    }
+}
+
+/// One `localityLbSetting.distribute[]` entry. `from` is an Istio-style
+/// `region/zone/subzone` locality string; `to` maps target localities
+/// (same syntax) to integer weights. Istio treats the values as
+/// percentages summing to 100; we propagate the integers verbatim and use
+/// them as ratios so non-summing operator configs still produce a
+/// deterministic split.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalityDistribute {
+    pub from: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub to: std::collections::BTreeMap<String, u32>,
+}
+
+/// One `localityLbSetting.failover[]` entry. `from` and `to` are Istio
+/// region names (the first `region/zone/subzone` segment of a locality).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalityFailover {
+    pub from: String,
+    pub to: String,
+}
+
 /// Health check probe type.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -705,6 +761,14 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
+    /// Optional projection of Istio
+    /// `DestinationRule.trafficPolicy.localityLbSetting`. Populated by the
+    /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
+    /// hand-crafted upstreams. The load balancer reads this at construction
+    /// time to honour weighted `distribute` and region-`failover` overrides
+    /// on top of the priority-tier preference driven by `source_locality`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,
@@ -3657,6 +3721,20 @@ impl Upstream {
                 "source_locality is projected from the mesh workload's \
                  locality and cannot be set directly via the admin API — \
                  set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
+        // `locality_lb_setting` is mesh-derived state populated at slice-apply
+        // time from `DestinationRule.trafficPolicy.localityLbSetting`. The
+        // canonical surface is a DestinationRule, mirroring `port_overrides`
+        // and `source_locality` above.
+        if self.locality_lb_setting.is_some() {
+            errors.push(
+                "locality_lb_setting is projected from a mesh \
+                 DestinationRule's trafficPolicy.localityLbSetting and \
+                 cannot be set directly via the admin API — express \
+                 weighted distribute and failover via a DestinationRule"
                     .to_string(),
             );
         }

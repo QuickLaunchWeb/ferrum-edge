@@ -898,6 +898,7 @@ fn build_east_west_service_proxies_and_upstreams(
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -1288,6 +1289,33 @@ fn apply_traffic_policy_to_upstream(
         apply_traffic_policy_tls_to_upstream(upstream, tls, runtime)?;
     }
 
+    // localityLbSetting projection. We propagate the operator-supplied
+    // settings verbatim onto the resolved `Upstream`; the load balancer
+    // pre-computes per-target weight/failover state at construction time
+    // from `Upstream.source_locality` + `locality_lb_setting`. Mesh-derived
+    // resources skip admin admission, so no further validation here.
+    if let Some(ref locality) = policy.locality_lb_setting {
+        upstream.locality_lb_setting = Some(crate::config::types::UpstreamLocalityLbSetting {
+            enabled: locality.enabled,
+            distribute: locality
+                .distribute
+                .iter()
+                .map(|entry| crate::config::types::LocalityDistribute {
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                })
+                .collect(),
+            failover: locality
+                .failover
+                .iter()
+                .map(|entry| crate::config::types::LocalityFailover {
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                })
+                .collect(),
+        });
+    }
+
     Ok(())
 }
 
@@ -1647,6 +1675,7 @@ fn build_egress_proxies_and_upstreams(
                     subsets: None,
                     port_overrides: HashMap::new(),
                     source_locality: None,
+                    locality_lb_setting: None,
                     backend_tls_client_cert_path: None,
                     backend_tls_client_key_path: None,
                     backend_tls_verify_server_cert: true,
@@ -4091,6 +4120,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -6170,6 +6200,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,

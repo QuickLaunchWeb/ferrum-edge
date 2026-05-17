@@ -127,6 +127,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_san_allow_list: Vec::new(),
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_setting: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -494,6 +495,7 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
         outlier_detection: None,
         load_balancer: None,
         tls: None,
+        locality_lb_setting: None,
     };
 
     let json = serde_json::to_value(&policy).expect("serialize");
@@ -501,6 +503,11 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
     assert!(
         !object.contains_key("tls"),
         "tls=None must NOT appear in serialized JSON (wire compatibility): {json}"
+    );
+    assert!(
+        !object.contains_key("locality_lb_setting"),
+        "locality_lb_setting=None must NOT appear in serialized JSON \
+         (wire compatibility): {json}"
     );
     // Sanity: the explicitly-set field is present.
     assert_eq!(
