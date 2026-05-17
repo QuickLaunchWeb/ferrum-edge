@@ -5781,16 +5781,25 @@ fn row_to_api_spec_with_content(
 }
 
 fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
-    let diff: String = row.try_get("diff")?;
+    let id: String = row.try_get("id")?;
+    let diff_raw: String = row.try_get("diff")?;
+    let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
+        warn!(
+            audit_event_id = %id,
+            error = %e,
+            "Audit event diff column is not valid JSON; returning empty diff"
+        );
+        serde_json::json!({})
+    });
     Ok(crate::admin::audit::AuditEvent {
-        id: row.try_get("id")?,
+        id,
         ts: parse_datetime_column(row, "ts"),
         actor: row.try_get("actor")?,
         action: row.try_get("action")?,
         resource_type: row.try_get("resource_type")?,
         resource_id: row.try_get("resource_id")?,
         namespace: row.try_get("namespace")?,
-        diff: serde_json::from_str(&diff).unwrap_or_else(|_| serde_json::json!({})),
+        diff,
     })
 }
 
