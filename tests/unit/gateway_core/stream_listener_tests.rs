@@ -129,6 +129,7 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         Arc::new(ferrum_edge::overload::OverloadState::new()),
         false, // ktls_enabled
         false, // io_uring_splice_enabled
+        false, // record_mesh_mtls_metric
         0,     // so_busy_poll_us
         false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false, // udp_gso_enabled
@@ -464,6 +465,7 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
         Arc::new(ferrum_edge::overload::OverloadState::new()),
         false,
         false,
+        false,
         0,
         false,
         false,
@@ -569,6 +571,7 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
         1,
         256,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
+        false,
         false,
         false,
         0,

@@ -1,7 +1,8 @@
 //! Lock-free mesh service graph aggregation.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -13,35 +14,36 @@ use crate::plugins::mesh::prometheus_helpers::{MeshRequestKey, mesh_request_key}
 
 const SNAPSHOT_REFRESH_MIN_MS: u64 = 1_000;
 
-static GLOBAL_SERVICE_GRAPH: LazyLock<ServiceGraphRegistry> =
-    LazyLock::new(ServiceGraphRegistry::default);
+static GLOBAL_SERVICE_GRAPH: LazyLock<Arc<ServiceGraphRegistry>> =
+    LazyLock::new(|| Arc::new(ServiceGraphRegistry::default()));
 
 pub fn global_service_graph() -> &'static ServiceGraphRegistry {
-    &GLOBAL_SERVICE_GRAPH
+    GLOBAL_SERVICE_GRAPH.as_ref()
 }
 
 pub fn record_transaction(summary: &TransactionSummary) {
-    global_service_graph().record_transaction(summary);
+    GLOBAL_SERVICE_GRAPH.ensure_snapshot_worker();
+    GLOBAL_SERVICE_GRAPH.record_transaction(summary);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ServiceGraphKey {
     source_principal: Arc<str>,
-    destination_principal: Arc<str>,
-}
-
-#[derive(Debug)]
-struct ServiceGraphCounters {
     source_workload: Arc<str>,
     source_namespace: Arc<str>,
     source_app: Arc<str>,
     source_service: Arc<str>,
+    destination_principal: Arc<str>,
     destination_workload: Arc<str>,
     destination_namespace: Arc<str>,
     destination_app: Arc<str>,
     destination_service: Arc<str>,
     request_protocol: Arc<str>,
     connection_security_policy: Arc<str>,
+}
+
+#[derive(Debug)]
+struct ServiceGraphCounters {
     requests_total: AtomicU64,
     errors_total: AtomicU64,
     duration_micros_total: AtomicU64,
@@ -49,18 +51,8 @@ struct ServiceGraphCounters {
 }
 
 impl ServiceGraphCounters {
-    fn new(mesh_key: &MeshRequestKey, now_unix_ms: u64) -> Self {
+    fn new(now_unix_ms: u64) -> Self {
         Self {
-            source_workload: Arc::clone(&mesh_key.source_workload),
-            source_namespace: Arc::clone(&mesh_key.source_namespace),
-            source_app: Arc::clone(&mesh_key.source_app),
-            source_service: Arc::clone(&mesh_key.source_service),
-            destination_workload: Arc::clone(&mesh_key.destination_workload),
-            destination_namespace: Arc::clone(&mesh_key.destination_namespace),
-            destination_app: Arc::clone(&mesh_key.destination_app),
-            destination_service: Arc::clone(&mesh_key.destination_service),
-            request_protocol: Arc::clone(&mesh_key.request_protocol),
-            connection_security_policy: Arc::clone(&mesh_key.connection_security_policy),
             requests_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             duration_micros_total: AtomicU64::new(0),
@@ -83,17 +75,17 @@ impl ServiceGraphCounters {
         let duration_ms_total = self.duration_micros_total.load(Ordering::Relaxed) as f64 / 1_000.0;
         ServiceGraphEdge {
             source_principal: key.source_principal.to_string(),
-            source_workload: self.source_workload.to_string(),
-            source_namespace: self.source_namespace.to_string(),
-            source_app: self.source_app.to_string(),
-            source_service: self.source_service.to_string(),
+            source_workload: key.source_workload.to_string(),
+            source_namespace: key.source_namespace.to_string(),
+            source_app: key.source_app.to_string(),
+            source_service: key.source_service.to_string(),
             destination_principal: key.destination_principal.to_string(),
-            destination_workload: self.destination_workload.to_string(),
-            destination_namespace: self.destination_namespace.to_string(),
-            destination_app: self.destination_app.to_string(),
-            destination_service: self.destination_service.to_string(),
-            request_protocol: self.request_protocol.to_string(),
-            connection_security_policy: self.connection_security_policy.to_string(),
+            destination_workload: key.destination_workload.to_string(),
+            destination_namespace: key.destination_namespace.to_string(),
+            destination_app: key.destination_app.to_string(),
+            destination_service: key.destination_service.to_string(),
+            request_protocol: key.request_protocol.to_string(),
+            connection_security_policy: key.connection_security_policy.to_string(),
             requests_total,
             errors_total: self.errors_total.load(Ordering::Relaxed),
             duration_ms_total,
@@ -113,6 +105,7 @@ pub struct ServiceGraphRegistry {
     edges: DashMap<ServiceGraphKey, ServiceGraphCounters>,
     snapshot: ArcSwap<ServiceGraphSnapshot>,
     last_snapshot_unix_ms: AtomicU64,
+    snapshot_worker_started: AtomicBool,
 }
 
 impl Default for ServiceGraphRegistry {
@@ -121,6 +114,7 @@ impl Default for ServiceGraphRegistry {
             edges: DashMap::new(),
             snapshot: ArcSwap::from_pointee(ServiceGraphSnapshot::default()),
             last_snapshot_unix_ms: AtomicU64::new(0),
+            snapshot_worker_started: AtomicBool::new(false),
         }
     }
 }
@@ -136,38 +130,58 @@ impl ServiceGraphRegistry {
         let now_unix_ms = now_unix_ms();
         let key = ServiceGraphKey {
             source_principal: Arc::clone(&mesh_key.source_principal),
+            source_workload: Arc::clone(&mesh_key.source_workload),
+            source_namespace: Arc::clone(&mesh_key.source_namespace),
+            source_app: Arc::clone(&mesh_key.source_app),
+            source_service: Arc::clone(&mesh_key.source_service),
             destination_principal: Arc::clone(&mesh_key.destination_principal),
+            destination_workload: Arc::clone(&mesh_key.destination_workload),
+            destination_namespace: Arc::clone(&mesh_key.destination_namespace),
+            destination_app: Arc::clone(&mesh_key.destination_app),
+            destination_service: Arc::clone(&mesh_key.destination_service),
+            request_protocol: Arc::clone(&mesh_key.request_protocol),
+            connection_security_policy: Arc::clone(&mesh_key.connection_security_policy),
         };
         self.edges
             .entry(key)
-            .or_insert_with(|| ServiceGraphCounters::new(&mesh_key, now_unix_ms))
+            .or_insert_with(|| ServiceGraphCounters::new(now_unix_ms))
             .observe(
                 summary.latency_total_ms,
                 service_graph_error(summary, &mesh_key),
                 now_unix_ms,
             );
-        self.refresh_snapshot_if_stale(now_unix_ms);
     }
 
     pub fn snapshot(&self) -> Arc<ServiceGraphSnapshot> {
         self.snapshot.load_full()
     }
 
-    fn refresh_snapshot_if_stale(&self, now_unix_ms: u64) {
-        let last = self.last_snapshot_unix_ms.load(Ordering::Relaxed);
-        if now_unix_ms.saturating_sub(last) < SNAPSHOT_REFRESH_MIN_MS {
+    fn ensure_snapshot_worker(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self
+            .snapshot_worker_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
-        if self
-            .last_snapshot_unix_ms
-            .compare_exchange(last, now_unix_ms, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.rebuild_snapshot(now_unix_ms);
-        }
+
+        let registry = Arc::clone(self);
+        handle.spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(SNAPSHOT_REFRESH_MIN_MS));
+            loop {
+                interval.tick().await;
+                registry.rebuild_snapshot(now_unix_ms());
+            }
+        });
     }
 
     fn rebuild_snapshot(&self, generated_at_unix_ms: u64) {
+        self.last_snapshot_unix_ms
+            .store(generated_at_unix_ms, Ordering::Relaxed);
         let mut edges: Vec<ServiceGraphEdge> = self
             .edges
             .iter()
@@ -177,6 +191,15 @@ impl ServiceGraphRegistry {
             left.source_principal
                 .cmp(&right.source_principal)
                 .then_with(|| left.destination_principal.cmp(&right.destination_principal))
+                .then_with(|| left.source_workload.cmp(&right.source_workload))
+                .then_with(|| left.source_namespace.cmp(&right.source_namespace))
+                .then_with(|| left.destination_workload.cmp(&right.destination_workload))
+                .then_with(|| left.destination_namespace.cmp(&right.destination_namespace))
+                .then_with(|| left.request_protocol.cmp(&right.request_protocol))
+                .then_with(|| {
+                    left.connection_security_policy
+                        .cmp(&right.connection_security_policy)
+                })
         });
         self.snapshot.store(Arc::new(ServiceGraphSnapshot {
             generated_at_unix_ms,
@@ -321,6 +344,48 @@ mod tests {
         registry.force_rebuild_snapshot();
 
         assert!(registry.snapshot().edges.is_empty());
+    }
+
+    #[test]
+    fn separates_edges_with_shared_principals_but_distinct_labels() {
+        let registry = ServiceGraphRegistry::default();
+        let source = "spiffe://cluster.local/ns/default/sa/shared";
+        let destination = "spiffe://cluster.local/ns/default/sa/backend";
+
+        let mut frontend = summary(source, destination, 200, 10.0);
+        frontend
+            .metadata
+            .insert("mesh.source.workload".to_string(), "frontend".to_string());
+        frontend
+            .metadata
+            .insert("mesh.source.service".to_string(), "frontend".to_string());
+
+        let mut checkout = summary(source, destination, 200, 20.0);
+        checkout
+            .metadata
+            .insert("mesh.source.workload".to_string(), "checkout".to_string());
+        checkout
+            .metadata
+            .insert("mesh.source.service".to_string(), "checkout".to_string());
+
+        registry.record_transaction(&frontend);
+        registry.record_transaction(&checkout);
+        registry.force_rebuild_snapshot();
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.edge_count, 2);
+        assert!(
+            snapshot
+                .edges
+                .iter()
+                .any(|edge| edge.source_workload == "frontend" && edge.duration_ms_total == 10.0)
+        );
+        assert!(
+            snapshot
+                .edges
+                .iter()
+                .any(|edge| edge.source_workload == "checkout" && edge.duration_ms_total == 20.0)
+        );
     }
 
     #[test]

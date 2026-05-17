@@ -2376,6 +2376,7 @@ impl ProxyState {
                     }
                     v
                 },
+                env_config_arc.mode == crate::config::env_config::OperatingMode::Mesh,
                 env_config_arc.so_busy_poll_us,
                 {
                     let v = env_config_arc
@@ -6752,6 +6753,7 @@ async fn handle_tls_connection(
         stream,
         state.env_config.frontend_tls_handshake_timeout_seconds,
         &remote_addr,
+        state.env_config.mode == crate::config::env_config::OperatingMode::Mesh,
     )
     .await?;
     info!("TLS connection established from {}", remote_addr.ip());

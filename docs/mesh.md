@@ -767,6 +767,8 @@ The endpoint is intentionally node-local. In CP/DP or horizontally scaled mesh d
 
 The Helm chart can install a `PrometheusRule` when `observability.enabled=true` and `observability.alerts.enabled=true`. The bundled rules cover certificate expiry, rotation failures, CA health, stale DP config, mTLS handshake failures, policy-deny spikes, and injector webhook failures. The observability dashboard config map includes RED, service-graph edge count, mTLS coverage, USE-lite process panels, certificate status, and trust-bundle churn panels.
 
+The injector webhook failure alert uses the Kubernetes API server metric `apiserver_admission_webhook_rejection_count`. Clusters that do not scrape kube-apiserver metrics will show that alert as no data; all Ferrum-emitted metric alerts continue to evaluate normally.
+
 ### Telemetry API
 
 `MeshTelemetryResource` provides per-scope telemetry configuration, merged by specificity (most specific scope wins per section):

@@ -57,6 +57,7 @@ pub async fn accept_with_optional_timeout<S>(
     stream: S,
     timeout_secs: u64,
     peer: &SocketAddr,
+    record_mesh_mtls_metric: bool,
 ) -> io::Result<TlsStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -66,9 +67,11 @@ where
         match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
             Ok(result) => result,
             Err(_) => {
-                crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
-                    "timeout",
-                );
+                if record_mesh_mtls_metric {
+                    crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
+                        "timeout",
+                    );
+                }
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
                     peer.ip(),
@@ -87,9 +90,11 @@ where
     match result {
         Ok(stream) => Ok(stream),
         Err(e) => {
-            crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
-                "error",
-            );
+            if record_mesh_mtls_metric {
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
+                    "error",
+                );
+            }
             warn!("Frontend TLS handshake failed from {}: {}", peer.ip(), e);
             Err(e)
         }
@@ -1128,7 +1133,7 @@ mod tests {
         });
 
         let (stream, peer) = listener.accept().await.expect("accept TCP");
-        let err = accept_with_optional_timeout(&acceptor, stream, 1, &peer)
+        let err = accept_with_optional_timeout(&acceptor, stream, 1, &peer, false)
             .await
             .expect_err("idle peer should hit TLS handshake timeout");
 

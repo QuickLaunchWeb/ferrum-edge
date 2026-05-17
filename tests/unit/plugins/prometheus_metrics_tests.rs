@@ -204,6 +204,20 @@ async fn test_registry_renders_mesh_cert_telemetry_metrics() {
     assert!(output.contains("# TYPE ferrum_mesh_cert_expiry_seconds gauge"));
     assert!(output.contains("ferrum_mesh_cert_expiry_seconds{"));
     assert!(output.contains("spiffe://cluster.local/ns/default/sa/prom-test"));
+    let expiry_line = output
+        .lines()
+        .find(|line| {
+            line.contains("ferrum_mesh_cert_expiry_seconds{")
+                && line.contains("spiffe://cluster.local/ns/default/sa/prom-test")
+                && line.contains("source=\"unit_test\"")
+        })
+        .expect("mesh cert expiry metric line");
+    let expiry_seconds = expiry_line
+        .rsplit_once(' ')
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .expect("expiry seconds value");
+    assert!(expiry_seconds <= 3600);
+    assert!(expiry_seconds > 3500);
     assert!(output.contains("# TYPE ferrum_mesh_cert_rotation_failures_total counter"));
     assert!(output.contains("ferrum_mesh_cert_rotation_failures_total{"));
     assert!(output.contains("# TYPE ferrum_mesh_ca_health gauge"));

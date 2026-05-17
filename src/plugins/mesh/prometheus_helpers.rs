@@ -13,7 +13,7 @@ use crate::identity::spiffe::SpiffeId;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 
-static MESH_CERT_EXPIRY_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, AtomicU64>> =
+static MESH_CERT_EXPIRY_UNIX_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static MESH_CERT_ROTATION_FAILURES: LazyLock<DashMap<MeshCertRotationFailureKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
@@ -110,14 +110,15 @@ pub fn record_mesh_cert_expiry_seconds(
     source: impl AsRef<str>,
     seconds_until_expiry: u64,
 ) {
+    let expires_at = (Utc::now().timestamp().max(0) as u64).saturating_add(seconds_until_expiry);
     let key = MeshCertExpiryKey {
         spiffe_id: Arc::from(spiffe_id.as_ref()),
         source: Arc::from(source.as_ref()),
     };
-    MESH_CERT_EXPIRY_SECONDS
+    MESH_CERT_EXPIRY_UNIX_SECONDS
         .entry(key)
         .or_insert_with(|| AtomicU64::new(0))
-        .store(seconds_until_expiry, Ordering::Relaxed);
+        .store(expires_at, Ordering::Relaxed);
 }
 
 pub fn record_mesh_cert_expiry_at(
@@ -125,11 +126,14 @@ pub fn record_mesh_cert_expiry_at(
     source: impl AsRef<str>,
     not_after: &DateTime<Utc>,
 ) {
-    let seconds_until_expiry = not_after
-        .signed_duration_since(Utc::now())
-        .num_seconds()
-        .max(0) as u64;
-    record_mesh_cert_expiry_seconds(spiffe_id, source, seconds_until_expiry);
+    let key = MeshCertExpiryKey {
+        spiffe_id: Arc::from(spiffe_id.as_str()),
+        source: Arc::from(source.as_ref()),
+    };
+    MESH_CERT_EXPIRY_UNIX_SECONDS
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(not_after.timestamp().max(0) as u64, Ordering::Relaxed);
 }
 
 pub fn increment_mesh_cert_rotation_failure(spiffe_id: impl AsRef<str>, source: impl AsRef<str>) {
@@ -195,17 +199,19 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
 }
 
 pub fn render_mesh_cert_metrics(output: &mut String) {
-    if !MESH_CERT_EXPIRY_SECONDS.is_empty() {
+    if !MESH_CERT_EXPIRY_UNIX_SECONDS.is_empty() {
         output.push_str(
             "# HELP ferrum_mesh_cert_expiry_seconds Seconds until mesh X.509-SVID expiry.\n",
         );
         output.push_str("# TYPE ferrum_mesh_cert_expiry_seconds gauge\n");
-        for entry in MESH_CERT_EXPIRY_SECONDS.iter() {
+        let now = Utc::now().timestamp().max(0) as u64;
+        for entry in MESH_CERT_EXPIRY_UNIX_SECONDS.iter() {
+            let seconds_until_expiry = entry.value().load(Ordering::Relaxed).saturating_sub(now);
             output.push_str(&format!(
                 "ferrum_mesh_cert_expiry_seconds{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
                 escape_label_value(&entry.key().spiffe_id),
                 escape_label_value(&entry.key().source),
-                entry.value().load(Ordering::Relaxed)
+                seconds_until_expiry
             ));
         }
     }
