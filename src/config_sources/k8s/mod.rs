@@ -210,6 +210,7 @@ pub struct GatewayApiRouteConflictKey {
     pub parent_ref: String,
     pub hostname: String,
     pub listen_path: String,
+    pub match_signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +256,7 @@ pub(crate) struct K8sAccumulator {
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
+    pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
 }
 
 impl K8sAccumulator {
@@ -276,6 +278,7 @@ impl K8sAccumulator {
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
+            gateway_api_conflict_losers: HashMap::new(),
         }
     }
 
@@ -475,34 +478,30 @@ where
     }
 
     let gateway_api_route_conflicts = gateway_api::route_conflicts(objects, &acc.options);
-    let gateway_api_conflict_losers: HashMap<K8sResourceKey, GatewayApiRouteConflict> =
-        gateway_api_route_conflicts
-            .into_iter()
-            .map(|conflict| (conflict.loser.clone(), conflict))
-            .collect();
+    for conflict in gateway_api_route_conflicts {
+        acc.warnings.push(format!(
+            "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and the conflicting match was skipped; winner is {}/{}",
+            conflict.loser.kind,
+            conflict.loser.namespace,
+            conflict.loser.name,
+            conflict.key.parent_ref,
+            conflict.key.hostname,
+            conflict.key.listen_path,
+            conflict.key.match_signature,
+            conflict.winner.namespace,
+            conflict.winner.name
+        ));
+        acc.gateway_api_conflict_losers
+            .entry(conflict.loser.clone())
+            .or_default()
+            .push(conflict);
+    }
 
     for object in objects.iter().filter(|object| include(object)) {
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
         observe_object_namespace(&mut acc, object);
-
-        if let Some(conflict) =
-            gateway_api_conflict_losers.get(&K8sResourceKey::from_object(object))
-        {
-            acc.warnings.push(format!(
-                "Gateway API {} {}/{} conflicted on parent={} host={} path={} and was skipped; winner is {}/{}",
-                object.kind,
-                object.metadata.namespace,
-                object.metadata.name,
-                conflict.key.parent_ref,
-                conflict.key.hostname,
-                conflict.key.listen_path,
-                conflict.winner.namespace,
-                conflict.winner.name
-            ));
-            continue;
-        }
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
