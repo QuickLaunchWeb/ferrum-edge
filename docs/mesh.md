@@ -1127,6 +1127,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` | `false` | Enables Istio `VirtualService` method/header/queryParam predicate capture through proxy-scoped `mesh_route_dispatch` plugins; unsupported predicate-only candidates fail closed through proxy-scoped `request_termination`, and destination-only collapse rejects route-local policy that cannot be carried per rule |
+| `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
 
 ### Listeners
 

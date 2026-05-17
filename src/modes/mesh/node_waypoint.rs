@@ -243,7 +243,9 @@ impl NodeWaypointIdentityResolver {
     }
 
     pub fn remove_identity(&self, pod_uid: &[u8; 16]) {
-        self.identities_by_pod_uid.remove(pod_uid);
+        if self.identities_by_pod_uid.remove(pod_uid).is_some() {
+            self.remove_policy_scopes_for_pods(&[*pod_uid]);
+        }
     }
 
     /// Iterate every enrolled identity and re-check its cgroup binding.
@@ -256,53 +258,77 @@ impl NodeWaypointIdentityResolver {
     /// PolicyScopeCache from a previous incarnation cannot apply to a
     /// newly enrolled pod with the same UID.
     pub fn sweep_cgroup_stale_identities(&self) -> CgroupSweepReport {
+        enum EvictionReason {
+            InodeChanged { current_inode: u64 },
+            PathMissing { error: String },
+        }
+
         let mut report = CgroupSweepReport::default();
         let mut evicted_pod_uids: Vec<[u8; 16]> = Vec::new();
-        self.identities_by_pod_uid.retain(|pod_uid, identity| {
-            let Some(path) = identity.cgroup_path.as_ref() else {
-                return true;
+
+        // Snapshot cgroup bindings first so filesystem metadata calls don't
+        // hold DashMap shard locks used by accept-time identity resolution.
+        let candidates: Vec<([u8; 16], PathBuf, u64)> = self
+            .identities_by_pod_uid
+            .iter()
+            .filter_map(|entry| {
+                let identity = entry.value();
+                Some((
+                    *entry.key(),
+                    identity.cgroup_path.as_ref()?.clone(),
+                    identity.cgroup_inode?,
+                ))
+            })
+            .collect();
+
+        for (pod_uid, path, expected_inode) in candidates {
+            let Some(reason) = (match read_cgroup_inode(&path) {
+                Ok(current_inode) if current_inode == expected_inode => None,
+                Ok(current_inode) => Some(EvictionReason::InodeChanged { current_inode }),
+                Err(error) => Some(EvictionReason::PathMissing {
+                    error: error.to_string(),
+                }),
+            }) else {
+                continue;
             };
-            let Some(expected_inode) = identity.cgroup_inode else {
-                return true;
-            };
-            match read_cgroup_inode(path) {
-                Ok(current_inode) if current_inode == expected_inode => true,
-                Ok(current_inode) => {
+
+            let removed = self
+                .identities_by_pod_uid
+                .remove_if(&pod_uid, |_, identity| {
+                    identity.cgroup_inode == Some(expected_inode)
+                        && identity.cgroup_path.as_deref() == Some(path.as_path())
+                });
+            if removed.is_none() {
+                continue;
+            }
+
+            match reason {
+                EvictionReason::InodeChanged { current_inode } => {
                     info!(
-                        pod_uid = %pod_uid_label(pod_uid),
+                        pod_uid = %pod_uid_label(&pod_uid),
                         expected_inode,
                         current_inode,
                         cgroup_path = %path.display(),
                         "Evicting node-waypoint identity (cgroup inode changed)"
                     );
                     report.evicted_inode_changed += 1;
-                    evicted_pod_uids.push(*pod_uid);
-                    false
                 }
-                Err(error) => {
+                EvictionReason::PathMissing { error } => {
                     debug!(
-                        pod_uid = %pod_uid_label(pod_uid),
+                        pod_uid = %pod_uid_label(&pod_uid),
                         cgroup_path = %path.display(),
                         %error,
                         "Evicting node-waypoint identity (cgroup path missing)"
                     );
                     report.evicted_path_missing += 1;
-                    evicted_pod_uids.push(*pod_uid);
-                    false
                 }
             }
-        });
+
+            evicted_pod_uids.push(pod_uid);
+        }
+
         if !evicted_pod_uids.is_empty() {
-            let mut scopes = self.policy_scopes_by_pod_uid.load_full().as_ref().clone();
-            let mut scopes_changed = false;
-            for pod_uid in &evicted_pod_uids {
-                if scopes.remove(pod_uid).is_some() {
-                    scopes_changed = true;
-                }
-            }
-            if scopes_changed {
-                self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
-            }
+            self.remove_policy_scopes_for_pods(&evicted_pod_uids);
         }
         self.cgroup_sweep_passes.fetch_add(1, Ordering::Relaxed);
         if report.evicted_inode_changed > 0 {
@@ -322,6 +348,24 @@ impl NodeWaypointIdentityResolver {
             inode_changed_total: self.cgroup_sweep_inode_changed.load(Ordering::Relaxed),
             path_missing_total: self.cgroup_sweep_path_missing.load(Ordering::Relaxed),
         }
+    }
+
+    fn remove_policy_scopes_for_pods(&self, pod_uids: &[[u8; 16]]) {
+        if pod_uids.is_empty() {
+            return;
+        }
+
+        self.policy_scopes_by_pod_uid.rcu(|current| {
+            if !pod_uids.iter().any(|pod_uid| current.contains_key(pod_uid)) {
+                return Arc::clone(current);
+            }
+
+            let mut scopes = current.as_ref().clone();
+            for pod_uid in pod_uids {
+                scopes.remove(pod_uid);
+            }
+            Arc::new(scopes)
+        });
     }
 
     pub fn install_policy_scopes(&self, scopes: HashMap<[u8; 16], Arc<PolicyScopeCache>>) {
@@ -687,17 +731,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let cgroup_path = tmp.path().join("pod.scope");
         std::fs::create_dir(&cgroup_path).expect("create cgroup dir");
+        let current_inode = read_cgroup_inode(&cgroup_path).expect("read cgroup inode");
+        let stale_inode = current_inode.wrapping_add(1);
 
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.upsert_identity_with_cgroup(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api")),
-            cgroup_path.clone(),
+        resolver.upsert_identity(
+            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"))
+                .with_cgroup(cgroup_path.clone(), stale_inode),
         );
 
-        // Simulate pod restart: same UID/path, fresh cgroup dir -> new inode.
-        std::fs::remove_dir(&cgroup_path).expect("remove cgroup dir");
-        std::fs::create_dir(&cgroup_path).expect("re-create cgroup dir");
+        // Simulate a restart with a stale enrolled inode. Recreate-based tests
+        // are flaky because filesystems may reuse the removed directory's inode.
+        assert_ne!(stale_inode, current_inode);
 
         let report = resolver.sweep_cgroup_stale_identities();
         assert_eq!(report.evicted_inode_changed, 1);
@@ -705,6 +751,32 @@ mod tests {
         assert!(
             !resolver.identities_by_pod_uid.contains_key(&pod_uid),
             "stale identity for pod-restart UID must be evicted"
+        );
+        let snapshot = resolver.cgroup_sweep_snapshot();
+        assert_eq!(snapshot.inode_changed_total, 1);
+    }
+
+    #[test]
+    fn remove_identity_clears_policy_scope_cache() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/api"),
+        ));
+        let scope_cache = Arc::new(PolicyScopeCache::new(
+            spiffe("spiffe://td/ns/default/sa/api"),
+            "default",
+            HashMap::new(),
+        ));
+        resolver.install_policy_scopes(HashMap::from([(pod_uid, scope_cache)]));
+
+        resolver.remove_identity(&pod_uid);
+
+        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "explicit identity removal must clear stale policy scope too"
         );
     }
 
