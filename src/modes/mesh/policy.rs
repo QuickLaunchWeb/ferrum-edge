@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
-    ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
+    ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
     normalize_mesh_policy_header_map,
 };
 use crate::modes::mesh::slice::MeshSlice;
@@ -41,11 +41,29 @@ pub fn evaluate_mesh_authorization(
     slice: &MeshSlice,
     request: &MeshAuthzRequest,
 ) -> MeshAuthzDecision {
+    evaluate_mesh_authorization_policies(&slice.mesh_policies, request)
+}
+
+/// Evaluate Layer 5 mesh authorization against an arbitrary policy iterator.
+///
+/// Mirrors [`evaluate_mesh_authorization`] but accepts any borrowing iterator
+/// of `&MeshPolicy`. Lets node-waypoint topology apply a per-request scope
+/// filter without cloning the full [`MeshSlice`] — the slice carries dozens
+/// of unrelated Vec fields (workloads, services, destination_rules, etc.)
+/// that the authz engine never reads, so cloning the slice just to swap
+/// `mesh_policies` would be a major regression on the request hot path.
+pub fn evaluate_mesh_authorization_policies<'a, I>(
+    policies: I,
+    request: &MeshAuthzRequest,
+) -> MeshAuthzDecision
+where
+    I: IntoIterator<Item = &'a MeshPolicy>,
+{
     let mut saw_allow = false;
     let mut matched_allow = false;
     let mut matched_audit = None;
 
-    for policy in &slice.mesh_policies {
+    for policy in policies {
         for rule in &policy.rules {
             if !rule_matches(rule, request) {
                 continue;

@@ -40,7 +40,8 @@ use crate::modes::mesh::config::{MeshPolicy, PolicyScope, policy_scope_applies_t
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
-    mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
+    evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
+    normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
@@ -130,34 +131,21 @@ impl MeshAuthz {
         })
     }
 
-    /// Filter `slice.mesh_policies` against the request's per-pod scope.
+    /// Predicate used by [`MeshAuthz::authorize`] to decide whether a
+    /// configured policy applies to the request's source pod when
+    /// per-pod policy scoping is enabled.
     ///
-    /// When the scope is missing, only mesh-wide policies are retained. That
-    /// avoids applying namespace- or selector-scoped policies to the wrong
-    /// source pod while still honoring policies that explicitly apply to all
-    /// workloads.
-    fn slice_for_pod_scope(
-        &self,
+    /// Missing scope retains only mesh-wide policies — namespace- and
+    /// selector-scoped policies are withheld because we cannot prove they
+    /// apply to this source pod yet (typically a race between accept-time
+    /// pod resolution and the resolver enrolling the pod's workload scope).
+    fn policy_applies_to_pod(
+        policy: &MeshPolicy,
         scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
-    ) -> std::borrow::Cow<'_, MeshSlice> {
-        let applies = |policy: &MeshPolicy| match scope {
+    ) -> bool {
+        match scope {
             Some(scope) => scope.policy_applies(policy),
             None => matches!(policy.scope, PolicyScope::MeshWide),
-        };
-        if self.slice.mesh_policies.iter().all(&applies) {
-            // Fast path: all policies apply to this pod, so share the
-            // existing slice without rebuilding mesh_policies.
-            std::borrow::Cow::Borrowed(&self.slice)
-        } else {
-            let mut narrowed = self.slice.clone();
-            narrowed.mesh_policies = self
-                .slice
-                .mesh_policies
-                .iter()
-                .filter(|policy| applies(policy))
-                .cloned()
-                .collect();
-            std::borrow::Cow::Owned(narrowed)
         }
     }
 
@@ -300,12 +288,21 @@ impl Plugin for MeshAuthz {
         // PolicyScopeCache. If the scope is absent, retain mesh-wide policies
         // only so scoped policies do not leak across pods. Other topologies
         // keep the pre-filtered slice.
-        let effective_slice = if self.per_pod_policy_scoping {
-            self.slice_for_pod_scope(ctx.node_waypoint_policy_scope.as_deref())
+        //
+        // Filtering is expressed as an iterator predicate so the hot path
+        // never clones the full `MeshSlice` (which carries workloads,
+        // services, destination_rules, etc. the authz engine never reads).
+        let decision = if self.per_pod_policy_scoping {
+            let scope = ctx.node_waypoint_policy_scope.as_deref();
+            let policies = self
+                .slice
+                .mesh_policies
+                .iter()
+                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            evaluate_mesh_authorization_policies(policies, &request)
         } else {
-            std::borrow::Cow::Borrowed(&self.slice)
+            evaluate_mesh_authorization(&self.slice, &request)
         };
-        let decision = evaluate_mesh_authorization(effective_slice.as_ref(), &request);
         let result = self.decision_to_result(decision, &mut ctx.metadata);
         if matches!(
             result,
