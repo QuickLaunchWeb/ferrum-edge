@@ -103,18 +103,11 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install sccache
-        if: steps.skip_check.outputs.skip != 'true'
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
+      - if: steps.skip_check.outputs.skip != 'true'
+        uses: ./.github/actions/setup-sccache
 
-      - name: Configure sccache
-        if: steps.skip_check.outputs.skip != 'true'
-        run: |
-          if command -v sccache &>/dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          fi
+      - if: steps.skip_check.outputs.skip != 'true'
+        uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
         if: steps.skip_check.outputs.skip != 'true'

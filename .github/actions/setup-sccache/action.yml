@@ -1,0 +1,33 @@
+name: Setup sccache
+description: >-
+  Installs sccache via mozilla-actions/sccache-action and wires it as the
+  cargo rustc wrapper. The checked-in `.cargo/config.toml` hardcodes
+  `[build] rustc-wrapper = "sccache"` so local developers get caching for
+  free once sccache is on PATH; this action provides the CI half of that
+  contract.
+
+  If sccache install fails (network blip, runner without the GH Actions
+  cache, unsupported platform), the action sets `RUSTC_WRAPPER=` and
+  `CARGO_BUILD_RUSTC_WRAPPER=` to clear the config-file value so cargo
+  doesn't try to exec a binary that isn't installed. Build still proceeds,
+  just without the cache.
+
+runs:
+  using: composite
+  steps:
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.10
+      continue-on-error: true
+
+    - name: Configure sccache
+      shell: bash
+      run: |
+        if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "sccache enabled"
+        else
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "sccache unavailable — cleared rustc-wrapper so cargo falls back to default"
+        fi
