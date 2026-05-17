@@ -610,8 +610,8 @@ pub struct EnvConfig {
     pub mesh_peer_auth_live_reload_enabled: bool,
     /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
     /// Identities enrolled with a cgroup v2 path are evicted when the
-    /// cgroup is gone or its inode changes (pod restart). Set to `0` to
-    /// disable. Defaults to `30`.
+    /// cgroup is gone or its inode/fingerprint changes (pod restart,
+    /// including inode-reuse cases). Set to `0` to disable. Defaults to `30`.
     pub mesh_node_waypoint_cgroup_sweep_interval_secs: u64,
 
     // Node agent
