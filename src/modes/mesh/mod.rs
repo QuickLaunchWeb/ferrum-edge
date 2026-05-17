@@ -3209,6 +3209,25 @@ fn start_mesh_slice_apply_task(
                             Ok(config) => {
                                 let previous_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let candidate_loaded_at = config.loaded_at;
+                                // GAP-2M.4: install the per-pod policy scope map BEFORE
+                                // proxy_state.update_config publishes the new plugin cache.
+                                // mesh_authz's per_pod_policy_scoping path filters policies
+                                // against ctx.node_waypoint_policy_scope at request time, so
+                                // any request that lands on the new plugin chain must see
+                                // scopes built from the same slice's workload metadata. If
+                                // we installed scopes after update_config, requests in the
+                                // gap would evaluate the new (unfiltered) mesh_policies
+                                // against stale per-pod scopes — a brief but real
+                                // mis-enforcement window. update_config rejection still
+                                // leaves the new scopes installed against the previous
+                                // policies; the next accepted slice apply resolves the
+                                // mismatch, and the rejected-config case is rare.
+                                if runtime.topology == MeshTopology::NodeWaypoint
+                                    && let Some(resolver) =
+                                        proxy_state.node_waypoint_identity_resolver.as_ref()
+                                {
+                                    resolver.install_policy_scopes_from_workloads(&slice.workloads);
+                                }
                                 // The TLS reload plan is validated before config apply, but the
                                 // live slot is swapped only after proxy config acceptance. That
                                 // creates a tiny accept window where listeners may still see the
@@ -3241,13 +3260,6 @@ fn start_mesh_slice_apply_task(
                                 }
                                 if accepted && let Some(ref dns_proxy) = dns_proxy {
                                     dns_proxy.update_from_slice(slice);
-                                }
-                                if accepted
-                                    && runtime.topology == MeshTopology::NodeWaypoint
-                                    && let Some(resolver) =
-                                        proxy_state.node_waypoint_identity_resolver.as_ref()
-                                {
-                                    resolver.install_policy_scopes_from_workloads(&slice.workloads);
                                 }
                                 if applied {
                                     info!(

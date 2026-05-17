@@ -1781,6 +1781,92 @@ async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_mesh_wide_only() {
 }
 
 #[tokio::test]
+async fn mesh_authz_per_pod_scoping_missing_scope_sets_scope_missing_metadata() {
+    // When per_pod_policy_scoping is on and the request has no
+    // node_waypoint_policy_scope, the plugin falls back to mesh-wide
+    // policies only and must surface that state via
+    // `mesh_authz.scope_missing` so transaction logs make the race window
+    // visible to operators.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    // Intentionally do not set node_waypoint_policy_scope.
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.scope_missing")
+            .map(String::as_str),
+        Some("true"),
+        "missing per-pod scope must surface mesh_authz.scope_missing metadata"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_present_scope_does_not_set_scope_missing_metadata() {
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+    use std::sync::Arc;
+
+    // With per_pod_policy_scoping on AND a populated scope cache, the
+    // missing-scope flag must NOT be set — that flag is a race signal,
+    // not a per-request always-on marker.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe"),
+        "default",
+        HashMap::new(),
+    )));
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.scope_missing"),
+        "populated per-pod scope must not set mesh_authz.scope_missing"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_disabled_does_not_set_scope_missing_metadata() {
+    // When per_pod_policy_scoping is off (sidecar/ambient/east-west/egress
+    // topologies), the missing-scope flag must never appear, even when the
+    // request happens to have no node_waypoint_policy_scope.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+
+    let _ = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.scope_missing"),
+        "disabled per_pod_policy_scoping must not surface scope_missing metadata"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_per_pod_scoping_disabled_path_preserves_construction_filter() {
     // With `per_pod_policy_scoping` defaulting to false (or absent), the
     // construction-time filter still applies and a namespace-scoped DENY

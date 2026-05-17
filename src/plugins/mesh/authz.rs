@@ -85,7 +85,13 @@ impl MeshAuthz {
 
         // Allow explicit identity overrides on top of the slice-embedded
         // namespace/labels — useful when `mesh_policies` is supplied directly
-        // (no slice context) or to override what the slice carried.
+        // (no slice context) or to override what the slice carried. These
+        // fields drive the construction-time scope filter below; when
+        // `per_pod_policy_scoping` is true (node-waypoint topology) the
+        // filter is skipped and these writes are unused, but the parsing
+        // still runs so the on-disk config shape is identical across
+        // topologies and validation errors (bad type / malformed labels)
+        // surface uniformly.
         if let Some(value) = config.get("namespace") {
             let namespace = value
                 .as_str()
@@ -292,8 +298,10 @@ impl Plugin for MeshAuthz {
         // Filtering is expressed as an iterator predicate so the hot path
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
+        let mut scope_missing = false;
         let decision = if self.per_pod_policy_scoping {
             let scope = ctx.node_waypoint_policy_scope.as_deref();
+            scope_missing = scope.is_none();
             let policies = self
                 .slice
                 .mesh_policies
@@ -303,6 +311,15 @@ impl Plugin for MeshAuthz {
         } else {
             evaluate_mesh_authorization(&self.slice, &request)
         };
+        // Surface the per-pod-scope race window through transaction logs so
+        // operators can see when mesh_authz is falling back to mesh-wide
+        // policies because the resolver hasn't enrolled the pod's workload
+        // metadata yet. Only emitted when per_pod_policy_scoping is on, so
+        // sidecar/ambient/east-west/egress traffic is unaffected.
+        if scope_missing {
+            ctx.metadata
+                .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+        }
         let result = self.decision_to_result(decision, &mut ctx.metadata);
         if matches!(
             result,

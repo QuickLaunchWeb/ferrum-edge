@@ -47,6 +47,7 @@ use dashmap::DashMap;
 use ferrum_ebpf_common::{OrigDst4, OrigDst6};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
+use tracing::warn;
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::Workload;
@@ -293,6 +294,20 @@ impl NodeWaypointIdentityResolver {
         self.policy_scopes_by_pod_uid.load().get(pod_uid).cloned()
     }
 
+    /// Install per-pod policy scopes derived from a slice's workload set.
+    ///
+    /// **Ordering contract**: callers in `start_mesh_slice_apply_task` invoke
+    /// this BEFORE `proxy_state.update_config(...)` publishes the new plugin
+    /// cache. `mesh_authz`'s per-pod path filters policies against the cache
+    /// returned by [`policy_scope_for_pod`] at request time, so the scope map
+    /// must reflect the same slice's workload metadata that the new policies
+    /// were authored against. Installing after `update_config` would leave a
+    /// brief window where new policies are evaluated against stale per-pod
+    /// scopes — for namespace- or selector-scoped DENYs, that means a
+    /// transient mis-enforcement. The scope install is cheap and idempotent,
+    /// so installing first even when `update_config` ends up rejecting the
+    /// candidate config is acceptable: the next accepted slice apply
+    /// rebuilds the map.
     pub fn install_policy_scopes_from_workloads<'a, I>(&self, workloads: I)
     where
         I: IntoIterator<Item = &'a Workload>,
@@ -334,9 +349,24 @@ impl NodeWaypointIdentityResolver {
     }
 
     fn lock_policy_scope_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        // Recover from a poisoned lock so a transient panic in a previous
+        // updater cannot wedge slice apply or identity enrollment forever.
+        // We log when the recovery happens because a poisoned mutex means
+        // the prior holder panicked mid-update — the per-pod scope map and
+        // the workload-scope index may be out of sync until the next
+        // accepted slice apply rebuilds both. Silent recovery would hide
+        // that history; the warn! makes it surface in operator logs and
+        // postmortem captures.
         self.policy_scope_update_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    "node-waypoint policy-scope update lock was poisoned by a previous panic; \
+                 recovering and continuing — per-pod scope map may be transiently inconsistent \
+                 with the workload index until the next mesh slice apply"
+                );
+                poisoned.into_inner()
+            })
     }
 
     fn build_per_pod_scopes_from_current_workload_index(
