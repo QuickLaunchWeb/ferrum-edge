@@ -41,6 +41,16 @@ This project and everyone participating in it is governed by our [Code of Conduc
 - **protoc** (Protocol Buffers compiler) - required for gRPC code generation
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB for testing database mode
 
+### One-time local bootstrap
+
+The checked-in `.cargo/config.toml` wires two toolchain extras that local builds and CI both rely on: **sccache** (compiler cache) and a **fast linker** (`mold` on Linux, `lld` on macOS). Run the bootstrap script once per workstation to install them:
+
+```bash
+./scripts/install-build-deps.sh
+```
+
+This installs `sccache` + `lld` via Homebrew on macOS, or `sccache` + `mold` + `clang` via apt/cargo on Linux. CI installs the same tools automatically. If a tool is missing locally, `cargo build` will error with a clear "command not found" pointing back here. To relocate sccache's cache (e.g., onto an external volume), `export SCCACHE_DIR=...` in your shell profile.
+
 ### Building
 
 ```bash
