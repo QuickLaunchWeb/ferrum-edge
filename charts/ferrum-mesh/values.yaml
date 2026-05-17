@@ -9,6 +9,13 @@ controlPlane:
   enabled: true
   replicas: 1
   grpcPort: 50051
+  rbac:
+    create: true
+    gatewayApi: true
+    istio: true
+    meshConfig: true
+    podDiscovery: false
+    nodeLocality: false
   env:
     FERRUM_MODE: cp
     FERRUM_XDS_ENABLED: "true"

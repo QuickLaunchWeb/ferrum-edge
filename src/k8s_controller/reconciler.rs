@@ -19,6 +19,7 @@ use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
+use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -45,6 +46,7 @@ pub fn spawn_reconcile_loop(
     config_arc: Arc<ArcSwap<GatewayConfig>>,
     broadcasters: ReconcileBroadcasters,
     reconciler_config: ReconcilerConfig,
+    gateway_status_writer: Option<GatewayApiStatusWriter>,
     metrics: Arc<ControllerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -96,6 +98,7 @@ pub fn spawn_reconcile_loop(
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
                 pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                gateway_status_writer: gateway_status_writer.as_ref(),
                 metrics: &metrics,
             },
         )
@@ -127,6 +130,7 @@ pub fn spawn_reconcile_loop(
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                            gateway_status_writer: gateway_status_writer.as_ref(),
                             metrics: &metrics,
                         },
                     ).await;
@@ -152,6 +156,7 @@ pub fn spawn_reconcile_loop(
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                            gateway_status_writer: gateway_status_writer.as_ref(),
                             metrics: &metrics,
                         },
                     ).await;
@@ -314,6 +319,7 @@ struct ReconcileContext<'a> {
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
     pod_discovery_enabled: bool,
+    gateway_status_writer: Option<&'a GatewayApiStatusWriter>,
     metrics: &'a ControllerMetrics,
 }
 
@@ -339,6 +345,7 @@ async fn do_reconcile(
         .with_istio_root_namespace(ctx.istio_root_namespace.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
+    patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options.clone()).await;
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
     };
@@ -385,6 +392,27 @@ async fn do_reconcile(
         elapsed_ms = elapsed.as_millis() as u64,
         "Reconciliation complete"
     );
+}
+
+async fn patch_gateway_api_statuses(
+    writer: Option<&GatewayApiStatusWriter>,
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let updates = plan_gateway_api_status_updates(objects, options);
+    if updates.is_empty() {
+        return;
+    }
+    if let Err(error) = writer.patch_updates(&updates).await {
+        warn!(
+            error = %error,
+            updates = updates.len(),
+            "Failed to patch Gateway API status"
+        );
+    }
 }
 
 fn swap_merged_k8s_translation(

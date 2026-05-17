@@ -1,0 +1,165 @@
+name: Gateway API Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_api_version:
+        description: Gateway API tag to test against
+        required: false
+        default: v1.5.1
+      supported_features:
+        description: Comma-separated Gateway API conformance features
+        required: false
+        default: Gateway,HTTPRoute
+  schedule:
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
+  KIND_VERSION: v0.27.0
+  KUBECTL_VERSION: v1.32.3
+
+jobs:
+  gateway-api-conformance:
+    name: Gateway API conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          gateway_api_version="${{ github.event.inputs.gateway_api_version }}"
+          supported_features="${{ github.event.inputs.supported_features }}"
+          if [ -z "$gateway_api_version" ]; then
+            gateway_api_version="v1.5.1"
+          fi
+          if [ -z "$supported_features" ]; then
+            supported_features="Gateway,HTTPRoute"
+          fi
+          echo "gateway_api_version=$gateway_api_version" >> "$GITHUB_OUTPUT"
+          echo "supported_features=$supported_features" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Install Kubernetes tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Build Ferrum image
+        run: docker build -t "$FERRUM_IMAGE" .
+
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name ferrum-gwapi --wait 120s
+          kind load docker-image "$FERRUM_IMAGE" --name ferrum-gwapi
+
+      - name: Install Gateway API CRDs
+        run: |
+          set -euo pipefail
+          gateway_api_version="${{ steps.inputs.outputs.gateway_api_version }}"
+          kubectl apply --server-side=true -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${gateway_api_version}/standard-install.yaml"
+          kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=120s
+          kubectl wait --for=condition=Established crd/gateways.gateway.networking.k8s.io --timeout=120s
+          kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=120s
+
+      - name: Deploy Ferrum mesh controller
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum
+          helm upgrade --install ferrum ./charts/ferrum-mesh \
+            --namespace ferrum \
+            --set image.repository=ferrum-edge \
+            --set image.tag=gateway-api-conformance \
+            --set image.pullPolicy=IfNotPresent \
+            --set controlPlane.rbac.create=true \
+            --set controlPlane.rbac.gatewayApi=true \
+            --set controlPlane.rbac.istio=false \
+            --set controlPlane.rbac.meshConfig=false \
+            --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
+            --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
+            --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
+            --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
+          kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s || true
+
+      - name: Create Ferrum GatewayClass
+        run: |
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: ferrum
+          spec:
+            controllerName: ferrum.io/gateway-controller
+          YAML
+
+      - name: Run upstream Gateway API conformance
+        id: conformance
+        run: |
+          set -uo pipefail
+          results="$GITHUB_WORKSPACE/conformance-results"
+          mkdir -p "$results"
+          git clone --depth 1 --branch "${{ steps.inputs.outputs.gateway_api_version }}" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
+          cd /tmp/gateway-api
+          go test -json ./conformance -run TestConformance -count=1 -timeout=45m -args \
+            --gateway-class=ferrum \
+            --supported-features="${{ steps.inputs.outputs.supported_features }}" \
+            --conformance-profiles=GATEWAY-HTTP \
+            --organization=Ferrum \
+            --project="Ferrum Edge" \
+            --url=https://github.com/ferrum-edge/ferrum-edge \
+            --version="${GITHUB_SHA}" \
+            --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+            --report-output="$results/gateway-api-conformance-report.yaml" \
+            2>&1 | tee "$results/gateway-api-conformance-test.json"
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/conformance-results"
+          mkdir -p "$results"
+          kubectl get gatewayclasses,gateways,httproutes,grpcroutes -A -o yaml > "$results/gateway-api-resources.yaml"
+          kubectl -n ferrum get all -o wide > "$results/ferrum-namespace.txt"
+          kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$results/ferrum-control-plane.log"
+          cat > "$results/CONFORMANCE.md" <<EOF
+          # Gateway API Conformance
+
+          Gateway API version: ${{ steps.inputs.outputs.gateway_api_version }}
+
+          Supported features: ${{ steps.inputs.outputs.supported_features }}
+
+          Conformance exit code: ${{ steps.conformance.outputs.exit_code }}
+
+          Artifacts:
+          - gateway-api-conformance-test.json
+          - gateway-api-conformance-report.yaml
+          - gateway-api-resources.yaml
+          - ferrum-namespace.txt
+          - ferrum-control-plane.log
+          EOF
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
+          path: conformance-results/

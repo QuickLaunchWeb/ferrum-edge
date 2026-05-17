@@ -17,6 +17,7 @@ pub struct CrdSpec {
     pub version: &'static str,
     pub kind: &'static str,
     pub plural: &'static str,
+    pub namespaced: bool,
 }
 
 pub struct CoreResourceSpec {
@@ -47,54 +48,63 @@ pub const ISTIO_CRDS: &[CrdSpec] = &[
         version: "v1",
         kind: "AuthorizationPolicy",
         plural: "authorizationpolicies",
+        namespaced: true,
     },
     CrdSpec {
         group: "security.istio.io",
         version: "v1",
         kind: "PeerAuthentication",
         plural: "peerauthentications",
+        namespaced: true,
     },
     CrdSpec {
         group: "security.istio.io",
         version: "v1",
         kind: "RequestAuthentication",
         plural: "requestauthentications",
+        namespaced: true,
     },
     CrdSpec {
         group: "networking.istio.io",
         version: "v1",
         kind: "VirtualService",
         plural: "virtualservices",
+        namespaced: true,
     },
     CrdSpec {
         group: "networking.istio.io",
         version: "v1",
         kind: "DestinationRule",
         plural: "destinationrules",
+        namespaced: true,
     },
     CrdSpec {
         group: "networking.istio.io",
         version: "v1",
         kind: "ServiceEntry",
         plural: "serviceentries",
+        namespaced: true,
     },
     CrdSpec {
         group: "networking.istio.io",
         version: "v1",
         kind: "WorkloadEntry",
         plural: "workloadentries",
+        namespaced: true,
     },
     CrdSpec {
         group: "networking.istio.io",
         version: "v1",
         kind: "Sidecar",
         plural: "sidecars",
+        namespaced: true,
     },
     CrdSpec {
         group: "telemetry.istio.io",
         version: "v1",
         kind: "Telemetry",
         plural: "telemetries",
+        namespaced: true,
     },
 ];
 
@@ -102,38 +112,51 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1",
+        kind: "GatewayClass",
+        plural: "gatewayclasses",
+        namespaced: false,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1",
         kind: "Gateway",
         plural: "gateways",
+        namespaced: true,
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1",
         kind: "HTTPRoute",
         plural: "httproutes",
+        namespaced: true,
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1",
         kind: "GRPCRoute",
         plural: "grpcroutes",
+        namespaced: true,
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1alpha2",
         kind: "TLSRoute",
         plural: "tlsroutes",
+        namespaced: true,
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1alpha2",
         kind: "TCPRoute",
         plural: "tcproutes",
+        namespaced: true,
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1beta1",
         kind: "ReferenceGrant",
         plural: "referencegrants",
+        namespaced: true,
     },
 ];
 
@@ -304,7 +327,7 @@ pub async fn start_crd_watchers(
             continue;
         };
 
-        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces, true) {
+        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces, crd.namespaced) {
             if store_set
                 .lock()
                 .await
@@ -666,6 +689,17 @@ mod tests {
         assert!(locality_kinds.contains("Pod"));
         assert!(locality_kinds.contains("Service"));
         assert!(locality_kinds.contains("EndpointSlice"));
+    }
+
+    #[test]
+    fn gateway_api_watches_gateway_class_cluster_scoped() {
+        let gateway_class = GATEWAY_API_CRDS
+            .iter()
+            .find(|resource| resource.kind == "GatewayClass")
+            .expect("GatewayClass watcher spec");
+
+        assert!(!gateway_class.namespaced);
+        assert_eq!(gateway_class.plural, "gatewayclasses");
     }
 
     #[test]
