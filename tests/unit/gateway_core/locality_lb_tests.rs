@@ -696,15 +696,17 @@ fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
         }],
         failover: Vec::new(),
     };
-    let up = upstream_with_locality_lb(
-        "us-west/us-west-1/a",
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        Some("us-west/us-west-1/a"),
         vec![
             target("west.local", Some("us-west/us-west-1/a")),
             weighted_target("east-heavy.local", Some("us-east/us-east-1/a"), 9),
             weighted_target("east-light.local", Some("us-east/us-east-1/a"), 1),
         ],
-        setting,
     );
+    up.locality_lb_setting = Some(setting);
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
 
@@ -731,6 +733,47 @@ fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
         (heavy_ratio - 0.9).abs() < 0.04,
         "east-heavy ratio {heavy_ratio:.3} outside +/-0.04 of 0.9"
     );
+}
+
+#[test]
+fn locality_distribute_preserves_consistent_hashing_within_selected_locality() {
+    let mut to = BTreeMap::new();
+    to.insert("us-east".to_string(), 100);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::ConsistentHashing,
+        Some("us-west/us-west-1/a"),
+        vec![
+            target("west.local", Some("us-west/us-west-1/a")),
+            target("east-a.local", Some("us-east/us-east-1/a")),
+            target("east-b.local", Some("us-east/us-east-1/a")),
+        ],
+    );
+    up.locality_lb_setting = Some(setting);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let first = LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user", no_health())
+        .expect("consistent hash distribute selection");
+    assert!(first.target.host.starts_with("east-"));
+
+    for _ in 0..16 {
+        let selection =
+            LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user", no_health())
+                .expect("consistent hash distribute selection");
+        assert_eq!(
+            selection.target.host, first.target.host,
+            "distribute must preserve consistent hashing within the selected locality"
+        );
+    }
 }
 
 #[test]

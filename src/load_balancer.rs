@@ -915,7 +915,7 @@ fn build_locality_lb_state(
         return Some(LocalityLbState {
             enabled: false,
             distribute_weights: None,
-            distribute_total: 0,
+            distribute_groups: None,
             failover_target_matches: None,
         });
     }
@@ -928,7 +928,7 @@ fn build_locality_lb_state(
         return Some(LocalityLbState {
             enabled: true,
             distribute_weights: None,
-            distribute_total: 0,
+            distribute_groups: None,
             failover_target_matches: None,
         });
     };
@@ -948,7 +948,7 @@ fn build_locality_lb_state(
     // matching locality according to their endpoint weights instead of copying
     // the full locality weight onto each endpoint.
     let mut distribute_weights: Option<Vec<u64>> = None;
-    let mut distribute_total: u64 = 0;
+    let mut distribute_groups: Option<Vec<LocalityDistributeGroup>> = None;
     for entry in &setting.distribute {
         let Some(entry_from) = LocalityPreference::parse(&entry.from) else {
             continue;
@@ -958,6 +958,7 @@ fn build_locality_lb_state(
         }
         let mut weights = vec![0u64; targets.len()];
         let mut total: u64 = 0;
+        let mut groups = Vec::new();
         for (to_locality, to_weight) in &entry.to {
             let Some(to_pref) = LocalityPreference::parse(to_locality) else {
                 continue;
@@ -986,13 +987,23 @@ fn build_locality_lb_state(
                 let target_count = matching_targets.len() as u64;
                 let per_target = scaled_weight / target_count;
                 let remainder = scaled_weight % target_count;
+                let mut group_indices = Vec::new();
+                let mut group_total = 0u64;
                 for (offset, (idx, _)) in matching_targets.into_iter().enumerate() {
                     let share = per_target + if (offset as u64) < remainder { 1 } else { 0 };
                     if share == 0 {
                         continue;
                     }
+                    group_indices.push(idx);
+                    group_total = group_total.saturating_add(share);
                     weights[idx] = weights[idx].saturating_add(share);
                     total = total.saturating_add(share);
+                }
+                if group_total > 0 {
+                    groups.push(LocalityDistributeGroup {
+                        weight: group_total,
+                        target_indices: group_indices,
+                    });
                 }
                 continue;
             };
@@ -1013,6 +1024,8 @@ fn build_locality_lb_state(
             }
             allocations.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
             let mut leftover = scaled_weight.saturating_sub(allocated);
+            let mut group_indices = Vec::new();
+            let mut group_total = 0u64;
             for (idx, mut share, _, endpoint_weight) in allocations {
                 if endpoint_weight > 0 && leftover > 0 {
                     share = share.saturating_add(1);
@@ -1021,8 +1034,16 @@ fn build_locality_lb_state(
                 if share == 0 {
                     continue;
                 }
+                group_indices.push(idx);
+                group_total = group_total.saturating_add(share);
                 weights[idx] = weights[idx].saturating_add(share);
                 total = total.saturating_add(share);
+            }
+            if group_total > 0 {
+                groups.push(LocalityDistributeGroup {
+                    weight: group_total,
+                    target_indices: group_indices,
+                });
             }
         }
         // Only honour the match if at least one target was reachable;
@@ -1031,7 +1052,7 @@ fn build_locality_lb_state(
         // distribute entry, or to the rest of the locality LB path.
         if total > 0 {
             distribute_weights = Some(weights);
-            distribute_total = total;
+            distribute_groups = Some(groups);
             break;
         }
     }
@@ -1068,7 +1089,7 @@ fn build_locality_lb_state(
     Some(LocalityLbState {
         enabled: true,
         distribute_weights,
-        distribute_total,
+        distribute_groups,
         failover_target_matches,
     })
 }
@@ -1211,7 +1232,7 @@ pub struct LoadBalancer {
     /// `Upstream.source_locality`. `None` when no DR `localityLbSetting`
     /// applies — the hot path then short-circuits to the existing priority
     /// tier preference. Computed at construction so request-time work is
-    /// limited to bitset masks and one weighted-RR scan.
+    /// limited to bitset masks and a small weighted bucket pick.
     locality_lb: Option<LocalityLbState>,
 }
 
@@ -1226,17 +1247,22 @@ struct LocalityLbState {
     /// Per-target fixed-point distribute weight, index-aligned with
     /// `LoadBalancer.targets`.
     /// `None` when no `distribute[]` entry matched the source locality.
-    /// Targets with weight 0 are excluded from distribute-mode selection.
-    /// Present + non-empty values trigger weighted random selection that
-    /// overrides the upstream / port / subset algorithm.
+    /// Targets with weight 0 are excluded from distribute-mode candidate sets.
     distribute_weights: Option<Vec<u64>>,
-    /// Pre-computed total of `distribute_weights` (for selection rng modulo).
-    distribute_total: u64,
+    /// Locality buckets for a matching `distribute[]` entry. Runtime selection
+    /// picks one bucket by the configured locality share, then runs the
+    /// upstream / port / subset algorithm inside that bucket.
+    distribute_groups: Option<Vec<LocalityDistributeGroup>>,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
     /// `true` when the target's locality region matches the failover `to`
     /// region for this source. `None` when no `failover[]` entry matched
     /// the source region. Consulted as a fourth tier after exact/zone/region.
     failover_target_matches: Option<Vec<bool>>,
+}
+
+struct LocalityDistributeGroup {
+    weight: u64,
+    target_indices: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -1885,10 +1911,10 @@ impl LoadBalancer {
         }
 
         // distribute-mode: restrict the candidate set to targets the
-        // operator put weight on. The selection algorithm will pick from
-        // that masked set using the weighted-RR path below. We do this
-        // before priority-tier preference because Istio treats distribute
-        // and priority as mutually exclusive.
+        // operator put weight on. Algorithm dispatch later picks one weighted
+        // distribute bucket inside this union and runs the configured endpoint
+        // algorithm there. We do this before priority-tier preference because
+        // Istio treats distribute and priority as mutually exclusive.
         if let Some(weights) = self
             .locality_lb
             .as_ref()
@@ -2034,87 +2060,116 @@ impl LoadBalancer {
         candidates
     }
 
-    /// Weighted random selection across `healthy` using
-    /// `LocalityLbState.distribute_weights`. Returns `None` (and the caller
-    /// runs the configured algorithm) unless distribute weights apply and
-    /// at least one weighted target is in the healthy set.
-    fn select_with_distribute_bitset(
+    fn distribute_pick(
         &self,
-        healthy: &HealthBitset,
+        ctx_key: &str,
+        total: u64,
+        algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-    ) -> Option<Arc<UpstreamTarget>> {
-        let state = self.locality_lb.as_ref()?;
-        let weights = state.distribute_weights.as_ref()?;
-        if state.distribute_total == 0 {
-            return None;
-        }
-        // Total weight across `healthy ∩ weighted` — recomputed each call
-        // because health can change between selections and skipping
-        // unhealthy targets has to keep the distribution proportional.
-        let mut healthy_total: u64 = 0;
-        for idx in 0..self.targets.len() {
-            if !healthy.contains(idx) {
-                continue;
-            }
-            healthy_total = healthy_total.saturating_add(weights.get(idx).copied().unwrap_or(0));
-        }
-        if healthy_total == 0 {
-            return None;
-        }
-        let raw = rr_counter.fetch_add(1, Ordering::Relaxed);
-        // Reuse the existing golden-ratio hash so distribute selection
-        // shares the same RNG quality and counter cadence as `Random`.
-        let pick = golden_ratio_hash(raw) % healthy_total;
-        let mut acc: u64 = 0;
-        for idx in 0..self.targets.len() {
-            if !healthy.contains(idx) {
-                continue;
-            }
-            let weight = weights.get(idx).copied().unwrap_or(0);
-            if weight == 0 {
-                continue;
-            }
-            acc = acc.saturating_add(weight);
-            if pick < acc {
-                return Some(Arc::clone(&self.targets[idx]));
-            }
-        }
-        None
+    ) -> u64 {
+        let raw = match algorithm {
+            LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
+            _ => rr_counter.fetch_add(1, Ordering::Relaxed),
+        };
+        golden_ratio_hash(raw) % total
     }
 
-    /// Vec-path counterpart of `select_with_distribute_bitset` for the
-    /// > 128-target fallback. Mirrors the same weighted-random math.
-    fn select_with_distribute_candidates(
+    /// Pick one distribute locality bucket that has at least one candidate,
+    /// then return that bucket as a bitset. The caller still runs the configured
+    /// endpoint algorithm inside the returned set.
+    fn distribute_group_bitset(
         &self,
-        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        healthy: &HealthBitset,
+        ctx_key: &str,
+        algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-    ) -> Option<Arc<UpstreamTarget>> {
+    ) -> Option<HealthBitset> {
         let state = self.locality_lb.as_ref()?;
-        let weights = state.distribute_weights.as_ref()?;
-        if state.distribute_total == 0 {
+        let groups = state.distribute_groups.as_ref()?;
+        let mut total = 0u64;
+        for group in groups {
+            if group
+                .target_indices
+                .iter()
+                .any(|idx| healthy.contains(*idx))
+            {
+                total = total.saturating_add(group.weight);
+            }
+        }
+        if total == 0 {
             return None;
         }
-        let mut healthy_total: u64 = 0;
-        for (idx, _) in candidates {
-            healthy_total = healthy_total.saturating_add(weights.get(*idx).copied().unwrap_or(0));
-        }
-        if healthy_total == 0 {
-            return None;
-        }
-        let raw = rr_counter.fetch_add(1, Ordering::Relaxed);
-        let pick = golden_ratio_hash(raw) % healthy_total;
-        let mut acc: u64 = 0;
-        for (idx, target) in candidates {
-            let weight = weights.get(*idx).copied().unwrap_or(0);
-            if weight == 0 {
+
+        let pick = self.distribute_pick(ctx_key, total, algorithm, rr_counter);
+        let mut acc = 0u64;
+        let mut first_eligible = None;
+        for group in groups {
+            let mut masked = HealthBitset::empty();
+            for &idx in &group.target_indices {
+                if healthy.contains(idx) {
+                    masked.set(idx);
+                }
+            }
+            if masked.is_empty() {
                 continue;
             }
-            acc = acc.saturating_add(weight);
+            if first_eligible.is_none() {
+                first_eligible = Some(masked);
+            }
+            acc = acc.saturating_add(group.weight);
             if pick < acc {
-                return Some(Arc::clone(target));
+                return Some(masked);
             }
         }
-        None
+        first_eligible
+    }
+
+    /// Vec-path counterpart of `distribute_group_bitset` for the >128-target
+    /// fallback. Returns candidates from one weighted locality bucket.
+    fn distribute_group_candidates<'a>(
+        &self,
+        candidates: &[(usize, &'a Arc<UpstreamTarget>)],
+        ctx_key: &str,
+        algorithm: LoadBalancerAlgorithm,
+        rr_counter: &AtomicU64,
+    ) -> Option<Vec<(usize, &'a Arc<UpstreamTarget>)>> {
+        let state = self.locality_lb.as_ref()?;
+        let groups = state.distribute_groups.as_ref()?;
+
+        let mut total = 0u64;
+        for group in groups {
+            if candidates
+                .iter()
+                .any(|(idx, _)| group.target_indices.contains(idx))
+            {
+                total = total.saturating_add(group.weight);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+
+        let pick = self.distribute_pick(ctx_key, total, algorithm, rr_counter);
+        let mut acc = 0u64;
+        let mut first_eligible = None;
+        for group in groups {
+            let masked: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+                .iter()
+                .copied()
+                .filter(|(idx, _)| group.target_indices.contains(idx))
+                .collect();
+            if masked.is_empty() {
+                continue;
+            }
+            if first_eligible.is_none() {
+                first_eligible = Some(masked.clone());
+            }
+            acc = acc.saturating_add(group.weight);
+            if pick < acc {
+                return Some(masked);
+            }
+        }
+        first_eligible
     }
 
     fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
@@ -2543,13 +2598,15 @@ impl LoadBalancer {
         if healthy.is_empty() {
             return None;
         }
-        // localityLbSetting.distribute is mutually exclusive with the
-        // upstream / port / subset algorithm. When pre-compute proved the
-        // operator weights apply, do weighted random selection across the
-        // (already-masked) bitset and skip the algorithm dispatch entirely.
-        if let Some(target) = self.select_with_distribute_bitset(healthy, rr_counter) {
-            return Some(target);
-        }
+        let distributed;
+        let healthy = if let Some(mask) =
+            self.distribute_group_bitset(healthy, ctx_key, algorithm, rr_counter)
+        {
+            distributed = mask;
+            &distributed
+        } else {
+            healthy
+        };
         let all = healthy.is_all(self.targets.len());
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
@@ -2639,11 +2696,15 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
-        // Same distribute-override hook as the bitset path; keeps the > 128
-        // target Vec fallback in lockstep with the small-upstream path.
-        if let Some(target) = self.select_with_distribute_candidates(candidates, rr_counter) {
-            return Some(target);
-        }
+        let distributed;
+        let candidates = if let Some(masked) =
+            self.distribute_group_candidates(candidates, ctx_key, algorithm, rr_counter)
+        {
+            distributed = masked;
+            distributed.as_slice()
+        } else {
+            candidates
+        };
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
