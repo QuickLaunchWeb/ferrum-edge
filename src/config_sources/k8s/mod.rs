@@ -452,9 +452,14 @@ pub(crate) fn translate_k8s_objects_with_filter<F>(
 where
     F: Fn(&K8sObject) -> bool,
 {
+    let included_objects: Vec<K8sObject> = objects
+        .iter()
+        .filter(|object| include(object))
+        .cloned()
+        .collect();
     let mut acc = K8sAccumulator::new(options);
 
-    for object in objects.iter().filter(|object| include(object)) {
+    for object in &included_objects {
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
@@ -477,7 +482,7 @@ where
         }
     }
 
-    let gateway_api_route_conflicts = gateway_api::route_conflicts(objects, &acc.options);
+    let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
     for conflict in gateway_api_route_conflicts {
         acc.warnings.push(format!(
             "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and the conflicting match was skipped; winner is {}/{}",
@@ -497,7 +502,7 @@ where
             .push(conflict);
     }
 
-    for object in objects.iter().filter(|object| include(object)) {
+    for object in &included_objects {
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
@@ -1538,6 +1543,43 @@ mod tests {
         assert_eq!(
             result.config.known_namespaces,
             vec!["default".to_string(), "prod".to_string()]
+        );
+    }
+
+    #[test]
+    fn include_filter_excludes_gateway_api_conflict_candidates() {
+        let mut skipped_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "skipped", "port": 8080}]
+                }]
+            }),
+        );
+        skipped_route.api_version = "gateway.networking.k8s.io/v1".to_string();
+        skipped_route.metadata.name = "api-a-skipped".to_string();
+        skipped_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut included_route = skipped_route.clone();
+        included_route.metadata.name = "api-b-included".to_string();
+        included_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+        included_route.spec["rules"][0]["backendRefs"][0]["name"] = serde_json::json!("included");
+
+        let result = translate_k8s_objects_with_filter(
+            &[skipped_route, included_route],
+            options("default"),
+            |object| object.metadata.name == "api-b-included",
+        )
+        .expect("filtered translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(result.config.proxies[0].id.contains("api-b-included"));
+        assert!(
+            result.warnings.is_empty(),
+            "skipped routes must not win conflicts: {:?}",
+            result.warnings
         );
     }
 
