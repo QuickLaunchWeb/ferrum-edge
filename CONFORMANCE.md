@@ -10,4 +10,4 @@ Default run parameters:
 - Supported features: `Gateway,HTTPRoute`
 - Conformance profile: `GATEWAY-HTTP`
 
-The workflow is intentionally non-gating while the Gateway API implementation is still converging. Its artifact bundle includes `gateway-api-conformance-test.json`, `gateway-api-conformance-report.yaml`, Kubernetes resource dumps, controller logs, and a run-local summary.
+The workflow is intentionally non-gating while the Gateway API implementation is still converging. A non-zero upstream conformance exit emits a GitHub Actions warning and is recorded in the uploaded run summary instead of failing the job. Its artifact bundle includes `gateway-api-conformance-test.json`, `gateway-api-conformance-report.yaml`, Kubernetes resource dumps, controller logs, and a run-local summary.

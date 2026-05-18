@@ -553,6 +553,12 @@ where
             continue;
         }
 
+        // GatewayClass is watched for ownership/status decisions by the
+        // controller, but it does not materialize proxy config directly.
+        if object.kind == "GatewayClass" {
+            continue;
+        }
+
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -1528,6 +1534,27 @@ mod tests {
             translate_k8s_objects(&[ignored], options("prod")).expect("translation should succeed");
 
         assert!(result.config.mesh.is_none());
+    }
+
+    #[test]
+    fn gateway_class_is_status_only_not_unsupported_translation_input() {
+        let mut gateway_class = object(
+            "GatewayClass",
+            serde_json::json!({"controllerName": "ferrum.io/gateway-controller"}),
+        );
+        gateway_class.api_version = "gateway.networking.k8s.io/v1".to_string();
+        gateway_class.metadata.namespace.clear();
+        let options = options("default").with_source_namespaces(Vec::new());
+
+        let result =
+            translate_k8s_objects(&[gateway_class], options).expect("translation should succeed");
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GatewayClass"))
+        );
     }
 
     #[test]

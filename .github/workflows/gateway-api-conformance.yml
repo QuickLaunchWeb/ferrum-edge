@@ -130,6 +130,9 @@ jobs:
             2>&1 | tee "$results/gateway-api-conformance-test.json"
           status=${PIPESTATUS[0]}
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=Gateway API conformance failed::go test exited with $status; artifacts were uploaded for non-gating review"
+          fi
           exit 0
 
       - name: Collect diagnostics

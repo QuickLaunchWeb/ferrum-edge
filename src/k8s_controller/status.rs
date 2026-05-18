@@ -3,6 +3,7 @@ use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use tracing::warn;
 
 use crate::config_sources::k8s::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
@@ -36,16 +37,30 @@ impl GatewayApiStatusWriter {
         updates: &[GatewayApiStatusUpdate],
     ) -> Result<(), kube::Error> {
         let futures = updates.iter().filter_map(|update| {
-            let ar = api_resource_for_update(update)?;
+            let Some(ar) = api_resource_for_update(update) else {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    "Skipping Gateway API status update for unsupported resource version"
+                );
+                return None;
+            };
             let api: Api<DynamicObject> = if update.kind == "GatewayClass" {
                 Api::all_with(self.client.clone(), &ar)
             } else {
                 Api::namespaced_with(self.client.clone(), &update.namespace, &ar)
             };
-            let patch = json!({ "status": update.status });
             let name = update.name.clone();
             Some(async move {
-                api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                let live = api.get_status(&name).await?;
+                let patch = status_patch_for_update(update, live.data.get("status"));
+                let params = PatchParams {
+                    field_manager: Some(FERRUM_GATEWAY_CONTROLLER_NAME.to_string()),
+                    ..PatchParams::default()
+                };
+                api.patch_status(&name, &params, &Patch::Merge(&patch))
                     .await
                     .map(|_| ())
             })
@@ -333,7 +348,7 @@ fn route_status(
                         false,
                         false,
                         "Accepted",
-                        "BackendRefNotPermitted",
+                        "RefNotPermitted",
                         format!(
                             "Ferrum accepted this route but could not resolve all backendRefs: {error}"
                         ),
@@ -351,7 +366,7 @@ fn route_status(
             }
         };
 
-    let mut parents = retained_existing_parent_statuses(&object.status, managed_parent_refs);
+    let mut parents = retained_existing_parent_statuses(&object.status);
     for parent_ref in managed_parent_refs {
         let existing_parent_status = existing_parent_status(&object.status, object, parent_ref);
         let parent_ref_key = route_parent_ref_key(object, parent_ref);
@@ -456,6 +471,7 @@ fn route_status(
                 conflicted_message,
             ),
         ];
+        let conditions = merge_condition_entries(existing_parent_status, conditions);
         parents.push(json!({
             "parentRef": parent_ref,
             "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
@@ -468,6 +484,68 @@ fn route_status(
     status
 }
 
+fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<&Value>) -> Value {
+    let fallback_status = &update.status;
+    let live_status_for_merge = live_status.unwrap_or(fallback_status);
+    let mut status_patch = serde_json::Map::new();
+
+    match update.kind.as_str() {
+        "GatewayClass" | "Gateway" => {
+            let desired_conditions =
+                desired_owned_conditions(&update.status, owned_condition_types(&update.kind));
+            let condition_source = match live_status {
+                Some(status) => existing_conditions(status),
+                None => existing_conditions(fallback_status),
+            };
+            let merged_conditions = merge_condition_entries(condition_source, desired_conditions);
+            status_patch.insert("conditions".to_string(), Value::Array(merged_conditions));
+        }
+        "HTTPRoute" | "GRPCRoute" => {
+            status_patch.insert(
+                "parents".to_string(),
+                Value::Array(merge_parent_statuses(
+                    live_status_for_merge,
+                    desired_ferrum_parent_statuses(&update.status),
+                )),
+            );
+        }
+        _ => {
+            status_patch = update.status.as_object().cloned().unwrap_or_default();
+        }
+    }
+
+    let mut patch = serde_json::Map::new();
+    patch.insert("status".to_string(), Value::Object(status_patch));
+    Value::Object(patch)
+}
+
+fn owned_condition_types(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "GatewayClass" => &["Accepted", "SupportedVersion"],
+        "Gateway" => &["Accepted", "ResolvedRefs", "Programmed", "Conflicted"],
+        _ => &[],
+    }
+}
+
+fn desired_owned_conditions(status: &Value, owned_types: &[&str]) -> Vec<Value> {
+    existing_conditions(status)
+        .into_iter()
+        .flatten()
+        .filter(|condition| {
+            condition_type(condition)
+                .is_some_and(|condition_type| owned_types.contains(&condition_type))
+        })
+        .cloned()
+        .collect()
+}
+
+fn existing_conditions(status: &Value) -> Option<&[Value]> {
+    status
+        .get("conditions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
 fn condition(
     object: &K8sObject,
     status: &Value,
@@ -478,10 +556,7 @@ fn condition(
 ) -> Value {
     condition_at(
         object,
-        status
-            .get("conditions")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice),
+        existing_conditions(status),
         condition_type,
         value,
         reason,
@@ -529,6 +604,53 @@ fn condition_at(
     })
 }
 
+fn merge_condition_entries(
+    existing_conditions: Option<&[Value]>,
+    desired_conditions: Vec<Value>,
+) -> Vec<Value> {
+    let desired_types: HashSet<String> = desired_conditions
+        .iter()
+        .filter_map(condition_type)
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut inserted_types = HashSet::new();
+    let mut merged = Vec::new();
+
+    for existing_condition in existing_conditions.into_iter().flatten() {
+        let Some(existing_type) = condition_type(existing_condition) else {
+            merged.push(existing_condition.clone());
+            continue;
+        };
+        if !desired_types.contains(existing_type) {
+            merged.push(existing_condition.clone());
+            continue;
+        }
+        if inserted_types.insert(existing_type.to_string())
+            && let Some(desired_condition) = desired_conditions
+                .iter()
+                .find(|condition| condition_type(condition) == Some(existing_type))
+        {
+            merged.push(desired_condition.clone());
+        }
+    }
+
+    for desired_condition in desired_conditions {
+        let Some(desired_type) = condition_type(&desired_condition) else {
+            merged.push(desired_condition);
+            continue;
+        };
+        if inserted_types.insert(desired_type.to_string()) {
+            merged.push(desired_condition);
+        }
+    }
+
+    merged
+}
+
+fn condition_type(condition: &Value) -> Option<&str> {
+    condition.get("type").and_then(Value::as_str)
+}
+
 fn existing_parent_status<'a>(
     status: &'a Value,
     object: &K8sObject,
@@ -552,19 +674,37 @@ fn existing_parent_status<'a>(
         .map(Vec::as_slice)
 }
 
-fn retained_existing_parent_statuses(status: &Value, _managed_parent_refs: &[Value]) -> Vec<Value> {
+fn merge_parent_statuses(status: &Value, desired_ferrum_parents: Vec<Value>) -> Vec<Value> {
+    retained_existing_parent_statuses(status)
+        .into_iter()
+        .chain(desired_ferrum_parents)
+        .collect()
+}
+
+fn desired_ferrum_parent_statuses(status: &Value) -> Vec<Value> {
     status
         .get("parents")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|parent| {
-            let is_ferrum_parent = parent.get("controllerName").and_then(Value::as_str)
-                == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
-            !is_ferrum_parent
-        })
+        .filter(|parent| is_ferrum_parent_status(parent))
         .cloned()
         .collect()
+}
+
+fn retained_existing_parent_statuses(status: &Value) -> Vec<Value> {
+    status
+        .get("parents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|parent| !is_ferrum_parent_status(parent))
+        .cloned()
+        .collect()
+}
+
+fn is_ferrum_parent_status(parent: &Value) -> bool {
+    parent.get("controllerName").and_then(Value::as_str) == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
 }
 
 fn has_ferrum_parent_status(status: &Value) -> bool {
@@ -987,6 +1127,67 @@ mod tests {
     }
 
     #[test]
+    fn gateway_status_preserves_non_owned_conditions() {
+        let gateway_class = ferrum_gateway_class();
+        let mut gateway = ferrum_gateway("edge");
+        gateway.status = json!({
+            "conditions": [
+                {
+                    "type": "example.com/CustomReady",
+                    "status": "True",
+                    "observedGeneration": 6,
+                    "reason": "CustomReady",
+                    "message": "owned by another status extension",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                },
+                {
+                    "type": "Accepted",
+                    "status": "False",
+                    "observedGeneration": 6,
+                    "reason": "Old",
+                    "message": "old status",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_eq!(
+            find_condition(conditions, "example.com/CustomReady")["message"].as_str(),
+            Some("owned by another status extension")
+        );
+    }
+
+    #[test]
+    fn gateway_class_status_preserves_non_owned_conditions() {
+        let mut gateway_class = ferrum_gateway_class();
+        gateway_class.status = json!({
+            "conditions": [{
+                "type": "example.com/PolicyReady",
+                "status": "True",
+                "observedGeneration": 6,
+                "reason": "PolicyReady",
+                "message": "custom condition",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"
+            }]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class], options());
+
+        let conditions = updates[0].status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "SupportedVersion", "True");
+        assert_eq!(
+            find_condition(conditions, "example.com/PolicyReady")["message"].as_str(),
+            Some("custom condition")
+        );
+    }
+
+    #[test]
     fn http_route_status_reports_parent_conditions() {
         let route = object(
             "HTTPRoute",
@@ -1050,7 +1251,7 @@ mod tests {
         );
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("BackendRefNotPermitted")
+            Some("RefNotPermitted")
         );
     }
 
@@ -1396,6 +1597,45 @@ mod tests {
     }
 
     #[test]
+    fn route_status_preserves_non_owned_parent_conditions() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        route.status = json!({
+            "parents": [{
+                "parentRef": {"name": "edge"},
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": [{
+                    "type": "example.com/CustomParentReady",
+                    "status": "True",
+                    "observedGeneration": 6,
+                    "reason": "CustomParentReady",
+                    "message": "custom parent condition",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }]
+            }]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_eq!(
+            find_condition(conditions, "example.com/CustomParentReady")["message"].as_str(),
+            Some("custom parent condition")
+        );
+    }
+
+    #[test]
     fn route_status_drops_stale_ferrum_parent_entries() {
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
@@ -1522,6 +1762,104 @@ mod tests {
             find_condition(conditions, "Accepted")["observedGeneration"].as_i64(),
             Some(7)
         );
+    }
+
+    #[test]
+    fn status_patch_for_gateway_updates_only_owned_conditions_from_live_status() {
+        let update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: "default".to_string(),
+            name: "edge".to_string(),
+            status: json!({
+                "addresses": [{"type": "IPAddress", "value": "stale"}],
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "observedGeneration": 7,
+                    "reason": "Accepted",
+                    "message": "Ferrum accepted this Gateway",
+                    "lastTransitionTime": "2026-02-01T00:00:00Z"
+                }]
+            }),
+        };
+        let live_status = json!({
+            "addresses": [{"type": "IPAddress", "value": "10.0.0.10"}],
+            "conditions": [{
+                "type": "example.com/CustomReady",
+                "status": "True",
+                "observedGeneration": 8,
+                "reason": "CustomReady",
+                "message": "fresh custom status",
+                "lastTransitionTime": "2026-03-01T00:00:00Z"
+            }]
+        });
+
+        let patch = status_patch_for_update(&update, Some(&live_status));
+
+        assert!(patch["status"].get("addresses").is_none());
+        let conditions = patch["status"]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_eq!(
+            find_condition(conditions, "example.com/CustomReady")["message"].as_str(),
+            Some("fresh custom status")
+        );
+    }
+
+    #[test]
+    fn status_patch_for_route_merges_ferrum_parents_into_live_status() {
+        let update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "HTTPRoute".to_string(),
+            namespace: "default".to_string(),
+            name: "api".to_string(),
+            status: json!({
+                "parents": [
+                    {
+                        "parentRef": {"name": "edge"},
+                        "controllerName": "example.com/stale-controller",
+                        "conditions": []
+                    },
+                    {
+                        "parentRef": {"name": "edge"},
+                        "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                        "conditions": [{"type": "Accepted", "status": "True"}]
+                    }
+                ]
+            }),
+        };
+        let live_status = json!({
+            "parents": [
+                {
+                    "parentRef": {"name": "edge"},
+                    "controllerName": "example.com/fresh-controller",
+                    "conditions": [{"type": "Accepted", "status": "True"}]
+                },
+                {
+                    "parentRef": {"name": "old-edge"},
+                    "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                    "conditions": []
+                }
+            ]
+        });
+
+        let patch = status_patch_for_update(&update, Some(&live_status));
+
+        let parents = patch["status"]["parents"].as_array().unwrap();
+        assert!(parents.iter().any(|parent| {
+            parent["controllerName"].as_str() == Some("example.com/fresh-controller")
+        }));
+        assert!(!parents.iter().any(|parent| {
+            parent["controllerName"].as_str() == Some("example.com/stale-controller")
+        }));
+        assert!(!parents.iter().any(|parent| {
+            parent["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                && parent["parentRef"]["name"].as_str() == Some("old-edge")
+        }));
+        assert!(parents.iter().any(|parent| {
+            parent["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                && parent["parentRef"]["name"].as_str() == Some("edge")
+        }));
     }
 
     fn assert_condition(conditions: &[Value], condition_type: &str, status: &str) {
