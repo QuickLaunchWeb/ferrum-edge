@@ -863,12 +863,14 @@ The injector checks annotations and labels to decide whether to inject:
 | Annotation/Label | Effect |
 |---|---|
 | `ferrum.io/inject: "true"` | Opt-in injection |
+| `sidecar.istio.io/inject: "true"` | Opt-in injection (Istio compat) |
 | `ferrum.io/mesh: "enabled"` (label) | Opt-in injection |
 | `ferrum.io/inject: "false"` | Skip injection |
 | `sidecar.istio.io/inject: "false"` | Skip injection (Istio compat) |
+| `ferrum.io/mesh: "false"` or `"disabled"` (label) | Skip injection |
 | `ferrum.io/injected` | Skip (already injected) |
 
-When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"` or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
+When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
 
 ### Port and IP-Range Capture Overrides
 
