@@ -235,7 +235,7 @@ impl SchemaSerializable for TransactionSummary {
                 Some(v) => map.serialize_entry(out_key, v),
                 None => Ok(()),
             },
-            "backend_target_url" => map.serialize_entry(out_key, &self.backend_target_url),
+            "backend_target" => map.serialize_entry(out_key, &self.backend_target),
             "backend_resolved_ip" => match &self.backend_resolved_ip {
                 Some(v) => map.serialize_entry(out_key, v),
                 None => Ok(()),
@@ -290,16 +290,16 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
-            "request_bytes" => {
-                if self.request_bytes != 0 {
-                    map.serialize_entry(out_key, &self.request_bytes)
+            "bytes_sent" => {
+                if self.bytes_sent != 0 {
+                    map.serialize_entry(out_key, &self.bytes_sent)
                 } else {
                     Ok(())
                 }
             }
-            "response_bytes" => {
-                if self.response_bytes != 0 {
-                    map.serialize_entry(out_key, &self.response_bytes)
+            "bytes_received" => {
+                if self.bytes_received != 0 {
+                    map.serialize_entry(out_key, &self.bytes_received)
                 } else {
                     Ok(())
                 }
@@ -341,7 +341,7 @@ impl SchemaSerializable for TransactionSummary {
                 map.serialize_entry(out_key, s)?;
                 Ok(true)
             }
-            DerivedKind::BackendHost => match &self.backend_target_url {
+            DerivedKind::BackendHost => match &self.backend_target {
                 Some(url) => match extract_host_from_url(url) {
                     Some(h) => {
                         map.serialize_entry(out_key, h)?;
@@ -671,10 +671,10 @@ mod tests {
             request_path: "/api/v1/things".into(),
             proxy_id: Some("p1".into()),
             proxy_name: Some("things-api".into()),
-            backend_target_url: Some("https://backend.example.com:8443/things".into()),
+            backend_target: Some("https://backend.example.com:8443/things".into()),
             response_status_code: 200,
             latency_total_ms: 12.5,
-            response_bytes: 1024,
+            bytes_received: 1024,
             metadata: HashMap::from([
                 ("trace_id".to_string(), "abc-123".to_string()),
                 ("authorization".to_string(), "Bearer secret".to_string()),
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn derived_backend_host_ipv6_bracketed() {
         let mut s = http_summary();
-        s.backend_target_url = Some("https://[2001:db8::1]:8443/path".into());
+        s.backend_target = Some("https://[2001:db8::1]:8443/path".into());
         let v = serialize_via(
             &s,
             json!({
@@ -995,10 +995,10 @@ mod tests {
     }
 
     #[test]
-    fn skip_serializing_if_preserved_for_zero_request_bytes() {
-        // Default http_summary() has request_bytes = 0 → should be skipped.
+    fn skip_serializing_if_preserved_for_zero_bytes_sent() {
+        // Default http_summary() has bytes_sent = 0 → should be skipped.
         let v = serialize_via(&http_summary(), json!({ "summary_type": "http" }));
-        assert!(v.get("request_bytes").is_none());
+        assert!(v.get("bytes_sent").is_none());
     }
 
     #[test]

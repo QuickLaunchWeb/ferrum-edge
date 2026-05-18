@@ -4,7 +4,7 @@
 //! populates `TransactionSummary` body-outcome fields and invokes plugin
 //! `log()` hooks when a streaming response reaches a terminal state:
 //!
-//! 1. Successful body completion → `body_completed=true`, `response_bytes=N`.
+//! 1. Successful body completion → `body_completed=true`, `bytes_received=N`.
 //! 2. Streaming errors (e.g. backend RST_STREAM mid-body in gRPC) → populate
 //!    `body_error_class` while preserving the already-flushed `response_status_code`.
 //! 3. Client disconnect detected mid-stream → `client_disconnected=true`.
@@ -75,7 +75,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         request_path: "/things/42".to_string(),
         proxy_id: Some("proxy-1".to_string()),
         proxy_name: Some("things".to_string()),
-        backend_target_url: Some("http://upstream:8080/things/42".to_string()),
+        backend_target: Some("http://upstream:8080/things/42".to_string()),
         backend_resolved_ip: Some("127.0.0.1".to_string()),
         response_status_code: status,
         latency_total_ms: 0.0,
@@ -91,8 +91,8 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        request_bytes: 0,
-        response_bytes: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
         mirror: false,
         metadata: HashMap::new(),
     }
@@ -136,7 +136,7 @@ async fn success_outcome_populates_body_fields() {
     assert_eq!(captures.len(), 1, "log should fire exactly once");
     let got = &captures[0];
     assert!(got.body_completed, "success outcome sets body_completed");
-    assert_eq!(got.response_bytes, 4096);
+    assert_eq!(got.bytes_received, 4096);
     assert!(!got.client_disconnected);
     assert!(got.body_error_class.is_none());
     assert_eq!(
@@ -165,7 +165,7 @@ async fn error_outcome_preserves_status_code() {
         "status is not rewritten by body error"
     );
     assert!(!got.body_completed);
-    assert_eq!(got.response_bytes, 1234);
+    assert_eq!(got.bytes_received, 1234);
     assert!(!got.client_disconnected, "error was not a disconnect");
     assert_eq!(got.body_error_class, Some(ErrorClass::ProtocolError));
 }
@@ -183,7 +183,7 @@ async fn client_disconnect_outcome_sets_flag() {
     assert_eq!(captures.len(), 1);
     let got = &captures[0];
     assert!(got.client_disconnected);
-    assert_eq!(got.response_bytes, 512);
+    assert_eq!(got.bytes_received, 512);
     assert!(!got.body_completed);
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
 }
@@ -206,7 +206,7 @@ async fn drop_without_fire_is_safety_net() {
     assert!(got.client_disconnected);
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
     assert!(!got.body_completed);
-    assert_eq!(got.response_bytes, 0);
+    assert_eq!(got.bytes_received, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -225,7 +225,7 @@ async fn double_fire_is_a_no_op() {
     assert_eq!(captures.len(), 1, "second fire must be a no-op");
     let got = &captures[0];
     assert!(got.body_completed, "first fire's outcome wins");
-    assert_eq!(got.response_bytes, 100);
+    assert_eq!(got.bytes_received, 100);
     assert!(!got.client_disconnected);
 }
 
@@ -245,7 +245,7 @@ async fn drop_after_explicit_fire_does_not_double_log() {
         "Drop after explicit fire must not emit a second log"
     );
     assert!(captures[0].body_completed);
-    assert_eq!(captures[0].response_bytes, 42);
+    assert_eq!(captures[0].bytes_received, 42);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -262,8 +262,8 @@ async fn all_plugins_receive_the_final_summary() {
     let b = wait_for_captures(&captured_b, 1).await;
     assert_eq!(a.len(), 1);
     assert_eq!(b.len(), 1);
-    assert_eq!(a[0].response_bytes, 777);
-    assert_eq!(b[0].response_bytes, 777);
+    assert_eq!(a[0].bytes_received, 777);
+    assert_eq!(b[0].bytes_received, 777);
     assert!(a[0].body_completed);
     assert!(b[0].body_completed);
 }
@@ -304,7 +304,7 @@ async fn body_polled_to_completion_fires_logger_once_with_success() {
     );
     let got = &captures[0];
     assert!(got.body_completed);
-    assert_eq!(got.response_bytes, expected_len);
+    assert_eq!(got.bytes_received, expected_len);
     assert!(!got.client_disconnected);
     assert!(got.body_error_class.is_none());
 }
@@ -326,7 +326,7 @@ async fn body_dropped_before_polling_fires_client_disconnect() {
     let got = &captures[0];
     assert!(got.client_disconnected);
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
-    assert_eq!(got.response_bytes, 0, "no bytes streamed before drop");
+    assert_eq!(got.bytes_received, 0, "no bytes streamed before drop");
     assert!(!got.body_completed);
 }
 
@@ -387,5 +387,5 @@ async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
         got.body_completed,
         "Drop path treats never-polled streaming bodies as successful completion"
     );
-    assert_eq!(got.response_bytes, 0);
+    assert_eq!(got.bytes_received, 0);
 }

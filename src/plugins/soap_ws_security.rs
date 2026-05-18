@@ -193,7 +193,64 @@ impl SoapWsSecurity {
                 )
             })?;
 
-            let public_key_der = cert.public_key().raw.to_vec();
+            // Defense-in-depth: this plugin only supports RSA-PKCS#1 v1.5
+            // signature verification (rsa-sha256 / rsa-sha1). The verify
+            // path passes the inner SPKI bytes into ring's `RSA_PKCS1_*`
+            // algorithms, which only accept a bare `RSAPublicKey`. A non-RSA
+            // cert (e.g. ECDSA P-256) would otherwise load silently here
+            // and only surface at request time as a generic "WS-Security:
+            // signature verification failed", making the misconfiguration
+            // hard to diagnose. Reject at load with a precise error.
+            let public_key_info = cert.public_key();
+            if public_key_info.algorithm.algorithm != oid_registry::OID_PKCS1_RSAENCRYPTION {
+                return Err(format!(
+                    "soap_ws_security: trusted cert '{}' is not an RSA public key \
+                     (algorithm OID '{}', expected '1.2.840.113549.1.1.1' / rsaEncryption); \
+                     only RSA certificates are supported for WS-Security signature verification",
+                    path, public_key_info.algorithm.algorithm,
+                ));
+            }
+
+            // An RSA SubjectPublicKeyInfo encapsulates the RSAPublicKey in a
+            // BIT STRING whose `unused_bits` MUST be 0 (the contents are
+            // byte-aligned DER). Anything else is a malformed cert.
+            if public_key_info.subject_public_key.unused_bits != 0 {
+                return Err(format!(
+                    "soap_ws_security: trusted cert '{}' RSA SPKI BIT STRING has {} unused bits \
+                     (expected 0)",
+                    path, public_key_info.subject_public_key.unused_bits,
+                ));
+            }
+
+            // Ring's `RSA_PKCS1_*` verification algorithms expect a bare
+            // RFC 8017 §A.1.1 `RSAPublicKey` (modulus + exponent), NOT a
+            // full RFC 5280 `SubjectPublicKeyInfo` (which wraps the key
+            // with the algorithm identifier OID). For RSA SPKI the inner
+            // `subject_public_key` BitString contents ARE that bare
+            // `RSAPublicKey` encoding, so use that directly instead of
+            // `public_key().raw` (which is the entire SPKI DER) — passing
+            // SPKI bytes makes `UnparsedPublicKey::verify` fail to parse
+            // the key and reject every signature, regardless of validity.
+            let public_key_der = public_key_info.subject_public_key.data.to_vec();
+
+            // Structural regression guard: an `RSAPublicKey` DER is a
+            // top-level SEQUENCE whose declared length matches the buffer
+            // length. A future refactor that accidentally went back to
+            // `public_key().raw` (the full SPKI) would also start with
+            // 0x30 — so a tag-only check is insufficient — but its
+            // declared length would not agree with the buffer (SPKI wraps
+            // the AlgorithmIdentifier alongside the BIT STRING, so its
+            // length header reports a content size that omits the
+            // AlgorithmIdentifier header bytes the buffer still contains).
+            // Verifying both tag and length encoding here catches that
+            // class of mistake at load time rather than at request time.
+            validate_rsa_public_key_der_shape(&public_key_der).map_err(|e| {
+                format!(
+                    "soap_ws_security: trusted cert '{}' has malformed RSA public key DER: {}",
+                    path, e
+                )
+            })?;
+
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
                 .to_vec();
@@ -237,6 +294,26 @@ impl SoapWsSecurity {
         if saml_enabled && saml_trusted_issuers.is_empty() {
             return Err(
                 "soap_ws_security: saml is enabled but no trusted_issuers are configured"
+                    .to_string(),
+            );
+        }
+
+        // `validate_saml_assertion` currently only checks the Issuer / NotBefore
+        // / NotOnOrAfter / Audience values inside the assertion XML. It does
+        // NOT cryptographically verify the assertion's `<Signature>`, so an
+        // attacker who can submit a SOAP body can forge an assertion claiming
+        // to be issued by any trusted issuer string and pass validation
+        // without holding the issuer's private key. Refuse to start with
+        // `saml.enabled: true` until proper XMLDSIG signature verification
+        // is plumbed in — running with this surface enabled provides only
+        // illusory authentication and is worse than not running it at all.
+        if saml_enabled {
+            return Err(
+                "soap_ws_security: saml.enabled is not currently supported — \
+                 the plugin does not yet cryptographically verify SAML \
+                 assertion signatures, so accepting them would be trivially \
+                 spoofable. Disable saml or wait for XMLDSIG signature \
+                 verification to land."
                     .to_string(),
             );
         }
@@ -1200,6 +1277,69 @@ fn find_wsu_id(element: &str) -> Option<String> {
     find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
 }
 
+/// Structural sanity check: `der` must be a top-level DER `SEQUENCE` whose
+/// declared length matches the buffer length exactly. This is intentionally
+/// the narrow shape of an RFC 8017 `RSAPublicKey ::= SEQUENCE { modulus,
+/// publicExponent }`. It does NOT parse the inner integers — ring does that
+/// at verify time. The check exists specifically to catch a regression where
+/// the full `SubjectPublicKeyInfo` (which also starts with 0x30, but whose
+/// length header omits the wrapping `AlgorithmIdentifier` bytes that are
+/// still present in the buffer) is passed in place of the bare `RSAPublicKey`.
+fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
+    if der.is_empty() {
+        return Err("public key DER is empty".to_string());
+    }
+    if der[0] != 0x30 {
+        return Err(format!(
+            "expected DER SEQUENCE tag (0x30) at offset 0, got 0x{:02x}",
+            der[0]
+        ));
+    }
+    if der.len() < 2 {
+        return Err("DER is truncated before length octet".to_string());
+    }
+
+    let first_len = der[1];
+    let (declared_content_len, header_len) = if first_len & 0x80 == 0 {
+        // Short-form: single-byte length, value 0..=127.
+        ((first_len & 0x7f) as usize, 2)
+    } else {
+        // Long-form: low 7 bits give number of length octets that follow.
+        let n = (first_len & 0x7f) as usize;
+        if n == 0 {
+            return Err("indefinite-length encoding is not valid DER".to_string());
+        }
+        if n > 4 {
+            return Err(format!(
+                "length uses {n} octets (refusing to parse > 4; a 4-octet length covers 4 GiB)"
+            ));
+        }
+        if der.len() < 2 + n {
+            return Err("DER is truncated inside length encoding".to_string());
+        }
+        let mut declared: usize = 0;
+        for &b in &der[2..2 + n] {
+            declared = (declared << 8) | b as usize;
+        }
+        (declared, 2 + n)
+    };
+
+    let expected_total = header_len
+        .checked_add(declared_content_len)
+        .ok_or_else(|| "declared length overflows usize".to_string())?;
+
+    if expected_total != der.len() {
+        return Err(format!(
+            "length mismatch: header declares {declared_content_len} content bytes \
+             ({expected_total}-byte total), buffer is {} bytes \
+             (regression: looks like a full SubjectPublicKeyInfo, not a bare RSAPublicKey)",
+            der.len()
+        ));
+    }
+
+    Ok(())
+}
+
 /// Decode PEM to DER bytes (handles the common CERTIFICATE block).
 fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
     let start_marker = "-----BEGIN CERTIFICATE-----";
@@ -1338,5 +1478,108 @@ mod tests {
         };
         assert_eq!(block, "<Foo/>");
         assert_eq!(&xml[end..], "after");
+    }
+
+    // ── RSA public-key DER shape validator ──────────────────────────────────
+    //
+    // These tests pin the structural regression guard that catches a future
+    // refactor accidentally routing the full SubjectPublicKeyInfo (instead of
+    // the bare RSAPublicKey) into `ring::signature::UnparsedPublicKey::new` —
+    // the original PR #844 bug class.
+
+    #[test]
+    fn rsa_pk_shape_accepts_short_form_sequence_with_matching_length() {
+        // SEQUENCE, content length 3, three content bytes — well-formed.
+        let der = [0x30, 0x03, 0x02, 0x01, 0x00];
+        assert!(validate_rsa_public_key_der_shape(&der).is_ok());
+    }
+
+    #[test]
+    fn rsa_pk_shape_accepts_long_form_two_octet_length() {
+        // SEQUENCE, long-form length: 0x82 means "next 2 octets are length";
+        // 0x01 0x00 = 256 content bytes. Build a buffer of exactly that size.
+        let mut der = vec![0x30, 0x82, 0x01, 0x00];
+        der.extend(std::iter::repeat_n(0xAB_u8, 256));
+        assert_eq!(der.len(), 4 + 256);
+        assert!(validate_rsa_public_key_der_shape(&der).is_ok());
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_empty_buffer() {
+        let err = validate_rsa_public_key_der_shape(&[]).unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_non_sequence_tag() {
+        // 0x02 = INTEGER tag — refused even with otherwise-valid length.
+        let err = validate_rsa_public_key_der_shape(&[0x02, 0x01, 0x00]).unwrap_err();
+        assert!(err.contains("SEQUENCE tag"), "got: {err}");
+        assert!(err.contains("0x02"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_truncated_after_tag() {
+        let err = validate_rsa_public_key_der_shape(&[0x30]).unwrap_err();
+        assert!(err.contains("length octet"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_indefinite_length_encoding() {
+        // 0x80 = "indefinite length" — invalid in DER (only BER allows it).
+        let err = validate_rsa_public_key_der_shape(&[0x30, 0x80, 0x00, 0x00]).unwrap_err();
+        assert!(err.contains("indefinite-length"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_overlong_length_field() {
+        // 0x85 = 5 length octets — refused (a 4-octet length already covers 4 GiB).
+        let der = [0x30, 0x85, 0, 0, 0, 0, 0, 0];
+        let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
+        assert!(err.contains("length uses 5 octets"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_truncated_long_form_length() {
+        // 0x82 promises 2 length octets, but only 1 is present.
+        let err = validate_rsa_public_key_der_shape(&[0x30, 0x82, 0x00]).unwrap_err();
+        assert!(err.contains("truncated"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_full_spki_shape_via_length_mismatch() {
+        // The exact regression: build a synthetic blob that resembles a
+        // SubjectPublicKeyInfo's outer wrapping. Its top-level SEQUENCE length
+        // header declares a content size that excludes the trailing bytes the
+        // buffer still carries — the length check must reject this.
+        //
+        // Layout: 0x30 0x09 [9 content bytes] [4 extra trailing bytes].
+        // 9 + 2 (header) = 11, but the buffer length is 15, so this rejects.
+        let der = [
+            0x30, 0x09, // SEQUENCE, 9 content bytes
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, // 9 content bytes
+            0xAA, 0xBB, 0xCC, 0xDD, // trailing extras (would be the inner BIT STRING)
+        ];
+        let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
+        assert!(err.contains("length mismatch"), "got: {err}");
+        // The hint about the SPKI regression class is included so the
+        // failure mode is recognizable to future maintainers.
+        assert!(err.contains("SubjectPublicKeyInfo"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_declared_shorter_than_buffer() {
+        // Header declares 2 content bytes but buffer has 4 content bytes.
+        let der = [0x30, 0x02, 0x01, 0x02, 0x03, 0x04];
+        let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
+        assert!(err.contains("length mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_pk_shape_rejects_declared_longer_than_buffer() {
+        // Header declares 100 content bytes but only 2 content bytes follow.
+        let der = [0x30, 0x64, 0x01, 0x02];
+        let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
+        assert!(err.contains("length mismatch"), "got: {err}");
     }
 }

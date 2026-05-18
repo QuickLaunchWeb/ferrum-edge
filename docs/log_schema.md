@@ -144,7 +144,7 @@ caveat applies only to incremental admin-API edits.
 | `kind` | HTTP / WS summary | Stream summary |
 |---|---|---|
 | `status_class` | `"1xx"` / `"2xx"` / `"3xx"` / `"4xx"` / `"5xx"` / `"other"` from `response_status_code` | always `"none"` |
-| `backend_host` | hostname from `backend_target_url` (port stripped, IPv6 brackets honored) | hostname from `backend_target` |
+| `backend_host` | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) |
 | `summary_kind` | `"http"` | `"stream"` |
 | `outcome` | `"error"` when `response_status_code >= 500` or any error_class is set; else `"ok"` | `"error"` when `connection_error`, `error_class`, or `disconnect_cause: backend_error` is set; else `"ok"` |
 
@@ -290,7 +290,7 @@ schema:
     proxy_id: route
     response_status_code: status
     client_ip: src
-    backend_target_url: dest
+    backend_target: dest
     latency_total_ms: duration
   derived_fields:
     - { name: status_class, kind: status_class }
@@ -314,7 +314,7 @@ schema:
     namespace: tenant
     response_status_code: http.status_code
     http_method: http.method
-    backend_target_url: http.url
+    backend_target: http.url
     request_path: http.url_details.path
   timestamp_format: rfc3339
 ```

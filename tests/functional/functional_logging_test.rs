@@ -457,7 +457,7 @@ async fn test_logging_transaction_summary_on_proxied_request() {
     }
 
     // Verify backend target and user agent
-    assert!(get_log["backend_target_url"].as_str().is_some());
+    assert!(get_log["backend_target"].as_str().is_some());
     assert_eq!(
         get_log["request_user_agent"].as_str().unwrap(),
         "logging-test-agent/1.0"

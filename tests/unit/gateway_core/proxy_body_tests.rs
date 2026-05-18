@@ -212,7 +212,7 @@ async fn test_proxy_body_binary_data() {
 //
 // These exercise the `Arc<AtomicU64>` counter plumbed through
 // `SizeLimitedIncoming::new_with_counter` and `CountingIncoming::new_with_counter`.
-// The integration pattern is: caller clones `ctx.request_bytes_observed`,
+// The integration pattern is: caller clones `ctx.bytes_sent_observed`,
 // passes it to the adapter constructor; the adapter's `poll_frame` writes
 // bytes into the shared counter; the summary builder reads the final value
 // after the request completes.
@@ -248,7 +248,7 @@ fn test_size_limited_incoming_shared_counter_pattern() {
 }
 
 #[test]
-fn test_request_bytes_observed_fetch_max_preserves_largest() {
+fn test_bytes_sent_observed_fetch_max_preserves_largest() {
     // The handler uses `fetch_max` on retries so a shorter plugin-transformed
     // body on a later attempt does not lower the observed value. This test
     // exercises that invariant at the AtomicU64 level.

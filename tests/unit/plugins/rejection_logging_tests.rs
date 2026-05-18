@@ -133,7 +133,7 @@ async fn test_log_rejected_request_all_phases() {
 }
 
 /// Verify that log_rejected_request sets backend fields correctly for rejected requests.
-/// Since the request never reached the backend, backend_target_url should be None
+/// Since the request never reached the backend, backend_target should be None
 /// and backend latency fields should be 0.
 #[tokio::test]
 async fn test_rejected_request_summary_no_backend_fields() {
@@ -177,10 +177,10 @@ async fn test_rejected_request_summary_no_backend_fields() {
 
     let summary = &summaries[0];
     assert_eq!(summary.response_status_code, 401);
-    // backend_target_url is populated from the matched proxy so log consumers
+    // backend_target is populated from the matched proxy so log consumers
     // can query which backend API proxy had rejected traffic.
-    assert!(summary.backend_target_url.is_some());
-    let target_url = summary.backend_target_url.as_ref().unwrap();
+    assert!(summary.backend_target.is_some());
+    let target_url = summary.backend_target.as_ref().unwrap();
     assert!(
         target_url.contains("localhost"),
         "Expected backend host in URL, got: {}",

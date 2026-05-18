@@ -80,14 +80,14 @@ async fn scripted_tls_backend_alpn_negotiation() {
     let reservation = reserve_port().await.expect("port");
     let port = reservation.port;
 
-    let response_bytes: Vec<u8> =
+    let bytes_received: Vec<u8> =
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
     let backend = ScriptedTlsBackend::builder(
         reservation.into_listener(),
         TlsConfig::new(cert_pem, key_pem).with_alpn(vec![b"http/1.1".to_vec()]),
     )
     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(response_bytes))
+    .step(TcpStep::Write(bytes_received))
     .step(TcpStep::Drop)
     .spawn()
     .expect("spawn");

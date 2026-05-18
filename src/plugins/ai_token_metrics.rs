@@ -15,7 +15,9 @@
 //! the model name from the first chunk, and looks for a final `usage` object in
 //! the last chunk (OpenAI sends usage in the final SSE event when
 //! `stream_options.include_usage` is set). For Anthropic streaming, the plugin
-//! looks for `message_delta` events containing `usage`.
+//! looks for `message_delta` events containing `usage`. For Cohere v2 streaming
+//! (`/v2/chat` with `stream: true`), the plugin looks for the `message-end`
+//! event which nests counts under `delta.usage.tokens.*`.
 //!
 //! This plugin is observability-only: it never rejects a request.
 
@@ -237,6 +239,20 @@ impl AiTokenMetrics {
                         provider: Some(AiProvider::Anthropic),
                     };
                     final_usage = Some(u);
+                }
+            }
+
+            // Cohere v2 streaming: message-end event nests counts under
+            // `delta.usage.tokens.*` instead of root `usage`, so the
+            // root-`usage` check above doesn't fire. `extract_cohere_usage`
+            // knows how to read both shapes.
+            if json.get("type").and_then(|t| t.as_str()) == Some("message-end") {
+                let mut extracted = extract_response_usage(&json, AiProvider::Cohere);
+                if extracted.prompt_tokens.is_some() || extracted.completion_tokens.is_some() {
+                    if extracted.model.is_none() {
+                        extracted.model = model.clone();
+                    }
+                    final_usage = Some(extracted);
                 }
             }
         }
