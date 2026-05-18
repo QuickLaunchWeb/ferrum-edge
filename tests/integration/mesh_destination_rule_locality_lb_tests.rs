@@ -430,7 +430,7 @@ fn locality_only_destination_rule_preserves_existing_upstream_algorithm() {
 }
 
 #[test]
-fn k8s_translator_rejects_port_level_locality_lb_setting() {
+fn k8s_translator_accepts_port_level_locality_lb_setting() {
     let object = istio_object(
         "DestinationRule",
         "reviews",
@@ -452,12 +452,61 @@ fn k8s_translator_rejects_port_level_locality_lb_setting() {
             }
         }),
     );
+    let result =
+        translate_k8s_objects(&[object], k8s_options()).expect("port-level locality must parse");
+    let mesh = result.config.mesh.as_ref().expect("mesh present");
+    let rule = mesh
+        .destination_rules
+        .iter()
+        .find(|r| r.name == "reviews")
+        .expect("DR present");
+    let port_policy = rule
+        .port_level_settings
+        .get(&8080)
+        .expect("port 8080 entry present");
+    let setting = port_policy
+        .locality_lb_setting
+        .as_ref()
+        .expect("per-port localityLbSetting parsed");
+    assert_eq!(setting.failover.len(), 1);
+    assert_eq!(setting.failover[0].from, "us-west");
+    assert_eq!(setting.failover[0].to, "us-east");
+}
+
+#[test]
+fn k8s_translator_rejects_malformed_port_level_locality_lb_setting() {
+    // Uses the shared `is_valid_locality_pattern` validator — a bare `*` zone
+    // with a non-wildcard region is rejected.
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "portLevelSettings": [
+                    {
+                        "port": { "number": 8080 },
+                        "loadBalancer": {
+                            "localityLbSetting": {
+                                "distribute": [
+                                    {
+                                        "from": "us-west/*/sub",
+                                        "to": { "us-east": 100 }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }
+        }),
+    );
     let err = translate_k8s_objects(&[object], k8s_options())
-        .expect_err("port-level locality LB must be rejected until projected");
+        .expect_err("malformed per-port locality must be rejected by shared validator");
     let msg = format!("{err}");
     assert!(
-        msg.contains("portLevelSettings[].loadBalancer.localityLbSetting is not supported"),
-        "expected port-level locality rejection, got: {msg}"
+        msg.contains("localityLbSetting.distribute"),
+        "expected distribute rejection from shared validator, got: {msg}"
     );
 }
 
@@ -503,4 +552,262 @@ fn distribute_projects_through_mesh_apply_onto_upstream_locality_lb_setting() {
     assert_eq!(setting.failover.len(), 1);
     assert_eq!(setting.failover[0].from, "us-west");
     assert_eq!(setting.failover[0].to, "us-east");
+}
+
+fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
+    let now = Utc::now();
+    Upstream {
+        id: id.to_string(),
+        namespace: "default".to_string(),
+        name: Some(id.to_string()),
+        targets: vec![
+            UpstreamTarget {
+                host: host_fqdn.to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-west/us-west-1/a".to_string()),
+                path: None,
+            },
+            UpstreamTarget {
+                host: host_fqdn.to_string(),
+                port: 9090,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-west/us-west-1/a".to_string()),
+                path: None,
+            },
+        ],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[test]
+fn port_level_locality_lb_projects_onto_upstream_port_overrides() {
+    // K8s DR with port-level locality on 8080 only must (a) project onto
+    // Upstream.port_overrides[8080].locality_lb_setting and (b) leave port
+    // 9090's override slot unaffected. Combined with a top-level
+    // localityLbSetting, the top-level value lands on Upstream.locality_lb_setting
+    // so dispatch on port 9090 falls back to upstream-level locality.
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failover": [
+                            { "from": "us-west", "to": "us-east" }
+                        ]
+                    }
+                },
+                "portLevelSettings": [
+                    {
+                        "port": { "number": 8080 },
+                        "loadBalancer": {
+                            "localityLbSetting": {
+                                "distribute": [
+                                    {
+                                        "from": "us-west/us-west-1/a",
+                                        "to": { "us-west/us-west-1/a": 100 }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }
+        }),
+    );
+
+    let result = translate_k8s_objects(&[object], k8s_options()).expect("translation");
+    let mut config = result.config;
+    config.upstreams.push(multi_port_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh apply");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream projected");
+
+    // Upstream-level locality_lb_setting from the top-level DR block.
+    let top_level = upstream
+        .locality_lb_setting
+        .as_ref()
+        .expect("top-level locality_lb_setting projected");
+    assert_eq!(top_level.failover.len(), 1);
+    assert!(top_level.distribute.is_empty());
+
+    // Port 8080 carries the per-port distribute override.
+    let port8080 = upstream
+        .port_overrides
+        .get(&8080)
+        .expect("port 8080 override populated");
+    let port8080_locality = port8080
+        .locality_lb_setting
+        .as_ref()
+        .expect("per-port localityLbSetting projected for port 8080");
+    assert!(port8080_locality.enabled);
+    assert_eq!(port8080_locality.distribute.len(), 1);
+    assert_eq!(port8080_locality.distribute[0].from, "us-west/us-west-1/a");
+    assert!(port8080_locality.failover.is_empty());
+
+    // Port 9090 has no DR portLevelSettings entry — no per-port override slot
+    // should be created. Dispatch on this port will fall through to the
+    // upstream-level locality_lb_setting via the LB's per-port resolution.
+    assert!(
+        !upstream.port_overrides.contains_key(&9090),
+        "phantom port 9090 must not create an override slot"
+    );
+}
+
+#[test]
+fn port_level_locality_lb_drives_distribute_at_dispatch() {
+    // Build an upstream where two targets serve port 8080 in different
+    // localities, and a DR's per-port localityLbSetting distributes traffic
+    // 100% to one of them. The LB must honour the per-port setting and
+    // never route to the other locality.
+    use ferrum_edge::config::types::{
+        LocalityDistribute, UpstreamLocalityLbSetting, UpstreamPortOverride,
+    };
+    use ferrum_edge::load_balancer::LoadBalancerCache;
+    use std::collections::BTreeMap;
+
+    let now = Utc::now();
+    let mut upstream = Upstream {
+        id: "reviews-u".to_string(),
+        namespace: "default".to_string(),
+        name: Some("reviews-u".to_string()),
+        targets: vec![
+            UpstreamTarget {
+                host: "exact.local".to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-west/us-west-1/a".to_string()),
+                path: None,
+            },
+            UpstreamTarget {
+                host: "other.local".to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-east/us-east-1/a".to_string()),
+                path: None,
+            },
+            UpstreamTarget {
+                host: "fallback-9090.local".to_string(),
+                port: 9090,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-east/us-east-1/a".to_string()),
+                path: None,
+            },
+        ],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: Some("us-west/us-west-1/a".to_string()),
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let mut distribute_to = BTreeMap::new();
+    distribute_to.insert("us-west/us-west-1/a".to_string(), 100u32);
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                enabled: true,
+                distribute: vec![LocalityDistribute {
+                    from: "us-west/us-west-1/a".to_string(),
+                    to: distribute_to,
+                }],
+                failover: Vec::new(),
+            }),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    // Port 9090 has a non-locality override slot — exercises the per-port
+    // selector with `port_state.locality_lb = None`, which must fall through
+    // to the upstream-level locality (also None here) and stay scoped to
+    // port-9090 targets only.
+    upstream.port_overrides.insert(
+        9090,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(1234),
+            ..UpstreamPortOverride::default()
+        },
+    );
+
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+
+    // Per-port locality on 8080 forces every selection into the exact-tier
+    // target, even though both are healthy and unweighted at upstream level.
+    for i in 0..16 {
+        let selection = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "reviews-u",
+            &format!("k-{i}"),
+            8080,
+            None,
+        )
+        .expect("per-port selection");
+        assert_eq!(
+            selection.target.host, "exact.local",
+            "per-port distribute must keep traffic on us-west even though both 8080 targets are healthy"
+        );
+    }
+
+    // Port 9090 has an override slot without locality — the per-port selector
+    // restricts candidates to port-9090 targets, so the per-port locality
+    // settings from port 8080 must NOT leak across ports.
+    let selection = LoadBalancerCache::select_target_for_port_from(
+        &snapshot,
+        "reviews-u",
+        "k-9090",
+        9090,
+        None,
+    )
+    .expect("port 9090 still selectable");
+    assert_eq!(selection.target.host, "fallback-9090.local");
 }

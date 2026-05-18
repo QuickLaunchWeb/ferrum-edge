@@ -37,9 +37,9 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
-    MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
-    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
-    ServiceEntryLocation, service_entry_exported_to_namespace,
+    MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
+    MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope,
+    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -1329,6 +1329,40 @@ fn apply_traffic_policy_to_port_override(
         apply_outlier_detection_to_passive(&mut passive, od);
         slot.passive_health_check = Some(passive);
     }
+    // Per-port localityLbSetting projection. A later matching DR entry with no
+    // localityLbSetting clears an earlier value, mirroring the upstream-level
+    // semantics in `apply_traffic_policy_to_upstream`.
+    slot.locality_lb_setting = policy
+        .locality_lb_setting
+        .as_ref()
+        .map(into_upstream_locality);
+}
+
+/// Project a mesh-derived `MeshLocalityLbSetting` onto its Ferrum
+/// `UpstreamLocalityLbSetting` counterpart. Used by both the upstream-level
+/// and per-port projection paths so they cannot drift apart.
+fn into_upstream_locality(
+    locality: &MeshLocalityLbSetting,
+) -> crate::config::types::UpstreamLocalityLbSetting {
+    crate::config::types::UpstreamLocalityLbSetting {
+        enabled: locality.enabled,
+        distribute: locality
+            .distribute
+            .iter()
+            .map(|entry| crate::config::types::LocalityDistribute {
+                from: entry.from.clone(),
+                to: entry.to.clone(),
+            })
+            .collect(),
+        failover: locality
+            .failover
+            .iter()
+            .map(|entry| crate::config::types::LocalityFailover {
+                from: entry.from.clone(),
+                to: entry.to.clone(),
+            })
+            .collect(),
+    }
 }
 
 fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstream) -> bool {
@@ -1405,27 +1439,10 @@ fn apply_traffic_policy_to_upstream(
     // mesh-derived slot, so a later matching DestinationRule with no
     // localityLbSetting clears an earlier value instead of leaving stale
     // distribute/failover state behind.
-    upstream.locality_lb_setting = policy.locality_lb_setting.as_ref().map(|locality| {
-        crate::config::types::UpstreamLocalityLbSetting {
-            enabled: locality.enabled,
-            distribute: locality
-                .distribute
-                .iter()
-                .map(|entry| crate::config::types::LocalityDistribute {
-                    from: entry.from.clone(),
-                    to: entry.to.clone(),
-                })
-                .collect(),
-            failover: locality
-                .failover
-                .iter()
-                .map(|entry| crate::config::types::LocalityFailover {
-                    from: entry.from.clone(),
-                    to: entry.to.clone(),
-                })
-                .collect(),
-        }
-    });
+    upstream.locality_lb_setting = policy
+        .locality_lb_setting
+        .as_ref()
+        .map(into_upstream_locality);
 
     Ok(())
 }
