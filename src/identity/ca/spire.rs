@@ -204,6 +204,18 @@ async fn stream_loop(
     first_received: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut backoff = RECONNECT_BACKOFF_INITIAL;
+    // Track the last successfully-fetched SPIFFE ID so subsequent rotation
+    // failures attribute to the actual workload identity instead of "unknown".
+    // Per-workload alerting (e.g. `ferrum_mesh_cert_rotation_failures_total`
+    // grouped by `spiffe_id`) needs this label to be stable across reconnects.
+    let attributed_spiffe_id = |current: &Arc<ArcSwap<Option<AgentSnapshot>>>| -> String {
+        current
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .map(|snap| snap.bundle.spiffe_id.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
 
     loop {
         match WorkloadApiClient::connect(&socket_path).await {
@@ -239,7 +251,7 @@ async fn stream_loop(
                                     false,
                                 );
                                 crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                                    "unknown",
+                                    &attributed_spiffe_id(&current),
                                     "spire_agent",
                                 );
                                 warn!(
@@ -257,7 +269,7 @@ async fn stream_loop(
                         false,
                     );
                     crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                        "unknown",
+                        &attributed_spiffe_id(&current),
                         "spire_agent",
                     );
                     error!(
@@ -269,7 +281,7 @@ async fn stream_loop(
             Err(e) => {
                 crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", false);
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                    "unknown",
+                    &attributed_spiffe_id(&current),
                     "spire_agent",
                 );
                 error!(
