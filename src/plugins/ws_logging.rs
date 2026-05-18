@@ -494,6 +494,18 @@ async fn send_batch(
 /// Uses `connect_async_tls_with_config` with the pre-built TLS connector
 /// so that `wss://` connections respect the gateway's CA trust chain and
 /// `FERRUM_TLS_NO_VERIFY` setting.
+///
+/// `tokio_tungstenite` handles WebSocket control frames (Ping / Pong /
+/// server-initiated Close) inside its `Stream` impl while the read half
+/// is being polled. We don't consume any inbound application messages
+/// — log shipping is write-only — but if we just `drop` the read half
+/// the server stops getting Pong replies to its Pings, and after the
+/// server's ping timeout it tears the connection down. Worse, a
+/// server-initiated Close goes unobserved until the next `send` errors
+/// out, by which time the kernel receive buffer may have filled. Spawn
+/// a small drain task that polls the read side and discards every
+/// message; that drives the protocol forward without doing anything
+/// with the data.
 async fn connect(cfg: &WsConfig) -> Option<WsSink> {
     use futures_util::StreamExt;
 
@@ -506,7 +518,12 @@ async fn connect(cfg: &WsConfig) -> Option<WsSink> {
     .await
     {
         Ok((stream, _response)) => {
-            let (sink, _read) = stream.split();
+            let (sink, mut read) = stream.split();
+            // Drain the read half so tungstenite can service Ping/Pong
+            // and server-initiated Close frames. Exits cleanly when
+            // the peer closes — at that point `sink.send(...)` will
+            // surface the same error and the main loop will reconnect.
+            tokio::spawn(async move { while read.next().await.is_some() {} });
             Some(sink)
         }
         Err(e) => {
