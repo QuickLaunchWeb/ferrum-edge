@@ -14,12 +14,12 @@
 //!
 //! Operations supported are the strict subset of header ops that the
 //! transformer plugins also expose:
-//! - `add`     — insert if absent (NOT Istio's append-to-multi-value
-//!               semantics — the existing Ferrum `request_transformer`
-//!               historically uses insert-if-absent and we preserve that
-//!               for consistency; use `update` to overwrite).
-//! - `update`  — insert or replace (`headers.request.set` semantics).
-//! - `remove`  — delete the header (all values for the key).
+//! - `add` — insert if absent. NOT Istio's append-to-multi-value
+//!   semantics — the existing Ferrum `request_transformer` historically
+//!   uses insert-if-absent and we preserve that for consistency; use
+//!   `update` to overwrite.
+//! - `update` — insert or replace (`headers.request.set` semantics).
+//! - `remove` — delete the header (all values for the key).
 //!
 //! Rename is intentionally not part of the route-level transform contract
 //! because Istio has no rename verb.
