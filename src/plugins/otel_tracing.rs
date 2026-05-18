@@ -40,6 +40,44 @@ pub struct OtelTracing {
     exporter: Option<Arc<dyn TraceExporter>>,
 }
 
+/// OTLP-flavoured span kind. Mirrored to Zipkin / Datadog payloads with each
+/// provider's preferred string form (`SERVER` / `CLIENT` for Zipkin v2,
+/// lowercase under `meta["span.kind"]` for Datadog). OTLP itself emits the
+/// raw enum integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpanKind {
+    /// OTLP enum value 2.
+    Server,
+    /// OTLP enum value 3.
+    Client,
+}
+
+impl SpanKind {
+    /// OTLP enum encoding (`opentelemetry.proto.trace.v1.Span.SpanKind`).
+    pub(crate) fn otlp_code(self) -> u8 {
+        match self {
+            Self::Server => 2,
+            Self::Client => 3,
+        }
+    }
+
+    /// Zipkin v2 wire form (`"SERVER"` / `"CLIENT"`).
+    pub(crate) fn zipkin_str(self) -> &'static str {
+        match self {
+            Self::Server => "SERVER",
+            Self::Client => "CLIENT",
+        }
+    }
+
+    /// Datadog `meta["span.kind"]` form (`"server"` / `"client"`).
+    pub(crate) fn datadog_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Client => "client",
+        }
+    }
+}
+
 /// Internal span data collected during the request lifecycle.
 #[derive(Clone)]
 pub(crate) struct SpanData {
@@ -49,6 +87,10 @@ pub(crate) struct SpanData {
     pub(crate) service_name: String,
     pub(crate) span_name: String,
     pub(crate) span_kind: u8,
+    /// Typed span kind used to render provider-specific encodings. Kept
+    /// alongside the legacy `span_kind` integer so call sites that haven't
+    /// migrated still produce SERVER spans.
+    pub(crate) span_kind_typed: SpanKind,
     pub(crate) http_method: String,
     pub(crate) http_url: String,
     pub(crate) http_status_code: Option<u16>,
@@ -102,6 +144,14 @@ impl SpanData {
         summary: &TransactionSummary,
         service_name: &str,
     ) -> Option<Self> {
+        Self::from_transaction_summary_with_kind(summary, service_name, SpanKind::Server)
+    }
+
+    pub(crate) fn from_transaction_summary_with_kind(
+        summary: &TransactionSummary,
+        service_name: &str,
+        kind: SpanKind,
+    ) -> Option<Self> {
         let trace_id = summary.metadata.get("trace_id")?.clone();
         let span_id = summary.metadata.get("span_id")?.clone();
         let parent_span_id = summary
@@ -115,7 +165,8 @@ impl SpanData {
             parent_span_id,
             service_name: service_name.to_string(),
             span_name: format!("{} {}", summary.http_method, summary.request_path),
-            span_kind: 2,
+            span_kind: kind.otlp_code(),
+            span_kind_typed: kind,
             http_method: summary.http_method.clone(),
             http_url: summary.request_path.clone(),
             http_status_code: Some(summary.response_status_code),
@@ -148,6 +199,14 @@ impl SpanData {
         summary: &StreamTransactionSummary,
         service_name: &str,
     ) -> Option<Self> {
+        Self::from_stream_summary_with_kind(summary, service_name, SpanKind::Server)
+    }
+
+    pub(crate) fn from_stream_summary_with_kind(
+        summary: &StreamTransactionSummary,
+        service_name: &str,
+        kind: SpanKind,
+    ) -> Option<Self> {
         let trace_id = summary.metadata.get("trace_id")?.clone();
         let span_id = summary.metadata.get("span_id")?.clone();
         let parent_span_id = summary
@@ -162,7 +221,8 @@ impl SpanData {
             parent_span_id,
             service_name: service_name.to_string(),
             span_name,
-            span_kind: 2,
+            span_kind: kind.otlp_code(),
+            span_kind_typed: kind,
             http_method: summary.protocol.clone(),
             http_url: summary.backend_target.clone(),
             http_status_code: None,
@@ -1195,6 +1255,7 @@ fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
                 "traceId": span.trace_id.clone(),
                 "id": span.span_id.clone(),
                 "name": span.span_name.clone(),
+                "kind": span.span_kind_typed.zipkin_str(),
                 "timestamp": start_us,
                 "duration": duration_us,
                 "localEndpoint": {
@@ -1231,6 +1292,7 @@ fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
     let start_ns = timestamp_nanos(&span.timestamp_received);
     let duration_ns = (span.duration_ms.max(0.0) * 1_000_000.0) as i64;
     let mut meta = serde_json::Map::new();
+    insert_tag(&mut meta, "span.kind", span.span_kind_typed.datadog_str());
     insert_tag(&mut meta, "http.method", &span.http_method);
     insert_tag(&mut meta, "http.url", &span.http_url);
     insert_tag(&mut meta, "client.ip", &span.client_ip);
@@ -1593,6 +1655,7 @@ mod tests {
             service_name: "ferrum-edge".to_string(),
             span_name: "GET /api".to_string(),
             span_kind: 2,
+            span_kind_typed: SpanKind::Server,
             http_method: "GET".to_string(),
             http_url: "/api".to_string(),
             http_status_code: Some(200),
@@ -1761,6 +1824,7 @@ mod tests {
             service_name: "ferrum-edge".to_string(),
             span_name: "GET /".to_string(),
             span_kind: 2,
+            span_kind_typed: SpanKind::Server,
             http_method: "GET".to_string(),
             http_url: "/".to_string(),
             http_status_code: Some(200),

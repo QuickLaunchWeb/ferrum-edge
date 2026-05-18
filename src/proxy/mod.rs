@@ -1602,6 +1602,9 @@ fn via_header_for_backend_response_body<'a>(
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
+    /// Direction stamped at listener-spawn time for mesh listeners.
+    /// `None` outside mesh mode.
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -4452,6 +4455,7 @@ async fn handle_connection(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -4504,6 +4508,7 @@ async fn handle_connection(
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
             node_waypoint_identity: node_waypoint_identity.clone(),
+            mesh_direction,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -6365,6 +6370,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         },
         conn_semaphore,
         shutdown,
+        None,
         0,
     )
     .await;
@@ -6451,17 +6457,52 @@ pub async fn start_proxy_listener_with_tls_and_signal(
             tls_config,
             record_mesh_mtls_metric: false,
         },
+        None,
+        started_tx,
+    )
+    .await
+}
+
+/// Start a mesh plaintext listener (e.g., outbound capture on 15001).
+///
+/// Same as [`start_proxy_listener_with_tls_and_signal`] except the listener
+/// stamps `mesh_direction` onto every accepted connection so mesh-aware
+/// plugins can gate CLIENT vs SERVER span emission. Used by mesh outbound
+/// capture, which terminates plaintext on a known port.
+pub(crate) async fn start_mesh_plaintext_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Static {
+            tls_config,
+            record_mesh_mtls_metric: false,
+        },
+        mesh_direction,
         started_tx,
     )
     .await
 }
 
 /// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
+///
+/// `mesh_direction` is stamped onto every accepted connection's
+/// [`RequestContext`] / [`StreamConnectionContext`] so mesh-aware plugins
+/// (e.g., `workload_metrics`) can gate CLIENT vs SERVER span emission on
+/// which side of the hop this listener represents.
 pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -6472,6 +6513,7 @@ pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
             tls_config,
             record_mesh_mtls_metric: true,
         },
+        mesh_direction,
         started_tx,
     )
     .await
@@ -6492,6 +6534,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -6499,6 +6542,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
         state,
         shutdown,
         ListenerTlsSource::MeshInbound,
+        mesh_direction,
         started_tx,
     )
     .await
@@ -6546,6 +6590,7 @@ struct TlsConnectionMetadata {
     frontend_listen_port: Option<u16>,
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
 }
 
 async fn start_proxy_listener_with_tls_source_and_signal(
@@ -6553,6 +6598,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_source: ListenerTlsSource,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
@@ -6613,7 +6659,16 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             let shutdown_rx = shutdown.clone();
 
             handles.push(tokio::spawn(async move {
-                run_accept_loop(listener, state, tls_source, semaphore, shutdown_rx, i).await;
+                run_accept_loop(
+                    listener,
+                    state,
+                    tls_source,
+                    semaphore,
+                    shutdown_rx,
+                    mesh_direction,
+                    i,
+                )
+                .await;
             }));
         }
 
@@ -6632,6 +6687,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             tls_source,
             conn_semaphore,
             shutdown,
+            mesh_direction,
             0,
         )
         .await;
@@ -6653,6 +6709,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             tls_source,
             conn_semaphore,
             shutdown,
+            mesh_direction,
             0,
         )
         .await;
@@ -6669,6 +6726,7 @@ async fn run_accept_loop(
     tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     _thread_id: usize,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
@@ -6747,6 +6805,7 @@ async fn run_accept_loop(
                                     frontend_listen_port,
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
+                                    mesh_direction,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -6765,6 +6824,7 @@ async fn run_accept_loop(
                                     conn_shutdown_rx,
                                     frontend_listen_port,
                                     node_waypoint_identity,
+                                    mesh_direction,
                                 )
                                     .await
                             };
@@ -6879,6 +6939,7 @@ async fn handle_tls_connection(
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
+            mesh_direction: tls_connection_metadata.mesh_direction,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -7483,6 +7544,7 @@ async fn handle_proxy_request_inner(
             state.env_config.proxy_http_port
         },
     ));
+    ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {

@@ -1497,6 +1497,7 @@ async fn start_dtls_frontend_listener(
                     tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
                     sni_hostname: None,
+                    mesh_direction: None,
                 };
                 let mut rejected = false;
                 for plugin in plugins.iter() {
@@ -2292,6 +2293,7 @@ async fn create_session(
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname,
+        mesh_direction: None,
     };
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {

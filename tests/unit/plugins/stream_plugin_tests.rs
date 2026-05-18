@@ -254,6 +254,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -282,6 +283,7 @@ async fn test_ip_restriction_stream_connect_denied() {
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -311,6 +313,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     }
 }
 

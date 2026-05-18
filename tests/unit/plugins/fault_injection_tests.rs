@@ -460,6 +460,7 @@ async fn test_stream_connect_abort_100_percent() {
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -505,6 +506,7 @@ async fn test_stream_connect_delay_100_percent() {
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     };
 
     let start = std::time::Instant::now();

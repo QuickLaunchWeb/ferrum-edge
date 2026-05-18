@@ -35,6 +35,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     }
 }
 

@@ -6,11 +6,11 @@ use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    OutboundTrafficPolicy, PolicyScope, TracingProvider, WorkloadSelector,
+    OutboundTrafficPolicy, PolicyScope, TelemetryTracingMode, TracingProvider, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    prepare_gateway_config_for_mesh,
+    MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
 use ferrum_edge::plugins::{TransactionSummary, create_plugin};
 use serde_json::{Value, json};
@@ -209,6 +209,208 @@ async fn telemetry_disable_span_reporting_from_mesh_slice_suppresses_export() {
         .expect("plugin creation succeeds")
         .expect("plugin exists");
     plugin.log(&traced_summary()).await;
+    drop(plugin);
+
+    assert_no_requests(&collector).await;
+}
+
+fn traced_summary_with_direction(direction: Option<MeshTrafficDirection>) -> TransactionSummary {
+    let mut summary = traced_summary();
+    if let Some(dir) = direction {
+        let value = match dir {
+            MeshTrafficDirection::Inbound => "inbound",
+            MeshTrafficDirection::Outbound => "outbound",
+        };
+        summary
+            .metadata
+            .insert("mesh.direction".to_string(), value.to_string());
+    }
+    summary
+}
+
+#[tokio::test]
+async fn telemetry_tracing_mode_client_emits_kind_client_span_on_outbound_listener() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: Some(TelemetryTracingMode::Client),
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+    assert_eq!(
+        plugin_config["direction_emit"],
+        json!({ "server": false, "client": true })
+    );
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
+        .expect("plugin creation succeeds")
+        .expect("plugin exists");
+    // An outbound-listener-stamped request: CLIENT-only plugin should export.
+    plugin
+        .log(&traced_summary_with_direction(Some(
+            MeshTrafficDirection::Outbound,
+        )))
+        .await;
+    drop(plugin);
+
+    let payload = received_json(&collector).await;
+    assert_eq!(
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["kind"],
+        json!(3),
+        "CLIENT span emitted with OTLP kind=3"
+    );
+}
+
+#[tokio::test]
+async fn telemetry_tracing_mode_client_skips_inbound_listener_traffic() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: Some(TelemetryTracingMode::Client),
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
+        .expect("plugin creation succeeds")
+        .expect("plugin exists");
+    // Inbound-listener-stamped request: a CLIENT-only plugin must not emit.
+    plugin
+        .log(&traced_summary_with_direction(Some(
+            MeshTrafficDirection::Inbound,
+        )))
+        .await;
+    drop(plugin);
+
+    assert_no_requests(&collector).await;
+}
+
+#[tokio::test]
+async fn telemetry_tracing_mode_client_and_server_emits_both_directions() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: Some(TelemetryTracingMode::ClientAndServer),
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+    assert_eq!(
+        plugin_config["direction_emit"],
+        json!({ "server": true, "client": true })
+    );
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
+        .expect("plugin creation succeeds")
+        .expect("plugin exists");
+    plugin
+        .log(&traced_summary_with_direction(Some(
+            MeshTrafficDirection::Inbound,
+        )))
+        .await;
+    plugin
+        .log(&traced_summary_with_direction(Some(
+            MeshTrafficDirection::Outbound,
+        )))
+        .await;
+    drop(plugin);
+
+    // Wait for both batched exports to flush.
+    for _ in 0..40 {
+        if collector
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0)
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let requests = collector
+        .received_requests()
+        .await
+        .expect("collector reachable");
+    assert_eq!(requests.len(), 2, "both directions exported");
+    let kinds: Vec<i64> = requests
+        .iter()
+        .map(|req| {
+            let body: serde_json::Value = req.body_json().expect("valid JSON");
+            body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["kind"]
+                .as_i64()
+                .expect("kind is an integer")
+        })
+        .collect();
+    assert!(kinds.contains(&2), "SERVER span (OTLP kind=2) present");
+    assert!(kinds.contains(&3), "CLIENT span (OTLP kind=3) present");
+}
+
+#[tokio::test]
+async fn telemetry_tracing_mode_unset_defaults_to_server_only() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: None,
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+    // No direction_emit key in serialized config when tracing.mode is None —
+    // plugin falls back to its server_only default.
+    assert!(plugin_config.get("direction_emit").is_none());
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
+        .expect("plugin creation succeeds")
+        .expect("plugin exists");
+    // Outbound-stamped summary should be skipped by the SERVER-only default.
+    plugin
+        .log(&traced_summary_with_direction(Some(
+            MeshTrafficDirection::Outbound,
+        )))
+        .await;
     drop(plugin);
 
     assert_no_requests(&collector).await;

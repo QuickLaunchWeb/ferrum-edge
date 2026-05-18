@@ -2264,21 +2264,33 @@ fn telemetry(
         .get("tracing")
         .and_then(Value::as_array)
         .map(|entries| {
+            // GAP-3F: Telemetry.tracing[].match.mode is preserved end-to-end so
+            // the auto-injected `workload_metrics` plugin can emit CLIENT spans
+            // for outbound mesh hops. The merged mode tracks the union across
+            // every entry (server-only by default → either side becomes
+            // CLIENT_AND_SERVER when both appear).
             let mut merged = MeshTracingConfig {
-                mode: Some(TelemetryTracingMode::Server),
+                mode: None,
                 sampling_percentage: None,
                 disable_span_reporting: None,
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 providers: Vec::new(),
             };
-            let mut saw_server_entry = false;
+            let mut emits_server = false;
+            let mut emits_client = false;
+            let mut saw_entry = false;
             for t in entries {
                 let mode = telemetry_tracing_mode(object, t)?;
-                if mode == Some(TelemetryTracingMode::Client) {
-                    continue;
-                }
-                saw_server_entry = true;
+                // Istio default mode is SERVER for ambient/sidecar inbound and
+                // CLIENT for sidecar outbound. The translator treats an unset
+                // mode as SERVER to match the pre-GAP-3F default; mesh runtime
+                // direction stamping then selects whichever side the listener
+                // represents.
+                let resolved_mode = mode.unwrap_or(TelemetryTracingMode::Server);
+                emits_server |= resolved_mode.emits_server();
+                emits_client |= resolved_mode.emits_client();
+                saw_entry = true;
                 let sampling = telemetry_sampling_percentage(object, t)?;
                 let mut custom_header_tags: HashMap<String, String> = HashMap::new();
                 let custom_tags: HashMap<String, String> = t
@@ -2354,7 +2366,18 @@ fn telemetry(
                     extend_unique_tracing_providers(&mut merged.providers, providers);
                 }
             }
-            Ok::<_, K8sTranslateError>(saw_server_entry.then_some(merged))
+            // Collapse the per-entry union into a single resolved mode. When
+            // `tracing[]` is non-empty but every entry resolved to neither
+            // direction (`Some(false), Some(false)` is unreachable in practice
+            // since `resolved_mode` always picks at least one), we still emit
+            // the merged config so providers and sampling propagate.
+            merged.mode = match (emits_server, emits_client) {
+                (true, true) => Some(TelemetryTracingMode::ClientAndServer),
+                (true, false) => Some(TelemetryTracingMode::Server),
+                (false, true) => Some(TelemetryTracingMode::Client),
+                (false, false) => None,
+            };
+            Ok::<_, K8sTranslateError>(saw_entry.then_some(merged))
         })
         .transpose()?
         .flatten();
@@ -2702,9 +2725,9 @@ fn telemetry_tracing_mode(
     };
     match mode {
         "SERVER" | "server" => Ok(Some(TelemetryTracingMode::Server)),
-        // Ferrum emits server-side spans today; keep CLIENT_AND_SERVER entries
-        // by collapsing them to Server until client-side span emission exists.
-        "CLIENT_AND_SERVER" | "client_and_server" => Ok(Some(TelemetryTracingMode::Server)),
+        "CLIENT_AND_SERVER" | "client_and_server" => {
+            Ok(Some(TelemetryTracingMode::ClientAndServer))
+        }
         "CLIENT" | "client" => Ok(Some(TelemetryTracingMode::Client)),
         other => Err(invalid_resource(
             object,
@@ -5395,7 +5418,10 @@ extensionProviders:
     }
 
     #[test]
-    fn telemetry_tracing_client_mode_is_skipped_for_server_span_export() {
+    fn telemetry_tracing_client_and_server_modes_both_carry_providers() {
+        // GAP-3F: both CLIENT and SERVER entries flow through the translator;
+        // the merged mode becomes CLIENT_AND_SERVER and providers from both
+        // sides accumulate so each can fire on the matching listener.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -5427,21 +5453,28 @@ extensionProviders:
             .config
             .tracing
             .as_ref()
-            .expect("server tracing config");
-        match tracing
+            .expect("tracing config emitted");
+        assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
+        let urls: Vec<&str> = tracing
             .providers
-            .first()
-            .expect("server provider translated")
-        {
-            TracingProvider::Zipkin { url } => {
-                assert_eq!(url, "http://server-zipkin:9411/api/v2/spans");
-            }
-            other => panic!("expected Zipkin, got {other:?}"),
-        }
+            .iter()
+            .filter_map(|p| match p {
+                TracingProvider::Zipkin { url } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            urls.contains(&"http://client-zipkin:9411/api/v2/spans"),
+            "CLIENT-side provider must survive translation: {urls:?}"
+        );
+        assert!(
+            urls.contains(&"http://server-zipkin:9411/api/v2/spans"),
+            "SERVER-side provider must survive translation: {urls:?}"
+        );
     }
 
     #[test]
-    fn telemetry_tracing_client_and_server_mode_is_kept_for_server_span_export() {
+    fn telemetry_tracing_client_and_server_mode_keeps_provider_and_resolves_mode() {
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -5464,7 +5497,8 @@ extensionProviders:
             .config
             .tracing
             .as_ref()
-            .expect("server tracing config");
+            .expect("tracing config emitted");
+        assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
         match tracing
             .providers
             .first()

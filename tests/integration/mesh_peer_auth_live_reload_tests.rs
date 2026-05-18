@@ -91,6 +91,7 @@ async fn start_live_reload_listener_with_retry(
                 addr,
                 listener_state,
                 shutdown_rx,
+                None,
                 Some(started_tx),
             )
             .await

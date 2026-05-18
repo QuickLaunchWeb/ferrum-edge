@@ -423,9 +423,11 @@ pub struct MeshTelemetryConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshTracingConfig {
-    /// Optional Istio tracing mode selector. Ferrum emits server-side gateway
-    /// spans in this phase, so translation only carries entries applying to
-    /// server mode.
+    /// Istio tracing mode selector — `Server`, `Client`, or `ClientAndServer`.
+    /// `None` defers to the default (Istio treats unset as SERVER for sidecar
+    /// inbound and CLIENT for sidecar outbound). The mesh plugin injection
+    /// path turns this into a `direction_emit` field on the `workload_metrics`
+    /// plugin instance so a single plugin handles both sides of a hop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<TelemetryTracingMode>,
     /// Sampling percentage 0.0–100.0. `None` inherits from less-specific Telemetry.
@@ -462,6 +464,19 @@ pub struct MeshTracingConfig {
 pub enum TelemetryTracingMode {
     Client,
     Server,
+    ClientAndServer,
+}
+
+impl TelemetryTracingMode {
+    /// Whether this mode covers server-side (inbound) span emission.
+    pub fn emits_server(self) -> bool {
+        matches!(self, Self::Server | Self::ClientAndServer)
+    }
+
+    /// Whether this mode covers client-side (outbound) span emission.
+    pub fn emits_client(self) -> bool {
+        matches!(self, Self::Client | Self::ClientAndServer)
+    }
 }
 
 /// Tracing backend selection for a `MeshTracingConfig`.

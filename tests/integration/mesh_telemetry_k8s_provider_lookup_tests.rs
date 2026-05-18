@@ -2,7 +2,7 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
-use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
+use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TelemetryTracingMode, TracingProvider};
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -280,4 +280,80 @@ fn k8s_telemetry_malformed_mesh_config_does_not_block_sibling_telemetry() {
         }
         other => panic!("expected Datadog inline provider, got {other:?}"),
     }
+}
+
+#[test]
+fn k8s_telemetry_match_mode_client_preserves_client_only_entries() {
+    // Before GAP-3F, the translator silently dropped CLIENT-only Telemetry
+    // entries because Ferrum only emitted SERVER spans. The translator now
+    // carries CLIENT through so the auto-injected workload_metrics plugin
+    // can gate emission per-direction.
+    let (tracing, warnings) = translated_tracing(&[telemetry(json!({
+        "tracing": [{
+            "match": { "mode": "CLIENT" },
+            "providers": [{
+                "name": "zipkin",
+                "url": "http://zipkin:9411/api/v2/spans"
+            }],
+            "randomSamplingPercentage": 12.5
+        }],
+    }))]);
+
+    assert!(
+        warnings.is_empty(),
+        "no warnings for CLIENT-only tracing match.mode: {warnings:?}",
+    );
+    assert_eq!(tracing.mode, Some(TelemetryTracingMode::Client));
+    assert_eq!(tracing.sampling_percentage, Some(12.5));
+    assert!(
+        !tracing.providers.is_empty(),
+        "CLIENT-only entry must still surface its provider so propagation works",
+    );
+}
+
+#[test]
+fn k8s_telemetry_match_mode_client_and_server_carries_both_directions() {
+    let (tracing, warnings) = translated_tracing(&[telemetry(json!({
+        "tracing": [{
+            "match": { "mode": "CLIENT_AND_SERVER" },
+            "providers": [{
+                "name": "zipkin",
+                "url": "http://zipkin:9411/api/v2/spans"
+            }],
+        }],
+    }))]);
+
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
+}
+
+#[test]
+fn k8s_telemetry_match_mode_unset_resolves_to_server() {
+    let (tracing, warnings) = translated_tracing(&[telemetry(json!({
+        "tracing": [{
+            "providers": [{
+                "name": "zipkin",
+                "url": "http://zipkin:9411/api/v2/spans"
+            }],
+        }],
+    }))]);
+
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(tracing.mode, Some(TelemetryTracingMode::Server));
+}
+
+#[test]
+fn k8s_telemetry_match_mode_server_plus_client_union_becomes_client_and_server() {
+    let zipkin_provider = json!({
+        "name": "zipkin",
+        "url": "http://zipkin:9411/api/v2/spans"
+    });
+    let (tracing, _warnings) = translated_tracing(&[telemetry(json!({
+        "tracing": [
+            { "match": { "mode": "SERVER" }, "providers": [zipkin_provider.clone()] },
+            { "match": { "mode": "CLIENT" }, "providers": [zipkin_provider] }
+        ],
+    }))]);
+
+    assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
 }
