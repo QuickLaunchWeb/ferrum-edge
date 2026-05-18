@@ -153,14 +153,24 @@ fn desired_status_for_object(
 }
 
 fn gateway_class_status(object: &K8sObject) -> Value {
-    let conditions = vec![condition(
-        object,
-        &object.status,
-        "Accepted",
-        true,
-        "Accepted",
-        "Ferrum accepted this GatewayClass",
-    )];
+    let conditions = vec![
+        condition(
+            object,
+            &object.status,
+            "Accepted",
+            true,
+            "Accepted",
+            "Ferrum accepted this GatewayClass",
+        ),
+        condition(
+            object,
+            &object.status,
+            "SupportedVersion",
+            true,
+            "SupportedVersion",
+            "Ferrum supports Gateway API v1",
+        ),
+    ];
 
     let mut status = object.status.clone();
     ensure_status_object(&mut status).insert("conditions".to_string(), Value::Array(conditions));
@@ -864,6 +874,7 @@ mod tests {
         assert_eq!(updates.len(), 1);
         let conditions = updates[0].status["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "SupportedVersion", "True");
     }
 
     #[test]

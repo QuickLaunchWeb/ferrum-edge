@@ -116,6 +116,7 @@ jobs:
           mkdir -p "$results"
           git clone --depth 1 --branch "${{ steps.inputs.outputs.gateway_api_version }}" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
           cd /tmp/gateway-api
+          set +e
           go test -json ./conformance -run TestConformance -count=1 -timeout=45m -args \
             --gateway-class=ferrum \
             --supported-features="${{ steps.inputs.outputs.supported_features }}" \
