@@ -1,0 +1,76 @@
+[package]
+name = "mesh-dns-e2e-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone crate, NOT a workspace member of the root ferrum-edge crate.
+# Mirrors tests/performance/multi_protocol/ pattern: own Cargo.toml, own
+# Cargo.lock, own proto compile pass. This crate does NOT depend on the root
+# `ferrum-edge` crate by path — it talks to a separately-built ferrum-edge
+# binary over UDP/TCP DNS + gRPC MeshSubscribe.
+#
+# The harness assumes `cargo build --release --bin ferrum-edge` has been run
+# in the workspace root. `run.sh` does this for you unless `--skip-build` is
+# passed.
+
+[[bin]]
+name = "dns_loadgen"
+path = "src/bin/dns_loadgen.rs"
+
+[[bin]]
+name = "dns_upstream_stub"
+path = "src/bin/dns_upstream_stub.rs"
+
+[[bin]]
+name = "mesh_cp_stub"
+path = "src/bin/mesh_cp_stub.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime — SYNC: version must match root Cargo.toml (mesh test stubs use
+# the same tokio API surface as the gateway DNS proxy server loop)
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Metrics
+hdrhistogram = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# gRPC — SYNC: version must match root Cargo.toml (CP/DP gRPC interop).
+# A mismatch silently produces a wire-incompatible MeshConfigUpdate.
+tonic = { version = "0.14.5", features = ["tls-ring"] }
+tonic-prost = "0.14.5"
+prost = "0.14.3"
+
+# Timestamps for MeshConfigUpdate.timestamp.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# DNS wire format is hand-rolled in src/dns_wire.rs to keep the dep
+# surface minimal. No `domain` or `trust-dns-proto` dependency.
+
+# Other
+bytes = "1"
+anyhow = "1"
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
