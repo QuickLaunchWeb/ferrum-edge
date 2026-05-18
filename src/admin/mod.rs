@@ -2693,19 +2693,21 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
-        let event = audit::AuditEvent::new(
-            actor,
-            "restore",
-            "gateway_config",
-            namespace,
-            namespace,
-            audit::update_diff(
-                json!({"replaced_namespace": namespace}),
-                response["restored"].clone(),
-            ),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
-            log_audit_enqueue_failure(&error);
+        if created.any() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "restore",
+                "gateway_config",
+                namespace,
+                namespace,
+                audit::update_diff(
+                    json!({"replaced_namespace": namespace}),
+                    response["restored"].clone(),
+                ),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+                log_audit_enqueue_failure(&error);
+            }
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
