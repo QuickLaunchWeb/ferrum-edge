@@ -1,0 +1,48 @@
+[package]
+name = "mesh-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone crate, not a workspace member of the root ferrum-edge crate.
+# Mirrors tests/performance/multi_protocol/ pattern: own Cargo.toml, own
+# Cargo.lock. Run with `cargo bench` from this directory, OR via run.sh.
+#
+# Depends on the root ferrum-edge crate by path so benches can call into the
+# public mesh API (`ferrum_edge::modes::mesh::*`, `ferrum_edge::xds::*`).
+# That means a `cargo bench` here rebuilds the root crate — slow first run,
+# fast iterations afterward via target/ cache.
+
+[dependencies]
+ferrum-edge = { path = "../../.." }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["plotters", "html_reports"] }
+
+[[bench]]
+name = "authz_match"
+harness = false
+
+[[bench]]
+name = "slice_apply"
+harness = false
+
+[[bench]]
+name = "xds_translation"
+harness = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+# Use release profile for benches so optimisation matches production.
+[profile.bench]
+inherits = "release"
+debug = false
