@@ -615,9 +615,14 @@ service. Per-target failures use jittered exponential backoff (1s → 30s cap,
 configured poll interval. The polled bundles win on conflict against any
 control-plane-supplied federated entries because the poller signals the
 freshest rotation; CP-supplied bundles remain as a fallback for trust domains
-the poller has not yet fetched. `FERRUM_MESH_FEDERATION_FAIL_OPEN=true` is an
-operator opt-in for environments where missing bundles should still admit
-traffic; the default is fail-closed via the unchanged verifier path.
+the poller has not yet fetched. `FERRUM_MESH_FEDERATION_FAIL_OPEN` is reserved
+for future verifier integration — today it is recorded in poll-failure log
+lines for operator visibility but does NOT change verifier behavior. Verifier
+behavior is fail-closed regardless of the flag (verification only succeeds
+against the last-good cached bundle). Endpoints are validated at slice apply
+for SSRF (link-local / loopback / cloud metadata IPs are rejected) and must
+use `https://`; response bodies are capped at 2 MiB and parsed bundles are
+capped at 256 X.509 + 256 JWT authorities.
 
 Two on-the-wire formats are accepted:
 

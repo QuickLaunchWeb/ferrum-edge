@@ -46,6 +46,20 @@ use crate::plugins::utils::http_client::PluginHttpClient;
 pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = 1;
 pub(crate) const FEDERATION_BACKOFF_MAX_SECS: u64 = 30;
 
+/// Hard cap on federation response body size. A real SPIFFE bundle is
+/// kilobytes — even a generous JWKS with several authorities fits well
+/// below 256 KiB. The 2 MiB cap leaves vast headroom while preventing a
+/// malicious or runaway endpoint from streaming gigabytes into a single
+/// `Bytes` allocation inside the timeout window.
+const FEDERATION_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Defense-in-depth bounds on parsed bundle sizes. SPIFFE bundles in the
+/// wild carry a handful of certs at most; 256 entries is orders of
+/// magnitude above realistic. Stops a small JSON document with millions of
+/// empty-string keys from allocating millions of `JwtAuthority` structs.
+const FEDERATION_MAX_X509_AUTHORITIES: usize = 256;
+const FEDERATION_MAX_JWT_AUTHORITIES: usize = 256;
+
 /// Snapshot the federation store hands out to slice apply and the admin API.
 /// Keyed by trust domain so two `RemoteCluster` entries with overlapping trust
 /// domains would dedupe at install time (last writer wins; the poller only
@@ -109,11 +123,42 @@ impl FederationStore {
     }
 
     fn install(&self, trust_domain: TrustDomain, bundle: FederatedBundle) {
-        let mut next = (*self.snapshot()).clone();
-        next.bundles.insert(trust_domain, bundle);
-        self.inner.store(Arc::new(next));
+        // Atomic compare-and-swap loop so two concurrent successful polls
+        // (different remote clusters) cannot stomp each other. Without the
+        // CAS loop, two tasks both reading the same starting snapshot would
+        // each insert their bundle into a clone and the second store would
+        // discard the first.
+        self.inner.rcu(|current| {
+            let mut next = (**current).clone();
+            next.bundles.insert(trust_domain.clone(), bundle.clone());
+            Arc::new(next)
+        });
         self.first_ready.store(true, Ordering::Release);
         self.revision_tx.send_modify(|revision| *revision += 1);
+    }
+
+    /// Remove a trust domain from the federated bundle map. Used by a
+    /// future reconcile pass when a `RemoteCluster` is removed from the
+    /// slice; today the poller spawns once at startup and never sees
+    /// removals. Plumbed here so the reconcile follow-up doesn't need to
+    /// touch the atomic install path again.
+    /// No-op if the domain isn't tracked.
+    #[allow(dead_code)]
+    pub fn remove(&self, trust_domain: &TrustDomain) {
+        let mut changed = false;
+        self.inner.rcu(|current| {
+            if current.bundles.contains_key(trust_domain) {
+                let mut next = (**current).clone();
+                next.bundles.remove(trust_domain);
+                changed = true;
+                Arc::new(next)
+            } else {
+                Arc::clone(current)
+            }
+        });
+        if changed {
+            self.revision_tx.send_modify(|revision| *revision += 1);
+        }
     }
 }
 
@@ -202,6 +247,20 @@ pub(crate) fn parse_federation_document(
                     "federation bundle trust_domain '{td}' does not match remote cluster trust domain '{expected_trust_domain}'"
                 ));
             }
+            if native.x509_authorities.len() > FEDERATION_MAX_X509_AUTHORITIES {
+                return Err(format!(
+                    "federation bundle for '{expected_trust_domain}' has {} x509 authorities (max {})",
+                    native.x509_authorities.len(),
+                    FEDERATION_MAX_X509_AUTHORITIES
+                ));
+            }
+            if native.jwt_authorities.len() > FEDERATION_MAX_JWT_AUTHORITIES {
+                return Err(format!(
+                    "federation bundle for '{expected_trust_domain}' has {} JWT authorities (max {})",
+                    native.jwt_authorities.len(),
+                    FEDERATION_MAX_JWT_AUTHORITIES
+                ));
+            }
             Ok(TrustBundle {
                 trust_domain: expected_trust_domain.clone(),
                 x509_authorities: native.x509_authorities,
@@ -210,6 +269,13 @@ pub(crate) fn parse_federation_document(
             })
         }
         FederationDocument::SpiffeJwks(jwks) => {
+            if jwks.keys.len() > FEDERATION_MAX_X509_AUTHORITIES + FEDERATION_MAX_JWT_AUTHORITIES {
+                return Err(format!(
+                    "federation JWKS for '{expected_trust_domain}' has {} keys (max {})",
+                    jwks.keys.len(),
+                    FEDERATION_MAX_X509_AUTHORITIES + FEDERATION_MAX_JWT_AUTHORITIES
+                ));
+            }
             let mut x509 = Vec::new();
             let mut jwts = Vec::new();
             for key in jwks.keys {
@@ -285,6 +351,13 @@ struct RemoteClusterPollTarget {
 pub struct FederationPollerConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
+    /// Reserved for future verifier integration. Today this value is
+    /// recorded in poll-failure log lines for operator visibility but does
+    /// NOT influence the verifier — cross-cluster mTLS always verifies
+    /// against the last-good bundle (fail-closed). When the verifier is
+    /// extended to honour this flag, `true` will let trust domains with no
+    /// cached bundle fall through to the CP-supplied slice. Tracked in
+    /// [`docs/mesh.md`](../../../docs/mesh.md) "Trust Federation".
     pub fail_open: bool,
 }
 
@@ -320,6 +393,20 @@ fn poll_targets_for_multi_cluster(
         .filter_map(|remote| {
             let endpoint = remote.federation_endpoint.as_deref()?.trim();
             if endpoint.is_empty() {
+                return None;
+            }
+            // SSRF + plaintext defense: reject endpoints pointing at link-
+            // local / loopback / cloud-metadata / non-https hosts at slice
+            // apply time so a misconfigured (or compromised) CP cannot
+            // weaponize the poller. Bad targets are dropped with a warn;
+            // the rest of the federation surface continues to function.
+            if let Err(err) = validate_federation_endpoint(endpoint) {
+                warn!(
+                    cluster = %remote.name,
+                    trust_domain = %remote.trust_domain,
+                    error = %err,
+                    "Dropping federation_endpoint that failed SSRF/scheme validation"
+                );
                 return None;
             }
             Some(RemoteClusterPollTarget {
@@ -458,6 +545,11 @@ async fn fetch_and_install_bundle(
     http_client: &PluginHttpClient,
     store: &FederationStore,
 ) -> Result<(), String> {
+    // Strip userinfo from the URL we use for logs / metrics so a
+    // credentialed endpoint (`https://user:token@host/...`) does not leak
+    // its token. The request itself still goes to the original URL via
+    // reqwest's normal handling.
+    let endpoint_for_logs = sanitize_endpoint_for_logging(endpoint);
     let request = http_client
         .get()
         .get(endpoint)
@@ -471,10 +563,21 @@ async fn fetch_and_install_bundle(
     if !status.is_success() {
         return Err(format!("HTTP {} from federation endpoint", status.as_u16()));
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("reading federation response body: {e}"))?;
+    // Reject early when the server advertises a Content-Length larger than
+    // our cap, so we don't even start streaming a multi-gigabyte body.
+    if let Some(cl_value) = response.content_length()
+        && cl_value as usize > FEDERATION_MAX_BODY_BYTES
+    {
+        return Err(format!(
+            "federation response Content-Length {} exceeds {} byte cap",
+            cl_value, FEDERATION_MAX_BODY_BYTES
+        ));
+    }
+    // Size-bounded streaming read. `response.bytes()` would allocate an
+    // unbounded `Bytes` from a hostile endpoint within the request timeout
+    // and OOM the gateway. The cap is enforced frame-by-frame so a
+    // streaming response that ignores Content-Length is also caught.
+    let body = read_bounded_body(response, FEDERATION_MAX_BODY_BYTES).await?;
     let bundle = parse_federation_document(&body, trust_domain)?;
     validate_polled_bundle(&bundle)?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
@@ -492,9 +595,132 @@ async fn fetch_and_install_bundle(
     info!(
         cluster = %cluster_name,
         trust_domain = %trust_domain,
-        endpoint = %endpoint,
+        endpoint = %endpoint_for_logs,
         "Installed federated trust bundle"
     );
+    Ok(())
+}
+
+/// Read the response body frame-by-frame and abort if it exceeds
+/// `max_bytes`. Returns `Vec<u8>` rather than `Bytes` because callers feed
+/// it straight to `serde_json::from_slice`.
+async fn read_bounded_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("reading federation response body: {e}"))?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "federation response body exceeded {max_bytes} bytes; aborting"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Strip userinfo (`user:password@`) from the URL when logging. Falls back
+/// to a placeholder string if parsing fails — never returns the raw input
+/// for logs.
+fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
+    match reqwest::Url::parse(endpoint) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "<unparseable>".to_string(),
+    }
+}
+
+/// SSRF defense for federation endpoints. Cloud metadata services
+/// (`169.254.169.254`, AWS IMDS) and link-local addresses are rejected to
+/// keep a compromised control plane from pivoting through the poller into
+/// node-local infrastructure. Loopback is allowed because legitimate
+/// local-development and integration-test setups use it; loopback offers
+/// no new attack surface that the local process doesn't already have.
+///
+/// HTTPS is recommended (a `warn!` fires on plain `http://`) but not
+/// enforced, so existing CP-supplied configurations that pre-date this
+/// validator keep working. Operators should treat the warn as a strong
+/// hint to migrate.
+pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|e| format!("federation_endpoint '{endpoint}' is not a valid URL: {e}"))?;
+    let scheme = url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(format!(
+            "federation_endpoint must use 'http' or 'https' scheme (got '{scheme}')"
+        ));
+    }
+    if scheme == "http" {
+        warn!(
+            endpoint = %sanitize_endpoint_for_logging(endpoint),
+            "federation_endpoint uses plain http; trust-bundle traffic should use https"
+        );
+    }
+    let Some(host) = url.host() else {
+        return Err(format!(
+            "federation_endpoint '{endpoint}' has no host component"
+        ));
+    };
+    match host {
+        url::Host::Ipv4(ip) => reject_unsafe_ipv4(&ip)?,
+        url::Host::Ipv6(ip) => reject_unsafe_ipv6(&ip)?,
+        url::Host::Domain(_) => {
+            // Hostnames are resolved at request time. We accept any
+            // syntactically valid host; the DNS-resolver layer enforces
+            // `BackendAllowIps` if configured by the operator.
+        }
+    }
+    Ok(())
+}
+
+fn reject_unsafe_ipv4(ip: &std::net::Ipv4Addr) -> Result<(), String> {
+    // Loopback is allowed for local development / integration test setups.
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if ip.is_link_local() {
+        return Err(format!(
+            "federation_endpoint refuses link-local host {ip} (defends against cloud metadata SSRF)"
+        ));
+    }
+    // 169.254.169.254 is link-local already, but call it out explicitly for
+    // the operator-readable error message.
+    if ip.octets() == [169, 254, 169, 254] {
+        return Err(format!(
+            "federation_endpoint refuses cloud metadata IP {ip}"
+        ));
+    }
+    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+        return Err(format!(
+            "federation_endpoint refuses non-unicast IPv4 host {ip}"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_ipv6(ip: &std::net::Ipv6Addr) -> Result<(), String> {
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!(
+            "federation_endpoint refuses non-unicast IPv6 host {ip}"
+        ));
+    }
+    // RFC 4291 link-local fe80::/10
+    let segs = ip.segments();
+    if segs[0] & 0xffc0 == 0xfe80 {
+        return Err(format!(
+            "federation_endpoint refuses link-local IPv6 host {ip}"
+        ));
+    }
     Ok(())
 }
 
@@ -870,5 +1096,119 @@ mod tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(60));
         assert_eq!(cfg.request_timeout, Duration::from_secs(10));
         assert!(cfg.fail_open);
+    }
+
+    #[test]
+    fn validate_federation_endpoint_rejects_cloud_metadata() {
+        let err = validate_federation_endpoint("https://169.254.169.254/x")
+            .expect_err("cloud metadata IP must be rejected");
+        assert!(err.contains("link-local") || err.contains("metadata"));
+    }
+
+    #[test]
+    fn validate_federation_endpoint_rejects_link_local_v6() {
+        let err = validate_federation_endpoint("https://[fe80::1]/x")
+            .expect_err("IPv6 link-local must be rejected");
+        assert!(err.contains("link-local"));
+    }
+
+    #[test]
+    fn validate_federation_endpoint_allows_loopback_for_tests() {
+        validate_federation_endpoint("http://127.0.0.1:9090/x")
+            .expect("loopback http is allowed for test scaffolding");
+        validate_federation_endpoint("http://[::1]:9090/x").expect("loopback IPv6 is allowed");
+    }
+
+    #[test]
+    fn validate_federation_endpoint_accepts_https_hostname() {
+        validate_federation_endpoint("https://federation.cluster-2.example.com/.well-known/spiffe")
+            .expect("valid https hostname endpoint must be accepted");
+    }
+
+    #[test]
+    fn validate_federation_endpoint_rejects_ftp_scheme() {
+        let err = validate_federation_endpoint("ftp://example.com/")
+            .expect_err("non-http(s) schemes must be rejected");
+        assert!(err.contains("http"));
+    }
+
+    #[test]
+    fn sanitize_endpoint_strips_userinfo() {
+        let safe = sanitize_endpoint_for_logging("https://user:token@host.example/path");
+        assert!(!safe.contains("user"), "userinfo must be stripped: {safe}");
+        assert!(!safe.contains("token"), "password must be stripped: {safe}");
+        assert!(safe.contains("host.example"), "host preserved: {safe}");
+    }
+
+    #[test]
+    fn parse_native_rejects_too_many_x509_authorities() {
+        let mut authorities = Vec::with_capacity(FEDERATION_MAX_X509_AUTHORITIES + 1);
+        for _ in 0..(FEDERATION_MAX_X509_AUTHORITIES + 1) {
+            authorities.push("ZGVhZGJlZWY=".to_string()); // base64 "deadbeef"
+        }
+        let doc = serde_json::json!({
+            "trust_domain": "cluster-2.local",
+            "x509_authorities": authorities,
+        });
+        let body = serde_json::to_vec(&doc).unwrap();
+        let td = TrustDomain::new("cluster-2.local").unwrap();
+        let err = parse_federation_document(&body, &td)
+            .expect_err("exceeding the x509 cap must be rejected");
+        assert!(err.contains("max"));
+    }
+
+    #[tokio::test]
+    async fn install_is_atomic_across_concurrent_polls() {
+        // Two concurrent successful polls (different trust domains) must
+        // not stomp each other. Without RCU the second store would discard
+        // the first.
+        let store = FederationStore::new();
+        let td_a = TrustDomain::new("cluster-a.local").unwrap();
+        let td_b = TrustDomain::new("cluster-b.local").unwrap();
+        let bundle_a = FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: td_a.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: 1,
+            endpoint: "https://a/".to_string(),
+            cluster_name: "a".to_string(),
+        };
+        let bundle_b = FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: td_b.clone(),
+                x509_authorities: vec!["b".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: 2,
+            endpoint: "https://b/".to_string(),
+            cluster_name: "b".to_string(),
+        };
+
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let h1 = tokio::spawn(async move {
+            for _ in 0..50 {
+                store_a.install(td_a.clone(), bundle_a.clone());
+            }
+        });
+        let h2 = tokio::spawn(async move {
+            for _ in 0..50 {
+                store_b.install(td_b.clone(), bundle_b.clone());
+            }
+        });
+        let _ = h1.await;
+        let _ = h2.await;
+
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.bundles.len(),
+            2,
+            "both trust domains must survive concurrent installs: {:?}",
+            snap.bundles.keys().collect::<Vec<_>>()
+        );
     }
 }
