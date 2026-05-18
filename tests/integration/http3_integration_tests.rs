@@ -419,6 +419,7 @@ async fn test_http3_proxy_state_creation() {
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         backend_svid_rotation_tx,
         backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        bpf_metrics_state: None,
     };
 
     // Verify proxy state is created successfully
@@ -683,6 +684,7 @@ async fn test_http3_full_integration() {
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         backend_svid_rotation_tx,
         backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        bpf_metrics_state: None,
     };
 
     // Verify proxy state is created successfully

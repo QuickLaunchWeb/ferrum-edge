@@ -2624,12 +2624,22 @@ async fn serve_mesh_runtime(
 
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let (proxy_state, health_check_handles) = ProxyState::new(
+    // GAP-3D: on node-waypoint topology, create the SOCK_OPS metrics
+    // state up front so plugin construction inside `ProxyState::new`
+    // picks it up via PluginHttpClient and the spawned ringbuf consumer
+    // updates the same Arc.
+    let bpf_metrics_state = if runtime.topology == MeshTopology::NodeWaypoint {
+        Some(crate::ebpf::bpf_metrics::BpfMetricsState::new())
+    } else {
+        None
+    };
+    let (proxy_state, health_check_handles) = ProxyState::new_with_bpf_metrics(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
+        bpf_metrics_state.clone(),
     )?;
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
@@ -2641,6 +2651,15 @@ async fn serve_mesh_runtime(
             env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
             shutdown_tx.subscribe(),
         ) {
+            mesh_background_handles.push(handle);
+        }
+        // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
+        // is not pinned (no node-agent on this host, kernel < 5.7, or
+        // build without the ebpf feature), the spawned task logs once
+        // and exits — the plugin still emits zero counters.
+        if let Some(state) = bpf_metrics_state.as_ref()
+            && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
+        {
             mesh_background_handles.push(handle);
         }
         proxy_state.with_node_waypoint_identity_resolver(resolver)
@@ -3648,6 +3667,41 @@ fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
 fn parse_duration_seconds(key: &str, raw: &str) -> Result<u64, String> {
     raw.parse::<u64>()
         .map_err(|e| format!("{key} must be a duration in seconds (got '{raw}'): {e}"))
+}
+
+/// Spawn the SOCK_OPS ringbuf consumer for `__mesh_bpf_metrics`.
+///
+/// On Linux + `ebpf` feature builds, opens the pinned ringbuf from the
+/// node-agent and drives a `tokio::select!` poll loop that updates the
+/// shared `BpfMetricsState`. On every other build target this is a no-op
+/// — the plugin still emits zero counters via the empty `BpfMetricsState`.
+fn spawn_sock_ops_consumer_task(
+    state: std::sync::Arc<crate::ebpf::bpf_metrics::BpfMetricsState>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    {
+        let consumer = crate::ebpf::event_consumer::SockOpsConsumer::new(state);
+        let shutdown_rx = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            if let Err(err) =
+                crate::ebpf::event_consumer::production::run_pinned_consumer(consumer, shutdown_rx)
+                    .await
+            {
+                tracing::warn!(error = %err, "SOCK_OPS ringbuf consumer task exited with error");
+            }
+        }))
+    }
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    {
+        // Reference the args so the no-op branch compiles cleanly.
+        let _ = state;
+        let _ = shutdown_tx;
+        tracing::debug!(
+            "SOCK_OPS ringbuf consumer skipped (build without ebpf feature or non-Linux target)"
+        );
+        None
+    }
 }
 
 #[cfg(test)]

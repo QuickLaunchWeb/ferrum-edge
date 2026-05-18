@@ -1572,6 +1572,20 @@ pub struct ProxyState {
     /// Current backend client SVID generation shared by backend pools.
     #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
+    /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
+    /// consumer. `Some(_)` only when the gateway runs the SOCK_OPS event
+    /// consumer (mesh-mode + node-waypoint topology). The same Arc is
+    /// attached to [`PluginHttpClient`] so the auto-injected
+    /// `__mesh_bpf_metrics` plugin reads from the live counters.
+    /// `None` elsewhere; the plugin falls back to an unattached fresh
+    /// state and emits zeros.
+    ///
+    /// The field is held on `ProxyState` so the Arc outlives a config
+    /// reload that rebuilds `PluginHttpClient` — the plugin factory
+    /// reads the live Arc via the http_client; the field itself is
+    /// retained as a lifetime anchor and observability surface.
+    #[allow(dead_code)]
+    pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
 }
 
 #[inline]
@@ -2053,11 +2067,38 @@ impl ProxyState {
     /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
     /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        Self::new_with_bpf_metrics(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            None,
+        )
+    }
+
+    /// Constructor variant that also accepts a pre-built
+    /// `Arc<BpfMetricsState>` so the auto-injected `__mesh_bpf_metrics`
+    /// plugin can read live SOCK_OPS counters from the kernel ringbuf
+    /// consumer.
+    ///
+    /// All other modes pass `None` (or call [`Self::new`] which forwards
+    /// `None`); only mesh-mode + node-waypoint topology builds the shared
+    /// metrics state at startup. Keeping the parameter optional avoids
+    /// forcing every other entry point to plumb a placeholder.
+    pub fn new_with_bpf_metrics(
         mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
@@ -2187,7 +2228,7 @@ impl ProxyState {
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
-        let plugin_http_client = crate::plugins::PluginHttpClient::new(
+        let mut plugin_http_client = crate::plugins::PluginHttpClient::new(
             &global_pool_config,
             dns_cache.clone(),
             env_config_arc.plugin_http_slow_threshold_ms,
@@ -2200,6 +2241,12 @@ impl ProxyState {
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
         );
+        // Attach the shared SOCK_OPS metrics state when present (mesh
+        // node-waypoint only). Plugin construction further down will
+        // route `__mesh_bpf_metrics` to use it via `with_state`.
+        if let Some(ref state) = bpf_metrics_state {
+            plugin_http_client = plugin_http_client.with_bpf_metrics_state(state.clone());
+        }
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
@@ -2503,6 +2550,7 @@ impl ProxyState {
             mesh_inbound_tls,
             backend_svid_rotation_tx,
             backend_svid_generation,
+            bpf_metrics_state,
         };
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())

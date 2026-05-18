@@ -38,6 +38,25 @@ pub const BPF_MAP_CIDR_INCLUDE6: &str = "FERRUM_CIDR_INCLUDE6";
 pub const BPF_MAP_PORT_EXCLUDE: &str = "FERRUM_PORT_EXCLUDE";
 pub const BPF_MAP_CAPTURE_CONFIG: &str = "FERRUM_CAPTURE_CONFIG";
 
+/// Name of the BPF ringbuf map that ferries SOCK_OPS event records from the
+/// kernel to the userspace consumer.
+pub const BPF_MAP_SOCK_OPS_EVENTS: &str = "FERRUM_SOCK_OPS_EVENTS";
+
+/// Name of the per-CPU stats array that tracks events dropped because the
+/// ringbuf could not be reserved.
+pub const BPF_MAP_SOCK_OPS_STATS: &str = "FERRUM_SOCK_OPS_STATS";
+
+/// Pinned path for the SOCK_OPS event ringbuf. Node-agent loads + pins;
+/// mesh-proxy opens by path. Both sides agree on the constant so no IPC is
+/// required.
+pub const BPF_SOCK_OPS_EVENTS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_events";
+
+/// Pinned path for the SOCK_OPS dropped-events counter array.
+pub const BPF_SOCK_OPS_STATS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_stats";
+
+/// Program name of the SOCK_OPS kernel program in the ELF.
+pub const BPF_PROGRAM_SOCK_OPS: &str = "ferrum_sock_ops";
+
 /// Node-agent proxy topology for the capture contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeAgentProxyMode {
@@ -257,6 +276,15 @@ pub trait EbpfBackend: Send + Sync {
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String>;
     fn update_port_exclude(&mut self, port: u16) -> Result<(), String>;
     fn cleanup_all(&mut self) -> Result<(), String>;
+
+    /// Attach the SOCK_OPS program to the cgroup root and pin the event
+    /// ringbuf + stats map at the well-known paths
+    /// (`BPF_SOCK_OPS_EVENTS_PIN_PATH`, `BPF_SOCK_OPS_STATS_PIN_PATH`) so
+    /// the mesh-proxy can open them by path.
+    ///
+    /// Failure is non-fatal for the node-agent — observability is best-
+    /// effort; capture (the cgroup_sockaddr / tc programs) still runs.
+    fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String>;
 }
 
 /// In-memory mock backend for Phase 1 and integration tests.
@@ -274,6 +302,7 @@ pub struct MockEbpfBackend {
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
+    pub sock_ops_attached_cgroup_root: Option<String>,
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -346,7 +375,13 @@ impl EbpfBackend for MockEbpfBackend {
         self.cgroup_attachments.clear();
         self.tc_attachments.clear();
         self.pod_ips.clear();
+        self.sock_ops_attached_cgroup_root = None;
         self.cleaned_up = true;
+        Ok(())
+    }
+
+    fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
+        self.sock_ops_attached_cgroup_root = Some(cgroup_root.to_string());
         Ok(())
     }
 }
@@ -498,5 +533,18 @@ mod tests {
         assert!(backend.cleaned_up);
         assert!(backend.cgroup_attachments.is_empty());
         assert!(backend.pod_ips.is_empty());
+    }
+
+    #[test]
+    fn mock_backend_records_sock_ops_attachment() {
+        let mut backend = MockEbpfBackend::default();
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        backend.attach_sock_ops("/sys/fs/cgroup").unwrap();
+        assert_eq!(
+            backend.sock_ops_attached_cgroup_root.as_deref(),
+            Some("/sys/fs/cgroup")
+        );
+        backend.cleanup_all().unwrap();
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
     }
 }

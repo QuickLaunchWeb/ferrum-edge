@@ -905,6 +905,17 @@ fn initialize_backend(
     // per-pod annotations are injector-only and CaptureConfig::from_env()
     // seeds an empty Vec; the iptables init container is the only consumer.
 
+    // Best-effort SOCK_OPS attach at cgroup root for TCP-layer observability.
+    // A failure here only loses telemetry; capture (cgroup_sockaddr / tc)
+    // continues to operate.
+    if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
+        warn!(
+            cgroup_root = %config.cgroup_root,
+            error = %e,
+            "Failed to attach SOCK_OPS program; mesh-proxy will see zero TCP-layer counters"
+        );
+    }
+
     info!("BPF programs loaded and maps initialized");
     Ok(())
 }

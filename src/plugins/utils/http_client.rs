@@ -105,6 +105,13 @@ pub struct PluginHttpClient {
     /// [`Self::strip_egress_baggage_in_vec`] /
     /// [`Self::strip_egress_baggage_in_map`]. Empty by default.
     mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
+    /// consumer. `Some(_)` only on mesh-mode node-waypoint topology where
+    /// the gateway opens the pinned ringbuf from the node-agent; `None`
+    /// in every other mode so the `__mesh_bpf_metrics` plugin (which
+    /// reads this slot) falls back to a fresh unattached state and
+    /// emits zero counters rather than panicking.
+    bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -261,7 +268,31 @@ impl PluginHttpClient {
             namespace: namespace.to_string(),
             backend_allow_ips,
             mesh_egress_strip_baggage_keys,
+            bpf_metrics_state: None,
         }
+    }
+
+    /// Attach a shared SOCK_OPS metrics state so the
+    /// `__mesh_bpf_metrics` plugin constructed via
+    /// [`crate::plugins::create_plugin_with_http_client`] sees the same
+    /// `Arc<BpfMetricsState>` the ringbuf consumer is updating.
+    ///
+    /// Builder method to keep call sites concise. `None` (default) leaves
+    /// the plugin falling back to a fresh unattached state — safe in
+    /// every non-mesh-node-waypoint deployment.
+    pub fn with_bpf_metrics_state(
+        mut self,
+        state: Arc<crate::ebpf::bpf_metrics::BpfMetricsState>,
+    ) -> Self {
+        self.bpf_metrics_state = Some(state);
+        self
+    }
+
+    /// Access the optional shared SOCK_OPS metrics state. Used by the
+    /// `__mesh_bpf_metrics` plugin factory; `None` means "no consumer is
+    /// updating real counters on this gateway — emit zeros".
+    pub fn bpf_metrics_state(&self) -> Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>> {
+        self.bpf_metrics_state.clone()
     }
 
     /// Build a plugin HTTP client from pool config without a DNS cache.
@@ -314,6 +345,7 @@ impl PluginHttpClient {
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             backend_allow_ips: BackendAllowIps::Both,
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
+            bpf_metrics_state: None,
         }
     }
 
@@ -661,6 +693,37 @@ mod egress_strip_tests {
         )];
         client.strip_egress_baggage_in_vec(&mut headers);
         assert_eq!(headers[0].1, "source.principal=spiffe://x");
+    }
+}
+
+#[cfg(test)]
+mod bpf_metrics_slot_tests {
+    //! GAP-3D: confirm `with_bpf_metrics_state` plumbs the shared Arc
+    //! through to the `__mesh_bpf_metrics` plugin factory.
+    use super::*;
+    use crate::ebpf::bpf_metrics::BpfMetricsState;
+
+    #[test]
+    fn bpf_metrics_state_default_is_none() {
+        let client = PluginHttpClient::default();
+        assert!(client.bpf_metrics_state().is_none());
+    }
+
+    #[test]
+    fn with_bpf_metrics_state_attaches_shared_arc() {
+        let state = BpfMetricsState::new();
+        state.record_connect();
+        let client = PluginHttpClient::default().with_bpf_metrics_state(state.clone());
+
+        let stored = client
+            .bpf_metrics_state()
+            .expect("state should be attached after with_bpf_metrics_state");
+        assert_eq!(stored.snapshot().connect, 1);
+
+        // Increment through the original handle; the stored clone observes
+        // the change (i.e. it is the same Arc, not a copy of the values).
+        state.record_connect();
+        assert_eq!(stored.snapshot().connect, 2);
     }
 }
 
