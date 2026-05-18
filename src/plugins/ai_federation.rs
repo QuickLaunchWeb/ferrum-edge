@@ -1045,6 +1045,41 @@ fn translate_openai_compatible(
     Ok((url, headers, body_bytes))
 }
 
+/// OpenAI chat-completions messages accept `content` as either a plain
+/// string OR an array of content parts (`[{"type":"text","text":"..."},
+/// {"type":"image_url","image_url":{...}}, ...]`). The text-only
+/// translation targets used by other providers only carry text, so we
+/// need to flatten array-form content down to its `text` parts. Using
+/// `Value::as_str` alone silently drops every multimodal message —
+/// including system prompts that operators rely on for safety
+/// guardrails.
+fn flatten_openai_message_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(parts) = content.as_array() {
+        let mut out = String::new();
+        for part in parts {
+            // OpenAI's spec: `{"type": "text", "text": "..."}`. Anything
+            // without a `text` field (image_url, input_audio, etc.) is
+            // intentionally omitted — the destination request schemas
+            // here are text-only.
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
 fn translate_to_anthropic(
     provider: &ResolvedProvider,
     openai_body: &Value,
@@ -1054,11 +1089,15 @@ fn translate_to_anthropic(
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
 
-    // Extract system messages into a single string
-    let system_parts: Vec<&str> = messages
+    // Extract system messages into a single string. System content may
+    // be either a plain string or an OpenAI-style content parts array
+    // (multimodal); flatten both forms so guardrails aren't silently
+    // dropped.
+    let system_parts: Vec<String> = messages
         .iter()
         .filter(|m| m["role"].as_str() == Some("system"))
-        .filter_map(|m| m["content"].as_str())
+        .map(|m| flatten_openai_message_text(&m["content"]))
+        .filter(|s| !s.is_empty())
         .collect();
 
     // Filter to user/assistant messages only
@@ -1120,15 +1159,18 @@ fn translate_to_gemini(
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
 
-    // Extract system messages → systemInstruction
+    // Extract system messages → systemInstruction. Content may be a
+    // string or a multimodal parts array; flatten to text either way.
     let system_parts: Vec<Value> = messages
         .iter()
         .filter(|m| m["role"].as_str() == Some("system"))
-        .filter_map(|m| m["content"].as_str())
-        .map(|text| json!({"text": text}))
+        .map(|m| flatten_openai_message_text(&m["content"]))
+        .filter(|s| !s.is_empty())
+        .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages → contents
+    // Map user/assistant messages → contents. Flatten OpenAI multimodal
+    // content arrays to plain text — this Gemini path is text-only.
     let contents: Vec<Value> = messages
         .iter()
         .filter(|m| {
@@ -1142,7 +1184,7 @@ fn translate_to_gemini(
             };
             json!({
                 "role": role,
-                "parts": [{"text": m["content"].as_str().unwrap_or("")}]
+                "parts": [{ "text": flatten_openai_message_text(&m["content"]) }]
             })
         })
         .collect();
@@ -1191,15 +1233,18 @@ fn translate_to_bedrock(
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
 
-    // Extract system messages
+    // Extract system messages. Content may be string or multimodal
+    // parts array; flatten both forms.
     let system_blocks: Vec<Value> = messages
         .iter()
         .filter(|m| m["role"].as_str() == Some("system"))
-        .filter_map(|m| m["content"].as_str())
-        .map(|text| json!({"text": text}))
+        .map(|m| flatten_openai_message_text(&m["content"]))
+        .filter(|s| !s.is_empty())
+        .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages to Bedrock Converse format
+    // Map user/assistant messages to Bedrock Converse format. Flatten
+    // multimodal content to text — this path is text-only.
     let bedrock_messages: Vec<Value> = messages
         .iter()
         .filter(|m| {
@@ -1209,7 +1254,7 @@ fn translate_to_bedrock(
         .map(|m| {
             json!({
                 "role": m["role"].as_str().unwrap_or("user"),
-                "content": [{"text": m["content"].as_str().unwrap_or("")}]
+                "content": [{ "text": flatten_openai_message_text(&m["content"]) }]
             })
         })
         .collect();
@@ -2060,6 +2105,11 @@ pub mod test_helpers {
     pub fn provider_embeds_model_in_url(provider_type: &str) -> Result<bool, String> {
         let pt = ProviderType::from_str(provider_type)?;
         Ok(super::provider_embeds_model_in_url(pt))
+    }
+
+    /// Expose the multimodal content-flattening helper for tests.
+    pub fn flatten_openai_message_text(content: &Value) -> String {
+        super::flatten_openai_message_text(content)
     }
 
     /// Expose request translation for tests.

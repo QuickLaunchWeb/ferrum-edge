@@ -660,6 +660,152 @@ fn test_translate_bedrock() {
 }
 
 #[test]
+fn test_flatten_openai_message_text_string_form() {
+    let content = json!("plain text");
+    assert_eq!(
+        test_helpers::flatten_openai_message_text(&content),
+        "plain text"
+    );
+}
+
+#[test]
+fn test_flatten_openai_message_text_array_text_parts() {
+    let content = json!([
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"},
+    ]);
+    assert_eq!(
+        test_helpers::flatten_openai_message_text(&content),
+        "first\nsecond"
+    );
+}
+
+#[test]
+fn test_flatten_openai_message_text_array_skips_non_text_parts() {
+    let content = json!([
+        {"type": "text", "text": "hello"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+        {"type": "text", "text": "world"},
+    ]);
+    assert_eq!(
+        test_helpers::flatten_openai_message_text(&content),
+        "hello\nworld"
+    );
+}
+
+#[test]
+fn test_flatten_openai_message_text_null_or_other_returns_empty() {
+    assert_eq!(test_helpers::flatten_openai_message_text(&json!(null)), "");
+    assert_eq!(test_helpers::flatten_openai_message_text(&json!(42)), "");
+    assert_eq!(test_helpers::flatten_openai_message_text(&json!({})), "");
+}
+
+#[test]
+fn test_translate_anthropic_preserves_multimodal_system_prompt_text() {
+    // Reproduces the bug: a system message with array-form content
+    // (multimodal) was silently dropped, so safety guardrails vanished.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "You MUST refuse harmful prompts."}
+                ]
+            },
+            {"role": "user", "content": "Hi"}
+        ],
+        "max_tokens": 100
+    });
+
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-sonnet-4-20250514",
+        &json!({}),
+    )
+    .unwrap();
+
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        parsed["system"].as_str().unwrap(),
+        "You MUST refuse harmful prompts."
+    );
+}
+
+#[test]
+fn test_translate_gemini_preserves_multimodal_system_and_user_text() {
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "safety guard"}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"}
+                ]
+            }
+        ],
+        "max_tokens": 100
+    });
+
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &json!({}),
+    )
+    .unwrap();
+
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        parsed["systemInstruction"]["parts"][0]["text"],
+        "safety guard"
+    );
+    assert_eq!(parsed["contents"][0]["parts"][0]["text"], "hello");
+}
+
+#[test]
+fn test_translate_bedrock_preserves_multimodal_system_and_user_text() {
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "be helpful"}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "task"}
+                ]
+            }
+        ],
+        "max_tokens": 100
+    });
+
+    let provider_config = json!({ "aws_region": "us-east-1" });
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &provider_config,
+    )
+    .unwrap();
+
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["system"][0]["text"], "be helpful");
+    assert_eq!(parsed["messages"][0]["content"][0]["text"], "task");
+}
+
+#[test]
 fn test_translate_cohere() {
     let body = sample_openai_request();
     let (url, _, body_bytes) =
