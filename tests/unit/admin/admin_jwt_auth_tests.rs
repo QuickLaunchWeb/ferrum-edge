@@ -56,6 +56,12 @@ fn test_admin_role_claim_parses_and_defaults_to_admin() {
 
     claims.additional = json!({});
     assert_eq!(claims.admin_role().unwrap(), AdminRole::Admin);
+
+    claims.additional = json!({"role": null});
+    assert!(
+        claims.admin_role().is_err(),
+        "explicit null role claims must not fail open as admin"
+    );
 }
 
 #[test]

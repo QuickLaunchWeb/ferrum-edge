@@ -81,7 +81,7 @@ impl AdminClaims {
             return Ok(AdminRole::Admin);
         };
         match obj.get("role") {
-            None | Some(serde_json::Value::Null) => Ok(AdminRole::Admin),
+            None => Ok(AdminRole::Admin),
             Some(serde_json::Value::String(role)) => AdminRole::parse(role),
             Some(_) => Err(
                 "Invalid admin role claim type; expected viewer, operator, or admin string"
