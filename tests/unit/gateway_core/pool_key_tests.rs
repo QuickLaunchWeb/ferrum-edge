@@ -145,17 +145,17 @@ async fn connection_pool_key_direct_backend_format() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     // Direct backend:
-    // d=host:port|protocol|dns|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // d=host:port|protocol|dns|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     assert!(
         key.starts_with("d=backend.example.com:8080|"),
         "key should start with d= prefix: {key}"
     );
     // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
-    // No DNS override, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
+    // No DNS override, no subset, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
     assert!(
-        key.ends_with("|||||||1|svidg=static"),
-        "key should end with empty dns/ca/mtls/sni/sans, verify=1, and SVID generation: {key}"
+        key.ends_with("||||||||1|svidg=static"),
+        "key should end with empty dns/subset/ca/mtls/sni/sans, verify=1, and SVID generation: {key}"
     );
 }
 
@@ -321,8 +321,8 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 9,
-        "10 fields need 9 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 10,
+        "11 fields need 10 pipe delimiters, got {pipe_count} in key: {key}"
     );
 }
 
@@ -472,9 +472,9 @@ async fn connection_pool_key_policy_fields_do_not_fragment() {
 fn h2_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
-    // Format: host|port|dns|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // Format: host|port|dns|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     assert_eq!(
-        key, "backend.example.com|8080|||||||1|svidg=static",
+        key, "backend.example.com|8080||||||||1|svidg=static",
         "basic H2 key format mismatch"
     );
 }
@@ -594,8 +594,8 @@ fn h2_pool_key_pipe_delimiter_count() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 9,
-        "10 fields need 9 pipe delimiters in H2 key, got {pipe_count}: {key}"
+        pipe_count, 10,
+        "11 fields need 10 pipe delimiters in H2 key, got {pipe_count}: {key}"
     );
 }
 
@@ -754,7 +754,7 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
     // Neither should contain field-level colons (only in host:port which is expected)
     for key in [&conn_key, &h2_key] {
         let pipe_count = key.chars().filter(|c| *c == '|').count();
-        assert_eq!(pipe_count, 9, "key should use | as delimiter: {key}");
+        assert_eq!(pipe_count, 10, "key should use | as delimiter: {key}");
     }
 }
 
@@ -766,10 +766,10 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
 fn h3_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
-    // Format: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // Format: host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     // (all TLS fields empty by default, verify=true, static SVID segment)
     assert_eq!(
-        key, "backend.example.com|8080|0|||||||1|svidg=static",
+        key, "backend.example.com|8080|0||||||||1|svidg=static",
         "basic H3 key format mismatch"
     );
 }
@@ -956,10 +956,10 @@ fn h3_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N = 11 fields → 10 pipes.
+    // Shape: host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N = 12 fields → 11 pipes.
     assert_eq!(
-        pipe_count, 10,
-        "11 fields need 10 pipe delimiters in H3 key, got {pipe_count}: {key}"
+        pipe_count, 11,
+        "12 fields need 11 pipe delimiters in H3 key, got {pipe_count}: {key}"
     );
 }
 
@@ -1049,11 +1049,11 @@ fn h3_pool_key_full_tls_config() {
     proxy.resolved_tls.client_key_path = Some("/client/key.pem".to_string());
     proxy.resolved_tls.verify_server_cert = false;
     let key = Http3ConnectionPool::pool_key(&proxy, 2);
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
-    // dns_override is empty here, so we get an empty field between index and CA.
+    // Shape: host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // dns_override and subset are empty here, so we get two empty fields between index and CA.
     assert_eq!(
         key,
-        "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem|||0|svidg=static",
+        "backend.example.com|8080|2|||/ca/bundle.pem|/client/cert.pem|/client/key.pem|||0|svidg=static",
         "full TLS config H3 key format mismatch"
     );
 }
@@ -1109,11 +1109,11 @@ fn h3_pool_key_for_target_different_ports() {
 fn h3_pool_key_for_target_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 0);
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N = 10 pipes.
+    // Shape: host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N = 11 pipes.
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 10,
-        "11 fields need 10 pipe delimiters in target key, got {pipe_count}: {key}"
+        pipe_count, 11,
+        "12 fields need 11 pipe delimiters in target key, got {pipe_count}: {key}"
     );
 }
 
