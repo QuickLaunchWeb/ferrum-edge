@@ -762,6 +762,57 @@ async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
     );
 }
 
+// ─── Cohere v2 SSE token recording ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_cohere_v2_sse_message_end_records_tokens() {
+    // Cohere v2 SSE: counts arrive on the terminal `message-end` event
+    // under `delta.usage.tokens.*`. Auto-detection must classify the
+    // hyphenated event types as Cohere (previously swallowed as Anthropic),
+    // and the rate-limiter must read the nested counts so token-based
+    // throttling works for Cohere v2 streaming clients.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 100, "window_seconds": 60, "provider": "auto"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let sse = concat!(
+        "data: {\"type\":\"message-start\",\"id\":\"abc\"}\n\n",
+        "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":40,\"output_tokens\":35}}}}\n\n",
+    )
+    .as_bytes();
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, sse)
+        .await;
+
+    // 75 tokens recorded — second request fits (75 + 25 ≤ 100), a 26-token
+    // follow-up would exceed.
+    let mut ctx2 = create_test_context();
+    let mut headers2 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+
+    let sse2 = concat!(
+        "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":15,\"output_tokens\":15}}}}\n\n",
+    ).as_bytes();
+    plugin
+        .on_response_body(&mut ctx2, 200, &resp_headers, sse2)
+        .await;
+
+    let mut ctx3 = create_test_context();
+    let mut headers3 = HashMap::new();
+    assert_reject(
+        plugin.before_proxy(&mut ctx3, &mut headers3).await,
+        Some(429),
+    );
+}
+
 // ─── TokenWindow running-sum invariant ─────────────────────────────────
 
 #[tokio::test]
