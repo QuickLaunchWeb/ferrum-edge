@@ -48,12 +48,26 @@ cargo fmt --all && cargo fmt --all -- --check
 
 **Prerequisite**: `protoc`. `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
+### Cargo target-dir isolation across Conductor workspaces
+
+Every Conductor workspace under `/Volumes/JustusStorage2/Conductor/workspaces/ferrum-edge/` is a git worktree of the same repo, and the host shell exports a single shared `CARGO_TARGET_DIR=/Volumes/JustusStorage2/cargo-target`. Running `cargo build`/`test`/`clippy` in two workspaces at once stalls on that target dir's lock — symptom is `Blocking waiting for file lock on build directory` or a cargo invocation that hangs with no output. The same applies to two cargo commands in *one* workspace (e.g. clippy + test in parallel).
+
+**Before any cargo command in this workspace, scope target dir to the worktree:**
+
+```bash
+export CARGO_TARGET_DIR="/Volumes/JustusStorage2/cargo-target/$(basename "$(git rev-parse --show-toplevel)")"
+```
+
+Keep `SCCACHE_DIR=/Volumes/JustusStorage2/sccache` shared (already configured via `.cargo/config.toml`'s `rustc-wrapper = "sccache"`). sccache is safe under concurrent access and amortizes dependency builds across worktrees, so a per-workspace target dir only pays for *this* crate's incremental artifacts. Disk on `/Volumes/JustusStorage2` is not a constraint (4 TiB+ free) — the duplication is intentional.
+
+Within a single workspace, still run `fmt` → `clippy` → `test` sequentially (not via `&` / parallel shells) — they share *this* workspace's target dir and will lock each other.
+
 ### Local testing — targeted, not exhaustive
 
 CI runs the full matrix on every PR (format, clippy, all test crates, perf regression, 5 build targets). Locally, test only what you changed and let CI catch the rest — don't run the whole suite after every iteration.
 
 **Before pushing, choose by change type:**
-- Rust changes → `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + the targeted tests below
+- Rust changes → `cargo fmt --all -- --check` + targeted clippy (`cargo clippy --lib --tests -p ferrum-edge -- -D warnings`) + the targeted tests below. Reserve `cargo clippy --all-targets -- -D warnings` for the "full suite" trigger conditions below — `--all-targets` pulls in benches and every test crate, i.e. a near-full build, and is what most often clashes with concurrent agents.
 - Docs/comment-only → `git diff --check` plus any relevant doc formatter/linter if one exists
 - Config/schema/spec/template changes → validate the changed surface (`ferrum-edge validate`, OpenAPI/schema checks, or targeted config/admin tests) and run Rust fmt/clippy only if Rust files changed
 
