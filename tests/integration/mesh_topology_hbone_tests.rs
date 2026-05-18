@@ -18,9 +18,9 @@ use ferrum_edge::modes::mesh::hbone::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_BPF_METRICS_PLUGIN_ID,
-    MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MESH_REQUEST_AUTH_PLUGIN_ID,
-    MESH_SPIFFE_IDENTITY_PLUGIN_ID, MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind,
-    MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MESH_REQUEST_AUTH_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
+    MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshTopology, MeshTrafficDirection,
+    prepare_gateway_config_for_mesh,
 };
 use http::{HeaderMap, HeaderValue, Method, Version};
 
@@ -239,9 +239,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
     // when at least one `MeshRequestAuthentication` resource declares a
     // JWT rule. Plugin chains in deployments without JWT requirements
     // should not pay the per-request cost.
-    use ferrum_edge::modes::mesh::config::{
-        MeshJwtRule, MeshRequestAuthentication, PolicyScope,
-    };
+    use ferrum_edge::modes::mesh::config::{MeshJwtRule, MeshRequestAuthentication, PolicyScope};
 
     // Case 1: no request_authentications → plugin absent.
     {
@@ -267,20 +265,21 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
         let runtime = runtime_for_topology(MeshTopology::Sidecar);
         let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
         let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
-        mesh.request_authentications.push(MeshRequestAuthentication {
-            name: "issuer".to_string(),
-            namespace: "default".to_string(),
-            scope: PolicyScope::MeshWide,
-            jwt_rules: vec![MeshJwtRule {
-                issuer: "https://issuer.example.com".to_string(),
-                audiences: vec!["api".to_string()],
-                jwks_uri: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
-                jwks: None,
-                from_headers: Vec::new(),
-                from_params: Vec::new(),
-                forward_original_token: false,
-            }],
-        });
+        mesh.request_authentications
+            .push(MeshRequestAuthentication {
+                name: "issuer".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                jwt_rules: vec![MeshJwtRule {
+                    issuer: "https://issuer.example.com".to_string(),
+                    audiences: vec!["api".to_string()],
+                    jwks_uri: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
+                    jwks: None,
+                    from_headers: Vec::new(),
+                    from_params: Vec::new(),
+                    forward_original_token: false,
+                }],
+            });
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
         let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
         let plugin_ids: std::collections::HashSet<_> = prepared
@@ -367,7 +366,11 @@ fn is_hbone_connect_accepts_plain_http2_connect_without_marker_header() {
     // therefore accept plain H2 CONNECT as HBONE-eligible without
     // requiring an `x-ferrum-mesh-protocol` marker.
     let headers = HeaderMap::new();
-    assert!(is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers));
+    assert!(is_hbone_connect(
+        &Method::CONNECT,
+        Version::HTTP_2,
+        &headers
+    ));
 }
 
 #[test]
@@ -390,14 +393,22 @@ fn is_hbone_connect_rejects_explicit_non_hbone_protocol_marker() {
         "x-istio-protocol",
         HeaderValue::from_static("connect-tunnel"),
     );
-    assert!(!is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers));
+    assert!(!is_hbone_connect(
+        &Method::CONNECT,
+        Version::HTTP_2,
+        &headers
+    ));
 }
 
 #[test]
 fn is_hbone_connect_accepts_explicit_marker_when_value_is_hbone() {
     let mut headers = HeaderMap::new();
     headers.insert("x-istio-protocol", HeaderValue::from_static("hbone"));
-    assert!(is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers));
+    assert!(is_hbone_connect(
+        &Method::CONNECT,
+        Version::HTTP_2,
+        &headers
+    ));
 }
 
 // ── Trust-domain alias plumbing on MeshRuntimeConfig ─────────────────────
