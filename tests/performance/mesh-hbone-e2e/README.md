@@ -73,4 +73,4 @@ cargo build --release --bin ferrum-edge
 
 ## SYNC notes
 
-If you bump `rustls` or `h2` in the root `Cargo.toml`, update the matching line here and re-run `cargo update -p <crate>` in this directory.
+The harness is an isolated standalone crate, so most dependency versions are free to drift from the root. **But** `rustls` and `h2` cross the wire between gateway and sidecar — a major-version mismatch on either can break the mTLS handshake or H2 flow-control framing. If you bump those in the root `Cargo.toml`, update the matching line here (look for `# SYNC:` comments) and re-run `cargo update -p <crate>` in this directory. Non-protocol deps (`rcgen`, `clap`, `hdrhistogram`, etc.) are intentionally allowed to drift.

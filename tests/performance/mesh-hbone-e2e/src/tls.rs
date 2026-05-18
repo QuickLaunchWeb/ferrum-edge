@@ -36,9 +36,8 @@ pub fn make_sidecar_server_config(
     key_path: &Path,
     ca_path: &Path,
 ) -> Result<Arc<ServerConfig>> {
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let certs = read_certs(cert_path)?;
     let key = read_key(key_path)?;

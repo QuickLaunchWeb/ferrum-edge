@@ -35,6 +35,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 GATEWAY_HTTP_PORT=18000
+GATEWAY_ADMIN_PORT=19999
 RUNTIME_DIR="$SCRIPT_DIR/runtime"
 CERTS_DIR="$RUNTIME_DIR/certs"
 
@@ -48,7 +49,7 @@ cleanup() {
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$SIDECAR_PID" ] && kill "$SIDECAR_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    for port in "$GATEWAY_HTTP_PORT" "$SIDECAR_PORT" 19999 ${BACKEND_PORT:-0}; do
+    for port in "$GATEWAY_HTTP_PORT" "$SIDECAR_PORT" "$GATEWAY_ADMIN_PORT" ${BACKEND_PORT:-0}; do
         [ "$port" = "0" ] && continue
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
@@ -168,11 +169,10 @@ start_gateway() {
         FERRUM_FILE_CONFIG_PATH="$RUNTIME_DIR/gateway.yaml" \
         FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
         FERRUM_PROXY_HTTPS_PORT=0 \
-        FERRUM_ADMIN_HTTP_PORT=19999 \
+        FERRUM_ADMIN_HTTP_PORT="$GATEWAY_ADMIN_PORT" \
         FERRUM_ADMIN_HTTPS_PORT=0 \
         FERRUM_LOG_LEVEL=error \
         FERRUM_POOL_WARMUP_ENABLED=true \
-        FERRUM_TLS_NO_VERIFY=true \
         FERRUM_GATEWAY_SVID_CERT_PATH="$CERTS_DIR/gateway-cert.pem" \
         FERRUM_GATEWAY_SVID_KEY_PATH="$CERTS_DIR/gateway-key.pem" \
         FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH="$CERTS_DIR/ca.pem" \
@@ -183,7 +183,7 @@ start_gateway() {
     GATEWAY_PID=$!
 
     for i in $(seq 1 40); do
-        if curl -sf "http://127.0.0.1:19999/health" > /dev/null 2>&1; then
+        if curl -sf "http://127.0.0.1:$GATEWAY_ADMIN_PORT/health" > /dev/null 2>&1; then
             echo -e "${GREEN}Gateway ready (PID $GATEWAY_PID)${NC}"
             return
         fi

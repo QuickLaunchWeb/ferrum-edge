@@ -25,6 +25,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::try_init().ok();
     let cli = Cli::parse();
     let listener = TcpListener::bind(cli.listen).await?;
     let bound = listener.local_addr()?;

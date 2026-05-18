@@ -6,8 +6,6 @@
 //! either a text report or a `BenchReport` JSON blob.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -102,7 +100,6 @@ async fn run(args: &RunArgs) -> Result<()> {
     };
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let in_flight = Arc::new(AtomicI64::new(0));
     let payload = Bytes::from(vec![b'x'; args.payload_size]);
 
     let mut handles = Vec::with_capacity(args.concurrency as usize);
@@ -111,17 +108,15 @@ async fn run(args: &RunArgs) -> Result<()> {
         let path = path.clone();
         let host_header = args.host_header.clone();
         let payload = payload.clone();
-        let in_flight = in_flight.clone();
         handles.push(tokio::spawn(async move {
-            worker(host, port, path, host_header, payload, deadline, in_flight).await
+            worker(host, port, path, host_header, payload, deadline).await
         }));
     }
 
     let mut combined = BenchMetrics::new();
     for h in handles {
         match h.await {
-            Ok(Ok(m)) => combined.merge(&m),
-            Ok(Err(e)) => eprintln!("worker error: {e:#}"),
+            Ok(m) => combined.merge(&m),
             Err(e) => eprintln!("join error: {e}"),
         }
     }
@@ -154,8 +149,7 @@ async fn worker(
     host_header: String,
     payload: Bytes,
     deadline: Instant,
-    in_flight: Arc<AtomicI64>,
-) -> Result<BenchMetrics> {
+) -> BenchMetrics {
     let mut metrics = BenchMetrics::new();
     // Each worker owns its own HTTP/1.1 sender. Hyper 1.x's SendRequest is
     // not Clone; we keep the live sender across iterations to exercise
@@ -175,15 +169,20 @@ async fn worker(
             },
         };
 
-        let req = Request::builder()
+        let req = match Request::builder()
             .method("POST")
             .uri(&path)
             .header("host", &host_header)
             .header("content-length", payload.len().to_string())
             .body(Full::new(payload.clone()))
-            .context("building request")?;
+        {
+            Ok(r) => r,
+            Err(_) => {
+                metrics.record_error();
+                continue;
+            }
+        };
 
-        in_flight.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
         let send_result = send.send_request(req).await;
         let elapsed = start.elapsed().as_micros() as u64;
@@ -191,9 +190,7 @@ async fn worker(
         match send_result {
             Ok(resp) => {
                 let status = resp.status();
-                let body_result = resp.into_body().collect().await;
-                in_flight.fetch_sub(1, Ordering::Relaxed);
-                match body_result {
+                match resp.into_body().collect().await {
                     Ok(body) if status == StatusCode::OK => {
                         let bytes = body.to_bytes();
                         metrics.record(elapsed, bytes.len());
@@ -208,13 +205,12 @@ async fn worker(
                 }
             }
             Err(_) => {
-                in_flight.fetch_sub(1, Ordering::Relaxed);
                 metrics.record_error();
                 // Drop the sender; next iteration will reopen.
             }
         }
     }
-    Ok(metrics)
+    metrics
 }
 
 async fn open_conn(host: &str, port: u16) -> Result<SendRequest<Full<Bytes>>> {

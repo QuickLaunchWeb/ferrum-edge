@@ -25,22 +25,18 @@ pub struct GeneratedCerts {
 }
 
 pub fn generate(trust_domain: &str) -> Result<GeneratedCerts> {
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     // CA
-    let ca_key =
-        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generating CA key")?;
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generating CA key")?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
         .push(DnType::CommonName, "hbone-e2e CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .context("self-signing CA")?;
+    let ca_cert = ca_params.self_signed(&ca_key).context("self-signing CA")?;
 
     // Helper for leaf certs with a URI SAN matching the SPIFFE ID.
     fn leaf(

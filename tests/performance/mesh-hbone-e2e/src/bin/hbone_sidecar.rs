@@ -67,11 +67,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_conn(
-    tcp: TcpStream,
-    acceptor: TlsAcceptor,
-    backend: (String, u16),
-) -> Result<()> {
+async fn handle_conn(tcp: TcpStream, acceptor: TlsAcceptor, backend: (String, u16)) -> Result<()> {
     let tls = acceptor
         .accept(tcp)
         .await
