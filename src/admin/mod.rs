@@ -2740,7 +2740,7 @@ fn parse_audit_filter(
         limit: pagination
             .limit
             .unwrap_or(DEFAULT_PAGE_SIZE)
-            .min(MAX_PAGE_SIZE) as u32,
+            .clamp(1, MAX_PAGE_SIZE) as u32,
         offset,
         ..Default::default()
     };
@@ -2776,7 +2776,16 @@ fn parse_audit_filter(
                             .with_timezone(&Utc),
                     );
                 }
-                "limit" | "offset" => {}
+                "limit" => {
+                    let parsed = value.parse::<usize>().map_err(|_| {
+                        Box::new(json_response(
+                            StatusCode::BAD_REQUEST,
+                            &json!({"error": "Invalid audit limit"}),
+                        ))
+                    })?;
+                    filter.limit = parsed.clamp(1, MAX_PAGE_SIZE) as u32;
+                }
+                "offset" => {}
                 _ => {}
             }
         }

@@ -273,6 +273,19 @@ async fn audit_list_rejects_offset_above_backend_range() {
 }
 
 #[tokio::test]
+async fn audit_list_clamps_zero_limit_to_one() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = get_json(&base, "/audit?limit=0", &admin).await;
+
+    assert_eq!(status, 200, "zero limit body: {body:?}");
+    assert_eq!(body["limit"], 1);
+}
+
+#[tokio::test]
 async fn partial_batch_mutation_writes_audit_event() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
