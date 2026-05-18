@@ -10,8 +10,8 @@ use tokio::sync::watch;
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginConfig, PluginScope,
-    Proxy,
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginAssociation,
+    PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -203,6 +203,71 @@ async fn start_idle_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<
     (addr, handle)
 }
 
+/// Accepts a connection, drains anything the client sends, but never writes
+/// back. Used to exercise the relay's `backend_read_timeout` (backend→client
+/// inactivity). The backend stays alive for the full test, so a stream close
+/// observed by the client is from the relay watchdog, not a backend hang-up.
+async fn start_quiet_backend() -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind quiet backend");
+    let addr = listener.local_addr().expect("quiet backend local addr");
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 4096];
+        tokio::select! {
+            _ = stop_rx => {}
+            _ = async {
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            } => {}
+        }
+    });
+    (addr, handle, stop_tx)
+}
+
+fn mesh_route_dispatch_connect_timeout_plugin(
+    proxy_id: &str,
+    backend_host: &str,
+    backend_port: u16,
+    timeout_ms: u64,
+) -> PluginConfig {
+    PluginConfig {
+        id: "mesh-route-dispatch-cfg".to_string(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "rules": [{
+                "match": { "methods": ["CONNECT"] },
+                "destination": {
+                    "backend_host": backend_host,
+                    "backend_port": backend_port,
+                },
+                "timeout_ms": timeout_ms,
+            }]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_relays_data_frames_to_tcp_backend() {
     let (backend_addr, backend_handle) = start_echo_backend().await;
@@ -306,6 +371,88 @@ async fn hbone_connect_with_body_auth_plugin_keeps_upgrade_streaming() {
 
     shutdown_tx.send(true).expect("shutdown gateway");
     backend_handle.await.expect("backend task");
+    conn_task.abort();
+}
+
+/// Regression test for GAP-3H: the standard `before_proxy` chain must run on
+/// the outer HBONE CONNECT request so `mesh_route_dispatch` can set route
+/// overrides (timeout / retry / backend selection) that flow into the HBONE
+/// relay via `apply_route_overrides_with_upstreams` inside
+/// `handle_hbone_request`.
+///
+/// Setup:
+/// * Proxy default `backend_read_timeout_ms = 30000` (30s, won't fire in test).
+/// * Proxy default `tcp_idle_timeout_seconds = 300` (huge — won't fire).
+/// * `mesh_route_dispatch` rule matches `method=CONNECT` and sets
+///   `timeout_ms: 500` for the same backend.
+/// * Backend accepts the relay and never writes back.
+///
+/// With the fix, the override lands on `proxy.backend_read_timeout_ms = 500`
+/// inside `handle_hbone_request`, the relay's backend→client watchdog fires
+/// within ~1.5s, and the H2 stream closes. Without the fix the override is
+/// dropped on the HBONE path and the relay stays open until the test bails.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_connect_mesh_route_dispatch_override_drives_relay_timeout() {
+    let (backend_addr, backend_handle, backend_stop) = start_quiet_backend().await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    // Defaults that would keep the relay open well past the assertion window
+    // — only the route override should be able to trip the watchdog.
+    proxy.backend_read_timeout_ms = 30_000;
+    proxy.backend_write_timeout_ms = 30_000;
+    proxy.tcp_idle_timeout_seconds = Some(300);
+    let proxy_id = proxy.id.clone();
+    let plugin = mesh_route_dispatch_connect_timeout_plugin(
+        &proxy_id,
+        "127.0.0.1",
+        backend_addr.port(),
+        500,
+    );
+    // Proxy-scoped plugins are wired into the proxy's plugin chain via the
+    // association list (see `PluginCache::build_cache`); without this, the
+    // route-dispatch plugin would never run.
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: plugin.id.clone(),
+    });
+    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![plugin]);
+    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, mut request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = response_fut.await.expect("CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Push at least one byte so the relay is fully wired up; the quiet
+    // backend will drain it without responding, exercising the
+    // backend→client watchdog rather than the c2b idle path.
+    request_body
+        .send_data(Bytes::from_static(b"ping"), false)
+        .expect("send CONNECT data");
+
+    let mut response_body = resp.into_body();
+    // 500ms override + ~1s watchdog tick → close should land well under 4s.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(4), response_body.data())
+        .await
+        .expect("relay should close once route override timeout fires");
+    match closed {
+        None => {}
+        Some(Err(_)) => {}
+        Some(Ok(chunk)) if chunk.is_empty() => {}
+        Some(Ok(chunk)) => panic!("unexpected relay data: {chunk:?}"),
+    }
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    let _ = backend_stop.send(());
+    let _ = backend_handle.await;
     conn_task.abort();
 }
 

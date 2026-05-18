@@ -27,8 +27,13 @@
 //! the effective override destination. WebSocket support applies to the
 //! HTTP upgrade handshake destination only — once upgraded, a WebSocket
 //! connection stays pinned to that backend and is not re-routed per frame.
-//! HBONE CONNECT traffic branches before `before_proxy`, so this plugin does
-//! not currently set route overrides for HBONE streams.
+//! HBONE CONNECT traffic now flows through the standard `before_proxy` chain
+//! before the HBONE relay branch in `proxy/mod.rs`, so this plugin can
+//! match on the outer CONNECT request (method, headers, query params) and
+//! set `route_override_*` fields that `handle_hbone_request` consumes via
+//! `apply_route_overrides_with_upstreams`. Once the upgrade succeeds, the
+//! HBONE tunnel is a transparent TCP relay — inner H2 frames are not
+//! re-classified per stream, mirroring the post-upgrade WebSocket pinning.
 //!
 //! ## Wire compatibility
 //!

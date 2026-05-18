@@ -8107,25 +8107,14 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    if is_hbone_connect {
-        return Ok(hbone_proxy::handle_hbone_request(
-            &state,
-            &proxy,
-            &epoch,
-            &mut ctx,
-            client_request_body,
-            &plugins,
-            start_time,
-            &method,
-            plugin_execution_ns,
-        )
-        .await);
-    }
-
     let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();
     // should_buffer_request_body is request-time (takes &RequestContext), so it
     // must still iterate. But the config-time capability checks use the bitset.
-    let requires_request_body_buffering = allows_request_body_buffering
+    // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
+    // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
+    // skipped — same reason as the pre-authenticate buffering guard above.
+    let requires_request_body_buffering = !is_hbone_connect
+        && allows_request_body_buffering
         && maybe_requires_request_body_buffering
         && plugins
             .iter()
@@ -8279,6 +8268,30 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
+
+    // HBONE CONNECT short-circuits the rest of the dispatch ladder: the relay
+    // is a transparent TCP tunnel, so identity-header injection, egress
+    // baggage strip on `owned_proxy_headers`, the WS/gRPC branches, and the
+    // HTTP backend pool selection below are all unreachable for it. We branch
+    // here — after `before_proxy` — so plugins like `mesh_route_dispatch` get
+    // to run and set `route_override_*` on the outer CONNECT request; the
+    // HBONE handler then consumes those via `apply_route_overrides_with_upstreams`
+    // before backend connect, mirroring the H1/H2/H3 dispatch contract.
+    if is_hbone_connect {
+        return Ok(hbone_proxy::handle_hbone_request(
+            &state,
+            &proxy,
+            &epoch,
+            &mut ctx,
+            client_request_body,
+            &plugins,
+            start_time,
+            &method,
+            plugin_execution_ns,
+        )
+        .await);
+    }
+
     // Inject identity headers when authentication resolved a principal.
     if let Some(username) = ctx.backend_consumer_username() {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());

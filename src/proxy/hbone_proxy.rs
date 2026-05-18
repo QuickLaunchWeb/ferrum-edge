@@ -247,13 +247,13 @@ pub(super) async fn handle_hbone_request(
     method: &str,
     plugin_execution_ns: u64,
 ) -> Response<ProxyBody> {
-    // Apply route overrides set before the HBONE branch. HBONE CONNECT
-    // currently branches before the `before_proxy` phase, so the in-tree
-    // `mesh_route_dispatch` plugin cannot set these fields for HBONE streams
-    // today. This hook is deliberately defensive: external/custom plugins or
-    // future auth-phase routing plugins may set `route_override_*` before
-    // backend connect, and keeping this here also preserves the same contract
-    // as normal H1/H2/H3 dispatch if HBONE later moves behind `before_proxy`.
+    // Apply route overrides set by `before_proxy` plugins (e.g.,
+    // `mesh_route_dispatch` from a VirtualService header/method match). The
+    // dispatcher in `proxy/mod.rs` runs the standard `before_proxy` chain on
+    // the outer CONNECT request before branching here, so the HBONE path
+    // honors the same per-rule routing / timeout / retry overrides as
+    // H1/H2/H3 dispatch. The Arc is cloned only when an override actually
+    // changes the effective destination — otherwise this is a no-op.
     let proxy_arc = ctx
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
