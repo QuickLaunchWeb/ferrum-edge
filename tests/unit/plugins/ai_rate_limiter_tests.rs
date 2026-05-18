@@ -798,9 +798,7 @@ async fn test_cohere_v2_sse_message_end_records_tokens() {
     let mut headers2 = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 
-    let sse2 = concat!(
-        "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":15,\"output_tokens\":15}}}}\n\n",
-    ).as_bytes();
+    let sse2 = b"data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":15,\"output_tokens\":15}}}}\n\n";
     plugin
         .on_response_body(&mut ctx2, 200, &resp_headers, sse2)
         .await;
