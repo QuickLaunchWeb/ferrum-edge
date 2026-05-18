@@ -669,20 +669,60 @@ fn gateway_programmed(object: &K8sObject, config: &crate::config::types::Gateway
 }
 
 fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
-    let route_kind = object.kind.to_ascii_lowercase();
-    let id_prefix = format!(
-        "{}-{}",
-        resource_id(
-            "gwapi-route",
-            &object.metadata.namespace,
-            &object.metadata.name,
-            ""
-        ),
-        route_kind
-    );
+    let candidate_ids = route_proxy_id_candidates(object);
     config.proxies.iter().any(|proxy| {
-        proxy.namespace == object.metadata.namespace && proxy.id.starts_with(&id_prefix)
+        proxy.namespace == object.metadata.namespace && candidate_ids.contains(&proxy.id)
     })
+}
+
+fn route_proxy_id_candidates(object: &K8sObject) -> HashSet<String> {
+    let route_kind = object.kind.to_ascii_lowercase();
+    let host_scope_count = object
+        .spec
+        .get("hostnames")
+        .and_then(Value::as_array)
+        .map_or(1, |hostnames| hostnames.len().max(1));
+    let mut candidates = HashSet::new();
+
+    for (rule_index, rule) in object
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let mut suffixes = vec![format!("{route_kind}-{rule_index}")];
+        if let Some(matches) = rule.get("matches").and_then(Value::as_array)
+            && matches.len() > 1
+        {
+            suffixes.extend(
+                matches
+                    .iter()
+                    .enumerate()
+                    .map(|(match_index, _)| format!("{route_kind}-{rule_index}-{match_index}")),
+            );
+        }
+
+        for suffix in suffixes {
+            candidates.insert(resource_id(
+                "gwapi-route",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &suffix,
+            ));
+            for host_index in 0..host_scope_count {
+                candidates.insert(resource_id(
+                    "gwapi-route",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &format!("{suffix}-host{host_index}"),
+                ));
+            }
+        }
+    }
+
+    candidates
 }
 
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
@@ -1038,6 +1078,44 @@ mod tests {
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("NoRules")
         );
+        assert_eq!(
+            find_condition(conditions, "Programmed")["reason"].as_str(),
+            Some("NoRules")
+        );
+    }
+
+    #[test]
+    fn route_status_does_not_match_overlapping_route_name_prefix() {
+        let empty_route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}]
+            }),
+        );
+        let programmed_overlap = object(
+            "HTTPRoute",
+            "api-httproute",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_gateway_api_status_updates(
+            &[gateway_class, gateway, empty_route, programmed_overlap],
+            options(),
+        );
+
+        let empty_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = empty_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "False");
         assert_eq!(
             find_condition(conditions, "Programmed")["reason"].as_str(),
             Some("NoRules")
