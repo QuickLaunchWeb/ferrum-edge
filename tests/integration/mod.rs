@@ -23,6 +23,7 @@ mod http2_pool_tests;
 mod http3_integration_tests;
 mod log_schema_integration_tests;
 mod log_schema_registry_tests;
+mod mesh_authz_e2e_tests;
 mod mesh_authz_negative_match_tests;
 mod mesh_destination_rule_locality_lb_tests;
 mod mesh_destination_rule_port_policy_tests;
