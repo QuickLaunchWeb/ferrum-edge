@@ -13,11 +13,21 @@ See also:
 
 All endpoints (except `/health`, `/status`, `/overload`, and exact `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/metrics/runtime` requires JWT authentication because it exposes process and host diagnostics. `/charges` also requires JWT authentication because it exposes customer and billing data.
 
+Admin JWTs must include a string `role` claim:
+
+| Role | Access |
+| --- | --- |
+| `viewer` | Read-only endpoints |
+| `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, and mesh egress-scope test operations |
+| `admin` | Full access, including consumers, credentials, API specs, batch/restore, and audit logs |
+
+Tokens without a valid `role` claim are rejected.
+
 Generate a token:
 ```bash
-# Using any JWT library; payload can be minimal
+# Using any JWT library; include an explicit role
 # Example using Node.js jsonwebtoken:
-node -e "console.log(require('jsonwebtoken').sign({sub:'admin'}, 'my-super-secret-jwt-key'))"
+node -e "console.log(require('jsonwebtoken').sign({sub:'admin', role:'admin'}, 'my-super-secret-jwt-key'))"
 ```
 
 ## Health Check (Unauthenticated)
@@ -220,6 +230,17 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
+
+## Audit Log
+
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` and `POST /restore` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+
+`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/audit?resource_type=proxy&resource_id=PROXY_ID"
+```
 
 ## Cluster Status
 

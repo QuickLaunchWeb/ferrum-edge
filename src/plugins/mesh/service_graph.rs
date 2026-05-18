@@ -171,7 +171,11 @@ impl ServiceGraphRegistry {
     }
 
     fn ensure_snapshot_worker(self: &Arc<Self>) {
-        if self.snapshot_worker_started.load(Ordering::Acquire) {
+        // Hot path: `record_transaction` calls this on every mesh request. Relaxed
+        // is sufficient — we only need to observe that the worker is started, not
+        // any memory it has written. The compare_exchange below provides the actual
+        // ordering for the one-time spawn.
+        if self.snapshot_worker_started.load(Ordering::Relaxed) {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -179,7 +183,7 @@ impl ServiceGraphRegistry {
         };
         if self
             .snapshot_worker_started
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             return;

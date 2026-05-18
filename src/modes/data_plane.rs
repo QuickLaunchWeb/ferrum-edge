@@ -360,6 +360,7 @@ pub async fn run(
         proxy_state: Some(proxy_state.clone()),
         mode: "dp".into(),
         read_only: true, // DP admin API is always read-only
+        admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,

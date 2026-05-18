@@ -897,6 +897,7 @@ fn mint_jwt(secret: &str, issuer: &str) -> String {
     let claims = json!({
         "iss": issuer,
         "sub": "test-admin",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

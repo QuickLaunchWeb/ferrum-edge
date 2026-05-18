@@ -511,6 +511,7 @@ impl LoadTestHarness {
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
+            "role": "admin",
             "iat": now.timestamp(),
             "nbf": now.timestamp(),
             "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

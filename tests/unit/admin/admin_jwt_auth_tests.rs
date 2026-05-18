@@ -1,7 +1,7 @@
 //! Tests for admin JWT authentication
 
 use chrono::{Duration, Utc};
-use ferrum_edge::admin::jwt_auth::{AdminClaims, JwtConfig, JwtManager};
+use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtManager};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 
@@ -38,6 +38,48 @@ fn test_jwt_verification() {
     assert_eq!(token_data.claims.iss, "test-issuer");
     assert_eq!(token_data.claims.sub, "admin-user");
     assert_eq!(token_data.claims.additional["role"], "admin");
+}
+
+#[test]
+fn test_admin_role_claim_parses_and_requires_explicit_role() {
+    let now = Utc::now();
+    let mut claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({"role": "operator"}),
+    };
+    assert_eq!(claims.admin_role().unwrap(), AdminRole::Operator);
+
+    claims.additional = json!({});
+    assert!(
+        claims.admin_role().is_err(),
+        "missing role claims must not fail open as admin"
+    );
+
+    claims.additional = json!({"role": null});
+    assert!(
+        claims.admin_role().is_err(),
+        "explicit null role claims must not fail open as admin"
+    );
+}
+
+#[test]
+fn test_admin_role_claim_rejects_unknown_role() {
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({"role": "root"}),
+    };
+    assert!(claims.admin_role().is_err());
 }
 
 #[test]
