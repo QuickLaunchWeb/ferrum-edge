@@ -337,6 +337,56 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
 }
 
 #[tokio::test]
+async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consumer = json!({
+        "id": "audit-keyauth-consumer",
+        "username": "audit-keyauth-user",
+        "credentials": {}
+    });
+    let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
+    assert_eq!(status, 201, "consumer create failed: {body:?}");
+
+    let plaintext_key = "super-secret-keyauth-api-key-do-not-leak";
+    let cred = json!([{ "key": plaintext_key }]);
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base}/consumers/audit-keyauth-consumer/credentials/keyauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&cred)
+        .send()
+        .await
+        .expect("PUT credentials");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "PUT keyauth failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer_credentials&resource_id=audit-keyauth-consumer",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["credentials"]["keyauth"][0]["key"],
+        "[REDACTED]",
+        "keyauth key not redacted in audit diff: {event:?}"
+    );
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(plaintext_key),
+        "plaintext keyauth key leaked into audit diff: {event:?}"
+    );
+}
+
+#[tokio::test]
 async fn audit_list_rejects_offset_above_backend_range() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
