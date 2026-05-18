@@ -50,17 +50,15 @@ cargo fmt --all && cargo fmt --all -- --check
 
 ### Cargo target-dir isolation across Conductor workspaces
 
-Every Conductor workspace under `/Volumes/JustusStorage2/Conductor/workspaces/ferrum-edge/` is a git worktree of the same repo, and the host shell exports a single shared `CARGO_TARGET_DIR=/Volumes/JustusStorage2/cargo-target`. Running `cargo build`/`test`/`clippy` in two workspaces at once stalls on that target dir's lock — symptom is `Blocking waiting for file lock on build directory` or a cargo invocation that hangs with no output. The same applies to two cargo commands in *one* workspace (e.g. clippy + test in parallel).
+Every Conductor workspace under `/Volumes/JustusStorage2/Conductor/workspaces/ferrum-edge/` is a git worktree of the same repo. With no override, Cargo's default puts artifacts in `<worktree>/target/`, so each workspace gets its own isolated target dir for free — no per-command incantation, no env hygiene required of agents.
 
-**Before any cargo command in this workspace, scope target dir to the worktree:**
+The pitfall: if the host shell exports `CARGO_TARGET_DIR` (e.g. in `~/.zshrc`), every worktree inherits the same path and concurrent `cargo build`/`test`/`clippy` invocations across worktrees stall on the shared target-dir lock — symptom is `Blocking waiting for file lock on build directory`, or a cargo invocation that hangs with no output. **Fix at the shell-profile level: leave `CARGO_TARGET_DIR` unset.** Env vars beat `.cargo/config.toml`, and the tracked config can't carry a per-worktree absolute path, so this is the only place to fix it.
 
-```bash
-export CARGO_TARGET_DIR="/Volumes/JustusStorage2/cargo-target/$(basename "$(git rev-parse --show-toplevel)")"
-```
+`SCCACHE_DIR=/Volumes/JustusStorage2/sccache` is concurrency-safe and *should* stay shared so dependency builds amortize across worktrees (already wired through `.cargo/config.toml`'s `rustc-wrapper = "sccache"`).
 
-Keep `SCCACHE_DIR=/Volumes/JustusStorage2/sccache` shared (already configured via `.cargo/config.toml`'s `rustc-wrapper = "sccache"`). sccache is safe under concurrent access and amortizes dependency builds across worktrees, so a per-workspace target dir only pays for *this* crate's incremental artifacts. Disk on `/Volumes/JustusStorage2` is not a constraint (4 TiB+ free) — the duplication is intentional.
+Within a single workspace, still run `fmt` → `clippy` → `test` sequentially (not via `&` / parallel shells) — they share *that* workspace's target dir and will lock each other.
 
-Within a single workspace, still run `fmt` → `clippy` → `test` sequentially (not via `&` / parallel shells) — they share *this* workspace's target dir and will lock each other.
+If an agent inherited a stale `CARGO_TARGET_DIR` from a parent shell, `env | grep CARGO_TARGET_DIR` confirms it; `unset CARGO_TARGET_DIR` in the same Bash invocation as the cargo command works around it until the host profile is fixed (each Bash tool call is a fresh shell, so the `unset` must share the call with `cargo`).
 
 ### Local testing — targeted, not exhaustive
 
