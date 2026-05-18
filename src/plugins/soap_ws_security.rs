@@ -2,11 +2,28 @@
 //!
 //! Validates WS-Security headers in SOAP envelopes at the proxy layer.
 //! Supports UsernameToken authentication (PasswordText and PasswordDigest),
-//! X.509 certificate signature verification, optional SAML assertion
-//! validation, timestamp freshness checks, and nonce replay protection.
+//! X.509 certificate signature verification, SAML assertion validation
+//! (XMLDSIG signature verification against trusted IdP signing certificates
+//! plus issuer / NotBefore / NotOnOrAfter / Audience checks and an enveloped-
+//! signature transform over the assertion), timestamp freshness checks, and
+//! nonce replay protection.
 //!
 //! Runs in `before_proxy` with request body buffering. Priority 1500 places
 //! it in the AuthN band after HMAC auth.
+//!
+//! ## XMLDSIG limitation (shared by X.509 and SAML signature paths)
+//!
+//! Both the WS-Security X.509 signature path and the SAML assertion signature
+//! path verify `<SignatureValue>` against the **wire bytes** of `<SignedInfo>`
+//! (and digest each Reference against the wire bytes of the referenced
+//! element, with the SAML enveloped-signature transform applied for the
+//! assertion). They do NOT yet apply Exclusive XML Canonicalization
+//! (`xml-exc-c14n#`) before hashing. Signers that canonicalize before signing
+//! AND whose canonical output happens to match the wire bytes will verify
+//! cleanly; signers whose intermediates re-serialize, reorder attributes, or
+//! re-emit namespace declarations may fail verification. Operators
+//! integrating with IdPs that mandate strict c14n should validate end-to-end
+//! before depending on these paths.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -90,6 +107,8 @@ pub struct SoapWsSecurity {
     saml_trusted_issuers: Vec<String>,
     saml_audience: Option<String>,
     saml_clock_skew_seconds: u64,
+    saml_trusted_signing_certs: Vec<TrustedCert>,
+    saml_allowed_signature_algorithms: Vec<SignatureAlgorithm>,
 
     // Nonce replay protection
     nonce_cache: Arc<DashMap<String, NonceEntry>>,
@@ -193,7 +212,12 @@ impl SoapWsSecurity {
                 )
             })?;
 
-            let public_key_der = cert.public_key().raw.to_vec();
+            // ring's RSA verifier expects RFC 8017 `RSAPublicKey` (the inner
+            // `SEQUENCE { modulus INTEGER, publicExponent INTEGER }`), NOT
+            // the full `SubjectPublicKeyInfo`. `SubjectPublicKeyInfo.raw`
+            // includes the AlgorithmIdentifier wrapper and would always fail
+            // verification.
+            let public_key_der = cert.public_key().subject_public_key.data.to_vec();
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
                 .to_vec();
@@ -241,28 +265,100 @@ impl SoapWsSecurity {
             );
         }
 
-        // `validate_saml_assertion` currently only checks the Issuer / NotBefore
-        // / NotOnOrAfter / Audience values inside the assertion XML. It does
-        // NOT cryptographically verify the assertion's `<Signature>`, so an
-        // attacker who can submit a SOAP body can forge an assertion claiming
-        // to be issued by any trusted issuer string and pass validation
-        // without holding the issuer's private key. Refuse to start with
-        // `saml.enabled: true` until proper XMLDSIG signature verification
-        // is plumbed in — running with this surface enabled provides only
-        // illusory authentication and is worse than not running it at all.
-        if saml_enabled {
+        let saml_audience = saml_cfg["audience"].as_str().map(String::from);
+        let saml_clock_skew_seconds = saml_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
+
+        // SAML trusted signing certs — IdP X.509 certs used to verify the
+        // assertion's `<Signature>`. Matched by SHA-256 fingerprint of the
+        // full DER, so operators must trust each leaf cert directly (no CA
+        // chain validation). This is the standard practice for SAML where
+        // IdPs publish their signing certs in metadata.
+        let saml_trusted_signing_cert_paths: Vec<String> = saml_cfg["trusted_signing_certs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if saml_enabled && saml_trusted_signing_cert_paths.is_empty() {
             return Err(
-                "soap_ws_security: saml.enabled is not currently supported — \
-                 the plugin does not yet cryptographically verify SAML \
-                 assertion signatures, so accepting them would be trivially \
-                 spoofable. Disable saml or wait for XMLDSIG signature \
-                 verification to land."
+                "soap_ws_security: saml is enabled but no trusted_signing_certs are configured — \
+                 without trusted IdP signing certs, assertion signatures cannot be verified and \
+                 any caller could forge an assertion claiming to be issued by a trusted issuer"
                     .to_string(),
             );
         }
 
-        let saml_audience = saml_cfg["audience"].as_str().map(String::from);
-        let saml_clock_skew_seconds = saml_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
+        let mut saml_trusted_signing_certs =
+            Vec::with_capacity(saml_trusted_signing_cert_paths.len());
+        for path in &saml_trusted_signing_cert_paths {
+            let pem_data = std::fs::read(path).map_err(|e| {
+                format!(
+                    "soap_ws_security: failed to read SAML trusted signing cert '{}': {}",
+                    path, e
+                )
+            })?;
+
+            let pem_str = std::str::from_utf8(&pem_data).map_err(|e| {
+                format!(
+                    "soap_ws_security: SAML trusted signing cert '{}' is not valid UTF-8: {}",
+                    path, e
+                )
+            })?;
+
+            let der_bytes = extract_pem_der(pem_str).ok_or_else(|| {
+                format!(
+                    "soap_ws_security: failed to decode PEM from SAML trusted signing cert '{}'",
+                    path
+                )
+            })?;
+
+            let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|e| {
+                format!(
+                    "soap_ws_security: failed to parse SAML trusted signing cert '{}': {}",
+                    path, e
+                )
+            })?;
+
+            // ring's RSA verifier expects RFC 8017 `RSAPublicKey` (the inner
+            // `SEQUENCE { modulus INTEGER, publicExponent INTEGER }`), NOT
+            // the full `SubjectPublicKeyInfo`. `SubjectPublicKeyInfo.raw`
+            // includes the AlgorithmIdentifier wrapper and would always fail
+            // verification.
+            let public_key_der = cert.public_key().subject_public_key.data.to_vec();
+            let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
+                .as_ref()
+                .to_vec();
+
+            saml_trusted_signing_certs.push(TrustedCert {
+                public_key_der,
+                fingerprint,
+            });
+        }
+
+        let saml_allowed_signature_algorithms: Vec<SignatureAlgorithm> =
+            saml_cfg["allowed_signature_algorithms"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| match v.as_str()? {
+                            "rsa-sha256" => Some(SignatureAlgorithm::RsaSha256),
+                            "rsa-sha1" => Some(SignatureAlgorithm::RsaSha1),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![SignatureAlgorithm::RsaSha256]);
+
+        if saml_enabled && saml_allowed_signature_algorithms.is_empty() {
+            return Err(
+                "soap_ws_security: saml.allowed_signature_algorithms must contain at least one of \
+                 'rsa-sha256' or 'rsa-sha1' when SAML is enabled"
+                    .to_string(),
+            );
+        }
 
         // ── Nonce / replay config ───────────────────────────────────────
         let nonce_cfg = config_obj.get("nonce").unwrap_or(&Value::Null);
@@ -299,6 +395,8 @@ impl SoapWsSecurity {
             saml_trusted_issuers,
             saml_audience,
             saml_clock_skew_seconds,
+            saml_trusted_signing_certs,
+            saml_allowed_signature_algorithms,
             nonce_cache: Arc::new(DashMap::new()),
             nonce_cache_ttl_seconds,
             max_nonce_cache_size,
@@ -741,23 +839,37 @@ impl SoapWsSecurity {
 
     // ── SAML assertion validation ───────────────────────────────────────
 
+    /// Validate the SAML assertion inside a WS-Security header.
+    ///
+    /// Returns the assertion's Subject NameID on success (the "who" of the
+    /// assertion) so callers can stash it in request metadata.
+    ///
+    /// Verification order is signature-first: an attacker who can post a SOAP
+    /// body controls every text node in the assertion, so issuer / conditions
+    /// / audience checks only mean something AFTER the assertion's XMLDSIG
+    /// signature has been verified against a configured trusted IdP cert.
     fn validate_saml_assertion(
         &self,
         security_block: &str,
         now: DateTime<Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let assertion = match find_element_block(security_block, "Assertion") {
             Some(a) => a,
             None => {
                 return if self.saml_enabled {
                     Err("WS-Security: missing SAML Assertion element".to_string())
                 } else {
-                    Ok(())
+                    Ok(None)
                 };
             }
         };
 
-        // Validate Issuer
+        // ── 1. Signature verification ─────────────────────────────────
+        // Must run before any other check — every other field is
+        // attacker-controlled until we know the IdP signed this assertion.
+        self.validate_saml_signature(&assertion)?;
+
+        // ── 2. Issuer trust ───────────────────────────────────────────
         let issuer = find_element_text(&assertion, "Issuer")
             .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
 
@@ -768,7 +880,7 @@ impl SoapWsSecurity {
             ));
         }
 
-        // Validate Conditions (NotBefore / NotOnOrAfter)
+        // ── 3. Conditions: NotBefore / NotOnOrAfter / Audience ────────
         if let Some(conditions) = find_element_block(&assertion, "Conditions") {
             let skew = chrono::Duration::seconds(self.saml_clock_skew_seconds as i64);
 
@@ -813,7 +925,198 @@ impl SoapWsSecurity {
             }
         }
 
+        // ── 4. Extract Subject NameID for downstream identity use ─────
+        let name_id = find_element_block(&assertion, "Subject")
+            .and_then(|subject| find_element_text(&subject, "NameID"));
+
         debug!("soap_ws_security: SAML assertion validated successfully");
+        Ok(name_id)
+    }
+
+    /// Verify the SAML assertion's XMLDSIG signature.
+    ///
+    /// Steps:
+    /// 1. Locate `<Signature>` inside the assertion.
+    /// 2. Resolve the signing algorithm and confirm it is in the allow list.
+    /// 3. Verify each `<Reference>` digest. The SAML enveloped-signature
+    ///    transform is applied — the assertion's Signature element is excised
+    ///    from the referenced content before hashing.
+    /// 4. Extract the signing cert from `KeyInfo/X509Data/X509Certificate`
+    ///    (or `BinarySecurityToken`) and confirm its SHA-256 fingerprint
+    ///    matches a configured trusted IdP cert.
+    /// 5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the
+    ///    matched cert's public key.
+    fn validate_saml_signature(&self, assertion: &str) -> Result<(), String> {
+        let sig_block = find_element_block(assertion, "Signature")
+            .ok_or_else(|| "WS-Security: SAML Assertion missing Signature element".to_string())?;
+
+        let signed_info = find_element_block(&sig_block, "SignedInfo")
+            .ok_or_else(|| "WS-Security: SAML Signature missing SignedInfo element".to_string())?;
+
+        // ── Resolve signature algorithm ───────────────────────────────
+        let sig_method_block = find_element_block(&signed_info, "SignatureMethod")
+            .ok_or_else(|| "WS-Security: SAML SignedInfo missing SignatureMethod".to_string())?;
+        let sig_algorithm_uri =
+            find_attribute(&sig_method_block, "Algorithm").ok_or_else(|| {
+                "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
+            })?;
+
+        let sig_algorithm = match sig_algorithm_uri.as_str() {
+            XMLDSIG_RSA_SHA256 => SignatureAlgorithm::RsaSha256,
+            XMLDSIG_RSA_SHA1 => SignatureAlgorithm::RsaSha1,
+            other => {
+                return Err(format!(
+                    "WS-Security: SAML unsupported signature algorithm '{}'",
+                    other
+                ));
+            }
+        };
+
+        if !self
+            .saml_allowed_signature_algorithms
+            .contains(&sig_algorithm)
+        {
+            return Err(format!(
+                "WS-Security: SAML signature algorithm '{}' is not allowed",
+                sig_algorithm_uri
+            ));
+        }
+
+        // ── Verify Reference digest(s) ────────────────────────────────
+        self.verify_saml_reference_digests(&signed_info, assertion)?;
+
+        // ── Extract SignatureValue ────────────────────────────────────
+        let sig_value_b64 = find_element_text(&sig_block, "SignatureValue")
+            .ok_or_else(|| "WS-Security: SAML Signature missing SignatureValue".to_string())?;
+        let sig_bytes = BASE64
+            .decode(sig_value_b64.replace(char::is_whitespace, "").as_bytes())
+            .map_err(|e| format!("WS-Security: SAML invalid SignatureValue base64: {}", e))?;
+
+        // ── Resolve signing cert and confirm it is trusted ────────────
+        let cert_der = extract_saml_signing_cert(&sig_block)?;
+        let cert_fingerprint = digest::digest(&digest::SHA256, &cert_der).as_ref().to_vec();
+
+        let trusted = self
+            .saml_trusted_signing_certs
+            .iter()
+            .find(|tc| tc.fingerprint == cert_fingerprint);
+
+        let public_key_der = match trusted {
+            Some(tc) => &tc.public_key_der,
+            None => {
+                return Err("WS-Security: SAML signing certificate is not trusted".to_string());
+            }
+        };
+
+        // ── Verify the signature over SignedInfo ──────────────────────
+        let verify_algorithm: &dyn ring_sig::VerificationAlgorithm = match sig_algorithm {
+            SignatureAlgorithm::RsaSha256 => &ring_sig::RSA_PKCS1_2048_8192_SHA256,
+            SignatureAlgorithm::RsaSha1 => &ring_sig::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
+        };
+
+        let public_key = ring_sig::UnparsedPublicKey::new(verify_algorithm, public_key_der);
+
+        public_key
+            .verify(signed_info.as_bytes(), &sig_bytes)
+            .map_err(|_| "WS-Security: SAML signature verification failed".to_string())?;
+
+        debug!("soap_ws_security: SAML assertion signature verified");
+        Ok(())
+    }
+
+    /// Verify Reference digests inside the SAML SignedInfo.
+    ///
+    /// At least one Reference must be present, and at least one Reference
+    /// must target the enclosing assertion via `URI="#<assertion-ID>"`. The
+    /// enveloped-signature transform is applied for the assertion-targeted
+    /// Reference: the assertion's own `<Signature>` element is removed before
+    /// digesting. Other References (e.g. SAML 2.0 SubjectConfirmationData)
+    /// are NOT supported here — they would require resolving arbitrary IDs
+    /// inside the assertion and applying additional transforms, which is
+    /// outside the scope of the current pragmatic implementation.
+    fn verify_saml_reference_digests(
+        &self,
+        signed_info: &str,
+        assertion: &str,
+    ) -> Result<(), String> {
+        let assertion_id = find_attribute(assertion, "ID")
+            .or_else(|| find_attribute(assertion, "AssertionID"))
+            .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
+        let expected_uri = format!("#{}", assertion_id);
+
+        // Pre-compute the enveloped-signature transform once.
+        let assertion_without_signature = remove_envelope_signature(assertion);
+
+        let mut search_from = 0;
+        let mut reference_count = 0;
+        let mut covered_assertion = false;
+
+        while let Some((ref_block, next_start)) =
+            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        {
+            reference_count += 1;
+            search_from = next_start.max(search_from + 1);
+
+            let uri = find_attribute(&ref_block, "URI").unwrap_or_default();
+
+            // Only Reference URIs that target this assertion are accepted —
+            // an attacker who can choose the Reference URI would otherwise
+            // pick a stable subtree they can control.
+            if uri != expected_uri {
+                return Err(format!(
+                    "WS-Security: SAML Reference URI '{}' does not target Assertion ID '{}'",
+                    uri, expected_uri
+                ));
+            }
+
+            let digest_method = find_element_block(&ref_block, "DigestMethod")
+                .ok_or_else(|| "WS-Security: SAML Reference missing DigestMethod".to_string())?;
+            let digest_alg_uri = find_attribute(&digest_method, "Algorithm").ok_or_else(|| {
+                "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
+            })?;
+
+            let expected_b64 = find_element_text(&ref_block, "DigestValue")
+                .ok_or_else(|| "WS-Security: SAML Reference missing DigestValue".to_string())?;
+            let expected_bytes = BASE64
+                .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
+                .map_err(|e| format!("WS-Security: SAML invalid DigestValue base64: {}", e))?;
+
+            let computed = match digest_alg_uri.as_str() {
+                XMLDSIG_SHA256 => {
+                    digest::digest(&digest::SHA256, assertion_without_signature.as_bytes())
+                }
+                XMLDSIG_SHA1 => digest::digest(
+                    &digest::SHA1_FOR_LEGACY_USE_ONLY,
+                    assertion_without_signature.as_bytes(),
+                ),
+                other => {
+                    return Err(format!(
+                        "WS-Security: SAML unsupported digest algorithm '{}'",
+                        other
+                    ));
+                }
+            };
+
+            if computed.as_ref() != expected_bytes.as_slice() {
+                return Err("WS-Security: SAML assertion digest mismatch".to_string());
+            }
+
+            covered_assertion = true;
+        }
+
+        if reference_count == 0 {
+            return Err("WS-Security: SAML SignedInfo contains no Reference elements".to_string());
+        }
+
+        // Defensive: if all References had matching URIs they already produced
+        // `covered_assertion = true`. This is a future-proofing check in case
+        // the URI-matching invariant above is ever relaxed.
+        if !covered_assertion {
+            return Err(
+                "WS-Security: SAML signature does not cover the enclosing assertion".to_string(),
+            );
+        }
+
         Ok(())
     }
 
@@ -972,15 +1275,24 @@ impl Plugin for SoapWsSecurity {
         }
 
         // Validate SAML assertion
-        if self.saml_enabled
-            && let Err(e) = self.validate_saml_assertion(&security_block, now)
-        {
-            warn!("soap_ws_security: SAML validation failed: {}", e);
-            return PluginResult::Reject {
-                status_code: 401,
-                body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
-                headers: HashMap::new(),
-            };
+        if self.saml_enabled {
+            match self.validate_saml_assertion(&security_block, now) {
+                Ok(name_id) => {
+                    if let Some(subject) = name_id {
+                        ctx.metadata
+                            .insert("soap_ws_saml_subject".to_string(), subject);
+                    }
+                    debug!("soap_ws_security: SAML assertion accepted");
+                }
+                Err(e) => {
+                    warn!("soap_ws_security: SAML validation failed: {}", e);
+                    return PluginResult::Reject {
+                        status_code: 401,
+                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
+                        headers: HashMap::new(),
+                    };
+                }
+            }
         }
 
         PluginResult::Continue
@@ -1218,6 +1530,61 @@ fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
 /// Extract the wsu:Id (or plain Id) attribute from an element.
 fn find_wsu_id(element: &str) -> Option<String> {
     find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
+}
+
+/// Resolve the signing certificate from a SAML `<Signature>` block.
+///
+/// SAML signatures conventionally carry the signing cert inline in
+/// `KeyInfo/X509Data/X509Certificate`. A `BinarySecurityToken` reference is
+/// also accepted for symmetry with the WS-Security X.509 path, though that
+/// is unusual for SAML.
+fn extract_saml_signing_cert(sig_block: &str) -> Result<Vec<u8>, String> {
+    if let Some(key_info) = find_element_block(sig_block, "KeyInfo")
+        && let Some(cert_b64) = find_element_text(&key_info, "X509Certificate")
+    {
+        return BASE64
+            .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
+            .map_err(|e| format!("WS-Security: SAML invalid X509Certificate base64: {}", e));
+    }
+
+    if let Some(bst) = find_element_block(sig_block, "BinarySecurityToken") {
+        let cert_b64 = extract_element_text_content(&bst, "BinarySecurityToken")
+            .ok_or_else(|| "WS-Security: SAML BinarySecurityToken has no content".to_string())?;
+        return BASE64
+            .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
+            .map_err(|e| {
+                format!(
+                    "WS-Security: SAML invalid BinarySecurityToken base64: {}",
+                    e
+                )
+            });
+    }
+
+    Err(
+        "WS-Security: SAML signature has no signing certificate (expected X509Certificate in KeyInfo)"
+            .to_string(),
+    )
+}
+
+/// Apply the XMLDSIG enveloped-signature transform: return a copy of `xml`
+/// with the first `<Signature>` element (and its contents) removed.
+///
+/// This is what XMLDSIG verifiers do before hashing the referenced element
+/// for an enveloped signature — the signer hashed the element with the
+/// (then-empty) Signature placeholder excised, so the verifier has to remove
+/// it too. For SAML assertions there is exactly one Signature child, so
+/// taking the first `<Signature>` match is correct.
+fn remove_envelope_signature(xml: &str) -> String {
+    let Some(start) = find_tag_start(xml, "Signature") else {
+        return xml.to_string();
+    };
+    let Some((_, end)) = find_element_block_from_with_end(xml, "Signature", 0) else {
+        return xml.to_string();
+    };
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..start]);
+    out.push_str(&xml[end..]);
+    out
 }
 
 /// Decode PEM to DER bytes (handles the common CERTIFICATE block).

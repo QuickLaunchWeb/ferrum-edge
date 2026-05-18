@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 // ── Helper functions ────────────────────────────────────────────────────────
@@ -671,31 +671,50 @@ async fn test_nonce_replay_detected() {
 
 // ── SAML config tests ───────────────────────────────────────────────────────
 //
-// `saml.enabled: true` is rejected at construction time because the
-// plugin does not currently cryptographically verify SAML assertion
-// signatures. Issuer / NotBefore / NotOnOrAfter / Audience are plain
-// XML text that any caller can craft, so accepting them without
-// signature verification is trivially spoofable. The runtime
-// `validate_saml_assertion` code path is retained for the future when
-// XMLDSIG signature verification lands, but it cannot be reached from
-// configuration today.
+// SAML assertions are cryptographically verified before any other field is
+// trusted. The verifier:
+//   1. Locates `<Signature>` inside the assertion.
+//   2. Confirms the signing cert (from `KeyInfo/X509Data/X509Certificate`)
+//      matches one of `saml.trusted_signing_certs` by SHA-256 fingerprint.
+//   3. Verifies each `<Reference>` digest against the assertion with its own
+//      `<Signature>` element excised (enveloped-signature transform).
+//   4. Verifies `<SignatureValue>` over the `<SignedInfo>` bytes using the
+//      cert's public key.
+//   5. THEN checks Issuer / NotBefore / NotOnOrAfter / Audience.
+//
+// Tests below construct SAML assertions and sign them with a bundled test
+// RSA keypair so every signature path is exercised end-to-end.
 
 #[test]
-fn test_saml_enabled_rejected_until_signature_verification_lands() {
+fn test_saml_enabled_without_trusted_issuers_is_error() {
     let config = json!({
         "timestamp": { "require": false },
         "saml": {
             "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"]
+            "trusted_issuers": [],
+            "trusted_signing_certs": []
         }
     });
     let err = SoapWsSecurity::new(&config)
         .err()
-        .expect("saml.enabled must be rejected until signature verification is implemented");
-    assert!(
-        err.contains("saml.enabled is not currently supported"),
-        "got: {err}"
-    );
+        .expect("saml.enabled must require trusted_issuers");
+    assert!(err.contains("no trusted_issuers"), "got: {err}");
+}
+
+#[test]
+fn test_saml_enabled_without_trusted_signing_certs_is_error() {
+    let config = json!({
+        "timestamp": { "require": false },
+        "saml": {
+            "enabled": true,
+            "trusted_issuers": ["https://idp.example.com"],
+            "trusted_signing_certs": []
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("saml.enabled must require trusted_signing_certs");
+    assert!(err.contains("no trusted_signing_certs"), "got: {err}");
 }
 
 #[test]
@@ -706,6 +725,635 @@ fn test_saml_disabled_construction_still_succeeds() {
         "saml": { "enabled": false }
     });
     assert!(SoapWsSecurity::new(&config).is_ok());
+}
+
+#[test]
+fn test_saml_unreadable_signing_cert_is_error() {
+    let config = json!({
+        "timestamp": { "require": false },
+        "saml": {
+            "enabled": true,
+            "trusted_issuers": ["https://idp.example.com"],
+            "trusted_signing_certs": ["/nonexistent/path/to/cert.pem"]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("missing trusted signing cert must fail construction");
+    assert!(
+        err.contains("failed to read SAML trusted signing cert"),
+        "got: {err}"
+    );
+}
+
+// ── SAML signature verification tests ───────────────────────────────────────
+//
+// `tests::saml_fixtures` writes the bundled test IDP cert+key to a temp dir
+// and lets each test load it the same way an operator would (a path on disk).
+
+mod saml_fixtures {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use ring::rand::SystemRandom;
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // 2048-bit RSA test key (PKCS#8 DER, base64) — committed test fixture,
+    // never used outside this test suite. Generated with:
+    //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048
+    pub const TEST_IDP_KEY_PKCS8_B64: &str = "\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCnAFvS4Ts5L4nl\
+GC7XVelbsO/DmJS/MWlGzgWws5Lo4H72W1pCclOF7nvMBvHsiTiM6l+30bU3oI3c\
+RwQJux6haITy484hUQEJRVu2a5bUrkCQCpZSKwfhM5OSEiw2qDYci7QB0aoqUFR3\
+2dXPAyNZ5bBWRo/SsTHtkwnAoj2CE8ngq3ESvgk56OKVtP6brk/xBm/Pk3413daB\
+byUUGbFFaB1vaNVL6nMjUtbqF2b9zc51eR6Y0LiXNY3NOMoEwS9M+35zEuPRswxT\
+vdM46lQys5au4fQj/pWzZbHx1LNUt6MHsrDxbCQyN5juBG+LzGaOhgahfaVo5GEh\
+sCV6a5dHAgMBAAECggEAEdCA+xLZrXT7wbt9q6zXcteCDBxnqamMsGfjxYCyaDMi\
+eAcwrqvhawUQoagQAIp2xNlvkn1FVoTC/T96F8ulLdSncf2JDJbGhIWojeIWOePI\
+sVTfyi4a7hQBZvCXVNFGzG6+qf8Cpvbgu9Q58ZZFHB7bW6i1SOVsDQrFXI4x/4EO\
+x1SnXlkL/Rpv4NgB1NzYhPFnKWe6CSfyvGaNU1fr1HYAvnXtknLpaHTKEYTTOYRr\
+dXyn/NGCU2xhE7Dwc8lXaIDrc1DCzpiZV8DJ23zgeNSj7GyKX4gKP3MG9SFK2p0I\
+jbmLYXjsm2imcfOyLo2Z2rPqpxOfkOY8A2igsSKgIQKBgQDQ6pxj8mECrqtd4XId\
+IRpjVUhz8ABnPzHnEDVvZzNeZmq5lCRt3PKCA1RbRSxkLaMa0vxn8hQPjX+1/gn9\
+tAabrIBHi5saXUuU5HwtPxMvPPzeZkFXbHjfX/ThnsRvKijHBdc4aVGF0RX/ItGr\
+kpJgAw470GUN4jd0lE7GM2360QKBgQDMo3fdTXZRDpynaIByySxHplPlbudLzvDt\
+tVynXINWaLfYERJhx8mNLfmhUDkqDj+J2z3b1p2jnvEJbMBstubqIB8Vf93NNp0m\
+yamov7MvvILzRhVuwg2l8IYlv+vU2XPBblq3Xk+jrUnQL9If1xstiEpfThn/GceD\
+JAFkMV/GlwKBgFpUFipgsfEm9JEy2NQfa/lm9lyqeIIroLf3GiOAy4UVYy+6DcYy\
+sefk6KRN1FO8J7mBYADRejr/Qyi9HjTDkdfdTdmhUv6jN/q4j7hAfVr/U5YVQEs8\
+a0aphofGzcgCwn7K17NcVhM1w/z8YQt95Cv/JjhWclr+ZFvTg/vOYM8BAoGBAMOe\
+IB70xX2Gskl1pBQWKrXzUY+pDIFzOOyCyidSUFpxkAyDhUbjbNAAevixb3O8WxC0\
++9UCu36FmXSg+PDzhpmYSx6KNMTOyDsj24LsfaXMVoGnJSXTaqiN3C6J4C6AEB+A\
+FkfjZ83XARB6Jis5vUkxV6bzSfaJ9iZubMYSTLPRAoGBAMk48YTI1qzabQAkZVQg\
+7eAq5OOOOZEPh9QTcTJWRzyDYT9H+S9C6nZ3D1ztfwt27DQrRCQn/JUX1/OWDD/5\
+V4CKFQiVEz0CeB2/ZWvXMy8fRr59Mam4/ud+M0UF3ZtEizIvolKiElZobVGCRj91\
+fkToWGXpRwg0Bav/16XULUNu";
+
+    // Matching self-signed X.509 certificate (PEM). CN=ferrum-test-saml-idp,
+    // 10-year validity. Operators in tests load the file path to mirror the
+    // production code path.
+    pub const TEST_IDP_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUYSizg6IjbHWwMlIcmMfy6Cp6qLUwDQYJKoZIhvcNAQEL
+BQAwHzEdMBsGA1UEAwwUZmVycnVtLXRlc3Qtc2FtbC1pZHAwHhcNMjYwNTE4MDgw
+NjEyWhcNMzYwNTE1MDgwNjEyWjAfMR0wGwYDVQQDDBRmZXJydW0tdGVzdC1zYW1s
+LWlkcDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKcAW9LhOzkvieUY
+LtdV6Vuw78OYlL8xaUbOBbCzkujgfvZbWkJyU4Xue8wG8eyJOIzqX7fRtTegjdxH
+BAm7HqFohPLjziFRAQlFW7ZrltSuQJAKllIrB+Ezk5ISLDaoNhyLtAHRqipQVHfZ
+1c8DI1nlsFZGj9KxMe2TCcCiPYITyeCrcRK+CTno4pW0/puuT/EGb8+TfjXd1oFv
+JRQZsUVoHW9o1UvqcyNS1uoXZv3NznV5HpjQuJc1jc04ygTBL0z7fnMS49GzDFO9
+0zjqVDKzlq7h9CP+lbNlsfHUs1S3oweysPFsJDI3mO4Eb4vMZo6GBqF9pWjkYSGw
+JXprl0cCAwEAAaNTMFEwHQYDVR0OBBYEFH4oqBABlq3HGxerUxsspSs++7siMB8G
+A1UdIwQYMBaAFH4oqBABlq3HGxerUxsspSs++7siMA8GA1UdEwEB/wQFMAMBAf8w
+DQYJKoZIhvcNAQELBQADggEBAIORtR6MY7nWEfwab/vgdzIA/EWiZ+auAPyBuKaS
+bayLTEQvL6Ev/BUB6Pi9h/PBZ4agNtgX+E7vIdq9B2Qcp9jKyXvlaHIYLObHTTjp
+0e8Qk+IzS+bRZpQZh7MSz4UVsargU8M8sGiVkXxe8WfhHu4tQ7rpBx0UhanX10GC
+v7HWtLj09+I5gu3XZ9vYoVqDRFzLJFqZSwSy4xlROVhG9oil4nCDemREOQJX6zUa
+VGcUUl86na4jECXuKaBn4sAwOQDG+LUaumQ6XcrTSJ2Zv3jYRSNwPhHocMoPLCX6
+wupTEoP8ySU223pQqBOX1E1WVEDcYuvNI+9KTJQUCYlw9bU=
+-----END CERTIFICATE-----
+";
+
+    /// A second untrusted RSA keypair + cert. Used to drive
+    /// "signing cert is not in the trust list" assertions.
+    pub const UNTRUSTED_IDP_KEY_PKCS8_B64: &str = "\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCdBCN5lkzAC6gM\
+1JA0/uqZd2efAVyJf6xtVQyCOrjryP313oR4kHJy1mbxTSvUM+cIXqLL2ZLsh3HX\
+qJ2j9a6EGl5pnXdix2EPEBY3BAJQxsfO2P53Dwcjx/MpFcYhFqkSFmLy00v4UdbZ\
+ayNCITwfWN7QDDj7N6VtOwIDGpQSFi0FAZcGi20YmWvCk/055LiJxSv4jalHGVg+\
+/cDkSVCY67D5rutqMrS3NdEDMmVrtJTSLhYse4NbdLF2QVSyrasmKkmMkSqFojnw\
+q4IJSwDbFsCOKSaAy9oDn4Ekgwt+cBgmOtioq4sFTtI9i5fKZJ7hpi62vqPRKtOC\
+3L24hAIBAgMBAAECggEAGiKQtxHF56dpCu2srS2LJg1Ccax71yUpsa8Y3Gpi0lhL\
+sUue+CRu8F9wlhSWyYT0HSgHZ+/orTckQ1W9G4fuyu1KrsC3mPj/1k6CrBiePAzC\
+QFNNE8ssEJAdEMcfie1oKesRAEMcX5JbtSfIoB7BD6SuvalzKJmMDwDl5ldbsyC8\
+Dl5Utgr4K+wgPxqcor3dxLU8kCdIvxzFdaXLxJPK4/KrKSUK+qvIId/D2zh0jvm5\
+bFLTAVdvPiniWKdM3kqa7G4HfJFLBU/GrooL/s47NwsFo9k4JylSusE2jAfJQltk\
+d6ZBctYwCPHowT+SlG6WXafNKQxSHKVXanHihXjEmwKBgQDM2/QARyfTp9fFQAAm\
+arr6Wzj7N6Aw2c2Ea9vXl040gwKdpUvnQONxPZnFvrOrY4cUEfzcqASfg8Nghn7A\
+Iu5vHL7iN7g9jiW5tShtb0h/TL/eshXPZlD6IzXKGE5wu/oNBcctxLLqp95XZDzc\
+APCL0WANdNvrTjAHLUp2PHgSuwKBgQDENqfId6eyw9BxaJENci7b0fFpvIHrURBY\
+pLf3oX/PVvxUEgDAyqhFNT/2T5+NQbnp+tg2/aF7enOYYkG3pNhmGi1AMkXEk3KA\
+89vq5Au6fpk7yrZrPeHFskC7oUQZKpKzsiu2aT4PMHDfx9/7C236QJQqRcgguMfx\
+FA24rH1IcwKBgDt0KmBaRki7EXgBlwmPOCyohOUDw83pqCeiVe8/zkaXLw8phdnb\
+jyayRgqJygMXo4BDqCsx6AWTbAR7hBWnDaPZp9xnZ2UV+ATpeo4oGdY4JAcxj/rd\
+KusthNLeMwWsyGk3IBM8XuCTT4f1Y2RGMYmifknpfFnSG0Y58r5V1lM5AoGBAIGT\
+EmQZWJ5+H5X1Fu1JPVafIwzPlwBeTSwswux+M1gqOoIOTX8DlfH2Q2IWnOf8wpiY\
+tdZC0jQn3lSAdqOe8eUjXkSprlcthA1SfSV2KaSj2++XY7YYbJNQrtz5l24DJlQS\
+0jko8Pm45KFzbh9sIdmEchQkdw/c1vUGaDVPe4CvAoGAJaXKVoH7oZd8K7/BVrmp\
+U1Oqwnm19SiSVKRTkj1SH+YQdfK9Ew8OqC68YXd46JcN6mdWESEicWb7AtFT4eOP\
+MoBlGGmQjV2L06HsoDiLTG5RKcloqBWTzM9AplJT9pMgoM+J/stXa0AIuqOGS0Z9\
+Wgj5Rnm3QRZWXCPzHCC231g=";
+
+    pub const UNTRUSTED_IDP_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDITCCAgmgAwIBAgIUVUiKUdYC97nzeC35QDdMDIZBmEUwDQYJKoZIhvcNAQEL
+BQAwIDEeMBwGA1UEAwwVZmVycnVtLXVudHJ1c3RlZC1zYW1sMB4XDTI2MDUxODA4
+MTg1MFoXDTM2MDUxNTA4MTg1MFowIDEeMBwGA1UEAwwVZmVycnVtLXVudHJ1c3Rl
+ZC1zYW1sMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnQQjeZZMwAuo
+DNSQNP7qmXdnnwFciX+sbVUMgjq468j99d6EeJByctZm8U0r1DPnCF6iy9mS7Idx
+16ido/WuhBpeaZ13YsdhDxAWNwQCUMbHztj+dw8HI8fzKRXGIRapEhZi8tNL+FHW
+2WsjQiE8H1je0Aw4+zelbTsCAxqUEhYtBQGXBottGJlrwpP9OeS4icUr+I2pRxlY
+Pv3A5ElQmOuw+a7rajK0tzXRAzJla7SU0i4WLHuDW3SxdkFUsq2rJipJjJEqhaI5
+8KuCCUsA2xbAjikmgMvaA5+BJIMLfnAYJjrYqKuLBU7SPYuXymSe4aYutr6j0SrT
+gty9uIQCAQIDAQABo1MwUTAdBgNVHQ4EFgQU6VLraFIn4HTB/6dnya9/ZBIgGHAw
+HwYDVR0jBBgwFoAU6VLraFIn4HTB/6dnya9/ZBIgGHAwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQsFAAOCAQEAMMKIxW0XuCDFnu6daoD7l8se2/nxsS/vyJv3
+4hjiH/1L7d2PdnPy80bMaTKwdxd8Fnca4cZh0Vy7Eiom53Fj994UmeOkfyobBOv5
+E2OkFXcDHpbQyggGwE1oUp9PUPkEAa0pVfbAxl50ObOtfBf3xtjxJ2TFWR9vh+51
+fcDotZi5I30E/Q+d27JhRccjR+j7itAUQikkvGbeUcNsMzu3MHg6g210UWWc9Qff
+mM1FlqKLfE2mDF3E31qqiqco5N1HgyU1PII+BBO6RrjOJQDVuloxecRFuBStykUq
+RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
+-----END CERTIFICATE-----
+";
+
+    /// A temp-dir bundle: the trusted IDP cert PEM is written to disk so the
+    /// plugin can be configured with a real file path, matching production
+    /// deployments.
+    pub struct IdpBundle {
+        pub _tempdir: TempDir,
+        pub trusted_cert_path: PathBuf,
+    }
+
+    impl IdpBundle {
+        pub fn new() -> Self {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let trusted = dir.path().join("trusted-idp.pem");
+            std::fs::write(&trusted, TEST_IDP_CERT_PEM).expect("write trusted PEM");
+            IdpBundle {
+                _tempdir: dir,
+                trusted_cert_path: trusted,
+            }
+        }
+    }
+
+    fn decode_b64(s: &str) -> Vec<u8> {
+        B64.decode(s.as_bytes())
+            .expect("test fixture is valid base64")
+    }
+
+    fn pem_to_der_b64(pem: &str) -> String {
+        pem.lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>()
+    }
+
+    pub struct AssertionBuilder<'a> {
+        pub assertion_id: &'a str,
+        pub issuer: &'a str,
+        pub subject_name_id: &'a str,
+        pub not_before: Option<&'a str>,
+        pub not_on_or_after: Option<&'a str>,
+        pub audience: Option<&'a str>,
+        pub sign_with_untrusted_key: bool,
+        /// Insert junk bytes into the assertion AFTER signing to simulate a
+        /// tampered payload.
+        pub corrupt_subject_after_signing: bool,
+        /// Mutate the SignatureValue bytes after signing to simulate a
+        /// forged or randomly damaged signature.
+        pub corrupt_signature_value: bool,
+    }
+
+    impl<'a> AssertionBuilder<'a> {
+        pub fn new(assertion_id: &'a str, issuer: &'a str, subject_name_id: &'a str) -> Self {
+            Self {
+                assertion_id,
+                issuer,
+                subject_name_id,
+                not_before: None,
+                not_on_or_after: None,
+                audience: None,
+                sign_with_untrusted_key: false,
+                corrupt_subject_after_signing: false,
+                corrupt_signature_value: false,
+            }
+        }
+
+        pub fn build(self) -> String {
+            // Body of the assertion that lives OUTSIDE the Signature
+            // element. Anything in here is part of the digested content
+            // (after envelope-signature transform removes the Signature).
+            let mut conditions = String::new();
+            if self.not_before.is_some()
+                || self.not_on_or_after.is_some()
+                || self.audience.is_some()
+            {
+                conditions.push_str("<Conditions");
+                if let Some(nb) = self.not_before {
+                    conditions.push_str(&format!(" NotBefore=\"{}\"", nb));
+                }
+                if let Some(noa) = self.not_on_or_after {
+                    conditions.push_str(&format!(" NotOnOrAfter=\"{}\"", noa));
+                }
+                if let Some(aud) = self.audience {
+                    conditions.push_str(&format!(
+                        "><AudienceRestriction><Audience>{}</Audience></AudienceRestriction></Conditions>",
+                        aud
+                    ));
+                } else {
+                    conditions.push_str("/>");
+                }
+            }
+
+            let subject_inner = if self.corrupt_subject_after_signing {
+                // Final subject text differs from what was signed — should
+                // make the assertion's digest mismatch what's in SignedInfo.
+                format!("evil-{}", self.subject_name_id)
+            } else {
+                self.subject_name_id.to_string()
+            };
+
+            let body_after_issuer = format!(
+                "<Subject><NameID>{}</NameID></Subject>{}",
+                subject_inner, conditions
+            );
+
+            // The bytes we actually sign use the ORIGINAL (untampered) subject.
+            let signed_body_after_issuer = format!(
+                "<Subject><NameID>{}</NameID></Subject>{}",
+                self.subject_name_id, conditions
+            );
+
+            // The assertion as it looks after enveloped-signature transform —
+            // this is what XMLDSIG digests for the Reference.
+            let assertion_no_sig = format!(
+                "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}</Assertion>",
+                self.assertion_id, self.issuer, signed_body_after_issuer
+            );
+
+            let asserted_digest =
+                ring::digest::digest(&ring::digest::SHA256, assertion_no_sig.as_bytes());
+            let digest_b64 = B64.encode(asserted_digest.as_ref());
+
+            // SignedInfo bytes — exactly these bytes are what
+            // `<SignatureValue>` covers.
+            let signed_info = format!(
+                "<SignedInfo>\
+<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
+<Reference URI=\"#{}\">\
+<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
+<DigestValue>{}</DigestValue>\
+</Reference>\
+</SignedInfo>",
+                self.assertion_id, digest_b64
+            );
+
+            // Pick the signing key + matching cert.
+            let (key_pkcs8_b64, cert_pem) = if self.sign_with_untrusted_key {
+                (UNTRUSTED_IDP_KEY_PKCS8_B64, UNTRUSTED_IDP_CERT_PEM)
+            } else {
+                (TEST_IDP_KEY_PKCS8_B64, TEST_IDP_CERT_PEM)
+            };
+
+            let pkcs8 = decode_b64(key_pkcs8_b64);
+            let key_pair =
+                RsaKeyPair::from_pkcs8(&pkcs8).expect("test fixture RSA key is valid PKCS#8");
+            let mut sig_bytes = vec![0u8; key_pair.public().modulus_len()];
+            let rng = SystemRandom::new();
+            key_pair
+                .sign(
+                    &RSA_PKCS1_SHA256,
+                    &rng,
+                    signed_info.as_bytes(),
+                    &mut sig_bytes,
+                )
+                .expect("test signing must succeed");
+            if self.corrupt_signature_value {
+                // Flip a byte in the middle of the signature.
+                let mid = sig_bytes.len() / 2;
+                sig_bytes[mid] ^= 0xFF;
+            }
+            let sig_value_b64 = B64.encode(&sig_bytes);
+            let cert_b64 = pem_to_der_b64(cert_pem);
+
+            let signature = format!(
+                "<Signature>{}<SignatureValue>{}</SignatureValue>\
+<KeyInfo><X509Data><X509Certificate>{}</X509Certificate></X509Data></KeyInfo>\
+</Signature>",
+                signed_info, sig_value_b64, cert_b64
+            );
+
+            // Final assertion: Signature follows Issuer, then the body
+            // (Subject + Conditions). Envelope-signature transform at
+            // verification time removes the first <Signature> element, so
+            // the digested view matches `assertion_no_sig`.
+            format!(
+                "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}{}</Assertion>",
+                self.assertion_id, self.issuer, signature, body_after_issuer
+            )
+        }
+    }
+}
+
+fn saml_config(bundle: &saml_fixtures::IdpBundle, audience: Option<&str>) -> serde_json::Value {
+    let mut saml = serde_json::Map::new();
+    saml.insert("enabled".into(), json!(true));
+    saml.insert(
+        "trusted_issuers".into(),
+        json!(["https://idp.example.com/metadata"]),
+    );
+    saml.insert(
+        "trusted_signing_certs".into(),
+        json!([bundle.trusted_cert_path.to_str().unwrap()]),
+    );
+    if let Some(aud) = audience {
+        saml.insert("audience".into(), json!(aud));
+    }
+    json!({
+        "timestamp": { "require": false },
+        "saml": Value::Object(saml),
+        "reject_missing_security_header": true
+    })
+}
+
+fn wrap_saml_assertion(assertion_xml: &str) -> String {
+    wrap_soap(assertion_xml)
+}
+
+fn far_future() -> String {
+    (chrono::Utc::now() + chrono::Duration::days(7))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+fn long_past() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_saml_valid_signed_assertion_accepted() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-001",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "valid signed SAML should pass, got {:?}",
+        result
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com"),
+        "Subject NameID must be exported as metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_saml_missing_signature_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    // Assertion with no Signature element — i.e. exactly the spoofable XML
+    // the previous behaviour silently accepted.
+    let unsigned = r#"<Assertion ID="_a"><Issuer>https://idp.example.com/metadata</Issuer><Subject><NameID>alice</NameID></Subject></Assertion>"#;
+    let body = wrap_saml_assertion(unsigned);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("missing Signature"),
+        "expected missing Signature rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_tampered_assertion_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-tamper",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.corrupt_subject_after_signing = true;
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("digest mismatch"),
+        "expected digest mismatch, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_corrupted_signature_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-corrupt",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.corrupt_signature_value = true;
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("signature verification failed"),
+        "expected signature verification failure, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_untrusted_signing_cert_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    // Signed by a different (real, valid) keypair whose cert is NOT in
+    // `trusted_signing_certs`. Signature math succeeds; trust check fails.
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-untrusted",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.sign_with_untrusted_key = true;
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("signing certificate is not trusted"),
+        "expected untrusted cert rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_untrusted_issuer_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    // Signature valid, but the (signed) Issuer string is not in the
+    // configured trust list.
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-bad-issuer",
+        "https://attacker.example.com/idp",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("not trusted"),
+        "expected untrusted issuer rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_expired_assertion_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let nb = "2020-01-01T00:00:00Z";
+    let noa = "2020-01-02T00:00:00Z";
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-expired",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.not_before = Some(nb);
+    builder.not_on_or_after = Some(noa);
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("expired"),
+        "expected SAML expired rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_not_yet_valid_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    // Pull clock_skew_seconds down so the future NotBefore actually trips it.
+    let cfg = {
+        let mut v = saml_config(&bundle, None);
+        v["saml"]["clock_skew_seconds"] = json!(5u64);
+        v
+    };
+    let plugin = SoapWsSecurity::new(&cfg).unwrap();
+
+    let nb = far_future();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-future",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.not_before = Some(&nb);
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("not yet valid"),
+        "expected SAML not-yet-valid rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_wrong_audience_rejects() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(
+        &bundle,
+        Some("https://my-service.example.com"),
+    ))
+    .unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-aud",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    let nb = long_past();
+    let noa = far_future();
+    builder.not_before = Some(&nb);
+    builder.not_on_or_after = Some(&noa);
+    builder.audience = Some("https://other-service.example.com");
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("does not match expected"),
+        "expected audience mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_signature_must_cover_enclosing_assertion() {
+    // Reference URI that doesn't match the Assertion's ID must reject — an
+    // attacker who can choose Reference URIs could otherwise point the
+    // signature at a stable subtree they control.
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    // Build a valid assertion, then surgically rewrite its Reference URI.
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-real-id",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+    let tampered = assertion.replace("URI=\"#_assertion-real-id\"", "URI=\"#somewhere-else\"");
+
+    let body = wrap_saml_assertion(&tampered);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("does not target Assertion ID"),
+        "expected Reference URI mismatch, got: {}",
+        reject_body(&result)
+    );
 }
 
 // ── Body buffering flag tests ───────────────────────────────────────────────
