@@ -118,7 +118,16 @@ impl AiRateLimiter {
 
     fn evict_stale_entries(&self) {
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
-            self.limiter.retain_active_at(Instant::now());
+            // `enforce_capacity` first calls `retain_active_at` to drop
+            // entries whose token-usage window has fully expired, then —
+            // if the map is still over capacity — forcibly removes
+            // additional keys until the hard cap holds. Plain
+            // `retain_active_at` is not enough on its own: when traffic
+            // is sustained, every tracked key keeps reporting "active"
+            // and nothing gets evicted, so the DashMap can grow without
+            // bound past `MAX_STATE_ENTRIES`.
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
         }
     }
 
