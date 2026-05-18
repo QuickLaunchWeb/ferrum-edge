@@ -253,6 +253,30 @@ async fn mesh_authz_reads_materialized_hbone_baggage_source_identity() {
 }
 
 #[tokio::test]
+async fn mesh_authz_ignores_hbone_baggage_from_untrusted_assertor() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/other"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+    ctx.materialize_headers();
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
 async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)]

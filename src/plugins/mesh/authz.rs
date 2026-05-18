@@ -371,14 +371,7 @@ impl Plugin for MeshAuthz {
 
 impl MeshAuthz {
     /// Resolve the SPIFFE identity used for authz, applying the HBONE baggage
-    /// trust-domain check.
-    ///
-    /// Returns `(principal, trust_domain_mismatch)`. When the second tuple
-    /// element is `true`, baggage carried a `source.principal` whose trust
-    /// domain neither matched the peer cert's trust domain nor appeared in
-    /// the configured `trust_domain_aliases` — the baggage identity is
-    /// dropped and the peer cert (the ztunnel's own SPIFFE id) is used as
-    /// fallback. Caller stamps diagnostic metadata.
+    /// trust-domain check for trusted HBONE assertors.
     fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, bool) {
         if !is_authenticated_hbone_request(ctx) {
             return (ctx.peer_spiffe_id.clone(), false);
@@ -386,6 +379,9 @@ impl MeshAuthz {
         let Some(peer) = ctx.peer_spiffe_id.as_ref() else {
             return (None, false);
         };
+        if !is_trusted_hbone_identity_assertor(peer) {
+            return (Some(peer.clone()), false);
+        }
         let baggage_principal = HboneIdentity::from_baggage_values(
             ctx.raw_header_values(BAGGAGE_HEADER)
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
@@ -450,4 +446,14 @@ fn record_ignored_baggage_reason(metadata: &mut HashMap<String, String>, reason:
 
 fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
     ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
+}
+
+fn is_trusted_hbone_identity_assertor(peer: &SpiffeId) -> bool {
+    let mut segments = peer.path_segments();
+    while let Some(segment) = segments.next() {
+        if segment == "sa" {
+            return matches!(segments.next(), Some("ztunnel" | "waypoint"));
+        }
+    }
+    false
 }
