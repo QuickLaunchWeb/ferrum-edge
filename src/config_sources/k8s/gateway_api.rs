@@ -370,6 +370,10 @@ fn route_match_descriptor_for_entry(
         });
     }
 
+    if http_route_match_has_untranslated_non_path_predicate(entry) {
+        return None;
+    }
+
     let listen_path = if let Some(path) = entry.get("path").and_then(http_path_match) {
         path
     } else if entry.as_object().is_some_and(|object| object.is_empty())
@@ -933,6 +937,31 @@ fn http_route_match_has_supported_non_path_predicate(entry: &Value) -> bool {
                         && string_field(param, "value").is_some()
                 })
             })
+}
+
+fn http_route_match_has_untranslated_non_path_predicate(entry: &Value) -> bool {
+    entry
+        .get("headers")
+        .and_then(Value::as_array)
+        .is_some_and(|headers| {
+            headers
+                .iter()
+                .any(gateway_header_query_match_is_untranslated)
+        })
+        || entry
+            .get("queryParams")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(gateway_header_query_match_is_untranslated)
+            })
+}
+
+fn gateway_header_query_match_is_untranslated(value: &Value) -> bool {
+    !gateway_match_type_is_exact(value)
+        || string_field(value, "name").is_none()
+        || string_field(value, "value").is_none()
 }
 
 fn gateway_match_type_is_exact(value: &Value) -> bool {
@@ -1674,6 +1703,59 @@ mod tests {
         let rule_match = &plugin.config["rules"][0]["match"];
         assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("first"));
         assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v1"));
+    }
+
+    #[test]
+    fn http_route_dispatch_skips_partially_supported_predicate_matches() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [
+                                    {"name": "x-tenant", "value": "a"},
+                                    {"type": "RegularExpression", "name": "x-scope", "value": "prod|dev"}
+                                ]
+                            },
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [{"name": "x-tenant", "value": "b"}],
+                                "queryParams": [
+                                    {"name": "version", "value": "v2"},
+                                    {"type": "RegularExpression", "name": "debug", "value": "true|false"}
+                                ]
+                            },
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [{"name": "x-tenant", "value": "c"}],
+                                "queryParams": [{"name": "version", "value": "v3"}]
+                            }
+                        ],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("supported HTTPRoute match emits mesh_route_dispatch");
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        let rule_match = &rules[0]["match"];
+        assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("c"));
+        assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v3"));
     }
 
     #[test]
