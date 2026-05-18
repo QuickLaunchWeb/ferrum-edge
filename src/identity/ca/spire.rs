@@ -251,7 +251,7 @@ async fn stream_loop(
                                     false,
                                 );
                                 crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                                    &attributed_spiffe_id(&current),
+                                    attributed_spiffe_id(&current),
                                     "spire_agent",
                                 );
                                 warn!(
@@ -269,7 +269,7 @@ async fn stream_loop(
                         false,
                     );
                     crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                        &attributed_spiffe_id(&current),
+                        attributed_spiffe_id(&current),
                         "spire_agent",
                     );
                     error!(
@@ -281,7 +281,7 @@ async fn stream_loop(
             Err(e) => {
                 crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", false);
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                    &attributed_spiffe_id(&current),
+                    attributed_spiffe_id(&current),
                     "spire_agent",
                 );
                 error!(
