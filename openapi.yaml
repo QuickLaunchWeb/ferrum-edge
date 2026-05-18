@@ -6633,7 +6633,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, timestamp freshness, and nonce replay protection. SAML assertion validation is currently NOT supported — saml.enabled: true is rejected at plugin construction time pending XMLDSIG signature verification. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled."
       properties:
         reject_missing_security_header:
           type: boolean
@@ -6711,25 +6711,32 @@ components:
               description: Require the Timestamp to be included in the signature's references
         saml:
           type: object
-          description: SAML 2.0 assertion validation
+          description: |
+            SAML 2.0 assertion validation. **NOT currently supported** — saml.enabled:
+            true is rejected at plugin construction time because XMLDSIG signature
+            verification is not yet implemented; accepting unsigned assertions would
+            trust attacker-supplied XML. Sub-fields are reserved for the upcoming
+            signature verification work.
           properties:
             enabled:
               type: boolean
               default: false
-              description: Enable SAML assertion validation
+              description: |
+                Enable SAML assertion validation. Setting to true currently causes
+                soap_ws_security to refuse construction with an explicit error.
             trusted_issuers:
               type: array
               items:
                 type: string
-              description: SAML Issuer values to trust
+              description: (Reserved) SAML Issuer values to trust once signature verification lands.
             audience:
               type: string
-              description: Expected SAML AudienceRestriction value (optional)
+              description: (Reserved) Expected SAML AudienceRestriction value (optional).
             clock_skew_seconds:
               type: integer
               format: uint64
               default: 300
-              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter
+              description: (Reserved) Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter.
         nonce:
           type: object
           description: Nonce replay protection cache (PasswordDigest only)

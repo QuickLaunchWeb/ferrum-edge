@@ -1424,7 +1424,7 @@ The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consume
 
 ### `soap_ws_security`
 
-Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, optional SAML assertion validation, timestamp freshness checks, and nonce replay protection.
+Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, timestamp freshness checks, and nonce replay protection. SAML assertion validation is **not currently supported** — see the SAML section below.
 
 The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
 
@@ -1444,14 +1444,14 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
-| `saml.enabled` | bool | `false` | Enable SAML assertion validation |
-| `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer values |
-| `saml.audience` | String | *(none)* | Expected SAML Audience value |
-| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML condition timestamps |
+| `saml.enabled` | bool | `false` | **Currently unsupported** — setting to `true` fails plugin construction (see [SAML Assertion Validation](#saml-assertion-validation) below) |
+| `saml.trusted_issuers` | String[] | `[]` | (Reserved for future XMLDSIG verification) Trusted SAML Issuer values |
+| `saml.audience` | String | *(none)* | (Reserved for future XMLDSIG verification) Expected SAML Audience value |
+| `saml.clock_skew_seconds` | u64 | `300` | (Reserved for future XMLDSIG verification) Clock skew tolerance for SAML condition timestamps |
 | `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection |
 | `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
 
-At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
+At least one security feature must be enabled (`timestamp.require`, `username_token`, or `x509_signature`). `saml.enabled: true` is currently rejected at plugin construction time.
 
 #### UsernameToken — PasswordDigest
 
@@ -1508,20 +1508,9 @@ config:
 
 #### SAML Assertion Validation
 
-Validates SAML 2.0 assertions embedded in the WS-Security header. Checks issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
+> **⚠ Not currently supported.** SAML assertion validation is gated off at plugin construction time. `saml.enabled: true` causes `soap_ws_security` to refuse to start with an explicit error message. The current implementation does not cryptographically verify the assertion's `<Signature>` (XMLDSIG), so accepting assertions would amount to trusting attacker-supplied XML — strictly worse than no SAML check. The config knobs are reserved for the upcoming XMLDSIG signature verification work; until that lands, leave `saml.enabled: false`.
 
-```yaml
-plugin_name: soap_ws_security
-config:
-  saml:
-    enabled: true
-    trusted_issuers:
-      - "https://idp.example.com"
-    audience: "https://api.example.com"
-    clock_skew_seconds: 300
-  timestamp:
-    require: true
-```
+When implemented, the validation will check the XMLDSIG signature against trusted IdP keys plus issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
 
 #### Combined Configuration
 
