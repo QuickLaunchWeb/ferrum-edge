@@ -333,7 +333,7 @@ impl CertificateAuthority for InternalCa {
                 }
             }
         })();
-        if result.is_err() {
+        if result.as_ref().is_err_and(ca_issue_error_marks_unhealthy) {
             crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", false);
         }
         result
@@ -410,6 +410,13 @@ fn verify_cert_key_match(root_cert_der: &[u8], key_pair: &KeyPair) -> Result<(),
     Ok(())
 }
 
+fn ca_issue_error_marks_unhealthy(error: &CaError) -> bool {
+    matches!(
+        error,
+        CaError::Config(_) | CaError::Upstream(_) | CaError::Internal(_) | CaError::Io(_)
+    )
+}
+
 /// `rand` 0.10 is a dev dep but not a runtime dep here. We use the system
 /// random source available via `ring` (already in our deps).
 ///
@@ -450,4 +457,32 @@ fn issued_cert_not_after(leaf_der: &[u8]) -> Result<DateTime<Utc>, CaError> {
     DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0).ok_or_else(|| {
         CaError::Internal("issued SVID notAfter is outside supported timestamp range".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ca_issue_health_only_tracks_backend_failures() {
+        assert!(!ca_issue_error_marks_unhealthy(&CaError::BadCsr(
+            "malformed csr".to_string()
+        )));
+        assert!(!ca_issue_error_marks_unhealthy(
+            &CaError::UnknownTrustDomain("other.test".to_string())
+        ));
+
+        assert!(ca_issue_error_marks_unhealthy(&CaError::Config(
+            "invalid backend configuration".to_string()
+        )));
+        assert!(ca_issue_error_marks_unhealthy(&CaError::Upstream(
+            "upstream failed".to_string()
+        )));
+        assert!(ca_issue_error_marks_unhealthy(&CaError::Internal(
+            "signing failed".to_string()
+        )));
+        assert!(ca_issue_error_marks_unhealthy(&CaError::Io(
+            "disk read failed".to_string()
+        )));
+    }
 }
