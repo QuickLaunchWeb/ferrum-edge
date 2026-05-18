@@ -1448,7 +1448,15 @@ paths:
     get:
       operationId: listAvailablePlugins
       summary: List available plugin types
-      description: Returns the names of all built-in plugins that can be configured.
+      description: |
+        Returns the names of all plugins that can be referenced from
+        `plugin_configs.plugin_name`. The set includes every built-in plugin
+        plus any custom plugins registered at build time via the
+        `custom_plugins/` directory. Use this endpoint as the source of truth
+        for valid `plugin_name` values; the example below is illustrative and
+        may lag if new plugins are added in the running gateway. Internal
+        reserved plugins (names prefixed with `__`, e.g. `__mesh_bpf_metrics`)
+        are auto-injected by mesh mode and not directly configurable.
       tags: [Plugins]
       responses:
         "200":
@@ -1460,8 +1468,8 @@ paths:
                 items:
                   type: [string, "null"]
               example:
+                - transaction_log_schema
                 - stdout_logging
-                - statsd_logging
                 - http_logging
                 - tcp_logging
                 - kafka_logging
@@ -1471,8 +1479,13 @@ paths:
                 - jwt_auth
                 - key_auth
                 - basic_auth
+                - ldap_auth
                 - hmac_auth
                 - mtls_auth
+                - spiffe_identity
+                - mesh_authz
+                - mesh_outbound_registry
+                - compression
                 - cors
                 - access_control
                 - tcp_connection_throttle
@@ -1481,7 +1494,7 @@ paths:
                 - correlation_id
                 - request_transformer
                 - response_transformer
-                - compression
+                - mesh_route_dispatch
                 - graphql
                 - grpc_method_router
                 - grpc_deadline
@@ -1489,11 +1502,11 @@ paths:
                 - rate_limiting
                 - request_size_limiting
                 - response_size_limiting
-                - fault_injection
                 - body_validator
                 - request_termination
-                - response_mock
                 - response_caching
+                - response_mock
+                - serverless_function
                 - prometheus_metrics
                 - proxy_alerts
                 - otel_tracing
@@ -1504,22 +1517,24 @@ paths:
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
-                - sse
-                - request_mirror
-                - load_testing
                 - ws_message_size_limiting
                 - ws_frame_logging
-                - ws_logging
                 - ws_rate_limiting
                 - udp_rate_limiting
                 - udp_logging
+                - statsd_logging
                 - loki_logging
-                - ldap_auth
-                - serverless_function
+                - sse
+                - request_mirror
+                - load_testing
+                - geo_restriction
+                - request_deduplication
                 - soap_ws_security
                 - spec_expose
                 - api_chargeback
-                - transaction_log_schema
+                - workload_metrics
+                - fault_injection
+                - access_log
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2032,7 +2047,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiSpecCreateResponse"
         "400":
-          description: Spec could not be parsed (invalid JSON/YAML, unrecognised version, or forbidden extension)
+          description: |
+            Spec document is structurally invalid (bad JSON/YAML, unrecognised
+            OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
+            extension). See `ApiSpecParseError.code` for which structural
+            problem fired.
           content:
             application/json:
               schema:
@@ -2054,11 +2073,25 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "422":
-          description: Spec parsed successfully but one or more extracted resources failed validation
+          description: |
+            Spec parsed successfully but failed Ferrum policy or per-resource
+            validation. Two body shapes are possible:
+
+            - **`ApiSpecParseError`** when a Ferrum extension violates a
+              semantic rule (`ConsumerExtensionNotAllowed`,
+              `PluginInvalidScope`, `PluginProxyIdMismatch`,
+              `PluginContainsCredentials`, `ProxyUpstreamIdMismatch`,
+              `InvalidTagName`).
+            - **`ApiSpecValidationError`** when one or more extracted
+              resources (proxy / upstream / plugin) failed structural
+              validation or database cross-checks (duplicate `listen_path`,
+              invalid plugin config, missing referenced upstream, etc.).
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecValidationError"
+                oneOf:
+                  - $ref: "#/components/schemas/ApiSpecValidationError"
+                  - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -2212,7 +2245,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiSpecCreateResponse"
         "400":
-          description: New spec could not be parsed
+          description: |
+            New spec is structurally invalid (bad JSON/YAML, unrecognised
+            OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
+            extension). See `ApiSpecParseError.code` for which structural
+            problem fired.
           content:
             application/json:
               schema:
@@ -2236,11 +2273,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "422":
-          description: New spec parsed but one or more resources failed validation
+          description: |
+            New spec parsed successfully but failed Ferrum policy or
+            per-resource validation. Two body shapes are possible:
+
+            - **`ApiSpecParseError`** when a Ferrum extension violates a
+              semantic rule (`ConsumerExtensionNotAllowed`,
+              `PluginInvalidScope`, `PluginProxyIdMismatch`,
+              `PluginContainsCredentials`, `ProxyUpstreamIdMismatch`,
+              `InvalidTagName`).
+            - **`ApiSpecValidationError`** when one or more extracted
+              resources failed structural validation or database
+              cross-checks.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecValidationError"
+                oneOf:
+                  - $ref: "#/components/schemas/ApiSpecValidationError"
+                  - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -2819,6 +2869,17 @@ components:
           description: |
             UDP session idle timeout in seconds. After this duration of inactivity,
             the UDP session mapping is removed. Only applicable for udp/dtls protocols.
+        udp_max_response_amplification_factor:
+          type: [number, "null"]
+          format: float
+          exclusiveMinimum: 0
+          description: |
+            Maximum allowed response amplification factor for UDP proxies.
+            When set, backend→client datagrams are dropped if their size exceeds
+            `last_request_size * factor`. Protects against UDP amplification
+            attacks (e.g., spoofed-source reflection). When omitted (default),
+            no per-datagram amplification cap is applied. Only applicable for
+            `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -3190,10 +3251,15 @@ components:
           description: >-
             Plugin-specific JSON configuration. Validated on create/update and
             again when the plugin is instantiated at config reload time.
-            Security plugins (key_auth, basic_auth, jwt_auth, hmac_auth,
-            jwks_auth, mtls_auth, access_control, tcp_connection_throttle,
-            ip_restriction) block gateway startup if their config is invalid.
-            See `PluginConfigs` section for per-plugin schema definitions.
+            Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
+            hmac_auth, ldap_auth, mtls_auth, access_control,
+            tcp_connection_throttle, ip_restriction, mesh_authz,
+            mesh_outbound_registry) are validation-fatal: invalid config blocks
+            gateway startup in file mode, and on DB/CP polling the new config
+            snapshot is rejected as a whole (the gateway keeps serving the
+            prior good config). Non-security plugins with invalid config are
+            logged and skipped instead. See
+            `PluginConfigs` section for per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -4448,11 +4514,11 @@ components:
         mode:
           type: string
           enum: [database, file, cp, dp]
+          description: Operating mode (set by FERRUM_MODE)
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
           example: "0.9.0"
-          description: Operating mode (set by FERRUM_MODE)
         uptime_seconds:
           type: integer
           format: int64
@@ -5943,7 +6009,17 @@ components:
         - connection_pool_error
         - port_exhaustion
         - graceful_remote_close
+        - dispatch_policy_rejected
         - request_error
+      description: |
+        Stable classification of a backend dispatch failure. Emitted on
+        `TransactionSummary.error_class` / `StreamTransactionSummary.error_class`
+        and used by alert rules. `graceful_remote_close` is the HTTP/3 backend's
+        spec-legal teardown signal (RFC 9114 §8.1) — the request still 502s but
+        the connection stays H3-capable. `dispatch_policy_rejected` covers
+        terminal gateway decisions taken before any backend dial (for example
+        an unsupportable backend TLS SNI override) and is intentionally not a
+        connection error, so retry policies do not fire.
 
     DisconnectCause:
       type: string
@@ -6232,6 +6308,337 @@ components:
           format: uint64
           default: 300
           description: Maximum allowed clock skew in seconds for the Date header replay protection window
+
+    # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
+    # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
+    # east-west / egress / waypoint topologies) from the CP-delivered slice. They
+    # are also accepted as operator-managed `plugin_configs` rows on non-mesh
+    # gateways for standalone deployments, with the schema below.
+    SpiffeIdentityConfig:
+      type: object
+      description: |
+        Plugin: spiffe_identity — Extracts the SPIFFE ID from the peer
+        certificate's URI SAN and populates `ctx.peer_spiffe_id` /
+        `StreamConnectionContext` metadata for downstream auth and rate-limit
+        plugins (notably `mesh_authz` and `rate_limiting` with
+        `limit_by: spiffe_identity`).
+
+        Auto-injected by mesh mode on every applicable topology; reserved
+        plugin id `__mesh_spiffe_identity`. Standalone usage is supported on
+        non-mesh gateways that still terminate mTLS and want to surface the
+        SPIFFE identity to other plugins.
+      additionalProperties: false
+      properties: {}
+
+    MeshAuthzConfig:
+      type: object
+      description: |
+        Plugin: mesh_authz — Layer 2 mesh authorization evaluator. Applies
+        Istio-style `MeshPolicy` (ALLOW / DENY / AUDIT) rules to the SPIFFE
+        identity extracted by `spiffe_identity` or the HBONE baggage on
+        ambient mTLS streams. DENY rules are evaluated first (first match
+        wins); the presence of any ALLOW rule with no match triggers an
+        implicit deny.
+
+        Auto-injected by mesh mode on every applicable topology; reserved
+        plugin id `__mesh_authz`. PolicyScope filtering (`MeshWide` /
+        `Namespace` / `WorkloadSelector`) is applied at construction time
+        from the slice-embedded workload identity, except in node-waypoint
+        topology where the filter runs per-request against the pod-scoped
+        cache attached to `RequestContext`.
+      properties:
+        mesh_slice:
+          type: object
+          description: |
+            Embedded mesh slice — supplied by mesh-mode auto-injection.
+            Carries the filtered policy set plus the workload's
+            `namespace`/`labels` used for slice-level scope filtering. Not
+            intended for direct operator configuration; operator-managed
+            instances pass `mesh_policies` instead.
+        mesh_policies:
+          type: array
+          items:
+            type: object
+            description: A single `MeshPolicy` document. See `docs/mesh.md`.
+          description: |
+            Standalone-mode policy list. Used by direct configuration / tests
+            when no slice is available.
+        namespace:
+          type: string
+          description: |
+            Proxy workload namespace, used by the slice-level PolicyScope
+            filter to discard policies that do not apply to this workload.
+            Overrides any namespace embedded in `mesh_slice`.
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Proxy workload labels, used by the slice-level scope filter for
+            `WorkloadSelector`-scoped policies. Overrides any labels embedded
+            in `mesh_slice`.
+        trust_domain_aliases:
+          type: array
+          items:
+            type: string
+          description: |
+            Additional SPIFFE trust domains accepted as equivalent to the
+            peer cert's trust domain when authorising HBONE baggage
+            `source.principal`. Empty (default) means strict same-trust-domain
+            match.
+        per_pod_policy_scoping:
+          type: boolean
+          default: false
+          description: |
+            When `true`, the construction-time slice-level scope filter is
+            skipped and policies are filtered per-request using the
+            `PolicyScopeCache` attached to `RequestContext.node_waypoint_policy_scope`.
+            Auto-set by mesh injection on `NodeWaypoint` topology where one
+            listener serves many pods.
+
+    MeshOutboundRegistryConfig:
+      type: object
+      description: |
+        Plugin: mesh_outbound_registry — Implements Istio
+        `MeshConfig.outboundTrafficPolicy.mode: REGISTRY_ONLY`. Rejects HTTP
+        requests whose `Host` header is not in the configured destination
+        registry. Auto-injected by mesh mode when the slice declares
+        `RegistryOnly`; not registered when policy is `AllowAny` (default).
+        Operator-managed instances on non-mesh gateways behave as a generic
+        HTTP `Host` allowlist.
+
+        Matches against four kinds of entries: bare hostnames (no Host port),
+        explicit `host:port` pairs, `host:*` (any explicit Host port), and
+        wildcard hosts (`*.example.com`, `*.example.com:443`,
+        `*.example.com:*`). Empty registry fails closed.
+      properties:
+        registry:
+          type: array
+          items:
+            type: string
+          default: []
+          description: |
+            Known destinations. Bare hostnames match requests with no
+            explicit `Host` port. `host:port` entries match only that port.
+            `host:*` entries match any explicit port. Wildcard entries
+            (`*.example.com[:port|:*]`) match one DNS label below the
+            suffix.
+        reject_status:
+          type: integer
+          format: uint16
+          minimum: 400
+          maximum: 599
+          default: 502
+          description: |
+            Status code returned for unknown destinations. Operators may
+            override to 404 to mask unknown destinations.
+        outbound_listen_ports:
+          type: array
+          items:
+            type: integer
+            format: uint16
+            minimum: 1
+          default: []
+          description: |
+            Optional frontend listener ports where the registry is enforced.
+            Empty means enforce on every HTTP-family request that reaches
+            the plugin (operator-managed default). Mesh auto-injection sets
+            this to the outbound capture listener port so the global plugin
+            does not apply to inbound listeners.
+        namespace:
+          type: string
+          default: ferrum
+          description: Mesh namespace label used by the Prometheus decision counter.
+
+    MeshRouteDispatchConfig:
+      type: object
+      description: |
+        Plugin: mesh_route_dispatch — Per-request route override driven by
+        method / header / query-param predicates. Closes the Istio
+        `VirtualService.http[].match` header/method gap without extending
+        the `Proxy` schema. Runs after authentication, authorization, and
+        rate limiting — admission decisions still use the public listener
+        identity; only downstream `before_proxy` plugins and backend
+        dispatch see the effective override destination.
+
+        At least one rule is required. When multiple plugin instances run on
+        one proxy, each matching instance replaces the override destination
+        set by earlier instances. Per-rule `backend_tls` is direct-backend
+        only (`upstream_id` destinations inherit TLS from the referenced
+        Upstream).
+      required: [rules]
+      properties:
+        rules:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [destination]
+            properties:
+              match:
+                type: object
+                description: |
+                  Match criteria — all configured fields must match for the
+                  rule to fire. At least one of `methods`/`headers`/
+                  `query_params` must be configured (an empty match is
+                  rejected at load time).
+                properties:
+                  methods:
+                    type: array
+                    items:
+                      type: string
+                    description: HTTP methods (any-of). Empty = no method restriction.
+                  headers:
+                    type: object
+                    additionalProperties:
+                      type: string
+                    description: Header equality matches (all-of). Header names are case-insensitive.
+                  query_params:
+                    type: object
+                    additionalProperties:
+                      type: string
+                    description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+              destination:
+                type: object
+                description: |
+                  Override applied on match. At least one field must be set.
+                  `upstream_id` is mutually exclusive with the direct-backend
+                  fields (`backend_host`/`backend_port`/`backend_tls`).
+                properties:
+                  upstream_id:
+                    type: [string, "null"]
+                  backend_host:
+                    type: [string, "null"]
+                  backend_port:
+                    type: [integer, "null"]
+                    format: uint16
+                    minimum: 1
+                  backend_tls:
+                    description: Optional per-rule backend TLS override (direct backends only).
+                    type: [object, "null"]
+        reject_unmatched:
+          type: boolean
+          default: false
+          description: |
+            When `true`, requests that match no rule are rejected with 404
+            instead of falling through to the proxy's default backend. The
+            Istio VirtualService translator sets this so a route gated by a
+            method/header/query-param `match` does not serve traffic that
+            misses those predicates.
+
+    WorkloadMetricsConfig:
+      type: object
+      description: |
+        Plugin: workload_metrics — Adds Istio / GAMMA-style workload identity
+        labels and Telemetry CRD tag overrides into transaction metadata, and
+        owns trace-context propagation for the mesh. The existing logging,
+        metrics, and OTel sinks pick these up via `TransactionSummary.metadata`
+        and `StreamTransactionSummary.metadata` without plugin-trait changes.
+
+        Auto-injected by mesh mode on every applicable topology; reserved
+        plugin id `__mesh_workload_metrics`. Standalone use is supported on
+        non-mesh gateways that want Istio-style workload labels in logs.
+      properties:
+        node_id:
+          type: string
+          description: Mesh node identifier attached to workload metadata.
+        topology:
+          type: string
+          description: Mesh topology name attached to workload metadata.
+        namespace:
+          type: string
+          description: Mesh namespace attached to workload metadata and used when deriving the default `service_name`.
+        workload_spiffe_id:
+          type: string
+          description: This workload's SPIFFE ID (e.g., `spiffe://cluster.local/ns/default/sa/api`).
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: Static workload labels to inject as `mesh.*` metadata keys on every transaction.
+        trust_domain_aliases:
+          type: array
+          items:
+            type: string
+          description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
+        sampling_percentage:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
+        custom_tags:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom tags injected into every transaction's metadata.
+        custom_header_tags:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom tags populated from request headers (`tag_name -> header_name`).
+        metrics:
+          type: object
+          description: |
+            Istio Telemetry-CRD-style metrics customization. Both fields are
+            optional and additive; unknown fields are ignored.
+          properties:
+            tag_overrides:
+              type: array
+              items:
+                type: object
+                required: [name, operation]
+                properties:
+                  name:
+                    type: string
+                    description: Tag name to override.
+                  operation:
+                    type: object
+                    required: [type]
+                    description: |
+                      One of `{"type": "remove"}`,
+                      `{"type": "rename", "new_name": "..."}`, or
+                      `{"type": "set", "value": "..."}`.
+                    properties:
+                      type:
+                        type: string
+                        enum: [remove, rename, set]
+                      new_name:
+                        type: string
+                        description: Replacement tag name when `type` is `rename`.
+                      value:
+                        type: string
+                        description: Replacement tag value when `type` is `set`.
+              description: Per-metric tag overrides translated from the Istio Telemetry CRD.
+            disabled_metrics:
+              type: array
+              items:
+                type: string
+              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+        tracing_providers:
+          type: array
+          items:
+            type: object
+          description: |
+            Per-provider tracing exporters surfaced from the Istio Telemetry
+            CRD via the mesh slice. Also enables trace-context propagation
+            when span reporting is disabled.
+        tracing_provider:
+          type: object
+          description: |
+            Singular tracing exporter fallback. Ignored when
+            `tracing_providers` is present.
+        span_reporting_disabled:
+          type: boolean
+          default: false
+          description: |
+            When `true`, trace context is still propagated but no spans are
+            exported. Matches Istio Telemetry CRD `disableSpanReporting`.
+        service_name:
+          type: string
+          description: |
+            Service name attached to exported spans. Defaults to the
+            workload's service when omitted.
 
     SoapWsSecurityConfig:
       type: object
@@ -6719,13 +7126,17 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. At least one of the preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`) must be configured."
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. At least one of the preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`) must be configured."
       properties:
         limit_by:
           type: string
-          enum: [ip, consumer]
+          enum: [ip, consumer, spiffe_identity, spiffe]
           default: ip
-          description: "Rate limit key: ip or consumer"
+          description: |
+            Rate limit key:
+            - `ip` (default) — client IP.
+            - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
+            - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
         expose_headers:
           type: boolean
           default: false
@@ -8760,13 +9171,15 @@ components:
     ApiSpecParseError:
       type: object
       description: |
-        Response body for 400 Bad Request from `POST /api-specs` or
-        `PUT /api-specs/{id}`. The spec document could not be parsed, or a
-        required Ferrum extension is missing or malformed.
+        Response body emitted by `POST /api-specs` and `PUT /api-specs/{id}`
+        when the spec document fails to parse or violates a Ferrum extension
+        rule. The body shape is identical for both 400 and 422 — the status
+        code indicates whether the problem is **structural** (400) or
+        **semantic** (422). The discriminator is the `code` field below.
       properties:
         error:
           type: string
-          description: Short human-readable summary
+          description: Short human-readable summary (always `"Spec parse failed"`).
         code:
           type: string
           enum:
@@ -8779,18 +9192,32 @@ components:
             - PluginInvalidScope
             - PluginProxyIdMismatch
             - PluginContainsCredentials
+            - ProxyUpstreamIdMismatch
+            - InvalidTagName
           description: |
-            Machine-readable error discriminant:
+            Machine-readable error discriminant.
+
+            **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
             - `InvalidJson` — body is not valid JSON
             - `InvalidYaml` — body is not valid YAML
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
             - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
+
+            **Semantic / policy violations — returned as HTTP 422 Unprocessable Entity:**
+
             - `ConsumerExtensionNotAllowed` — `x-ferrum-consumers` is present (forbidden)
             - `PluginInvalidScope` — a plugin in `x-ferrum-plugins` has `scope: global` or `scope: proxy_group`
             - `PluginProxyIdMismatch` — a plugin's `proxy_id` does not match the spec's proxy ID
             - `PluginContainsCredentials` — a plugin's `config` contains a forbidden key (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, or `consumers`)
+            - `ProxyUpstreamIdMismatch` — `x-ferrum-proxy.upstream_id` conflicts with the `id` of the inline `x-ferrum-upstream`
+            - `InvalidTagName` — a `tags[].name` contains a forbidden character (`"`, `%`, `_`, or `\`) that would break the SQL `has_tag` LIKE filter
         details:
           type: string
-          description: Full error text including field paths and values where applicable
+          description: |
+            Verbose error message — for `MalformedExtension` includes the
+            offending extension name and the underlying serde error; for
+            `Plugin*` codes includes the plugin id; for `InvalidTagName`
+            includes the offending tag name and character. Includes field
+            paths and values where applicable.

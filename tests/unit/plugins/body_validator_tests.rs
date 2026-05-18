@@ -400,6 +400,38 @@ async fn test_xml_required_element_missing() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_xml_required_element_prefix_must_not_match() {
+    // Body has `<username>` but `<user>` is required — the prefix match
+    // alone must not satisfy the requirement.
+    let plugin = xml_plugin_with_required(vec!["user"]);
+    let body = "<root><username>alice</username></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_self_closing_tag_matches() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = "<root><item/></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_xml_required_element_with_attributes_matches() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = r#"<root><item id="1">content</item></root>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 // ─── Edge Cases ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -740,6 +772,30 @@ async fn test_json_schema_additional_properties_false_valid() {
         "additionalProperties": false
     }));
     let mut ctx = make_json_ctx(r#"{"name": "test"}"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_additional_properties_false_no_properties_rejects_any() {
+    // Without `properties`, `additionalProperties: false` should reject
+    // ANY object that has fields (per JSON Schema spec: no properties allowed).
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false
+    }));
+    let mut ctx = make_json_ctx(r#"{"anything": "rejected"}"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_additional_properties_false_no_properties_accepts_empty() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false
+    }));
+    let mut ctx = make_json_ctx("{}");
     let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
