@@ -669,177 +669,43 @@ async fn test_nonce_replay_detected() {
     assert!(reject_body(&result2).contains("nonce replay"));
 }
 
-// ── SAML assertion tests ────────────────────────────────────────────────────
+// ── SAML config tests ───────────────────────────────────────────────────────
+//
+// `saml.enabled: true` is rejected at construction time because the
+// plugin does not currently cryptographically verify SAML assertion
+// signatures. Issuer / NotBefore / NotOnOrAfter / Audience are plain
+// XML text that any caller can craft, so accepting them without
+// signature verification is trivially spoofable. The runtime
+// `validate_saml_assertion` code path is retained for the future when
+// XMLDSIG signature verification lands, but it cannot be reached from
+// configuration today.
 
-#[tokio::test]
-async fn test_saml_valid_assertion() {
-    let config = json!({
-        "timestamp": { "require": false },
-        "saml": {
-            "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"],
-            "audience": "https://service.example.com",
-            "clock_skew_seconds": 300
-        },
-        "reject_missing_security_header": true
-    });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-
-    let now = chrono::Utc::now();
-    let not_before = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
-    let not_after = (now + chrono::Duration::minutes(25)).format("%Y-%m-%dT%H:%M:%SZ");
-
-    let assertion = format!(
-        r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0">
-        <saml:Issuer>https://idp.example.com</saml:Issuer>
-        <saml:Conditions NotBefore="{}" NotOnOrAfter="{}">
-            <saml:AudienceRestriction>
-                <saml:Audience>https://service.example.com</saml:Audience>
-            </saml:AudienceRestriction>
-        </saml:Conditions>
-    </saml:Assertion>"#,
-        not_before, not_after
-    );
-    let body = wrap_soap(&assertion);
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Continue));
-}
-
-#[tokio::test]
-async fn test_saml_untrusted_issuer_rejects() {
+#[test]
+fn test_saml_enabled_rejected_until_signature_verification_lands() {
     let config = json!({
         "timestamp": { "require": false },
         "saml": {
             "enabled": true,
             "trusted_issuers": ["https://idp.example.com"]
-        },
-        "reject_missing_security_header": true
+        }
     });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-
-    let assertion = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
-        <saml:Issuer>https://evil.example.com</saml:Issuer>
-    </saml:Assertion>"#;
-    let body = wrap_soap(assertion);
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("not trusted"));
-}
-
-#[tokio::test]
-async fn test_saml_expired_assertion_rejects() {
-    let config = json!({
-        "timestamp": { "require": false },
-        "saml": {
-            "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"],
-            "clock_skew_seconds": 5
-        },
-        "reject_missing_security_header": true
-    });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-
-    let assertion = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
-        <saml:Issuer>https://idp.example.com</saml:Issuer>
-        <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2020-01-01T01:00:00Z">
-        </saml:Conditions>
-    </saml:Assertion>"#;
-    let body = wrap_soap(assertion);
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("expired"));
-}
-
-#[tokio::test]
-async fn test_saml_not_yet_valid_rejects() {
-    let config = json!({
-        "timestamp": { "require": false },
-        "saml": {
-            "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"],
-            "clock_skew_seconds": 5
-        },
-        "reject_missing_security_header": true
-    });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-
-    let future = (chrono::Utc::now() + chrono::Duration::hours(2)).format("%Y-%m-%dT%H:%M:%SZ");
-    let assertion = format!(
-        r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
-        <saml:Issuer>https://idp.example.com</saml:Issuer>
-        <saml:Conditions NotBefore="{}">
-        </saml:Conditions>
-    </saml:Assertion>"#,
-        future
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("saml.enabled must be rejected until signature verification is implemented");
+    assert!(
+        err.contains("saml.enabled is not currently supported"),
+        "got: {err}"
     );
-    let body = wrap_soap(&assertion);
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("not yet valid"));
 }
 
-#[tokio::test]
-async fn test_saml_wrong_audience_rejects() {
+#[test]
+fn test_saml_disabled_construction_still_succeeds() {
+    // Disabled SAML config alongside another feature still constructs cleanly.
     let config = json!({
-        "timestamp": { "require": false },
-        "saml": {
-            "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"],
-            "audience": "https://service.example.com",
-            "clock_skew_seconds": 300
-        },
-        "reject_missing_security_header": true
+        "timestamp": { "require": true },
+        "saml": { "enabled": false }
     });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-
-    let now = chrono::Utc::now();
-    let not_before = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
-    let not_after = (now + chrono::Duration::minutes(25)).format("%Y-%m-%dT%H:%M:%SZ");
-
-    let assertion = format!(
-        r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
-        <saml:Issuer>https://idp.example.com</saml:Issuer>
-        <saml:Conditions NotBefore="{}" NotOnOrAfter="{}">
-            <saml:AudienceRestriction>
-                <saml:Audience>https://wrong-service.example.com</saml:Audience>
-            </saml:AudienceRestriction>
-        </saml:Conditions>
-    </saml:Assertion>"#,
-        not_before, not_after
-    );
-    let body = wrap_soap(&assertion);
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("Audience"));
-}
-
-#[tokio::test]
-async fn test_saml_missing_assertion_rejects() {
-    let config = json!({
-        "timestamp": { "require": false },
-        "saml": {
-            "enabled": true,
-            "trusted_issuers": ["https://idp.example.com"]
-        },
-        "reject_missing_security_header": true
-    });
-    let plugin = SoapWsSecurity::new(&config).unwrap();
-    let body = wrap_soap("<!-- no assertion -->");
-    let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("missing SAML Assertion"));
+    assert!(SoapWsSecurity::new(&config).is_ok());
 }
 
 // ── Body buffering flag tests ───────────────────────────────────────────────
