@@ -1,6 +1,7 @@
 //! Tests for prometheus_metrics plugin
 
 use ferrum_edge::ebpf::NodeAgentMetrics;
+use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, HboneRelayFailureKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
@@ -174,6 +175,63 @@ async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
     assert!(output.contains("# TYPE ferrum_mesh_request_duration_ms histogram"));
     assert!(output.contains("ferrum_mesh_request_duration_ms_bucket{"));
     assert!(output.contains("le=\"+Inf\""));
+}
+
+#[tokio::test]
+async fn test_registry_renders_mesh_cert_telemetry_metrics() {
+    let registry = MetricsRegistry::new();
+
+    prometheus_helpers::record_mesh_cert_expiry_seconds(
+        "spiffe://cluster.local/ns/default/sa/prom-test",
+        "unit_test",
+        3600,
+    );
+    prometheus_helpers::increment_mesh_cert_rotation_failure(
+        "spiffe://cluster.local/ns/default/sa/prom-test",
+        "unit_test",
+    );
+    prometheus_helpers::set_mesh_ca_health("unit_test_ca", true);
+    prometheus_helpers::record_mesh_trust_bundle_roots(
+        "cluster.local",
+        "unit_test",
+        &[vec![1, 2, 3]],
+    );
+    prometheus_helpers::record_mesh_config_received("unit-test-ns");
+    prometheus_helpers::increment_mesh_mtls_handshake_failure("unit_test");
+
+    let output = registry.render_uncached();
+
+    assert!(output.contains("# TYPE ferrum_mesh_cert_expiry_seconds gauge"));
+    assert!(output.contains("ferrum_mesh_cert_expiry_seconds{"));
+    assert!(output.contains("spiffe://cluster.local/ns/default/sa/prom-test"));
+    let expiry_line = output
+        .lines()
+        .find(|line| {
+            line.contains("ferrum_mesh_cert_expiry_seconds{")
+                && line.contains("spiffe://cluster.local/ns/default/sa/prom-test")
+                && line.contains("source=\"unit_test\"")
+        })
+        .expect("mesh cert expiry metric line");
+    let expiry_seconds = expiry_line
+        .rsplit_once(' ')
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .expect("expiry seconds value");
+    assert!(expiry_seconds <= 3600);
+    assert!(expiry_seconds > 3500);
+    assert!(output.contains("# TYPE ferrum_mesh_cert_rotation_failures_total counter"));
+    assert!(output.contains("ferrum_mesh_cert_rotation_failures_total{"));
+    assert!(output.contains("# TYPE ferrum_mesh_ca_health gauge"));
+    assert!(output.contains("ferrum_mesh_ca_health{ca_type=\"unit_test_ca\"} 1"));
+    assert!(output.contains("# TYPE ferrum_mesh_trust_bundle_version gauge"));
+    assert!(output.contains(
+        "ferrum_mesh_trust_bundle_version{trust_domain=\"cluster.local\",source=\"unit_test\"} 1"
+    ));
+    assert!(output.contains("# TYPE ferrum_mesh_config_last_received_timestamp_seconds gauge"));
+    assert!(output.contains(
+        "ferrum_mesh_config_last_received_timestamp_seconds{namespace=\"unit-test-ns\"}"
+    ));
+    assert!(output.contains("# TYPE ferrum_mesh_mtls_handshake_failures_total counter"));
+    assert!(output.contains("ferrum_mesh_mtls_handshake_failures_total{reason=\"unit_test\"} 1"));
 }
 
 #[tokio::test]

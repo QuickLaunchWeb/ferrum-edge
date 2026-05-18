@@ -261,6 +261,7 @@ async fn handle_admin_tls_connection(
         stream,
         tls_handshake_timeout,
         &remote_addr,
+        false,
     )
     .await?;
     info!("Admin TLS connection established from {}", remote_addr.ip());
@@ -851,6 +852,9 @@ pub async fn handle_admin_request(
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
 
+        // Mesh service graph
+        (Method::GET, ["mesh", "service-graph"]) => handle_mesh_service_graph_get(&state).await,
+
         // Mesh egress-scope operability
         (Method::GET, ["mesh", "egress-scope"]) => handle_mesh_egress_scope_get(&state).await,
         (Method::POST, ["mesh", "egress-scope", "test"]) => {
@@ -941,6 +945,25 @@ async fn handle_mesh_egress_scope_get(
             "health": egress.health(),
         }),
     ))
+}
+
+async fn handle_mesh_service_graph_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh service graph"}),
+        ));
+    };
+    if !mesh_runtime.has_first_slice() {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh service graph"}),
+        ));
+    }
+    let snapshot = crate::plugins::mesh::service_graph::global_service_graph().snapshot();
+    Ok(json_response(StatusCode::OK, &json!(snapshot.as_ref())))
 }
 
 async fn handle_mesh_egress_scope_test(

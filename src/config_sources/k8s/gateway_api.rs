@@ -1,5 +1,7 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
@@ -8,13 +10,17 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
-    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
-    resource_id, service_dns_name, string_array, string_field, upstream_for_route,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
+    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field, port_from_u64,
+    proxy_for_route, resource_id, service_dns_name, string_array, string_field, upstream_for_route,
 };
+use crate::config::types::{PluginConfig, Proxy};
 
 const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid";
 const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
+const GATEWAY_API_DISPATCH_PRECEDENCE_KEY: &str = "_ferrum_gateway_api_precedence";
 
 /// `Gateway.spec.gatewayClassName` values that mark a GAMMA Waypoint
 /// Gateway. Both the Istio canonical value and a Ferrum-native alias are
@@ -38,6 +44,44 @@ const KEY_USE_WAYPOINT_NAMESPACE: &str = "istio.io/use-waypoint-namespace";
 /// schema change. Annotations are accepted as a compatibility fallback.
 const KEY_WAYPOINT_FOR: &str = "istio.io/waypoint-for";
 
+#[derive(Debug, Clone)]
+struct GatewayApiRouteConflictCandidate {
+    resource: K8sResourceKey,
+    creation_timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RouteMatchDescriptor {
+    listen_path: String,
+    match_signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct RouteMatchEntryDescriptor {
+    match_index: usize,
+    descriptor: RouteMatchDescriptor,
+}
+
+#[derive(Debug, Clone)]
+struct RouteHostScope {
+    proxy_hosts: Vec<String>,
+    conflict_hostname: String,
+    suffix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayApiDispatchRulePrecedence {
+    has_precedence: bool,
+    method_match: bool,
+    header_count: usize,
+    query_param_count: usize,
+    creation_timestamp: Option<DateTime<Utc>>,
+    namespace: String,
+    name: String,
+    rule_index: usize,
+    match_index: usize,
+}
+
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -52,10 +96,17 @@ pub(super) fn translate(
             }
             Ok(true)
         }
-        "HTTPRoute" | "GRPCRoute" => {
-            for proxy in http_route_proxies(object, acc)? {
+        "HTTPRoute" => {
+            let (proxies, plugins) = http_route_resources(object, acc)?;
+            upsert_http_route_resources(acc, proxies, plugins);
+            Ok(true)
+        }
+        "GRPCRoute" => {
+            let (proxies, plugins) = http_route_resources(object, acc)?;
+            for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
+            acc.config.plugin_configs.extend(plugins);
             Ok(true)
         }
         "TCPRoute" => {
@@ -210,6 +261,585 @@ fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn route_conflicts(
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+) -> Vec<GatewayApiRouteConflict> {
+    let mut candidates_by_key: HashMap<
+        GatewayApiRouteConflictKey,
+        Vec<GatewayApiRouteConflictCandidate>,
+    > = HashMap::new();
+
+    for object in objects
+        .iter()
+        .filter(|object| super::includes_object_namespace(options, object))
+        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+    {
+        let resource = K8sResourceKey::from_object(object);
+        let creation_timestamp = object
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .and_then(parse_k8s_timestamp);
+        for key in route_conflict_keys(object) {
+            candidates_by_key
+                .entry(key)
+                .or_default()
+                .push(GatewayApiRouteConflictCandidate {
+                    resource: resource.clone(),
+                    creation_timestamp,
+                });
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for (key, mut candidates) in candidates_by_key {
+        candidates.sort_by(compare_conflict_candidates);
+        candidates.dedup_by(|left, right| left.resource == right.resource);
+        let Some(winner) = candidates.first().cloned() else {
+            continue;
+        };
+        for loser in candidates.into_iter().skip(1) {
+            conflicts.push(GatewayApiRouteConflict {
+                key: key.clone(),
+                winner: winner.resource.clone(),
+                loser: loser.resource,
+            });
+        }
+    }
+    conflicts.sort_by(|left, right| {
+        (&left.loser, &left.key, &left.winner).cmp(&(&right.loser, &right.key, &right.winner))
+    });
+    conflicts.dedup_by(|left, right| left.loser == right.loser && left.key == right.key);
+    conflicts
+}
+
+fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
+    let hostnames = route_hostnames(object);
+    let parent_refs = route_parent_ref_keys(object);
+    let route_family = object.kind.to_ascii_lowercase();
+    let mut keys = Vec::new();
+
+    for rule in object
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for descriptor in route_match_descriptors(object, rule) {
+            for parent_ref in &parent_refs {
+                for hostname in &hostnames {
+                    keys.push(GatewayApiRouteConflictKey {
+                        route_family: route_family.clone(),
+                        parent_ref: parent_ref.clone(),
+                        hostname: hostname.clone(),
+                        listen_path: descriptor.listen_path.clone(),
+                        match_signature: route_conflict_match_signature(&descriptor),
+                    });
+                }
+            }
+        }
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn route_conflict_match_signature(descriptor: &RouteMatchDescriptor) -> String {
+    descriptor.match_signature.clone()
+}
+
+fn upsert_http_route_resources(
+    acc: &mut K8sAccumulator,
+    proxies: Vec<Proxy>,
+    plugins: Vec<PluginConfig>,
+) {
+    let mut plugins_by_proxy: HashMap<String, Vec<PluginConfig>> = HashMap::new();
+    for plugin in plugins {
+        if let Some(proxy_id) = plugin.proxy_id.clone() {
+            plugins_by_proxy.entry(proxy_id).or_default().push(plugin);
+        } else {
+            acc.config.plugin_configs.push(plugin);
+        }
+    }
+
+    for proxy in proxies {
+        let route_plugins = plugins_by_proxy.remove(&proxy.id).unwrap_or_default();
+        if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins) {
+            acc.upsert_proxy(proxy, SourceKind::GatewayApi);
+            acc.config.plugin_configs.extend(route_plugins);
+        }
+    }
+
+    for (_, plugins) in plugins_by_proxy {
+        acc.config.plugin_configs.extend(plugins);
+    }
+}
+
+fn merge_http_route_proxy(
+    acc: &mut K8sAccumulator,
+    proxy: Proxy,
+    route_plugins: &[PluginConfig],
+) -> bool {
+    let Some(existing_index) = acc
+        .config
+        .proxies
+        .iter()
+        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy))
+    else {
+        return false;
+    };
+
+    let new_dispatch = route_plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch");
+    let existing_id = acc.config.proxies[existing_index].id.clone();
+    let existing_dispatch_index = dispatch_plugin_index(&acc.config.plugin_configs, &existing_id);
+    if new_dispatch.is_none() && existing_dispatch_index.is_none() {
+        return false;
+    }
+
+    let new_has_default = dispatch_reject_unmatched(new_dispatch) == Some(false)
+        || (new_dispatch.is_none() && route_plugins.is_empty());
+    let existing_has_default = existing_dispatch_index
+        .and_then(|index| dispatch_reject_unmatched(Some(&acc.config.plugin_configs[index])))
+        != Some(true);
+
+    if new_has_default {
+        replace_proxy_default_route(&mut acc.config.proxies[existing_index], &proxy);
+    }
+
+    if let Some(plugin) = new_dispatch {
+        let new_rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(index) = existing_dispatch_index {
+            append_dispatch_rules(&mut acc.config.plugin_configs[index], new_rules);
+            set_dispatch_reject_unmatched(
+                &mut acc.config.plugin_configs[index],
+                !(existing_has_default || new_has_default),
+            );
+        } else {
+            let mut plugin = retarget_dispatch_plugin(plugin.clone(), &existing_id);
+            set_dispatch_reject_unmatched(&mut plugin, false);
+            sort_dispatch_rules(&mut plugin);
+            attach_route_plugins_to_proxy(
+                &mut acc.config.proxies[existing_index],
+                std::slice::from_ref(&plugin),
+            );
+            acc.config.plugin_configs.push(plugin);
+        }
+    } else if let Some(index) = existing_dispatch_index {
+        set_dispatch_reject_unmatched(&mut acc.config.plugin_configs[index], false);
+    }
+
+    true
+}
+
+fn can_merge_http_route_proxy(acc: &K8sAccumulator, existing: &Proxy, proxy: &Proxy) -> bool {
+    acc.proxy_sources.get(&existing.id) == Some(&SourceKind::GatewayApi)
+        && existing.namespace == proxy.namespace
+        && existing.listen_path == proxy.listen_path
+        && existing.hosts == proxy.hosts
+}
+
+fn dispatch_plugin_index(plugins: &[PluginConfig], proxy_id: &str) -> Option<usize> {
+    plugins.iter().position(|plugin| {
+        plugin.plugin_name == "mesh_route_dispatch" && plugin.proxy_id.as_deref() == Some(proxy_id)
+    })
+}
+
+fn dispatch_reject_unmatched(plugin: Option<&PluginConfig>) -> Option<bool> {
+    plugin.and_then(|plugin| {
+        plugin
+            .config
+            .get("reject_unmatched")
+            .and_then(Value::as_bool)
+    })
+}
+
+fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginConfig {
+    plugin.id = format!("istio-vs-mrd-{proxy_id}");
+    plugin.proxy_id = Some(proxy_id.to_string());
+    plugin
+}
+
+fn append_dispatch_rules(plugin: &mut PluginConfig, rules: Vec<Value>) {
+    if rules.is_empty() {
+        return;
+    }
+    if let Some(existing_rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut) {
+        existing_rules.extend(rules);
+        sort_dispatch_rule_values(existing_rules);
+    }
+}
+
+pub(super) fn finalize_dispatch_plugin_precedence(plugins: &mut [PluginConfig]) {
+    for plugin in plugins {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        sort_dispatch_rules(plugin);
+        strip_dispatch_rule_precedence(plugin);
+    }
+}
+
+pub(super) fn dispatch_rule_internal_metadata_present(plugins: &[PluginConfig]) -> bool {
+    plugins
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .filter_map(|plugin| plugin.config.get("rules").and_then(Value::as_array))
+        .flatten()
+        .any(|rule| {
+            rule.as_object()
+                .is_some_and(|object| object.keys().any(|key| key.starts_with("_ferrum_")))
+        })
+}
+
+fn sort_dispatch_rules(plugin: &mut PluginConfig) {
+    if let Some(rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut) {
+        sort_dispatch_rule_values(rules);
+    }
+}
+
+fn sort_dispatch_rule_values(rules: &mut [Value]) {
+    if !rules
+        .iter()
+        .any(|rule| rule.get(GATEWAY_API_DISPATCH_PRECEDENCE_KEY).is_some())
+    {
+        return;
+    }
+    rules.sort_by(|left, right| {
+        let left_precedence = dispatch_rule_precedence(left);
+        let right_precedence = dispatch_rule_precedence(right);
+        compare_dispatch_rule_precedence(&left_precedence, &right_precedence)
+    });
+}
+
+fn strip_dispatch_rule_precedence(plugin: &mut PluginConfig) {
+    let Some(rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for rule in rules {
+        if let Some(object) = rule.as_object_mut() {
+            object.remove(GATEWAY_API_DISPATCH_PRECEDENCE_KEY);
+        }
+    }
+}
+
+fn dispatch_rule_precedence(rule: &Value) -> GatewayApiDispatchRulePrecedence {
+    let metadata = rule
+        .get(GATEWAY_API_DISPATCH_PRECEDENCE_KEY)
+        .and_then(Value::as_object);
+    GatewayApiDispatchRulePrecedence {
+        has_precedence: metadata.is_some(),
+        method_match: precedence_bool(metadata, "method_match"),
+        header_count: precedence_usize(metadata, "header_count"),
+        query_param_count: precedence_usize(metadata, "query_param_count"),
+        creation_timestamp: metadata
+            .and_then(|metadata| metadata.get("creation_timestamp"))
+            .and_then(Value::as_str)
+            .and_then(parse_k8s_timestamp),
+        namespace: precedence_string(metadata, "namespace"),
+        name: precedence_string(metadata, "name"),
+        rule_index: precedence_usize(metadata, "rule_index"),
+        match_index: precedence_usize(metadata, "match_index"),
+    }
+}
+
+fn precedence_bool(metadata: Option<&serde_json::Map<String, Value>>, key: &str) -> bool {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn precedence_usize(metadata: Option<&serde_json::Map<String, Value>>, key: &str) -> usize {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn precedence_string(metadata: Option<&serde_json::Map<String, Value>>, key: &str) -> String {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn compare_dispatch_rule_precedence(
+    left: &GatewayApiDispatchRulePrecedence,
+    right: &GatewayApiDispatchRulePrecedence,
+) -> Ordering {
+    right
+        .has_precedence
+        .cmp(&left.has_precedence)
+        .then_with(|| right.method_match.cmp(&left.method_match))
+        .then_with(|| right.header_count.cmp(&left.header_count))
+        .then_with(|| right.query_param_count.cmp(&left.query_param_count))
+        .then_with(|| {
+            compare_creation_timestamps(&left.creation_timestamp, &right.creation_timestamp)
+        })
+        .then_with(|| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)))
+        .then_with(|| left.rule_index.cmp(&right.rule_index))
+        .then_with(|| left.match_index.cmp(&right.match_index))
+}
+
+fn set_dispatch_reject_unmatched(plugin: &mut PluginConfig, reject_unmatched: bool) {
+    if let Some(config) = plugin.config.as_object_mut() {
+        config.insert(
+            "reject_unmatched".to_string(),
+            Value::Bool(reject_unmatched),
+        );
+    }
+}
+
+fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
+    existing.backend_host.clone_from(&proxy.backend_host);
+    existing.backend_port = proxy.backend_port;
+    existing.upstream_id.clone_from(&proxy.upstream_id);
+    existing.retry.clone_from(&proxy.retry);
+    existing.backend_read_timeout_ms = proxy.backend_read_timeout_ms;
+}
+
+fn route_match_descriptors(object: &K8sObject, rule: &Value) -> Vec<RouteMatchDescriptor> {
+    dedup_route_match_descriptors(
+        route_match_entry_descriptors(object, rule)
+            .into_iter()
+            .map(|entry| entry.descriptor)
+            .collect(),
+    )
+}
+
+fn route_match_entry_descriptors(
+    object: &K8sObject,
+    rule: &Value,
+) -> Vec<RouteMatchEntryDescriptor> {
+    let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        return vec![RouteMatchEntryDescriptor {
+            match_index: 0,
+            descriptor: default_route_match_descriptor(),
+        }];
+    };
+    if matches.is_empty() {
+        return vec![RouteMatchEntryDescriptor {
+            match_index: 0,
+            descriptor: default_route_match_descriptor(),
+        }];
+    }
+
+    matches
+        .iter()
+        .enumerate()
+        .filter_map(|(match_index, entry)| {
+            route_match_descriptor_for_entry(object, entry).map(|descriptor| {
+                RouteMatchEntryDescriptor {
+                    match_index,
+                    descriptor,
+                }
+            })
+        })
+        .collect()
+}
+
+fn dedup_route_match_descriptors(
+    mut descriptors: Vec<RouteMatchDescriptor>,
+) -> Vec<RouteMatchDescriptor> {
+    descriptors.sort_by(|left, right| {
+        (&left.listen_path, &left.match_signature)
+            .cmp(&(&right.listen_path, &right.match_signature))
+    });
+    descriptors.dedup();
+    descriptors
+}
+
+fn default_route_match_descriptor() -> RouteMatchDescriptor {
+    RouteMatchDescriptor {
+        listen_path: "/".to_string(),
+        match_signature: "{}".to_string(),
+    }
+}
+
+fn route_match_descriptor_for_entry(
+    object: &K8sObject,
+    entry: &Value,
+) -> Option<RouteMatchDescriptor> {
+    if object.kind == "GRPCRoute" {
+        return Some(RouteMatchDescriptor {
+            listen_path: entry
+                .get("path")
+                .and_then(http_path_match)
+                .unwrap_or_else(|| "/".to_string()),
+            // Ferrum does not yet dispatch GRPCRoute method/header matches within
+            // a shared host/path proxy, so conflict resolution remains scoped to
+            // the materialized path for GRPCRoute.
+            match_signature: "{}".to_string(),
+        });
+    }
+
+    if http_route_match_has_untranslated_non_path_predicate(entry) {
+        return None;
+    }
+
+    let listen_path = if let Some(path) = entry.get("path").and_then(http_path_match) {
+        path
+    } else if entry.as_object().is_some_and(|object| object.is_empty())
+        || http_route_match_has_supported_non_path_predicate(entry)
+    {
+        "/".to_string()
+    } else {
+        return None;
+    };
+
+    Some(RouteMatchDescriptor {
+        listen_path,
+        match_signature: http_route_match_signature(entry),
+    })
+}
+
+fn http_route_match_signature(entry: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(method) = string_field(entry, "method") {
+        parts.push(format!("method={}", json_string(method)));
+    }
+
+    let mut headers = Vec::new();
+    if let Some(headers_array) = entry.get("headers").and_then(Value::as_array) {
+        for header in headers_array {
+            if !gateway_match_type_is_exact(header) {
+                continue;
+            }
+            let Some(name) = string_field(header, "name") else {
+                continue;
+            };
+            let Some(value) = string_field(header, "value") else {
+                continue;
+            };
+            headers.push(format!(
+                "{}={}",
+                name.to_ascii_lowercase(),
+                json_string(value)
+            ));
+        }
+    }
+    headers.sort();
+    for header in headers {
+        parts.push(format!("header:{header}"));
+    }
+
+    let mut query_params = Vec::new();
+    if let Some(params_array) = entry.get("queryParams").and_then(Value::as_array) {
+        for param in params_array {
+            if !gateway_match_type_is_exact(param) {
+                continue;
+            }
+            let Some(name) = string_field(param, "name") else {
+                continue;
+            };
+            let Some(value) = string_field(param, "value") else {
+                continue;
+            };
+            query_params.push(format!("{}={}", json_string(name), json_string(value)));
+        }
+    }
+    query_params.sort();
+    for param in query_params {
+        parts.push(format!("query:{param}"));
+    }
+
+    if parts.is_empty() {
+        "{}".to_string()
+    } else {
+        parts.join("|")
+    }
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn route_hostnames(object: &K8sObject) -> Vec<String> {
+    let mut hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| hostname.to_ascii_lowercase())
+        .collect();
+    if hostnames.is_empty() {
+        hostnames.push("*".to_string());
+    }
+    hostnames.sort();
+    hostnames.dedup();
+    hostnames
+}
+
+fn route_parent_ref_keys(object: &K8sObject) -> Vec<String> {
+    let mut refs: Vec<String> = object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|parent| {
+            let group = string_field(parent, "group").unwrap_or("gateway.networking.k8s.io");
+            let kind = string_field(parent, "kind").unwrap_or("Gateway");
+            let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
+            let name = string_field(parent, "name").unwrap_or("*");
+            let section = string_field(parent, "sectionName").unwrap_or("*");
+            let port = parent
+                .get("port")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "*".to_string(), |port| port.to_string());
+            format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
+        })
+        .collect();
+    if refs.is_empty() {
+        refs.push(format!(
+            "gateway.networking.k8s.io/Gateway/{}/{}/*/*",
+            object.metadata.namespace, "*"
+        ));
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn compare_creation_timestamps(
+    left: &Option<DateTime<Utc>>,
+    right: &Option<DateTime<Utc>>,
+) -> Ordering {
+    match (left, right) {
+        (Some(left_ts), Some(right_ts)) => left_ts.cmp(right_ts),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_conflict_candidates(
+    left: &GatewayApiRouteConflictCandidate,
+    right: &GatewayApiRouteConflictCandidate,
+) -> Ordering {
+    compare_creation_timestamps(&left.creation_timestamp, &right.creation_timestamp).then_with(
+        || {
+            (&left.resource.namespace, &left.resource.name)
+                .cmp(&(&right.resource.namespace, &right.resource.name))
+        },
+    )
+}
+
 fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {
     let mut services = Vec::new();
     object
@@ -240,13 +870,25 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
     Ok(services)
 }
 
-fn http_route_proxies(
+type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
+
+fn http_route_resources(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
-) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+) -> Result<HttpRouteResources, K8sTranslateError> {
     let hostnames = string_array(&object.spec, "hostnames");
+    let conflict_hostnames = route_hostnames(object);
+    let parent_refs = route_parent_ref_keys(object);
+    let route_family = object.kind.to_ascii_lowercase();
+    let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
+        .gateway_api_conflict_losers
+        .get(&K8sResourceKey::from_object(object))
+        .into_iter()
+        .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
+        .collect();
     let route_kind = object.kind.to_ascii_lowercase();
     let mut proxies = Vec::new();
+    let mut plugins = Vec::new();
 
     for (rule_index, rule) in object
         .spec
@@ -256,13 +898,26 @@ fn http_route_proxies(
         .flatten()
         .enumerate()
     {
-        let match_paths = match_paths(object, rule);
-        if match_paths.is_empty() {
+        let entry_descriptors = route_match_entry_descriptors(object, rule);
+        let descriptors = dedup_route_match_descriptors(
+            entry_descriptors
+                .iter()
+                .map(|entry| entry.descriptor.clone())
+                .collect(),
+        );
+        if descriptors.is_empty() {
             continue;
         }
+        let mut match_paths: Vec<String> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.listen_path.clone())
+            .collect();
+        match_paths.sort();
+        match_paths.dedup();
 
         let backends = route_backends(object, rule, acc)?;
-        let (backend_host, backend_port, upstream_id) = if backends.is_empty() {
+        let (backend_host, backend_port, upstream_id, mut pending_upstream) = if backends.is_empty()
+        {
             if !has_only_zero_weight_backend_refs(rule) {
                 continue;
             }
@@ -270,12 +925,13 @@ fn http_route_proxies(
                 ZERO_WEIGHT_BACKEND_HOST.to_string(),
                 ZERO_WEIGHT_BACKEND_PORT,
                 None,
+                None,
             )
         } else if backends.len() == 1 {
             let Some(backend) = backends.into_iter().next() else {
                 continue;
             };
-            (backend.host, backend.port, None)
+            (backend.host, backend.port, None, None)
         } else {
             let route_suffix = format!("{route_kind}-{rule_index}");
             let upstream_id = resource_id(
@@ -284,44 +940,205 @@ fn http_route_proxies(
                 &object.metadata.name,
                 &route_suffix,
             );
-            acc.upsert_upstream(upstream_for_route(
+            let upstream = upstream_for_route(
                 upstream_id.clone(),
                 object.metadata.namespace.clone(),
                 backends,
-            ));
-            (String::new(), 0, Some(upstream_id))
+            );
+            (String::new(), 0, Some(upstream_id), Some(upstream))
         };
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+            let entry_descriptors_for_path: Vec<_> = entry_descriptors
+                .iter()
+                .filter(|entry| entry.descriptor.listen_path == listen_path)
+                .cloned()
+                .collect();
+            let descriptors_for_path = dedup_route_match_descriptors(
+                entry_descriptors_for_path
+                    .iter()
+                    .map(|entry| entry.descriptor.clone())
+                    .collect(),
+            );
+            let host_scopes = route_host_scopes_for_path(
+                &hostnames,
+                &conflict_hostnames,
+                &parent_refs,
+                &route_family,
+                &descriptors_for_path,
+                &losing_conflict_keys,
+            );
+            if host_scopes.is_empty() {
+                continue;
+            }
+            if let Some(upstream) = pending_upstream.take() {
+                acc.upsert_upstream(upstream);
+            }
             let suffix = if match_count == 1 {
                 format!("{route_kind}-{rule_index}")
             } else {
                 format!("{route_kind}-{rule_index}-{match_index}")
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
+
+            for host_scope in host_scopes {
+                let scoped_suffix = host_scope.suffix.as_ref().map_or_else(
+                    || suffix.clone(),
+                    |host_suffix| format!("{suffix}-{host_suffix}"),
+                );
+                let proxy_id = resource_id(
                     "gwapi-route",
                     &object.metadata.namespace,
                     &object.metadata.name,
-                    &suffix,
-                ),
-                namespace: object.metadata.namespace.clone(),
-                hosts: hostnames.clone(),
-                listen_path,
-                strip_listen_path: false,
-                backend_host: backend_host.clone(),
-                backend_port,
-                upstream_id: upstream_id.clone(),
-                backend_scheme: BackendScheme::Http,
-                listen_port: None,
-                retry: None,
-                backend_read_timeout_ms: None,
-            }));
+                    &scoped_suffix,
+                );
+                let mut proxy = proxy_for_route(RouteProxySpec {
+                    id: proxy_id.clone(),
+                    namespace: object.metadata.namespace.clone(),
+                    hosts: host_scope.proxy_hosts,
+                    listen_path: Some(listen_path.clone()),
+                    strip_listen_path: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: upstream_id.clone(),
+                    backend_scheme: BackendScheme::Http,
+                    listen_port: None,
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+
+                if object.kind == "HTTPRoute" {
+                    let skipped_descriptors = skipped_descriptors_for_host(
+                        &parent_refs,
+                        &route_family,
+                        &host_scope.conflict_hostname,
+                        &descriptors_for_path,
+                        &losing_conflict_keys,
+                    );
+                    let (rules, has_path_only_match) = http_route_dispatch_rules_for_proxy(
+                        object,
+                        rule,
+                        rule_index,
+                        Some(listen_path.as_str()),
+                        MeshRouteDispatchDestination {
+                            backend_host: backend_host.as_str(),
+                            backend_port,
+                            upstream_id: upstream_id.as_deref(),
+                        },
+                        &skipped_descriptors,
+                        &entry_descriptors_for_path,
+                    );
+                    if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
+                        &proxy_id,
+                        &object.metadata.namespace,
+                        rules,
+                        !has_path_only_match,
+                    ) {
+                        sort_dispatch_rules(&mut plugin);
+                        attach_route_plugins_to_proxy(&mut proxy, std::slice::from_ref(&plugin));
+                        plugins.push(plugin);
+                    }
+                }
+
+                proxies.push(proxy);
+            }
         }
     }
 
-    Ok(proxies)
+    Ok((proxies, plugins))
+}
+
+fn route_host_scopes_for_path(
+    spec_hostnames: &[String],
+    conflict_hostnames: &[String],
+    parent_refs: &[String],
+    route_family: &str,
+    descriptors_for_path: &[RouteMatchDescriptor],
+    losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
+) -> Vec<RouteHostScope> {
+    if losing_conflict_keys.is_empty() {
+        return vec![RouteHostScope {
+            proxy_hosts: spec_hostnames.to_vec(),
+            conflict_hostname: conflict_hostnames
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "*".to_string()),
+            suffix: None,
+        }];
+    }
+
+    conflict_hostnames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, hostname)| {
+            let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
+                !descriptor_conflicts_for_host(
+                    parent_refs,
+                    route_family,
+                    hostname,
+                    descriptor,
+                    losing_conflict_keys,
+                )
+            });
+            if !has_surviving_match {
+                return None;
+            }
+
+            Some(RouteHostScope {
+                proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
+                conflict_hostname: hostname.clone(),
+                suffix: Some(format!("host{index}")),
+            })
+        })
+        .collect()
+}
+
+fn proxy_hosts_for_conflict_hostname(spec_hostnames: &[String], hostname: &str) -> Vec<String> {
+    if spec_hostnames.is_empty() && hostname == "*" {
+        Vec::new()
+    } else {
+        vec![hostname.to_string()]
+    }
+}
+
+fn skipped_descriptors_for_host(
+    parent_refs: &[String],
+    route_family: &str,
+    hostname: &str,
+    descriptors_for_path: &[RouteMatchDescriptor],
+    losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
+) -> HashSet<RouteMatchDescriptor> {
+    descriptors_for_path
+        .iter()
+        .filter(|descriptor| {
+            descriptor_conflicts_for_host(
+                parent_refs,
+                route_family,
+                hostname,
+                descriptor,
+                losing_conflict_keys,
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn descriptor_conflicts_for_host(
+    parent_refs: &[String],
+    route_family: &str,
+    hostname: &str,
+    descriptor: &RouteMatchDescriptor,
+    losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
+) -> bool {
+    parent_refs.iter().any(|parent_ref| {
+        losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
+            route_family: route_family.to_string(),
+            parent_ref: parent_ref.clone(),
+            hostname: hostname.to_string(),
+            listen_path: descriptor.listen_path.clone(),
+            match_signature: route_conflict_match_signature(descriptor),
+        })
+    })
 }
 
 fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
@@ -337,42 +1154,246 @@ fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
         .all(|backend_ref| backend_ref.get("weight").and_then(Value::as_u64) == Some(0))
 }
 
-fn match_paths(object: &K8sObject, rule: &Value) -> Vec<Option<String>> {
+fn http_route_dispatch_rules_for_proxy(
+    object: &K8sObject,
+    rule: &Value,
+    rule_index: usize,
+    listen_path: Option<&str>,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    skipped_descriptors: &HashSet<RouteMatchDescriptor>,
+    entry_descriptors: &[RouteMatchEntryDescriptor],
+) -> (Vec<Value>, bool) {
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
-        return vec![Some("/".to_string())];
+        return (Vec::new(), true);
     };
     if matches.is_empty() {
-        return vec![Some("/".to_string())];
+        return (Vec::new(), true);
     }
 
-    let mut seen_paths = HashSet::new();
-    if object.kind == "GRPCRoute" {
-        return matches
-            .iter()
-            .map(|m| {
-                m.get("path")
-                    .and_then(http_path_match)
-                    .or_else(|| Some("/".to_string()))
+    let mut rules = Vec::new();
+    let mut has_path_only_match = false;
+    for entry_descriptor in entry_descriptors {
+        let match_index = entry_descriptor.match_index;
+        let Some(entry) = matches.get(match_index) else {
+            continue;
+        };
+        let descriptor = &entry_descriptor.descriptor;
+        let entry_path = descriptor.listen_path.as_str();
+        if let Some(listen_path) = listen_path
+            && entry_path != listen_path
+        {
+            continue;
+        }
+        if skipped_descriptors.contains(descriptor) {
+            continue;
+        }
+
+        let mut match_criteria = serde_json::Map::new();
+        if let Some(method) = string_field(entry, "method") {
+            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+        }
+
+        if let Some(headers_array) = entry.get("headers").and_then(Value::as_array) {
+            let mut headers = serde_json::Map::new();
+            for header in headers_array {
+                if !gateway_match_type_is_exact(header) {
+                    continue;
+                }
+                let Some(name) = string_field(header, "name") else {
+                    continue;
+                };
+                let Some(value) = string_field(header, "value") else {
+                    continue;
+                };
+                let name = name.to_ascii_lowercase();
+                if !headers.contains_key(&name) {
+                    headers.insert(name, Value::String(value.to_string()));
+                }
+            }
+            if !headers.is_empty() {
+                match_criteria.insert("headers".to_string(), Value::Object(headers));
+            }
+        }
+
+        if let Some(params_array) = entry.get("queryParams").and_then(Value::as_array) {
+            let mut params = serde_json::Map::new();
+            for param in params_array {
+                if !gateway_match_type_is_exact(param) {
+                    continue;
+                }
+                let Some(name) = string_field(param, "name") else {
+                    continue;
+                };
+                let Some(value) = string_field(param, "value") else {
+                    continue;
+                };
+                let name = name.to_string();
+                if !params.contains_key(&name) {
+                    params.insert(name, Value::String(value.to_string()));
+                }
+            }
+            if !params.is_empty() {
+                match_criteria.insert("query_params".to_string(), Value::Object(params));
+            }
+        }
+
+        if match_criteria.is_empty() {
+            has_path_only_match = true;
+            continue;
+        }
+
+        let mut destination = serde_json::Map::new();
+        if let Some(uid) = route_destination.upstream_id {
+            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+        } else {
+            destination.insert(
+                "backend_host".to_string(),
+                Value::String(route_destination.backend_host.to_string()),
+            );
+            destination.insert(
+                "backend_port".to_string(),
+                serde_json::json!(route_destination.backend_port),
+            );
+        }
+
+        let mut route_rule = serde_json::Map::new();
+        route_rule.insert("match".to_string(), Value::Object(match_criteria));
+        route_rule.insert("destination".to_string(), Value::Object(destination));
+        route_rule.insert(
+            GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
+            gateway_api_dispatch_rule_precedence(object, entry, rule_index, match_index),
+        );
+        rules.push(Value::Object(route_rule));
+    }
+
+    (rules, has_path_only_match)
+}
+
+fn gateway_api_dispatch_rule_precedence(
+    object: &K8sObject,
+    entry: &Value,
+    rule_index: usize,
+    match_index: usize,
+) -> Value {
+    let mut precedence = serde_json::Map::new();
+    precedence.insert(
+        "method_match".to_string(),
+        Value::Bool(string_field(entry, "method").is_some()),
+    );
+    precedence.insert(
+        "header_count".to_string(),
+        serde_json::json!(translated_header_match_count(entry)),
+    );
+    precedence.insert(
+        "query_param_count".to_string(),
+        serde_json::json!(translated_query_param_match_count(entry)),
+    );
+    if let Some(creation_timestamp) = object.metadata.creation_timestamp.as_deref() {
+        precedence.insert(
+            "creation_timestamp".to_string(),
+            Value::String(creation_timestamp.to_string()),
+        );
+    }
+    precedence.insert(
+        "namespace".to_string(),
+        Value::String(object.metadata.namespace.clone()),
+    );
+    precedence.insert(
+        "name".to_string(),
+        Value::String(object.metadata.name.clone()),
+    );
+    precedence.insert("rule_index".to_string(), serde_json::json!(rule_index));
+    precedence.insert("match_index".to_string(), serde_json::json!(match_index));
+    Value::Object(precedence)
+}
+
+fn translated_header_match_count(entry: &Value) -> usize {
+    let mut names = HashSet::new();
+    if let Some(headers) = entry.get("headers").and_then(Value::as_array) {
+        for header in headers {
+            if !gateway_match_type_is_exact(header) {
+                continue;
+            }
+            let Some(name) = string_field(header, "name") else {
+                continue;
+            };
+            if string_field(header, "value").is_some() {
+                names.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+    names.len()
+}
+
+fn translated_query_param_match_count(entry: &Value) -> usize {
+    let mut names = HashSet::new();
+    if let Some(params) = entry.get("queryParams").and_then(Value::as_array) {
+        for param in params {
+            if !gateway_match_type_is_exact(param) {
+                continue;
+            }
+            let Some(name) = string_field(param, "name") else {
+                continue;
+            };
+            if string_field(param, "value").is_some() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names.len()
+}
+
+fn http_route_match_has_supported_non_path_predicate(entry: &Value) -> bool {
+    string_field(entry, "method").is_some()
+        || entry
+            .get("headers")
+            .and_then(Value::as_array)
+            .is_some_and(|headers| {
+                headers.iter().any(|header| {
+                    gateway_match_type_is_exact(header)
+                        && string_field(header, "name").is_some()
+                        && string_field(header, "value").is_some()
+                })
             })
-            .filter(|listen_path| seen_paths.insert(listen_path.clone()))
-            .collect();
-    }
+        || entry
+            .get("queryParams")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params.iter().any(|param| {
+                    gateway_match_type_is_exact(param)
+                        && string_field(param, "name").is_some()
+                        && string_field(param, "value").is_some()
+                })
+            })
+}
 
-    matches
-        .iter()
-        .filter_map(|m| {
-            if let Some(path) = m.get("path").and_then(http_path_match) {
-                return Some(Some(path));
-            }
-            if m.as_object().is_some_and(|object| object.is_empty()) {
-                return Some(Some("/".to_string()));
-            }
-            // Pathless predicate-only matches default to "/" in Gateway API, but
-            // Ferrum route proxies do not encode those predicates yet.
-            None
+fn http_route_match_has_untranslated_non_path_predicate(entry: &Value) -> bool {
+    entry
+        .get("headers")
+        .and_then(Value::as_array)
+        .is_some_and(|headers| {
+            headers
+                .iter()
+                .any(gateway_header_query_match_is_untranslated)
         })
-        .filter(|listen_path| seen_paths.insert(listen_path.clone()))
-        .collect()
+        || entry
+            .get("queryParams")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(gateway_header_query_match_is_untranslated)
+            })
+}
+
+fn gateway_header_query_match_is_untranslated(value: &Value) -> bool {
+    !gateway_match_type_is_exact(value)
+        || string_field(value, "name").is_none()
+        || string_field(value, "value").is_none()
+}
+
+fn gateway_match_type_is_exact(value: &Value) -> bool {
+    matches!(string_field(value, "type"), None | Some("Exact"))
 }
 
 fn route_backends(
@@ -657,6 +1678,7 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
@@ -674,6 +1696,23 @@ mod tests {
             spec,
             ..object(kind, Value::Null)
         }
+    }
+
+    fn route_with_name_and_created_at(name: &str, created_at: &str) -> K8sObject {
+        let mut route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        route.metadata.name = name.to_string();
+        route.metadata.creation_timestamp = Some(created_at.to_string());
+        route
     }
 
     #[test]
@@ -701,6 +1740,444 @@ mod tests {
         );
         assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn conflicting_http_routes_use_oldest_creation_timestamp_winner() {
+        let newer = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+
+        let result =
+            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-a"),
+            "oldest route must win the conflicting host/path"
+        );
+        assert!(result.warnings.iter().any(
+            |warning| warning.contains("api-b") && warning.contains("winner is default/api-a")
+        ));
+    }
+
+    #[test]
+    fn conflicting_http_route_timestamp_tie_uses_name_winner() {
+        let right = route_with_name_and_created_at("api-b", "2026-01-01T00:00:00Z");
+        let left = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+
+        let result =
+            translate_k8s_objects(&[right, left], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-a"),
+            "lexicographically earlier route name must win timestamp ties"
+        );
+    }
+
+    #[test]
+    fn conflicting_http_routes_normalize_hostname_case() {
+        let mut upper = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        upper.spec["hostnames"] = serde_json::json!(["Api.Example.Com"]);
+        let lower = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+
+        let result =
+            translate_k8s_objects(&[lower, upper], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-a"),
+            "case-equivalent hostnames must share one conflict bucket"
+        );
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("host=api.example.com") && warning.contains("winner is default/api-a")
+        }));
+    }
+
+    #[test]
+    fn conflicting_http_route_drops_match_when_any_parent_ref_loses() {
+        let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
+
+        let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}, {"name": "edge-b"}]);
+
+        let result =
+            translate_k8s_objects(&[loser, winner], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-old"),
+            "route losing on one parentRef must not materialize an unscoped proxy"
+        );
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("api-new")
+                && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
+                && warning.contains("winner is default/api-old")
+        }));
+    }
+
+    #[test]
+    fn http_route_conflicts_preserve_match_predicates_per_path() {
+        let mut get_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET"
+                    }],
+                    "backendRefs": [{"name": "api-get", "port": 8080}]
+                }]
+            }),
+        );
+        get_route.metadata.name = "api-get".to_string();
+        get_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut post_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "POST"
+                    }],
+                    "backendRefs": [{"name": "api-post", "port": 8081}]
+                }]
+            }),
+        );
+        post_route.metadata.name = "api-post".to_string();
+        post_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[get_route, post_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "merged predicate routes must not produce duplicate host/path proxies"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("api-post")),
+            "distinct match predicates must not conflict: {:?}",
+            result.warnings
+        );
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("merged predicate routes need dispatch rules");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8080));
+        assert_eq!(rules[1]["match"]["methods"][0].as_str(), Some("POST"));
+        assert!(
+            rules[1]["destination"]["backend_port"].as_u64() == Some(8081),
+            "POST route must keep its own backend destination"
+        );
+    }
+
+    #[test]
+    fn http_route_dispatch_prefers_more_specific_gateway_api_match() {
+        let mut header_only = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "headers": [{"name": "x-env", "value": "prod"}]
+                    }],
+                    "backendRefs": [{"name": "api-header", "port": 8080}]
+                }]
+            }),
+        );
+        header_only.metadata.name = "api-header".to_string();
+        header_only.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut method_and_header = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET",
+                        "headers": [{"name": "x-env", "value": "prod"}]
+                    }],
+                    "backendRefs": [{"name": "api-get-header", "port": 8081}]
+                }]
+            }),
+        );
+        method_and_header.metadata.name = "api-get-header".to_string();
+        method_and_header.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[header_only, method_and_header], options())
+            .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("merged predicate routes need dispatch rules");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8081));
+        assert_eq!(rules[1]["destination"]["backend_port"].as_u64(), Some(8080));
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.get(GATEWAY_API_DISPATCH_PRECEDENCE_KEY).is_none()),
+            "internal sort metadata must not leak into the translated config"
+        );
+    }
+
+    #[test]
+    fn http_route_dispatch_specificity_ties_use_route_creation_order() {
+        let mut newer = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "headers": [{"name": "x-newer", "value": "yes"}]
+                    }],
+                    "backendRefs": [{"name": "api-newer", "port": 8081}]
+                }]
+            }),
+        );
+        newer.metadata.name = "api-newer".to_string();
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let mut older = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "headers": [{"name": "x-older", "value": "yes"}]
+                    }],
+                    "backendRefs": [{"name": "api-older", "port": 8080}]
+                }]
+            }),
+        );
+        older.metadata.name = "api-older".to_string();
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let result =
+            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("merged predicate routes need dispatch rules");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8080));
+        assert_eq!(rules[1]["destination"]["backend_port"].as_u64(), Some(8081));
+    }
+
+    #[test]
+    fn http_route_conflicts_include_parent_ref_port() {
+        let mut port_80_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge", "port": 80}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-http", "port": 8080}]
+                }]
+            }),
+        );
+        port_80_route.metadata.name = "api-http".to_string();
+        port_80_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut port_8080_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge", "port": 8080}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-alt", "port": 8081}]
+                }]
+            }),
+        );
+        port_8080_route.metadata.name = "api-alt".to_string();
+        port_8080_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[port_80_route, port_8080_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(
+            result.warnings.is_empty(),
+            "port-distinct parentRefs must not conflict: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn conflicting_http_route_skips_only_conflicting_rule() {
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        let mut mixed = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [
+                    {
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                        "backendRefs": [{"name": "api-b", "port": 8080}]
+                    },
+                    {
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                        "backendRefs": [{"name": "admin", "port": 9090}]
+                    }
+                ]
+            }),
+        );
+        mixed.metadata.name = "api-b".to_string();
+        mixed.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result =
+            translate_k8s_objects(&[older, mixed], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/admin")
+        }));
+        assert!(!result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+    }
+
+    #[test]
+    fn conflicting_weighted_http_route_does_not_emit_orphan_upstream() {
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        let mut weighted_loser = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [
+                        {"name": "api-v1", "port": 8080, "weight": 90},
+                        {"name": "api-v2", "port": 8081, "weight": 10}
+                    ]
+                }]
+            }),
+        );
+        weighted_loser.metadata.name = "api-b".to_string();
+        weighted_loser.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[older, weighted_loser], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.upstreams.is_empty(),
+            "fully conflicted weighted route must not leave an unreferenced upstream"
+        );
+    }
+
+    #[test]
+    fn conflicting_http_route_drops_match_with_surviving_parent_ref() {
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        let mut mixed_parent_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}, {"name": "edge-alt"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-b", "port": 8080}]
+                }]
+            }),
+        );
+        mixed_parent_route.metadata.name = "api-b".to_string();
+        mixed_parent_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[older, mixed_parent_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(!result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+    }
+
+    #[test]
+    fn conflicting_grpc_route_warning_explains_shared_path_limit() {
+        let mut greeter = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["grpc.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"method": {"service": "helloworld.Greeter"}}],
+                    "backendRefs": [{"name": "greeter", "port": 50051}]
+                }]
+            }),
+        );
+        greeter.metadata.name = "greeter".to_string();
+        greeter.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut goodbye = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["grpc.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"method": {"service": "helloworld.Goodbye"}}],
+                    "backendRefs": [{"name": "goodbye", "port": 50052}]
+                }]
+            }),
+        );
+        goodbye.metadata.name = "goodbye".to_string();
+        goodbye.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result =
+            translate_k8s_objects(&[greeter, goodbye], options()).expect("translation succeeds");
+
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains(
+                "cannot yet dispatch GRPCRoute method/header matches within a shared path",
+            )
+        }));
     }
 
     #[test]
@@ -817,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_skips_predicate_only_pathless_matches() {
+    fn http_route_emits_dispatch_for_predicate_only_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -839,8 +2316,121 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert!(result.config.proxies.is_empty());
-        assert!(result.config.upstreams.is_empty());
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.upstreams.len(), 1);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("predicate-only HTTPRoute emits mesh_route_dispatch");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(rules[1]["match"]["headers"]["x-tenant"].as_str(), Some("a"));
+        assert_eq!(
+            rules[0]["destination"]["upstream_id"].as_str(),
+            result.config.proxies[0].upstream_id.as_deref()
+        );
+    }
+
+    #[test]
+    fn http_route_dispatch_matchers_keep_first_duplicate_header_and_query_name() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [{
+                            "headers": [
+                                {"name": "X-Tenant", "value": "first"},
+                                {"name": "x-tenant", "value": "second"}
+                            ],
+                            "queryParams": [
+                                {"name": "version", "value": "v1"},
+                                {"name": "version", "value": "v2"}
+                            ]
+                        }],
+                        "backendRefs": [
+                            {"name": "api-a", "port": 8080},
+                            {"name": "api-b", "port": 8081}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("predicate-only HTTPRoute emits mesh_route_dispatch");
+        let rule_match = &plugin.config["rules"][0]["match"];
+        assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("first"));
+        assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v1"));
+    }
+
+    #[test]
+    fn http_route_dispatch_skips_partially_supported_predicate_matches() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [
+                                    {"name": "x-tenant", "value": "a"},
+                                    {"type": "RegularExpression", "name": "x-scope", "value": "prod|dev"}
+                                ]
+                            },
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [{"name": "x-tenant", "value": "b"}],
+                                "queryParams": [
+                                    {"name": "version", "value": "v2"},
+                                    {"type": "RegularExpression", "name": "debug", "value": "true|false"}
+                                ]
+                            },
+                            {
+                                "path": {"type": "PathPrefix", "value": "/api"},
+                                "headers": [{"name": "x-tenant", "value": "c"}],
+                                "queryParams": [{"name": "version", "value": "v3"}]
+                            }
+                        ],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("supported HTTPRoute match emits mesh_route_dispatch");
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        let rule_match = &rules[0]["match"];
+        assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("c"));
+        assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v3"));
     }
 
     #[test]
@@ -867,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_ignores_pathless_match_in_mixed_rule() {
+    fn http_route_keeps_pathless_predicate_in_mixed_rule() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -886,8 +2476,32 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        let paths: HashSet<_> = result
+            .config
+            .proxies
+            .iter()
+            .filter_map(|proxy| proxy.listen_path.as_deref())
+            .collect();
+        assert_eq!(paths, HashSet::from(["/v1", "/"]));
+        let catch_all = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/"))
+            .expect("pathless predicate catch-all proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(catch_all.id.as_str())
+            })
+            .expect("catch-all proxy has dispatch rule");
+        assert_eq!(
+            plugin.config["rules"][0]["match"]["headers"]["x-tenant"].as_str(),
+            Some("a")
+        );
     }
 
     #[test]

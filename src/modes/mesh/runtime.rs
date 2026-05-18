@@ -206,6 +206,7 @@ impl MeshRuntimeState {
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.
     pub fn install_slice(&self, slice: MeshSlice) {
+        crate::plugins::mesh::prometheus_helpers::record_mesh_config_received(&slice.namespace);
         self.egress_scope.install_from_slice(&slice);
         self.current.store(Arc::new(Some(slice)));
         self.revision_tx.send_modify(|revision| *revision += 1);

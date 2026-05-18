@@ -29,6 +29,7 @@ fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
             namespace: "default".to_string(),
             labels: Default::default(),
             annotations: Default::default(),
+            creation_timestamp: None,
             deletion_timestamp: None,
         },
         spec,

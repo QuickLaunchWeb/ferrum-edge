@@ -18,9 +18,9 @@ use crate::modes::mesh::config::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    attach_route_plugins_to_proxy, exact_path_listen_path, fault_injection_plugin_for_proxy,
-    invalid_resource, mesh_route_dispatch_can_emit_rule,
+    MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
+    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    fault_injection_plugin_for_proxy, invalid_resource, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
@@ -1516,12 +1516,8 @@ fn take_pending_route_dispatch(
     Some(pending.remove(index).1)
 }
 
-fn route_has_local_policy(
-    route_plugins: &[PluginConfig],
-    retry: &Option<RetryConfig>,
-    timeout_ms: Option<u64>,
-) -> bool {
-    !route_plugins.is_empty() || retry.is_some() || timeout_ms.is_some()
+fn route_has_uncollapsible_local_policy(route_plugins: &[PluginConfig]) -> bool {
+    !route_plugins.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1588,8 +1584,7 @@ fn virtual_service_routes(
         .collect();
 
     for (index, http) in http_routes.iter().copied().enumerate() {
-        let route_candidates =
-            route_candidate_paths(http, acc.options.vs_header_routing_experimental);
+        let route_candidates = route_candidate_paths(http);
         if route_candidates.is_empty() {
             continue;
         }
@@ -1651,21 +1646,22 @@ fn virtual_service_routes(
                 route_plugins.push(plugin);
             }
 
-            let (current_route_rules, has_uri_only_match) =
-                if acc.options.vs_header_routing_experimental {
-                    mesh_route_dispatch_rules_for_proxy(
-                        http,
-                        listen_path.as_deref(),
-                        MeshRouteDispatchDestination {
-                            backend_host: backend_host.as_str(),
-                            backend_port,
-                            upstream_id: upstream_id.as_deref(),
-                        },
-                        false,
-                    )
-                } else {
-                    (Vec::new(), false)
-                };
+            let (current_route_rules, has_uri_only_match) = mesh_route_dispatch_rules_for_proxy(
+                http,
+                listen_path.as_deref(),
+                MeshRouteDispatchDestination {
+                    backend_host: backend_host.as_str(),
+                    backend_port,
+                    upstream_id: upstream_id.as_deref(),
+                },
+                MeshRouteDispatchPolicy {
+                    timeout_ms,
+                    timeout_disabled: timeout_ms.is_none(),
+                    retry: retry.as_ref(),
+                    retry_disabled: retry.is_none(),
+                },
+                false,
+            );
 
             let proxy = proxy_for_route(RouteProxySpec {
                 id: proxy_id,
@@ -1692,22 +1688,20 @@ fn virtual_service_routes(
             // a synthetic `~.*` catch-all is emitted at the end for paths no later
             // route handles.
             let current_route_has_rules = !current_route_rules.is_empty();
-            let guarded_route = force_terminate_current
-                || (acc.options.vs_header_routing_experimental
-                    && current_route_has_rules
-                    && !has_uri_only_match);
+            let guarded_route =
+                force_terminate_current || (current_route_has_rules && !has_uri_only_match);
             let has_later_same_path = guarded_route
                 && !is_uri_less_catch_all
                 && http_routes.iter().skip(index + 1).any(|later| {
-                    route_candidate_paths(later, acc.options.vs_header_routing_experimental)
+                    route_candidate_paths(later)
                         .iter()
                         .any(|(later_path, _)| later_path == &listen_path)
                 });
             let has_later_any_path = is_uri_less_catch_all
-                && http_routes.iter().skip(index + 1).any(|later| {
-                    !route_candidate_paths(later, acc.options.vs_header_routing_experimental)
-                        .is_empty()
-                });
+                && http_routes
+                    .iter()
+                    .skip(index + 1)
+                    .any(|later| !route_candidate_paths(later).is_empty());
             let consumes_pending_uri_less = pending_uri_less_route.is_some();
             let consumes_pending_scoped = pending_scoped_routes
                 .iter()
@@ -1716,7 +1710,7 @@ fn virtual_service_routes(
                 || consumes_pending_scoped
                 || (is_uri_less_catch_all
                     && (has_later_any_path || pending_uri_less_route.is_some()));
-            if route_has_local_policy(&route_plugins, &retry, timeout_ms)
+            if route_has_uncollapsible_local_policy(&route_plugins)
                 && (consumes_pending_uri_less
                     || consumes_pending_scoped
                     || (guarded_route && collapse_required))
@@ -1724,7 +1718,7 @@ fn virtual_service_routes(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService HTTP route {index} uses route-local fault/retries/timeout policy on a route that must be merged with another route; Ferrum cannot apply that policy per mesh_route_dispatch rule"
+                        "VirtualService HTTP route {index} uses route-local fault policy on a route that must be merged with another route; Ferrum cannot apply that plugin per mesh_route_dispatch rule"
                     ),
                 ));
             }
@@ -1829,11 +1823,8 @@ fn virtual_service_routes(
     Ok((proxies, upstreams, plugins))
 }
 
-fn route_candidate_paths(
-    http: &Value,
-    vs_header_routing_experimental: bool,
-) -> Vec<(Option<String>, bool)> {
-    let supported_paths = match_paths(http, vs_header_routing_experimental);
+fn route_candidate_paths(http: &Value) -> Vec<(Option<String>, bool)> {
+    let supported_paths = match_paths(http);
     let mut seen_paths: HashSet<Option<String>> = HashSet::with_capacity(supported_paths.len());
     let mut candidates = Vec::with_capacity(supported_paths.len());
     for path in supported_paths {
@@ -1841,7 +1832,7 @@ fn route_candidate_paths(
         candidates.push((path, false));
     }
 
-    for path in unsupported_match_paths(http, vs_header_routing_experimental) {
+    for path in unsupported_match_paths(http) {
         if seen_paths.insert(path.clone()) {
             candidates.push((path, true));
         } else if let Some((_, force_terminate)) = candidates
@@ -1855,7 +1846,7 @@ fn route_candidate_paths(
     candidates
 }
 
-fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option<String>> {
+fn match_paths(http: &Value) -> Vec<Option<String>> {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
         return vec![Some("/".to_string())];
     };
@@ -1869,17 +1860,14 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
         // Istio forbids empty HTTPMatchRequest blocks; URI-less entries depend on
         // unsupported predicates such as headers/method/queryParams, so do not
         // broaden them into Ferrum catch-all routes.
-        .filter(|m| {
-            !vs_header_routing_experimental || !mesh_route_dispatch_has_unsupported_predicate(m)
-        })
+        .filter(|m| !mesh_route_dispatch_has_unsupported_predicate(m))
         .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
         .collect();
 
-    // Codex P2 (#3237631709): with `vs_header_routing_experimental=true`,
-    // materialize a regex catch-all listen_path when at least one match
-    // entry has NO URI predicate but DOES carry a fully-supported non-URI
-    // predicate (`method.exact`, `headers.X.exact`, `queryParams.X.exact`).
+    // Materialize a regex catch-all listen_path when at least one match entry
+    // has NO URI predicate but DOES carry a fully-supported non-URI predicate
+    // (`method.exact`, `headers.X.exact`, `queryParams.X.exact`).
     // Without this, an `http.match[]` consisting only of header/method/
     // queryParam predicates produces no listen_path → no proxy → the
     // operator's predicates are silently dropped and traffic that should
@@ -1891,8 +1879,7 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
     // a URI-less sibling shadow real prefix URI routes. The translator
     // defers these catch-all proxies until after all URI-derived proxies so
     // they also do not shadow later regex URI routes.
-    if vs_header_routing_experimental
-        && !seen_paths.contains(&Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
+    if !seen_paths.contains(&Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
         && matches
             .iter()
             .any(|m| m.get("uri").is_none() && mesh_route_dispatch_can_emit_rule(m))
@@ -1903,14 +1890,7 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
     paths
 }
 
-fn unsupported_match_paths(
-    http: &Value,
-    vs_header_routing_experimental: bool,
-) -> Vec<Option<String>> {
-    if !vs_header_routing_experimental {
-        return Vec::new();
-    }
-
+fn unsupported_match_paths(http: &Value) -> Vec<Option<String>> {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -3049,6 +3029,7 @@ mod tests {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
@@ -4223,7 +4204,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_skips_explicit_pathless_matches() {
+    fn virtual_service_emits_catch_all_for_explicit_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -4242,12 +4223,23 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert!(result.config.proxies.is_empty());
-        assert!(result.config.upstreams.is_empty());
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some(URI_LESS_MATCH_LISTEN_PATH)
+        );
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "mesh_route_dispatch emitted for pathless multi-predicate match"
+        );
     }
 
     #[test]
-    fn virtual_service_ignores_pathless_match_in_mixed_rule() {
+    fn virtual_service_keeps_pathless_predicate_in_mixed_rule() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -4266,8 +4258,24 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        let listen_paths: HashSet<_> = result
+            .config
+            .proxies
+            .iter()
+            .filter_map(|p| p.listen_path.as_deref())
+            .collect();
+        assert_eq!(
+            listen_paths,
+            HashSet::from(["/v1", URI_LESS_MATCH_LISTEN_PATH])
+        );
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "mesh_route_dispatch emitted for pathless predicate in mixed rule"
+        );
     }
 
     #[test]
@@ -6388,6 +6396,35 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_retry_5xx_allows_explicit_non_5xx_codes() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "5xx,400,401,403,404,connect-failure"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert_eq!(retry.retryable_status_codes.len(), 104);
+        assert!(retry.retryable_status_codes.contains(&400));
+        assert!(retry.retryable_status_codes.contains(&599));
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.validate_fields().is_ok());
+    }
+
+    #[test]
     fn virtual_service_zero_retry_attempts_produces_no_retry_config() {
         let result = translate_k8s_objects(
             &[object(
@@ -6981,8 +7018,7 @@ extensionProviders:
     // -- mesh_route_dispatch ----------------------------------------------
 
     #[test]
-    fn virtual_service_method_match_dropped_without_experimental_flag() {
-        // env var OFF (default): predicates silently dropped, no plugin emitted.
+    fn virtual_service_method_match_emits_plugin_by_default() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6998,35 +7034,6 @@ extensionProviders:
                 }),
             )],
             options(),
-        )
-        .expect("translation succeeds");
-        assert!(
-            result
-                .config
-                .plugin_configs
-                .iter()
-                .all(|p| p.plugin_name != "mesh_route_dispatch"),
-            "no mesh_route_dispatch plugin should be emitted when env var is off"
-        );
-    }
-
-    #[test]
-    fn virtual_service_method_match_emits_plugin_with_experimental_flag() {
-        let result = translate_k8s_objects(
-            &[object(
-                "VirtualService",
-                serde_json::json!({
-                    "hosts": ["api.example.com"],
-                    "http": [{
-                        "match": [{
-                            "uri": {"prefix": "/api"},
-                            "method": {"exact": "GET"}
-                        }],
-                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
-                    }]
-                }),
-            )],
-            options().with_vs_header_routing_experimental(true),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7087,7 +7094,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7123,7 +7130,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         assert!(
@@ -7159,7 +7166,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         assert!(
@@ -7204,7 +7211,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7243,7 +7250,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7301,7 +7308,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7385,7 +7392,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7436,7 +7443,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -7472,9 +7479,9 @@ extensionProviders:
         // legitimate Istio configuration -- it routes "any URI with these
         // predicates" on the listed hosts. Previously the translator
         // dropped such routes entirely because match_paths was URI-driven.
-        // With the experimental flag on, materialize a regex catch-all
-        // proxy + mesh_route_dispatch plugin so the operator's predicates
-        // are actually enforced without shadowing real prefix/regex routes.
+        // Materialize a regex catch-all proxy + mesh_route_dispatch plugin
+        // so the operator's predicates are actually enforced without
+        // shadowing real prefix/regex routes.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7488,7 +7495,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7555,7 +7562,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7635,7 +7642,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7694,7 +7701,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7737,7 +7744,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7778,7 +7785,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7835,7 +7842,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7918,7 +7925,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -7969,8 +7976,8 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_same_path_guarded_route_with_local_policy_is_rejected() {
-        let err = translate_k8s_objects(
+    fn virtual_service_same_path_guarded_route_carries_local_timeout_on_rule() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -7991,13 +7998,88 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
-        .expect_err("route-local timeout cannot be collapsed into a destination-only rule");
-        assert!(err.to_string().contains("route-local"), "got: {err}");
+        .expect("route-local timeout is represented on the dispatch rule");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/api")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later stable proxy");
+        assert_eq!(stable_proxy.backend_read_timeout_ms, 30_000);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("canary branch decorates stable proxy");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["timeout_ms"].as_u64(), Some(250));
+        assert_eq!(
+            rules[0]["destination"]["backend_host"].as_str(),
+            Some("canary.default.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn virtual_service_same_path_guarded_route_without_timeout_sets_timeout_disabled() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("route without timeout must not force dispatch timeout");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/api")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later stable proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("canary branch decorates stable proxy");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["timeout_disabled"].as_bool(), Some(true));
         assert!(
-            err.to_string().contains("mesh_route_dispatch"),
-            "got: {err}"
+            rules[0].get("timeout_ms").is_none(),
+            "unconfigured VirtualService timeout should clear inherited proxy timeout instead"
         );
     }
 
@@ -8023,7 +8105,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -8108,7 +8190,7 @@ extensionProviders:
                     ]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -8175,10 +8257,7 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_header_only_match_skipped_without_experimental_flag() {
-        // The experimental flag still gates this materialization. With it
-        // off, behaviour matches today's wire output: no proxy is emitted
-        // for a header-only match block.
+    fn virtual_service_header_only_match_materializes_by_default() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8196,20 +8275,20 @@ extensionProviders:
         )
         .expect("translation succeeds");
         assert!(
-            !result
+            result
                 .config
                 .proxies
                 .iter()
                 .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
-            "no catch-all materialized when experimental flag is off"
+            "catch-all materialized for header-only match"
         );
         assert!(
-            !result
+            result
                 .config
                 .plugin_configs
                 .iter()
                 .any(|p| p.plugin_name == "mesh_route_dispatch"),
-            "no plugin emitted when experimental flag is off"
+            "mesh_route_dispatch emitted for header-only match"
         );
     }
 
@@ -8233,7 +8312,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         assert!(
@@ -8286,7 +8365,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let proxy = result
@@ -8336,7 +8415,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -8413,7 +8492,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
 
@@ -8471,7 +8550,7 @@ extensionProviders:
                     }]
                 }),
             )],
-            options().with_vs_header_routing_experimental(true),
+            options(),
         )
         .expect("translation succeeds");
         let plugin = result
@@ -8882,6 +8961,7 @@ extensionProviders:
                     name: "mesh-default".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    creation_timestamp: None,
                     deletion_timestamp: None,
                     annotations: HashMap::new(),
                 },
@@ -8919,6 +8999,7 @@ extensionProviders:
                     name: "mesh-api".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    creation_timestamp: None,
                     deletion_timestamp: None,
                     annotations: HashMap::new(),
                 },
@@ -9049,6 +9130,7 @@ extensionProviders:
                         name: "api-overrides".to_string(),
                         namespace: "default".to_string(),
                         labels: HashMap::new(),
+                        creation_timestamp: None,
                         deletion_timestamp: None,
                         annotations: HashMap::new(),
                     },
@@ -9607,6 +9689,7 @@ extensionProviders:
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
@@ -9623,6 +9706,7 @@ extensionProviders:
                 name: name.to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
@@ -9815,6 +9899,7 @@ extensionProviders:
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
@@ -9864,6 +9949,7 @@ extensionProviders:
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                creation_timestamp: None,
                 deletion_timestamp: None,
                 annotations: HashMap::new(),
             },
