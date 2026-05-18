@@ -392,6 +392,7 @@ impl K8sAccumulator {
     }
 
     fn finish(mut self) -> K8sTranslation {
+        gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
         self.mesh.normalize();
         self.mesh.request_authentications.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
