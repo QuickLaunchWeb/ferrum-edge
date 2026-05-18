@@ -2144,29 +2144,35 @@ fn inject_mesh_global_plugins(
     );
     inject_mesh_request_auth_plugin(config, runtime, mesh_slice);
 
-    // Build access log config with optional filter from Telemetry CRD
-    let access_log_config = if let Some(al) = &merged_telemetry.access_logging {
-        if !al.enabled {
-            // Access logging disabled — don't inject the plugin
+    // Build access log config with optional filter from Telemetry CRD.
+    // `None` means "access logging is explicitly disabled" — we retain-remove
+    // any existing mesh access_log plugin and skip injection, but we MUST NOT
+    // short-circuit the rest of inject_mesh_global_plugins (e.g. the bpf_metrics
+    // branch below). Earlier versions used `return;` here, which silently
+    // skipped bpf_metrics injection/cleanup on NodeWaypoint topology whenever
+    // Telemetry CRD disabled access logging.
+    let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
+        Some(al) if !al.enabled => {
             config
                 .plugin_configs
                 .retain(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID);
-            return;
+            None
         }
-        match &al.filter {
+        Some(al) => Some(match &al.filter {
             Some(filter) => serde_json::json!({ "filter": filter }),
             None => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
+        }),
+        None => Some(serde_json::json!({})),
     };
-    ensure_global_plugin(
-        config,
-        MESH_ACCESS_LOG_PLUGIN_ID,
-        "access_log",
-        access_log_config,
-        &runtime.namespace,
-    );
+    if let Some(cfg) = access_log_config {
+        ensure_global_plugin(
+            config,
+            MESH_ACCESS_LOG_PLUGIN_ID,
+            "access_log",
+            cfg,
+            &runtime.namespace,
+        );
+    }
 
     // GAP-SC3: `__mesh_bpf_metrics` exposes BPF SOCK_OPS counters as
     // Prometheus metrics. Auto-inject only on `NodeWaypoint` topology;
@@ -5652,6 +5658,59 @@ mod tests {
                 "bpf_metrics must NOT be auto-injected for topology {topology:?}"
             );
         }
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_still_injects_bpf_metrics_when_access_logging_disabled_on_node_waypoint()
+     {
+        // Regression: earlier versions of `inject_mesh_global_plugins`
+        // `return`'d after retain-removing the access_log plugin when
+        // `Telemetry.access_logging.enabled == false`, which silently
+        // skipped the bpf_metrics injection branch below it. On
+        // NodeWaypoint with access logging disabled, operators lost
+        // BPF SOCK_OPS Prometheus metrics entirely. Lock in that
+        // disabling access logging does NOT suppress bpf_metrics
+        // injection on NodeWaypoint.
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::NodeWaypoint;
+        runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "no-access-logs".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                config: MeshTelemetryConfig {
+                    access_logging: Some(MeshAccessLoggingConfig {
+                        enabled: false,
+                        filter: None,
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        // Access log plugin is explicitly absent (Telemetry disabled).
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID),
+            "access_log plugin must be absent when Telemetry disables access logging"
+        );
+        // BPF metrics plugin MUST still be present — NodeWaypoint always
+        // gets it, regardless of the Telemetry access-logging toggle.
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|p| p.id == MESH_BPF_METRICS_PLUGIN_ID),
+            "bpf_metrics plugin must be injected on NodeWaypoint even when access logging disabled"
+        );
     }
 
     #[test]
