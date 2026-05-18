@@ -13,7 +13,9 @@ use crate::identity::spiffe::SpiffeId;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 
-static MESH_CERT_EXPIRY_UNIX_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, AtomicU64>> =
+const MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS: u64 = 6 * 60 * 60;
+
+static MESH_CERT_EXPIRY_UNIX_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, MeshCertExpiryGauge>> =
     LazyLock::new(DashMap::new);
 static MESH_CERT_ROTATION_FAILURES: LazyLock<DashMap<MeshCertRotationFailureKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
@@ -73,6 +75,25 @@ struct MeshMtlsHandshakeFailureKey {
     reason: Arc<str>,
 }
 
+struct MeshCertExpiryGauge {
+    expires_at: AtomicU64,
+    last_observed_at: AtomicU64,
+}
+
+impl MeshCertExpiryGauge {
+    fn new(expires_at: u64, observed_at: u64) -> Self {
+        Self {
+            expires_at: AtomicU64::new(expires_at),
+            last_observed_at: AtomicU64::new(observed_at),
+        }
+    }
+
+    fn observe(&self, expires_at: u64, observed_at: u64) {
+        self.expires_at.store(expires_at, Ordering::Relaxed);
+        self.last_observed_at.store(observed_at, Ordering::Relaxed);
+    }
+}
+
 struct TrustBundleVersionGauge {
     fingerprint: AtomicU64,
     version: AtomicU64,
@@ -110,15 +131,13 @@ pub fn record_mesh_cert_expiry_seconds(
     source: impl AsRef<str>,
     seconds_until_expiry: u64,
 ) {
-    let expires_at = (Utc::now().timestamp().max(0) as u64).saturating_add(seconds_until_expiry);
-    let key = MeshCertExpiryKey {
-        spiffe_id: Arc::from(spiffe_id.as_ref()),
-        source: Arc::from(source.as_ref()),
-    };
-    MESH_CERT_EXPIRY_UNIX_SECONDS
-        .entry(key)
-        .or_insert_with(|| AtomicU64::new(0))
-        .store(expires_at, Ordering::Relaxed);
+    let now = unix_now_seconds();
+    record_mesh_cert_expiry_unix_seconds(
+        spiffe_id,
+        source,
+        now.saturating_add(seconds_until_expiry),
+        now,
+    );
 }
 
 pub fn record_mesh_cert_expiry_at(
@@ -126,14 +145,28 @@ pub fn record_mesh_cert_expiry_at(
     source: impl AsRef<str>,
     not_after: &DateTime<Utc>,
 ) {
+    record_mesh_cert_expiry_unix_seconds(
+        spiffe_id.as_str(),
+        source,
+        not_after.timestamp().max(0) as u64,
+        unix_now_seconds(),
+    );
+}
+
+fn record_mesh_cert_expiry_unix_seconds(
+    spiffe_id: impl AsRef<str>,
+    source: impl AsRef<str>,
+    expires_at: u64,
+    observed_at: u64,
+) {
     let key = MeshCertExpiryKey {
-        spiffe_id: Arc::from(spiffe_id.as_str()),
+        spiffe_id: Arc::from(spiffe_id.as_ref()),
         source: Arc::from(source.as_ref()),
     };
     MESH_CERT_EXPIRY_UNIX_SECONDS
         .entry(key)
-        .or_insert_with(|| AtomicU64::new(0))
-        .store(not_after.timestamp().max(0) as u64, Ordering::Relaxed);
+        .or_insert_with(|| MeshCertExpiryGauge::new(expires_at, observed_at))
+        .observe(expires_at, observed_at);
 }
 
 pub fn increment_mesh_cert_rotation_failure(spiffe_id: impl AsRef<str>, source: impl AsRef<str>) {
@@ -199,14 +232,20 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
 }
 
 pub fn render_mesh_cert_metrics(output: &mut String) {
+    let now = unix_now_seconds();
+    evict_stale_mesh_cert_expiry_series(now);
+
     if !MESH_CERT_EXPIRY_UNIX_SECONDS.is_empty() {
         output.push_str(
             "# HELP ferrum_mesh_cert_expiry_seconds Seconds until mesh X.509-SVID expiry.\n",
         );
         output.push_str("# TYPE ferrum_mesh_cert_expiry_seconds gauge\n");
-        let now = Utc::now().timestamp().max(0) as u64;
         for entry in MESH_CERT_EXPIRY_UNIX_SECONDS.iter() {
-            let seconds_until_expiry = entry.value().load(Ordering::Relaxed).saturating_sub(now);
+            let seconds_until_expiry = entry
+                .value()
+                .expires_at
+                .load(Ordering::Relaxed)
+                .saturating_sub(now);
             output.push_str(&format!(
                 "ferrum_mesh_cert_expiry_seconds{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
                 escape_label_value(&entry.key().spiffe_id),
@@ -285,6 +324,32 @@ pub fn render_mesh_cert_metrics(output: &mut String) {
             ));
         }
     }
+}
+
+fn unix_now_seconds() -> u64 {
+    Utc::now().timestamp().max(0) as u64
+}
+
+fn evict_stale_mesh_cert_expiry_series(now: u64) {
+    let stale_keys: Vec<_> = MESH_CERT_EXPIRY_UNIX_SECONDS
+        .iter()
+        .filter_map(|entry| {
+            let expires_at = entry.value().expires_at.load(Ordering::Relaxed);
+            let last_observed_at = entry.value().last_observed_at.load(Ordering::Relaxed);
+            mesh_cert_expiry_series_is_stale(expires_at, last_observed_at, now)
+                .then(|| entry.key().clone())
+        })
+        .collect();
+    for key in stale_keys {
+        MESH_CERT_EXPIRY_UNIX_SECONDS.remove(&key);
+    }
+}
+
+fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now: u64) -> bool {
+    let stale_after = expires_at
+        .max(last_observed_at)
+        .saturating_add(MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS);
+    now >= stale_after
 }
 
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
@@ -453,4 +518,42 @@ pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
         labels.push_str(&format!(",le=\"{}\"", le));
     }
     labels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_mesh_cert_metrics_evicts_stale_expired_series() {
+        let now = unix_now_seconds();
+        let suffix = format!("{}-{}", std::process::id(), now);
+        let stale_id = format!("spiffe://cluster.local/ns/default/sa/stale-{suffix}");
+        let active_expired_id = format!("spiffe://cluster.local/ns/default/sa/active-{suffix}");
+
+        record_mesh_cert_expiry_unix_seconds(
+            &stale_id,
+            "unit-test",
+            now.saturating_sub(MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS + 1),
+            now.saturating_sub(MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS + 1),
+        );
+        record_mesh_cert_expiry_unix_seconds(
+            &active_expired_id,
+            "unit-test",
+            now.saturating_sub(1),
+            now,
+        );
+
+        let mut output = String::new();
+        render_mesh_cert_metrics(&mut output);
+
+        assert!(
+            !output.contains(&stale_id),
+            "stale expired certificate series should be evicted: {output}"
+        );
+        assert!(
+            output.contains(&active_expired_id),
+            "recently observed expired certificate should still be exported: {output}"
+        );
+    }
 }
