@@ -159,8 +159,8 @@ fn destination_rule_with_no_matching_upstream_is_a_no_op() {
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
     let upstream = http_upstream("ratings-u", "ratings.default.svc.cluster.local", 8080);
     let initial_algo = upstream.algorithm;
-    let initial_timeout = http_proxy("ratings-p", "ratings.example.com", 8080)
-        .backend_connect_timeout_ms;
+    let initial_timeout =
+        http_proxy("ratings-p", "ratings.example.com", 8080).backend_connect_timeout_ms;
     let proxy = {
         let mut p = http_proxy("ratings-p", "ratings.example.com", 8080);
         p.upstream_id = Some("ratings-u".to_string());
@@ -293,7 +293,12 @@ fn service_entry_with_no_export_to_admits_workload_in_same_namespace() {
     // in the same namespace as the entry should see it in its slice.
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let workload = workload_for("reviews", DEFAULT_NAMESPACE, [("app", "reviews")], ["10.0.0.1"]);
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.1"],
+    );
     let entry = service_entry_external("ext-payments", vec!["payments.example.com"], vec![443]);
     let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     mesh.service_entries.push(entry);
@@ -382,7 +387,12 @@ fn service_entry_mesh_internal_location_is_round_tripped_through_slice() {
 fn mesh_service_visible_in_slice_when_workload_in_same_namespace() {
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let workload = workload_for("reviews", DEFAULT_NAMESPACE, [("app", "reviews")], ["10.0.0.1"]);
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.1"],
+    );
     let service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
