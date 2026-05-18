@@ -2376,7 +2376,15 @@ impl ProxyState {
                     }
                     v
                 },
-                false,
+                // Mesh-mode TCP/UDP stream listeners may terminate inbound mTLS
+                // (sidecar, east-west, egress); their handshake failures must
+                // increment the same mesh-mTLS handshake-failure metric as the
+                // HBONE/HTTP mesh listeners so operator alerts cover every
+                // mesh-frontend TLS surface.
+                matches!(
+                    env_config_arc.mode,
+                    crate::config::env_config::OperatingMode::Mesh
+                ),
                 env_config_arc.so_busy_poll_us,
                 {
                     let v = env_config_arc

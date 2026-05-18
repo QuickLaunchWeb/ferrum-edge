@@ -457,6 +457,13 @@ pub(crate) fn translate_k8s_objects_with_filter<F>(
 where
     F: Fn(&K8sObject) -> bool,
 {
+    // Performance follow-up: each K8sObject carries the entire `spec`/`status`
+    // `serde_json::Value` (HTTPRoute/VirtualService specs can be tens of KB).
+    // Cloning every included object once per reconcile is bounded by reconcile
+    // cadence (~30s on the CP) but unnecessary — every downstream consumer
+    // borrows immutably. Migrating this to `Vec<&K8sObject>` requires
+    // `gateway_api::route_conflicts` (and any future `&[K8sObject]` consumers)
+    // to take `&[&K8sObject]`; left as a follow-up to keep this slice focused.
     let included_objects: Vec<K8sObject> = objects
         .iter()
         .filter(|object| include(object))

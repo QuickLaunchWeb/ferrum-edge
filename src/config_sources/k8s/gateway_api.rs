@@ -602,6 +602,15 @@ fn set_dispatch_reject_unmatched(plugin: &mut PluginConfig, reject_unmatched: bo
     }
 }
 
+/// Overlay the new proxy's "default route" fields onto an existing proxy that
+/// is being preserved across a same-path collapse. The fields listed here are
+/// the only ones the route-translation layer can supply — listener identity
+/// (id, namespace, hosts, listen_path, listen_port, protocol family),
+/// plugin-set state (resolved_tls, dispatch_kind), and frontend / pool /
+/// admission policy come from elsewhere and must NOT be overwritten by a
+/// dispatch-rule collapse. If a future field becomes route-derivable, it must
+/// be added here AND a regression test added; otherwise traffic for the
+/// collapsed default route silently retains stale per-proxy policy.
 fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
     existing.backend_host.clone_from(&proxy.backend_host);
     existing.backend_port = proxy.backend_port;
@@ -876,7 +885,10 @@ fn http_route_resources(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<HttpRouteResources, K8sTranslateError> {
-    let hostnames = string_array(&object.spec, "hostnames");
+    let hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| hostname.to_ascii_lowercase())
+        .collect();
     let conflict_hostnames = route_hostnames(object);
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();

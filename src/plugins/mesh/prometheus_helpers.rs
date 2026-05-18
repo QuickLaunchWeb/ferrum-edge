@@ -216,6 +216,16 @@ pub fn record_mesh_trust_bundle_roots(
         .observe(fingerprint);
 }
 
+/// Record the timestamp of the most recently installed mesh slice for `namespace`.
+///
+/// A mesh data-plane instance only ever installs slices for its own mesh
+/// namespace, so the underlying map is effectively a single-element gauge —
+/// the `retain` call deliberately evicts any stale namespace label that would
+/// otherwise stick around forever in the `/metrics` output (for example after
+/// `FERRUM_MESH_NAMESPACE` is reconfigured mid-process for testing). The map
+/// shape is kept so the namespace label remains on the wire for alerting rules
+/// that group by namespace; alerts must not rely on multiple namespace series
+/// per gateway.
 pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
     let namespace = namespace.as_ref();
     MESH_CONFIG_LAST_RECEIVED.retain(|key, _| key.as_ref() == namespace);
@@ -377,6 +387,16 @@ fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now:
     now >= stale_after
 }
 
+/// Build a `MeshRequestKey` from a transaction summary.
+///
+/// Performance follow-up: this allocates ~11 `Arc<str>` values per call from
+/// `metadata_arc` / `metadata_arc_or_clone` / `metadata_arc_any`, called from
+/// three hot paths (RED metrics, service-graph aggregation, log shaping). The
+/// label space is small and bounded (workload / namespace / principal /
+/// app / service / protocol / response-flags / security-policy), so a process-
+/// wide interning pool keyed by `&str -> Arc<str>` would let these become a
+/// single hash lookup per call. Tracked as a follow-up to keep the W1 slice
+/// focused on routing parity.
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
     if !summary.metadata.keys().any(|key| key.starts_with("mesh.")) {
         return None;

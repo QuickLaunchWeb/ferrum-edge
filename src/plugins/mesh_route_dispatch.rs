@@ -398,6 +398,13 @@ impl Plugin for MeshRouteDispatch {
                 ctx.route_override_backend_host = rule.destination.backend_host.clone();
                 ctx.route_override_backend_port = rule.destination.backend_port;
                 ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
+                // `timeout_disabled: true` (with `timeout_ms = None`) maps to
+                // `Some(0)`: the proxy hot path interprets `backend_read_timeout_ms == 0`
+                // as "no timeout" (see `proxy/mod.rs` and `proxy/tcp_proxy.rs` —
+                // every dispatch site guards on `backend_read_timeout_ms > 0`). The
+                // explicit `Some(0)` is necessary to override an inherited proxy-level
+                // timeout; leaving the field `None` would fall back to that inherited
+                // value, which is the opposite of the operator's intent.
                 ctx.route_override_backend_read_timeout_ms =
                     if rule.timeout_ms.is_some() || rule.timeout_disabled {
                         Some(rule.timeout_ms.unwrap_or(0))
