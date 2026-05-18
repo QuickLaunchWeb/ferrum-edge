@@ -1064,15 +1064,14 @@ fn flatten_openai_message_text(content: &Value) -> String {
             // without a `text` field (image_url, input_audio, etc.) is
             // intentionally omitted — the destination request schemas
             // here are text-only.
-            if part.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(text) = part.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
+            if part.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                if !out.is_empty() {
+                    out.push('\n');
                 }
+                out.push_str(text);
             }
         }
         return out;
