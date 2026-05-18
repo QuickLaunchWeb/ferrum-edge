@@ -382,7 +382,7 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
     timer.tick().await;
 
     // Lazily connect — the first flush attempt will establish the connection.
-    let mut ws_sink: Option<WsSink> = None;
+    let mut ws_conn: Option<WsConnection> = None;
 
     loop {
         tokio::select! {
@@ -394,14 +394,14 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
                         buffer.push(entry);
                         if buffer.len() >= cfg.batch_size {
                             let batch = std::mem::take(&mut buffer);
-                            ws_sink = send_batch(&cfg, batch, ws_sink).await;
+                            ws_conn = send_batch(&cfg, batch, ws_conn).await;
                         }
                     }
                     None => {
                         // Channel closed — flush remaining entries and exit.
                         if !buffer.is_empty() {
                             let batch = std::mem::take(&mut buffer);
-                            let _ = send_batch(&cfg, batch, ws_sink).await;
+                            let _ = send_batch(&cfg, batch, ws_conn).await;
                         }
                         break;
                     }
@@ -411,7 +411,7 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
             _ = timer.tick() => {
                 if !buffer.is_empty() {
                     let batch = std::mem::take(&mut buffer);
-                    ws_sink = send_batch(&cfg, batch, ws_sink).await;
+                    ws_conn = send_batch(&cfg, batch, ws_conn).await;
                 }
             }
         }
@@ -423,14 +423,33 @@ type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::tungstenite::protocol::Message,
 >;
 
-/// Attempt to send a batch over the WebSocket connection. Returns the sink
-/// on success, or `None` if the connection was lost and could not be
-/// re-established within the retry budget.
+/// A live WebSocket connection paired with the abort handle for its
+/// drain task. Dropping the connection aborts the drain task so the
+/// underlying `WebSocketStream` — held alive by
+/// `futures_util::stream::split`'s `BiLock` while either half lives —
+/// is released immediately. Without this, a `sink.send(...)` failure
+/// that drops only the sink leaves the read half (and the underlying
+/// TCP/TLS stream) alive until the peer eventually closes, briefly
+/// stacking two drain tasks + two connections during a reconnect.
+struct WsConnection {
+    sink: WsSink,
+    drain: tokio::task::AbortHandle,
+}
+
+impl Drop for WsConnection {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// Attempt to send a batch over the WebSocket connection. Returns the
+/// connection on success, or `None` if the connection was lost and
+/// could not be re-established within the retry budget.
 async fn send_batch(
     cfg: &WsConfig,
     batch: Vec<LogEntry>,
-    mut sink: Option<WsSink>,
-) -> Option<WsSink> {
+    mut conn: Option<WsConnection>,
+) -> Option<WsConnection> {
     let total_attempts = cfg.max_retries.saturating_add(1);
     let entry_count = batch.len();
 
@@ -442,15 +461,15 @@ async fn send_batch(
         Ok(json) => json,
         Err(e) => {
             warn!("WebSocket logging: failed to serialize batch: {e}");
-            return sink;
+            return conn;
         }
     };
 
     for attempt in 1..=total_attempts {
         // Ensure we have a live connection.
-        if sink.is_none() {
-            sink = connect(cfg).await;
-            if sink.is_none() {
+        if conn.is_none() {
+            conn = connect(cfg).await;
+            if conn.is_none() {
                 warn!(
                     "WebSocket logging: connection failed (attempt {}/{})",
                     attempt, total_attempts,
@@ -462,18 +481,21 @@ async fn send_batch(
             }
         }
 
-        if let Some(ref mut ws) = sink {
+        if let Some(ref mut ws) = conn {
             let msg =
                 tokio_tungstenite::tungstenite::protocol::Message::Text(payload.clone().into());
-            match ws.send(msg).await {
-                Ok(()) => return sink,
+            match ws.sink.send(msg).await {
+                Ok(()) => return conn,
                 Err(e) => {
                     warn!(
                         "WebSocket logging: send failed: {e} (attempt {}/{})",
                         attempt, total_attempts,
                     );
-                    // Connection is broken — drop it and reconnect on next attempt.
-                    sink = None;
+                    // Connection is broken — dropping `conn` aborts the
+                    // drain task so the underlying stream is released
+                    // immediately rather than lingering alongside the
+                    // reconnect attempt.
+                    conn = None;
                     if attempt < total_attempts {
                         tokio::time::sleep(cfg.retry_delay).await;
                     }
@@ -486,7 +508,7 @@ async fn send_batch(
         "WebSocket logging batch discarded after {} attempts ({} entries lost)",
         total_attempts, entry_count,
     );
-    sink
+    conn
 }
 
 /// Establish a new WebSocket connection to the configured endpoint.
@@ -505,8 +527,10 @@ async fn send_batch(
 /// out, by which time the kernel receive buffer may have filled. Spawn
 /// a small drain task that polls the read side and discards every
 /// message; that drives the protocol forward without doing anything
-/// with the data.
-async fn connect(cfg: &WsConfig) -> Option<WsSink> {
+/// with the data. The task's abort handle rides along with the sink in
+/// [`WsConnection`] so a sink-side failure tears down both halves in
+/// lock-step (see the type's doc-comment for the race it prevents).
+async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     use futures_util::StreamExt;
 
     match tokio_tungstenite::connect_async_tls_with_config(
@@ -520,11 +544,14 @@ async fn connect(cfg: &WsConfig) -> Option<WsSink> {
         Ok((stream, _response)) => {
             let (sink, mut read) = stream.split();
             // Drain the read half so tungstenite can service Ping/Pong
-            // and server-initiated Close frames. Exits cleanly when
-            // the peer closes — at that point `sink.send(...)` will
-            // surface the same error and the main loop will reconnect.
-            tokio::spawn(async move { while read.next().await.is_some() {} });
-            Some(sink)
+            // and server-initiated Close frames. Exits cleanly when the
+            // peer closes — at that point `sink.send(...)` errors and
+            // the main loop reconnects.
+            let drain = tokio::spawn(async move { while read.next().await.is_some() {} });
+            Some(WsConnection {
+                sink,
+                drain: drain.abort_handle(),
+            })
         }
         Err(e) => {
             warn!(
