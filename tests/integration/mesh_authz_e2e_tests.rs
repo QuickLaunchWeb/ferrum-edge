@@ -615,7 +615,10 @@ fn mesh_authz_construction_fails_when_selector_labels_set_but_workload_labels_mi
         "namespace": DEFAULT_NAMESPACE,
         // labels: intentionally omitted
     });
-    let err = MeshAuthz::new(&config).expect_err("expected construction error");
+    let err = match MeshAuthz::new(&config) {
+        Err(e) => e,
+        Ok(_) => panic!("expected construction error"),
+    };
     assert!(
         err.contains("no proxy labels are configured"),
         "construction error should mention missing proxy labels, got {err:?}"
