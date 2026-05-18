@@ -450,6 +450,14 @@ pub async fn start_mesh_gateway(state: ProxyState) -> (SocketAddr, watch::Sender
     (addr, shutdown_tx)
 }
 
+/// Function the scripted backend invokes per request. Returns the response
+/// body bytes to write back to the client. Factored into a type alias because
+/// the bare `Arc<dyn Fn ...>` shape tripped clippy's `type_complexity` lint.
+pub type BackendResponder = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
+/// Captured-request log shared between a [`BackendResponder`] and the test.
+pub type BackendCaptureLog = Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Spawn a bare-bones HTTP/1.1 backend that responds `200 OK` with the request
 /// body echoed back. Returns the bound address and the join handle so callers
 /// can await graceful drain.
@@ -458,7 +466,7 @@ pub async fn start_mesh_gateway(state: ProxyState) -> (SocketAddr, watch::Sender
 /// return a specific status). The default [`echo_backend_handler`] echoes
 /// `"backend-ok\n"` regardless of input.
 pub async fn start_http_backend(
-    responder: Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>,
+    responder: BackendResponder,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -494,20 +502,17 @@ pub async fn start_http_backend(
 }
 
 /// Default HTTP backend responder: returns `backend-ok\n` regardless of input.
-pub fn echo_backend_handler() -> Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync> {
+pub fn echo_backend_handler() -> BackendResponder {
     Arc::new(|_request: &str| b"backend-ok\n".to_vec())
 }
 
 /// HTTP backend responder that captures every received request line for later
 /// inspection. Returns a tuple of `(responder, captured_log)` where
 /// `captured_log` is appended to on each request.
-pub fn capturing_backend_handler() -> (
-    Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>,
-    Arc<std::sync::Mutex<Vec<String>>>,
-) {
-    let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+pub fn capturing_backend_handler() -> (BackendResponder, BackendCaptureLog) {
+    let log: BackendCaptureLog = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log_cloned = log.clone();
-    let responder: Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync> = Arc::new(move |request: &str| {
+    let responder: BackendResponder = Arc::new(move |request: &str| {
         if let Ok(mut guard) = log_cloned.lock() {
             guard.push(request.to_string());
         }
