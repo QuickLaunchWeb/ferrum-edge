@@ -36,6 +36,10 @@
 //! warning and skip the instance, preserving the existing "drop the
 //! header/method match" behavior. The CP can emit the plugin instances
 //! unconditionally — they're a no-op on old binaries.
+//! `retry_disabled` is intentionally build-out-era additive config: older DPs
+//! that do know this plugin but do not know that field will ignore it, so
+//! operators must upgrade DPs before relying on collapsed routes that clear an
+//! inherited retry policy.
 
 use std::collections::HashMap;
 

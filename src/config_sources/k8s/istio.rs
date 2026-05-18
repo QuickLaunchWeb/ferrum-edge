@@ -1655,7 +1655,7 @@ fn virtual_service_routes(
                     upstream_id: upstream_id.as_deref(),
                 },
                 MeshRouteDispatchPolicy {
-                    timeout_ms: Some(timeout_ms.unwrap_or(30_000)),
+                    timeout_ms,
                     retry: retry.as_ref(),
                     retry_disabled: retry.is_none(),
                 },
@@ -6395,6 +6395,35 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_retry_5xx_allows_explicit_non_5xx_codes() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "5xx,400,401,403,404,connect-failure"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert_eq!(retry.retryable_status_codes.len(), 104);
+        assert!(retry.retryable_status_codes.contains(&400));
+        assert!(retry.retryable_status_codes.contains(&599));
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.validate_fields().is_ok());
+    }
+
+    #[test]
     fn virtual_service_zero_retry_attempts_produces_no_retry_config() {
         let result = translate_k8s_objects(
             &[object(
@@ -7997,6 +8026,58 @@ extensionProviders:
         assert_eq!(
             rules[0]["destination"]["backend_host"].as_str(),
             Some("canary.default.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn virtual_service_same_path_guarded_route_without_timeout_leaves_rule_timeout_unset() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("route without timeout must not force dispatch timeout");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/api")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later stable proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("canary branch decorates stable proxy");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].get("timeout_ms").is_none(),
+            "unconfigured VirtualService timeout should leave proxy default in force"
         );
     }
 

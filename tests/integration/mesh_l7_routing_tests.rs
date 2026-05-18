@@ -228,9 +228,9 @@ fn mesh_l7_routing_virtual_service_weighted_split_uses_generated_upstream_weight
         .get("v3.default.svc.cluster.local")
         .copied()
         .unwrap_or_default();
-    assert!((880..=920).contains(&v1), "v1 count: {v1}");
-    assert!((75..=105).contains(&v2), "v2 count: {v2}");
-    assert!((5..=20).contains(&v3), "v3 count: {v3}");
+    assert_eq!(v1, 900);
+    assert_eq!(v2, 90);
+    assert_eq!(v3, 10);
 }
 
 #[tokio::test]

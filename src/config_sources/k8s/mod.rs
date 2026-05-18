@@ -393,6 +393,10 @@ impl K8sAccumulator {
 
     fn finish(mut self) -> K8sTranslation {
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
+        debug_assert!(
+            !gateway_api::dispatch_rule_internal_metadata_present(&self.config.plugin_configs),
+            "internal Gateway API dispatch precedence metadata must be stripped before translation output"
+        );
         self.mesh.normalize();
         self.mesh.request_authentications.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
@@ -485,8 +489,15 @@ where
 
     let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
     for conflict in gateway_api_route_conflicts {
+        let skipped_reason = if conflict.loser.kind == "GRPCRoute"
+            && conflict.key.match_signature == "{}"
+        {
+            "Ferrum cannot yet dispatch GRPCRoute method/header matches within a shared path, so this conflicting match was skipped"
+        } else {
+            "the conflicting match was skipped"
+        };
         acc.warnings.push(format!(
-            "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and the conflicting match was skipped; winner is {}/{}",
+            "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",
             conflict.loser.kind,
             conflict.loser.namespace,
             conflict.loser.name,
@@ -494,6 +505,7 @@ where
             conflict.key.hostname,
             conflict.key.listen_path,
             conflict.key.match_signature,
+            skipped_reason,
             conflict.winner.namespace,
             conflict.winner.name
         ));

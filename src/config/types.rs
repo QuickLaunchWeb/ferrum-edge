@@ -79,9 +79,10 @@ pub const MAX_ACL_GROUP_LENGTH: usize = 255;
 /// Maximum length for hash_on field in upstream.
 pub const MAX_HASH_ON_LENGTH: usize = 255;
 /// Maximum number of status codes in circuit breaker / retry / health check lists.
-/// Allows a full 5xx retry range (500-599) emitted by Istio VirtualService
-/// translation while still bounding operator-provided lists.
-pub const MAX_STATUS_CODES: usize = 100;
+/// Allows any bounded subset of the valid HTTP status-code range (100-599),
+/// including translated Istio retry expressions such as `5xx` plus explicit
+/// non-5xx codes.
+pub const MAX_STATUS_CODES: usize = 500;
 /// Maximum number of retryable methods.
 pub const MAX_RETRYABLE_METHODS: usize = 9;
 /// Maximum length for file path fields (TLS cert/key paths).
