@@ -906,6 +906,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         pub not_on_or_after: Option<&'a str>,
         pub audience: Option<&'a str>,
         pub sign_with_untrusted_key: bool,
+        pub use_sha1_digest: bool,
         /// Insert junk bytes into the assertion AFTER signing to simulate a
         /// tampered payload.
         pub corrupt_subject_after_signing: bool,
@@ -924,6 +925,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 not_on_or_after: None,
                 audience: None,
                 sign_with_untrusted_key: false,
+                use_sha1_digest: false,
                 corrupt_subject_after_signing: false,
                 corrupt_signature_value: false,
             }
@@ -981,8 +983,20 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 self.assertion_id, self.issuer, signed_body_after_issuer
             );
 
-            let asserted_digest =
-                ring::digest::digest(&ring::digest::SHA256, assertion_no_sig.as_bytes());
+            let (digest_method_uri, asserted_digest) = if self.use_sha1_digest {
+                (
+                    "http://www.w3.org/2000/09/xmldsig#sha1",
+                    ring::digest::digest(
+                        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                        assertion_no_sig.as_bytes(),
+                    ),
+                )
+            } else {
+                (
+                    "http://www.w3.org/2001/04/xmlenc#sha256",
+                    ring::digest::digest(&ring::digest::SHA256, assertion_no_sig.as_bytes()),
+                )
+            };
             let digest_b64 = B64.encode(asserted_digest.as_ref());
 
             // SignedInfo bytes — exactly these bytes are what
@@ -992,11 +1006,11 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 <CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
 <SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
 <Reference URI=\"#{}\">\
-<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
+<DigestMethod Algorithm=\"{}\"/>\
 <DigestValue>{}</DigestValue>\
 </Reference>\
 </SignedInfo>",
-                self.assertion_id, digest_b64
+                self.assertion_id, digest_method_uri, digest_b64
             );
 
             // Pick the signing key + matching cert.
@@ -1323,6 +1337,92 @@ async fn test_saml_wrong_audience_rejects() {
     assert!(
         reject_body(&result).contains("does not match expected"),
         "expected audience mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_configured_audience_requires_conditions() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(
+        &bundle,
+        Some("https://my-service.example.com"),
+    ))
+    .unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-no-conditions",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("Conditions are required"),
+        "expected missing Conditions rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_configured_audience_requires_audience_restriction() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(
+        &bundle,
+        Some("https://my-service.example.com"),
+    ))
+    .unwrap();
+
+    let nb = long_past();
+    let noa = far_future();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-no-audience-restriction",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.not_before = Some(&nb);
+    builder.not_on_or_after = Some(&noa);
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("AudienceRestriction is required"),
+        "expected missing AudienceRestriction rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_sha1_digest_rejected_by_default() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-sha1-digest",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.use_sha1_digest = true;
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("digest algorithm")
+            && reject_body(&result).contains("not allowed"),
+        "expected SHA-1 digest rejection, got: {}",
         reject_body(&result)
     );
 }

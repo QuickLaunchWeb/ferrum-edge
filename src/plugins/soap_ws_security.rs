@@ -902,11 +902,16 @@ impl SoapWsSecurity {
                 }
             }
 
-            // Audience restriction
-            if let Some(ref expected_audience) = self.saml_audience
-                && let Some(audience_restriction) =
+            if let Some(ref expected_audience) = self.saml_audience {
+                let Some(audience_restriction) =
                     find_element_block(&conditions, "AudienceRestriction")
-            {
+                else {
+                    return Err(
+                        "WS-Security: SAML AudienceRestriction is required when audience is configured"
+                            .to_string(),
+                    );
+                };
+
                 let audience =
                     find_element_text(&audience_restriction, "Audience").ok_or_else(|| {
                         "WS-Security: AudienceRestriction missing Audience element".to_string()
@@ -920,6 +925,10 @@ impl SoapWsSecurity {
                     ));
                 }
             }
+        } else if self.saml_audience.is_some() {
+            return Err(
+                "WS-Security: SAML Conditions are required when audience is configured".to_string(),
+            );
         }
 
         // ── 4. Extract Subject NameID for downstream identity use ─────
@@ -1082,10 +1091,21 @@ impl SoapWsSecurity {
                 XMLDSIG_SHA256 => {
                     digest::digest(&digest::SHA256, assertion_without_signature.as_bytes())
                 }
-                XMLDSIG_SHA1 => digest::digest(
-                    &digest::SHA1_FOR_LEGACY_USE_ONLY,
-                    assertion_without_signature.as_bytes(),
-                ),
+                XMLDSIG_SHA1 => {
+                    if !self
+                        .saml_allowed_signature_algorithms
+                        .contains(&SignatureAlgorithm::RsaSha1)
+                    {
+                        return Err(format!(
+                            "WS-Security: SAML digest algorithm '{}' is not allowed",
+                            digest_alg_uri
+                        ));
+                    }
+                    digest::digest(
+                        &digest::SHA1_FOR_LEGACY_USE_ONLY,
+                        assertion_without_signature.as_bytes(),
+                    )
+                }
                 other => {
                     return Err(format!(
                         "WS-Security: SAML unsupported digest algorithm '{}'",
