@@ -28,7 +28,7 @@ use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
@@ -4628,7 +4628,7 @@ impl DatabaseStore {
              (id, ts, actor, action, resource_type, resource_id, namespace, diff) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
         .bind(&event.id)
-        .bind(event.ts.to_rfc3339())
+        .bind(audit_ts_string(&event.ts))
         .bind(&event.actor)
         .bind(&event.action)
         .bind(&event.resource_type)
@@ -4686,10 +4686,10 @@ impl DatabaseStore {
             count_query = count_query.bind(value);
         }
         if let Some(ref value) = filter.start {
-            count_query = count_query.bind(value.to_rfc3339());
+            count_query = count_query.bind(audit_ts_string(value));
         }
         if let Some(ref value) = filter.end {
-            count_query = count_query.bind(value.to_rfc3339());
+            count_query = count_query.bind(audit_ts_string(value));
         }
         let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
 
@@ -4712,10 +4712,10 @@ impl DatabaseStore {
             query = query.bind(value);
         }
         if let Some(ref value) = filter.start {
-            query = query.bind(value.to_rfc3339());
+            query = query.bind(audit_ts_string(value));
         }
         if let Some(ref value) = filter.end {
-            query = query.bind(value.to_rfc3339());
+            query = query.bind(audit_ts_string(value));
         }
         let rows = query
             .bind(filter.limit as i64)
@@ -5803,6 +5803,10 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
     })
 }
 
+fn audit_ts_string(ts: &DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
 /// Parse a datetime column from a database row, falling back to `Utc::now()` if
 /// the column is missing or the value cannot be parsed. Database stores timestamps
 /// as RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
@@ -5846,7 +5850,19 @@ mod proxy_insert_sql_drift_tests {
     //!      the constants. If the bind chain is missing a column, sqlx will
     //!      surface "wrong number of parameters" at execute time (caught by
     //!      the existing integration tests).
-    use super::DatabaseStore;
+    use super::{DatabaseStore, audit_ts_string};
+
+    #[test]
+    fn audit_ts_string_is_fixed_width_and_lexically_ordered() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-18T03:00:00Z")
+            .expect("base timestamp")
+            .with_timezone(&chrono::Utc);
+        let later = base + chrono::Duration::milliseconds(100);
+
+        assert_eq!(audit_ts_string(&base), "2026-05-18T03:00:00.000000000Z");
+        assert_eq!(audit_ts_string(&later), "2026-05-18T03:00:00.100000000Z");
+        assert!(audit_ts_string(&base) < audit_ts_string(&later));
+    }
 
     #[test]
     fn proxy_insert_sql_placeholder_count_matches_const() {
