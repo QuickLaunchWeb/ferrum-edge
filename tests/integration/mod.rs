@@ -39,6 +39,7 @@ mod mesh_sidecar_e2e_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
+mod mesh_topology_hbone_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
