@@ -1139,8 +1139,13 @@ mod x509_roundtrip {
         // Build SignedInfo as the EXACT bytes that will appear in the envelope.
         // This is what `find_element_block(security_block, "SignedInfo")`
         // returns and what we pass into `ring::RsaKeyPair::sign`.
+        // Raw-string delimiter must be `##` because the URL fragments
+        // `xml-exc-c14n#`, `xmldsig-more#`, and `xmlenc#` contain `#`
+        // and a single-`#` raw literal would terminate at the first
+        // `"#` (e.g. inside `xml-exc-c14n#"/>`), which is what tripped
+        // the parser before the fix.
         let signed_info = format!(
-            r#"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"#,
+            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
             ts_digest_b64
         );
 
@@ -1297,7 +1302,10 @@ mod x509_roundtrip {
         let cert_file = write_pem_to_tempfile(&ecdsa_pem);
 
         let result = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()));
-        let err = result.expect_err("ECDSA cert must be rejected at constructor time");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("ECDSA cert must be rejected at constructor time"),
+        };
         assert!(
             err.contains("not an RSA public key"),
             "error should name the RSA constraint, got: {err}"
@@ -1317,7 +1325,10 @@ mod x509_roundtrip {
         let result = SoapWsSecurity::new(&x509_plugin_config(std::path::Path::new(
             "/this/path/does/not/exist/cert.pem",
         )));
-        let err = result.expect_err("missing cert file must fail load");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing cert file must fail load"),
+        };
         assert!(err.contains("failed to read trusted cert"), "got: {err}");
     }
 }
