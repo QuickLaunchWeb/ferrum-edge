@@ -2103,3 +2103,70 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
         .map(|(key, value)| (key.to_ascii_lowercase(), value))
         .collect();
 }
+
+// ── MeshRuntimeOverlay (GAP-3E) ───────────────────────────────────────────
+
+/// Mesh runtime knobs sourced from xDS RTDS (`envoy.service.runtime.v3.Runtime`)
+/// layers.
+///
+/// GAP-3E ships subscription + parse + slice exposure ONLY. Downstream
+/// consumers (fault rates, log levels, header filters) are deferred follow-up
+/// items — the overlay is carried verbatim on
+/// [`crate::modes::mesh::slice::MeshSlice`] so operators can inspect it via
+/// `GET /mesh/runtime-overlay` and so future plumbing has a stable target.
+///
+/// Wire compatibility: the type is an optional field on `MeshSlice` with
+/// `#[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]`,
+/// so non-RTDS deployments round-trip byte-identical.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshRuntimeOverlay {
+    /// Top-level keys flattened from the RTDS layer's `google.protobuf.Struct`
+    /// payload. Keys are runtime feature names
+    /// (e.g. `envoy.reloadable_features.allow_multiplexed_response`); values
+    /// preserve the typed shape from the wire.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fields: HashMap<String, RuntimeValue>,
+}
+
+impl MeshRuntimeOverlay {
+    /// Cheap emptiness check used by both `skip_serializing_if` and runtime
+    /// callers that want to elide overlay handling when no layer has shipped
+    /// any fields.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+/// Typed runtime value mapped from an RTDS layer field.
+///
+/// Mirrors the subset of `google.protobuf.Value` kinds that RTDS layers ship
+/// in practice. `null` and list values are intentionally absent — Envoy / Istio
+/// CPs do not emit them as runtime knob values today, and inventing a
+/// placeholder semantics here would be a footgun once consumers land.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum RuntimeValue {
+    Number(f64),
+    String(String),
+    Bool(bool),
+    FractionalPercent(RuntimeFractionalPercent),
+}
+
+/// Envoy `type.v3.FractionalPercent`-shaped runtime value. RTDS layers
+/// encode it on the wire as a `google.protobuf.Struct` with two fields,
+/// `numerator: number` and `denominator: string`, where the string is one of
+/// the three named denominators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFractionalPercent {
+    pub numerator: u32,
+    pub denominator: FractionalPercentDenominator,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FractionalPercentDenominator {
+    #[default]
+    Hundred,
+    TenThousand,
+    Million,
+}

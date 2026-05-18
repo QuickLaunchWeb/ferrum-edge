@@ -6,11 +6,11 @@ use tracing::{debug, warn};
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
-    MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource, MtlsMode,
-    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels, policy_scope_applies_to_workload,
-    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
-    workload_selector_matches,
+    MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
+    MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
+    ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
+    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
+    service_entry_applies_to_workload, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -205,6 +205,13 @@ pub struct MeshSlice {
     /// fragmentary CDS/EDS recoverable fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<MeshExtensionConfig>,
+    /// xDS RTDS (`envoy.service.runtime.v3.Runtime`) overlay merged across
+    /// all subscribed layers. GAP-3E scope is subscription + parse + slice
+    /// exposure only — downstream consumers (fault rates, log levels,
+    /// header filters) are deferred follow-ups. Empty unless RTDS layers
+    /// arrived on the stream.
+    #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
+    pub runtime_overlay: MeshRuntimeOverlay,
 }
 
 /// One opaque typed extension config, transported through xDS ECDS.
@@ -326,6 +333,7 @@ impl MeshSlice {
             && self.outbound_traffic_policy == other.outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
             && self.extension_configs == other.extension_configs
+            && self.runtime_overlay == other.runtime_overlay
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -702,6 +710,12 @@ impl MeshSlice {
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs: mesh.extension_configs.clone(),
+            // GAP-3E: the canonical `MeshConfig` does not (yet) carry a
+            // declarative RTDS overlay surface. xDS callers populate this
+            // through `reverse_translate`; native MeshSubscribe deployments
+            // leave it empty until the protocol gains an RTDS-equivalent
+            // field.
+            runtime_overlay: MeshRuntimeOverlay::default(),
         }
     }
 }
@@ -2097,6 +2111,7 @@ mod tests {
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
+            runtime_overlay: MeshRuntimeOverlay::default(),
             waypoint_name: None,
         };
         assert!(slice.content_eq(&slice.clone()));

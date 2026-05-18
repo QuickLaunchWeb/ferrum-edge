@@ -5,6 +5,7 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/ferrum.proto");
     println!("cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto");
+    println!("cargo:rerun-if-changed=proto/envoy/service/runtime/v3/rtds.proto");
     println!("cargo:rerun-if-changed=proto/health.proto");
     println!("cargo:rerun-if-changed=proto/workload_api.proto");
 
@@ -25,6 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto/envoy/service/discovery/v3/discovery.proto"],
             &["proto/"],
         )?;
+
+    // GAP-3E: RTDS resources are carried by the same ADS stream as the
+    // standard xDS types. The vendored Runtime proto inlines a minimal
+    // google.protobuf.Struct shim (field numbers preserved) so Phase B
+    // builds stay self-contained, matching the discovery.proto Any/Status
+    // pattern.
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .compile_protos(&["proto/envoy/service/runtime/v3/rtds.proto"], &["proto/"])?;
 
     tonic_prost_build::compile_protos("proto/health.proto")?;
 

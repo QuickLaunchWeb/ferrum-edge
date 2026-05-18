@@ -1038,6 +1038,129 @@ paths:
                   error:
                     type: string
 
+  # ── Mesh runtime overlay (mesh mode, GAP-3E) ─────────────────────────
+  /mesh/runtime-overlay:
+    get:
+      operationId: getMeshRuntimeOverlay
+      summary: Inspect the xDS RTDS runtime overlay for this workload
+      description: |
+        Returns the merged runtime overlay built from every
+        `envoy.service.runtime.v3.Runtime` layer the mesh xDS client has
+        received. Each layer's top-level fields are flattened into a single
+        keyed map; later layers override earlier ones on key conflicts.
+
+        Field values are typed:
+        - `number` — `f64`
+        - `string` — UTF-8 string
+        - `bool` — boolean
+        - `fractional_percent` — `{numerator, denominator}` shaped like an
+          Envoy `FractionalPercent` (`denominator` is one of `hundred`,
+          `ten_thousand`, `million`)
+
+        GAP-3E scope is subscription + parse + slice exposure only.
+        Downstream consumers (fault rates, log levels, header filters) are
+        deferred follow-up items so each can be reviewed against the
+        parsed overlay independently.
+
+        Returns `404 Not Found` outside mesh mode or before the first slice
+        is installed. A slice with no RTDS layers returns `200` with an
+        empty `runtime_overlay` so operators can distinguish "no slice yet"
+        from "slice has no RTDS layers".
+      tags: [Mesh Runtime Overlay]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current runtime overlay
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [namespace, version, runtime_overlay]
+                properties:
+                  namespace:
+                    type: string
+                  version:
+                    type: string
+                    description: Mesh slice version that produced this overlay.
+                  runtime_overlay:
+                    type: object
+                    properties:
+                      fields:
+                        type: object
+                        additionalProperties:
+                          oneOf:
+                            - type: object
+                              required: [kind, value]
+                              properties:
+                                kind:
+                                  type: string
+                                  enum: [number]
+                                value:
+                                  type: number
+                                  format: double
+                            - type: object
+                              required: [kind, value]
+                              properties:
+                                kind:
+                                  type: string
+                                  enum: [string]
+                                value:
+                                  type: string
+                            - type: object
+                              required: [kind, value]
+                              properties:
+                                kind:
+                                  type: string
+                                  enum: [bool]
+                                value:
+                                  type: boolean
+                            - type: object
+                              required: [kind, value]
+                              properties:
+                                kind:
+                                  type: string
+                                  enum: [fractional_percent]
+                                value:
+                                  type: object
+                                  required: [numerator, denominator]
+                                  properties:
+                                    numerator:
+                                      type: integer
+                                      format: int32
+                                    denominator:
+                                      type: string
+                                      enum: [hundred, ten_thousand, million]
+              examples:
+                runtime-overlay-populated:
+                  value:
+                    namespace: alpha
+                    version: v-2026-05-18T00:00:00Z
+                    runtime_overlay:
+                      fields:
+                        envoy.reloadable_features.use_observable_cluster_name:
+                          kind: bool
+                          value: true
+                        envoy.access_loggers.json_default_log_level:
+                          kind: string
+                          value: warn
+                        ferrum.fault.sample_fraction:
+                          kind: fractional_percent
+                          value:
+                            numerator: 25
+                            denominator: hundred
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh runtime overlay
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Audit ────────────────────────────────────────────────────────────
   /audit:
     parameters:

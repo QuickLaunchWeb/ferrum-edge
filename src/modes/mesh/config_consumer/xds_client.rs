@@ -13,17 +13,18 @@ use super::common::{
     wait_for_shutdown,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret, generate_dp_jwt_with_issuer};
-use crate::modes::mesh::config::{AppProtocol, MeshService, ServicePort};
+use crate::modes::mesh::config::{AppProtocol, MeshRuntimeOverlay, MeshService, ServicePort};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
+use crate::xds::runtime_proto;
 use crate::xds::translator::{
     CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
-    RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
+    RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_rtds_layer,
 };
 
-const INITIAL_TYPE_URL_ORDER: [&str; 6] = [
+const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
     CDS_TYPE_URL,
     EDS_TYPE_URL,
     LDS_TYPE_URL,
@@ -31,10 +32,14 @@ const INITIAL_TYPE_URL_ORDER: [&str; 6] = [
     SDS_TYPE_URL,
     // ECDS rides the same ADS stream as the standard xDS resources so the
     // GAP-2K DR-carrier path piggybacks on existing subscription lifecycles.
-    // Kept last in the initial subscription order so DPs request the
-    // baseline resources first and treat ECDS as a "richer-semantics"
-    // overlay rather than a hard dependency.
+    // Kept after the baseline so DPs request the baseline first and treat
+    // ECDS as a "richer-semantics" overlay rather than a hard dependency.
     ECDS_TYPE_URL,
+    // GAP-3E: RTDS is subscribed alongside the other xDS types, but it
+    // ships runtime knobs that downstream consumers haven't been wired to
+    // yet. Kept last so the baseline slice can apply even when the CP has
+    // no Runtime layers to send.
+    RTDS_TYPE_URL,
 ];
 const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
     [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
@@ -282,9 +287,11 @@ impl ResourceAccumulator {
                     "xDS resource for type_url '{type_url}' has an empty name"
                 ));
             }
-            // Only ECDS reverse-translation reads the full bytes back. Other
-            // resource types only carry routing names, so skip the allocation.
-            let bytes = if type_url == ECDS_TYPE_URL {
+            // ECDS reverse-translation reads the full bytes back to decode
+            // its inner TypedExtensionConfig. RTDS reverse-translation does
+            // the same to decode the layer struct. Other resource types
+            // only carry routing names, so skip the allocation.
+            let bytes = if type_url == ECDS_TYPE_URL || type_url == RTDS_TYPE_URL {
                 resource.value.clone()
             } else {
                 Vec::new()
@@ -897,6 +904,30 @@ fn reverse_translate(
     log_omitted_sds_trust_domains(trust_domains);
     log_ignored_sds_resource_names(ignored_sds_names);
 
+    // GAP-3E: merge RTDS layers into the slice's runtime overlay. Layers
+    // arrive sorted by resource name on the wire; later fields win on key
+    // conflicts so a higher-priority layer overrides a base layer. Layers
+    // with empty `name` would have been rejected at name decode, so any
+    // resource that reaches this point has a stable identity.
+    let mut runtime_overlay = MeshRuntimeOverlay::default();
+    for resource in accumulator.resources(RTDS_TYPE_URL) {
+        match runtime_proto::Runtime::decode(resource.bytes.as_slice()) {
+            Ok(layer) => {
+                let overlay = translate_rtds_layer(&layer);
+                for (key, value) in overlay.fields {
+                    runtime_overlay.fields.insert(key, value);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    resource_name = %resource.name,
+                    error = %e,
+                    "xDS RTDS resource failed Runtime decode; skipping"
+                );
+            }
+        }
+    }
+
     Ok(MeshSlice {
         node_id: config.node_id.clone(),
         namespace: config.namespace.clone(),
@@ -947,6 +978,9 @@ fn reverse_translate(
         // alongside CDS via the same wire so this stays empty unless future
         // ADS-side recovery wires it.
         extension_configs: Vec::new(),
+        // GAP-3E: merged RTDS layers. Empty when no Runtime resources have
+        // shipped on this stream.
+        runtime_overlay,
     })
 }
 
@@ -970,6 +1004,9 @@ fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> 
         ECDS_TYPE_URL => proto::TypedExtensionConfig::decode(value)
             .map(|resource| resource.name)
             .map_err(|e| format!("failed to decode TypedExtensionConfig resource: {e}")),
+        RTDS_TYPE_URL => runtime_proto::Runtime::decode(value)
+            .map(|resource| resource.name)
+            .map_err(|e| format!("failed to decode Runtime resource: {e}")),
         other => Err(format!("unknown xDS type_url '{other}'")),
     }
 }
@@ -1138,6 +1175,11 @@ mod tests {
                 }),
             }
             .encode_to_vec(),
+            RTDS_TYPE_URL => runtime_proto::Runtime {
+                name: name.to_string(),
+                layer: None,
+            }
+            .encode_to_vec(),
             other => panic!("unknown test type_url: {other}"),
         };
         proto::Any {
@@ -1201,6 +1243,7 @@ mod tests {
                 RDS_TYPE_URL,
                 SDS_TYPE_URL,
                 ECDS_TYPE_URL,
+                RTDS_TYPE_URL,
             ]
         );
         assert!(requests.iter().all(|request| request.node.is_some()));
