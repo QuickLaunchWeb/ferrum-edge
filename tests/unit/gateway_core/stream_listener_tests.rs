@@ -301,7 +301,19 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
 
 #[tokio::test]
 async fn test_reconcile_defers_udp_without_dtls_config() {
-    let port = ephemeral_port().await;
+    // Hold a UDP socket on an ephemeral port for the duration of the test.
+    // ephemeral_port() allocates from TCP space, but a free TCP port number may
+    // still be bound by another concurrent test in UDP space, so probing UDP at
+    // that number after reconcile is flaky. Reserving the port in UDP space
+    // ourselves both eliminates the cross-protocol race and gives us a stronger
+    // deferral assertion: if reconcile correctly defers, it never reaches the
+    // port probe and `failures` stays empty; if deferral regresses, the probe
+    // collides with our held socket and surfaces as a bind failure.
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind UDP holder");
+    let port = holder.local_addr().unwrap().port();
+
     let mut proxy = create_stream_proxy("udp-dtls", BackendScheme::Udp, port);
     proxy.frontend_tls = true;
 
@@ -320,13 +332,7 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         failures
     );
 
-    // Verify the UDP port is NOT bound (listener was deferred)
-    let probe = tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", port)).await;
-    assert!(
-        probe.is_ok(),
-        "UDP port {} should NOT be in use (listener was deferred)",
-        port
-    );
+    drop(holder);
 }
 
 // ============================================================================
