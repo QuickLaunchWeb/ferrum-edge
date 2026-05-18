@@ -786,3 +786,104 @@ async fn test_response_transformer_header_only_rules_never_buffer() {
         .insert("accept".to_string(), "application/json".to_string());
     assert!(!plugin.should_buffer_response_body(&ctx_json));
 }
+
+// ── Route-level transform overrides (`apply_route_overrides`) ──────────────
+
+use ferrum_edge::plugins::utils::route_header_transform::{
+    RawRouteHeaderTransformRule, parse_route_header_transforms,
+};
+use std::sync::Arc;
+
+#[tokio::test]
+async fn test_response_transformer_apply_route_overrides_accepts_empty_rules() {
+    ResponseTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .expect("apply_route_overrides=true allows zero static rules");
+}
+
+#[tokio::test]
+async fn test_response_transformer_empty_rules_without_opt_in_still_errors() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [],
+    }))
+    .err()
+    .expect("zero rules without apply_route_overrides must error");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_route_override_applies_after_static_rules() {
+    // Static rule sets X-Backend=static; route-level override sets
+    // X-Backend=route. Per documented precedence (static first, then
+    // per-rule), the route override must win.
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "X-Backend", "value": "static"}
+        ]
+    }))
+    .unwrap();
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Backend", "value": "route"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    let mut ctx = make_ctx();
+    ctx.route_override_response_transform = Some(route_rules);
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert_eq!(
+        response_headers.get("x-backend").map(String::as_str),
+        Some("route")
+    );
+    // Plugin must consume the Arc so a subsequent response_transformer
+    // instance in the chain does not re-apply the same list.
+    assert!(ctx.route_override_response_transform.is_none());
+}
+
+#[tokio::test]
+async fn test_response_transformer_apply_route_overrides_no_static_rules_applies_overrides() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .unwrap();
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Cache", "value": "miss"},
+        {"operation": "remove", "target": "header", "key": "X-Origin"},
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    let mut ctx = make_ctx();
+    ctx.route_override_response_transform = Some(route_rules);
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert("x-origin".to_string(), "alpha".to_string());
+
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("x-cache").map(String::as_str),
+        Some("miss")
+    );
+    assert!(!response_headers.contains_key("x-origin"));
+}
+
+#[tokio::test]
+async fn test_response_transformer_apply_route_overrides_invalid_type_rejected() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": "yes",
+    }))
+    .err()
+    .expect("non-boolean apply_route_overrides must error");
+    assert!(err.contains("must be a boolean"), "got: {err}");
+}

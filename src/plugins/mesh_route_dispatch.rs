@@ -7,7 +7,10 @@
 //! conditions (method, headers, query params) become `mesh_route_dispatch`
 //! rules attached as a proxy-scoped plugin. At request time the plugin walks
 //! its rule list and — when a rule matches — sets one or more of
-//! `RequestContext.route_override_{upstream_id, backend_host, backend_port, resolved_tls}`.
+//! `RequestContext.route_override_{upstream_id, backend_host, backend_port, resolved_tls}`
+//! and optionally publishes per-rule
+//! `route_override_{request,response}_transform` lists for the request /
+//! response transformer plugins to apply after their own static rules.
 //! The dispatch path picks those up after the `before_proxy` phase via
 //! `RequestContext::apply_route_overrides`, which bakes the overrides into a
 //! fresh `Arc<Proxy>` so every downstream pool key, capability-registry
@@ -42,6 +45,7 @@
 //! collapsed routes that clear inherited retry or timeout policy.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -51,6 +55,9 @@ use crate::config::types::{
     BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
+};
+use crate::plugins::utils::route_header_transform::{
+    RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
@@ -185,9 +192,26 @@ impl MeshRouteDispatchConfig {
             if let Some(tls) = rule.destination.backend_tls.as_mut() {
                 normalize_and_validate_backend_tls(idx, tls)?;
             }
+            rule.request_transform_compiled =
+                compile_transform_field(idx, "request_transform", &rule.request_transform)?;
+            rule.response_transform_compiled =
+                compile_transform_field(idx, "response_transform", &rule.response_transform)?;
         }
         Ok(())
     }
+}
+
+fn compile_transform_field(
+    rule_idx: usize,
+    field: &str,
+    raw: &[RawRouteHeaderTransformRule],
+) -> Result<Option<Arc<Vec<RouteHeaderTransformRule>>>, String> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let context = format!("mesh_route_dispatch.rules[{rule_idx}].{field}");
+    let parsed = parse_route_header_transforms(raw, &context)?;
+    Ok(Some(Arc::new(parsed)))
 }
 
 fn normalize_and_validate_backend_tls(
@@ -263,6 +287,26 @@ pub struct RouteRule {
     /// fallback route's retry policy from leaking onto an earlier route.
     #[serde(default, skip_serializing_if = "is_false")]
     pub retry_disabled: bool,
+    /// Optional request-header transforms applied by `request_transformer`
+    /// after its own static rules when this rule matches. Projects Istio
+    /// `VirtualService.http[].headers.request.{set,add,remove}` onto each
+    /// emitted dispatch rule. Operators may also configure these directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_transform: Vec<RawRouteHeaderTransformRule>,
+    /// Optional response-header transforms applied by `response_transformer`
+    /// after its own static rules when this rule matches. Counterpart to
+    /// `request_transform`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_transform: Vec<RawRouteHeaderTransformRule>,
+    /// Pre-compiled `request_transform` rules, built during normalize so the
+    /// hot path clones an `Arc` pointer (not the rule list) on every match.
+    /// `None` when `request_transform` is empty.
+    #[serde(skip)]
+    request_transform_compiled: Option<Arc<Vec<RouteHeaderTransformRule>>>,
+    /// Pre-compiled `response_transform` rules; counterpart to
+    /// `request_transform_compiled`.
+    #[serde(skip)]
+    response_transform_compiled: Option<Arc<Vec<RouteHeaderTransformRule>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -416,6 +460,15 @@ impl Plugin for MeshRouteDispatch {
                 } else {
                     None
                 };
+                // Per-rule header transforms: publish the pre-compiled Arc
+                // so request_transformer / response_transformer can apply
+                // them after their own static rules. Cloning an Arc is one
+                // atomic refcount bump — cheaper than rebuilding the rule
+                // list on every match.
+                ctx.route_override_request_transform =
+                    rule.request_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform =
+                    rule.response_transform_compiled.as_ref().map(Arc::clone);
                 return PluginResult::Continue;
             }
         }
@@ -1096,5 +1149,104 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(matches!(result, PluginResult::Continue));
         assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn rule_with_request_transform_publishes_arc_on_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Api-Version", "value": "v1"},
+                    {"operation": "add",    "target": "header", "key": "X-Trace", "value": "y"},
+                    {"operation": "remove", "target": "header", "key": "X-Debug"},
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let arc = ctx
+            .route_override_request_transform
+            .expect("request_transform must be published on match");
+        assert_eq!(arc.len(), 3);
+        assert!(ctx.route_override_response_transform.is_none());
+    }
+
+    #[tokio::test]
+    async fn rule_with_response_transform_publishes_arc_on_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "response_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Backend", "value": "v1"},
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_request_transform.is_none());
+        let arc = ctx
+            .route_override_response_transform
+            .expect("response_transform must be published on match");
+        assert_eq!(arc.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_matching_rule_does_not_publish_transforms() {
+        // A rule with transforms that does not match must not leak its Arcs
+        // onto the context (would be applied to the wrong route).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Api-Version", "value": "v1"},
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("POST", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_request_transform.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_request_transform_rule_at_load() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Inject",
+                     "value": "good\r\nX-Injected: 1"}
+                ]
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("request_transform"), "got: {err}");
+        assert!(err.contains("CR or LF"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_request_transform_with_unknown_operation_at_load() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "request_transform": [
+                    {"operation": "rename", "target": "header", "key": "X", "value": "Y"}
+                ]
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("request_transform"), "got: {err}");
+        assert!(err.contains("add/update/remove"), "got: {err}");
     }
 }

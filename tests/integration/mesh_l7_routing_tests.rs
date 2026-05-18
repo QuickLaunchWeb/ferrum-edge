@@ -331,3 +331,250 @@ async fn mesh_l7_routing_collapsed_istio_route_overrides_timeout_and_retry() {
     assert_eq!(effective_miss.backend_read_timeout_ms, 30_000);
     assert!(effective_miss.retry.is_none());
 }
+
+// ── VirtualService route-level header transforms ──────────────────────────
+//
+// Istio `VirtualService.http[].headers.{request,response}.{set,add,remove}`
+// projects onto each emitted `mesh_route_dispatch` rule as
+// `request_transform` / `response_transform` arrays, and the translator
+// auto-emits a `request_transformer` / `response_transformer` instance so
+// the per-rule transforms have a consumer at runtime.
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_header_set_emits_request_transform() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "headers": {
+                        "request": {
+                            "set": {"X-Api-Version": "v1"},
+                            "add": {"X-Trace": "added"},
+                            "remove": ["X-Debug"]
+                        }
+                    },
+                    "route": [{"destination": {"host": "v1.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("/v1"))
+        .expect("/v1 proxy");
+
+    // Dispatch plugin must carry the per-rule request_transform array.
+    let dispatch = dispatch_plugin_for_proxy(&result.config, proxy);
+    let transforms = dispatch.config["rules"][0]["request_transform"]
+        .as_array()
+        .expect("request_transform array");
+    assert_eq!(transforms.len(), 3, "set + add + remove → 3 rules");
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "update" && r["key"] == "X-Api-Version")
+    );
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "add" && r["key"] == "X-Trace")
+    );
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "remove" && r["key"] == "X-Debug")
+    );
+
+    // Translator must auto-emit a request_transformer instance on this
+    // proxy so the per-rule overrides have a consumer at runtime.
+    let auto_xform = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| {
+            p.plugin_name == "request_transformer"
+                && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("auto-emitted request_transformer plugin for proxy");
+    assert_eq!(
+        auto_xform.config["apply_route_overrides"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        auto_xform.config["rules"].as_array().unwrap().is_empty(),
+        "auto-emitted instance carries only route-level rules, no static ones"
+    );
+
+    // End-to-end: when the dispatch rule matches, the per-rule Arc lands on
+    // the context, and applying it via the auto-emitted transformer rewrites
+    // headers. We exercise both halves via the plugin classes directly.
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+    let mrd = MeshRouteDispatch::new(&dispatch.config).expect("mrd plugin");
+    let req_xform = RequestTransformer::new(&auto_xform.config).expect("auto request_transformer");
+    assert!(req_xform.modifies_request_headers());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/v1/items".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("x-debug".to_string(), "yes".to_string());
+    let _ = mrd.before_proxy(&mut ctx, &mut headers).await;
+    let _ = req_xform.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-api-version").map(String::as_str), Some("v1"));
+    assert_eq!(headers.get("x-trace").map(String::as_str), Some("added"));
+    assert!(!headers.contains_key("x-debug"));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_header_remove_emits_response_transform() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "headers": {
+                        "response": {
+                            "set": {"X-Backend": "v1"},
+                            "remove": ["Server"]
+                        }
+                    },
+                    "route": [{"destination": {"host": "v1.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("/v1"))
+        .expect("/v1 proxy");
+    let dispatch = dispatch_plugin_for_proxy(&result.config, proxy);
+
+    let transforms = dispatch.config["rules"][0]["response_transform"]
+        .as_array()
+        .expect("response_transform array");
+    assert_eq!(transforms.len(), 2);
+    // Request side must NOT be populated when the VS only configured
+    // response-side transforms.
+    assert!(
+        dispatch.config["rules"][0]
+            .get("request_transform")
+            .is_none()
+    );
+
+    let auto_xform = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| {
+            p.plugin_name == "response_transformer"
+                && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("auto-emitted response_transformer plugin for proxy");
+    assert_eq!(
+        auto_xform.config["apply_route_overrides"].as_bool(),
+        Some(true)
+    );
+
+    // No auto-emitted request_transformer when there are only response
+    // transforms — the translator must avoid emitting plugins that would be
+    // no-ops.
+    let request_xform_emitted = result.config.plugin_configs.iter().any(|p| {
+        p.plugin_name == "request_transformer" && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+    });
+    assert!(
+        !request_xform_emitted,
+        "translator must not emit a request_transformer when only response-side transforms exist"
+    );
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_headers_route_scope_does_not_leak_across_paths() {
+    // Two http[] entries; only the /v1 entry has a header transform. The
+    // header transform must NOT show up on the /v2 proxy.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "headers": {"request": {"set": {"X-Api-Version": "v1"}}},
+                        "route": [{"destination": {"host": "v1.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/v2"}}],
+                        "route": [{"destination": {"host": "v2.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let v1_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/v1"))
+        .expect("/v1 proxy");
+    let v2_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/v2"))
+        .expect("/v2 proxy");
+
+    // /v1's dispatch plugin carries request_transform; /v2's does not.
+    let v1_dispatch = dispatch_plugin_for_proxy(&result.config, v1_proxy);
+    assert!(
+        v1_dispatch.config["rules"][0]["request_transform"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty())
+    );
+    let v2_dispatch_plugin = result.config.plugin_configs.iter().find(|p| {
+        p.plugin_name == "mesh_route_dispatch"
+            && p.proxy_id.as_deref() == Some(v2_proxy.id.as_str())
+    });
+    if let Some(v2_dispatch) = v2_dispatch_plugin {
+        // The /v2 proxy may have a dispatch plugin only if its match has a
+        // non-URI predicate; in this VS it does not, so the dispatch plugin
+        // may be absent. If present, no rule must carry request_transform.
+        for rule in v2_dispatch.config["rules"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+        {
+            assert!(rule.get("request_transform").is_none());
+        }
+    }
+
+    // Only /v1's proxy gets the auto-emitted request_transformer.
+    let v1_has_xform = result.config.plugin_configs.iter().any(|p| {
+        p.plugin_name == "request_transformer"
+            && p.proxy_id.as_deref() == Some(v1_proxy.id.as_str())
+    });
+    let v2_has_xform = result.config.plugin_configs.iter().any(|p| {
+        p.plugin_name == "request_transformer"
+            && p.proxy_id.as_deref() == Some(v2_proxy.id.as_str())
+    });
+    assert!(v1_has_xform);
+    assert!(!v2_has_xform);
+}

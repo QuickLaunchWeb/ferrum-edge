@@ -877,6 +877,60 @@ pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[Plugin
         }));
 }
 
+/// Build a no-static-rules `request_transformer` whose only purpose is to
+/// apply per-rule `mesh_route_dispatch` route-level transforms. Emitted by
+/// the VirtualService translator on proxies that do not already carry a
+/// `request_transformer` plugin so the per-context override channel
+/// reaches a consumer. `apply_route_overrides: true` lets the plugin
+/// accept the empty-rules config.
+pub(crate) fn route_request_transformer_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+) -> PluginConfig {
+    let now = Utc::now();
+    PluginConfig {
+        id: format!("istio-vs-req-xform-{proxy_id}"),
+        plugin_name: "request_transformer".to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "rules": [],
+            "apply_route_overrides": true,
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Counterpart to [`route_request_transformer_plugin_for_proxy`] for response
+/// header transforms.
+pub(crate) fn route_response_transformer_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+) -> PluginConfig {
+    let now = Utc::now();
+    PluginConfig {
+        id: format!("istio-vs-resp-xform-{proxy_id}"),
+        plugin_name: "response_transformer".to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "rules": [],
+            "apply_route_overrides": true,
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Build a `request_termination` plugin config for a translated route that
 /// cannot safely be represented by Ferrum's current routing dimensions.
 pub(crate) fn request_termination_plugin_for_proxy(
@@ -1085,6 +1139,14 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         return (Vec::new(), false);
     }
 
+    // VirtualService `headers.{request,response}.{set,add,remove}` is a
+    // per-http[] (not per-match) block. Project it onto each emitted rule so
+    // the same transforms fire regardless of which match-branch wins. The
+    // mesh_route_dispatch plugin parses and validates these at construction
+    // time; we only emit the JSON shape here.
+    let route_request_transform = vs_route_header_transform_rules(http, "request");
+    let route_response_transform = vs_route_header_transform_rules(http, "response");
+
     let mut rules = Vec::new();
     let mut has_uri_only_match = false;
     for entry in matches {
@@ -1192,10 +1254,78 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         } else if route_policy.retry_disabled {
             rule.insert("retry_disabled".to_string(), Value::Bool(true));
         }
+        if !route_request_transform.is_empty() {
+            rule.insert(
+                "request_transform".to_string(),
+                Value::Array(route_request_transform.clone()),
+            );
+        }
+        if !route_response_transform.is_empty() {
+            rule.insert(
+                "response_transform".to_string(),
+                Value::Array(route_response_transform.clone()),
+            );
+        }
         rules.push(Value::Object(rule));
     }
 
     (rules, has_uri_only_match)
+}
+
+/// Extract `headers.{direction}.{set,add,remove}` from a VirtualService
+/// `http[]` entry into the canonical transformer rule JSON shape (the same
+/// shape the `request_transformer` / `response_transformer` plugins accept).
+/// `direction` is `"request"` or `"response"`.
+pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> Vec<Value> {
+    let Some(headers) = http
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|h| h.get(direction))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let set = headers.get("set").and_then(Value::as_object);
+    let add = headers.get("add").and_then(Value::as_object);
+    let remove = headers.get("remove").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    });
+    crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json(
+        set,
+        add,
+        remove.as_deref(),
+    )
+}
+
+/// True when a VirtualService `http[]` entry carries any
+/// `headers.{request,response}.{set,add,remove}` directive that the
+/// translator projects onto dispatch rules. The K8s translator uses this to
+/// auto-emit a `request_transformer` / `response_transformer` instance on
+/// proxies that do not already carry one.
+pub(crate) fn vs_route_has_header_transforms(http: &Value, direction: &str) -> bool {
+    let Some(headers) = http
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|h| h.get(direction))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let set_non_empty = headers
+        .get("set")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let add_non_empty = headers
+        .get("add")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let remove_non_empty = headers
+        .get("remove")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|v| v.is_string()));
+    set_non_empty || add_non_empty || remove_non_empty
 }
 
 pub(crate) fn mesh_route_dispatch_plugin_from_rules(
