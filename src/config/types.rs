@@ -230,6 +230,12 @@ pub struct UpstreamPortOverride {
     /// `outlierDetection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
+    /// Per-port locality LB override mapped from DestinationRule
+    /// `portLevelSettings[].loadBalancer.localityLbSetting`. When present,
+    /// HTTP-family / gRPC / WebSocket / HBONE dispatch consults this before
+    /// the upstream-level `Upstream.locality_lb_setting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
 }
 
 /// Cold-path projection of an [`UpstreamPortOverride`] onto a `Proxy`.
@@ -243,6 +249,7 @@ pub struct ResolvedPortOverride {
     pub algorithm: Option<LoadBalancerAlgorithm>,
     pub hash_on: Option<String>,
     pub passive_health_check: Option<PassiveHealthCheck>,
+    pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
 }
 
 impl ResolvedPortOverride {
@@ -252,6 +259,7 @@ impl ResolvedPortOverride {
             algorithm: value.algorithm,
             hash_on: value.hash_on.clone(),
             passive_health_check: value.passive_health_check.clone(),
+            locality_lb_setting: value.locality_lb_setting.clone(),
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -261,6 +269,7 @@ impl ResolvedPortOverride {
             && self.algorithm.is_none()
             && self.hash_on.is_none()
             && self.passive_health_check.is_none()
+            && self.locality_lb_setting.is_none()
     }
 }
 

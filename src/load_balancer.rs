@@ -1269,6 +1269,7 @@ pub struct LoadBalancer {
 
 /// Per-target state derived from `UpstreamLocalityLbSetting` so the hot
 /// path doesn't re-parse / re-match localities on every selection.
+#[derive(Debug)]
 struct LocalityLbState {
     /// `true` when the operator left the block enabled. When `false`, the
     /// load balancer skips both distribute weighting and failover override
@@ -1294,6 +1295,7 @@ struct LocalityLbState {
     failover_target_matches: Option<Vec<bool>>,
 }
 
+#[derive(Debug)]
 struct LocalityDistributeGroup {
     weight: u64,
     target_indices: Vec<usize>,
@@ -1309,6 +1311,12 @@ struct PortLbState {
     wrr_needs_stale_check: AtomicBool,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
+    /// Per-port projection of `UpstreamPortOverride.locality_lb_setting`.
+    /// When `Some`, dispatch on this port consults the per-port locality
+    /// preference before falling through to the upstream-level
+    /// `LoadBalancer.locality_lb`. Pre-computed at cold path so the hot
+    /// path stays branch-light.
+    locality_lb: Option<LocalityLbState>,
 }
 
 impl LoadBalancer {
@@ -1516,6 +1524,16 @@ impl LoadBalancer {
                 } else {
                     Vec::new()
                 };
+                // Per-port locality LB falls back to the upstream-level setting
+                // when the operator did not override it at this port. The
+                // pre-compute uses the full target list so target indices stay
+                // aligned with `LoadBalancer.targets`.
+                let port_locality_setting = override_config
+                    .locality_lb_setting
+                    .as_ref()
+                    .or(locality_lb_setting);
+                let port_locality_lb =
+                    build_locality_lb_state(port_locality_setting, source_locality, targets);
                 port_states.insert(
                     *port,
                     PortLbState {
@@ -1526,6 +1544,7 @@ impl LoadBalancer {
                         wrr_needs_stale_check: AtomicBool::new(false),
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
+                        locality_lb: port_locality_lb,
                     },
                 );
             }
@@ -1934,14 +1953,14 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn preferred_locality_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
+    fn preferred_locality_bitset(
+        &self,
+        candidates: &HealthBitset,
+        locality_lb: Option<&LocalityLbState>,
+    ) -> HealthBitset {
         // Operator-disabled locality LB short-circuits the priority tier
         // preference entirely (Istio `localityLbSetting.enabled: false`).
-        if self
-            .locality_lb
-            .as_ref()
-            .is_some_and(|state| !state.enabled)
-        {
+        if locality_lb.is_some_and(|state| !state.enabled) {
             return *candidates;
         }
 
@@ -1950,11 +1969,7 @@ impl LoadBalancer {
         // distribute bucket inside this union and runs the configured endpoint
         // algorithm there. We do this before priority-tier preference because
         // Istio treats distribute and priority as mutually exclusive.
-        if let Some(weights) = self
-            .locality_lb
-            .as_ref()
-            .and_then(|state| state.distribute_weights.as_ref())
-        {
+        if let Some(weights) = locality_lb.and_then(|state| state.distribute_weights.as_ref()) {
             let mut masked = HealthBitset::empty();
             for idx in 0..self.targets.len() {
                 if candidates.contains(idx) && weights.get(idx).copied().unwrap_or(0) > 0 {
@@ -2003,10 +2018,7 @@ impl LoadBalancer {
         // Failover override sits between the region tier and the unfiltered
         // candidate set: when the source region is exhausted, prefer the
         // operator-configured failover region before falling through.
-        if let Some(matches) = self
-            .locality_lb
-            .as_ref()
-            .and_then(|state| state.failover_target_matches.as_ref())
+        if let Some(matches) = locality_lb.and_then(|state| state.failover_target_matches.as_ref())
         {
             let mut failover = HealthBitset::empty();
             for idx in 0..self.targets.len() {
@@ -2025,25 +2037,18 @@ impl LoadBalancer {
     fn preferred_locality_candidates<'a>(
         &self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+        locality_lb: Option<&LocalityLbState>,
     ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
         // Mirror `preferred_locality_bitset` semantics on the Vec path so the
         // > 128-target fallback agrees with the bitset path.
-        if self
-            .locality_lb
-            .as_ref()
-            .is_some_and(|state| !state.enabled)
-        {
+        if locality_lb.is_some_and(|state| !state.enabled) {
             return candidates;
         }
 
         // distribute-mode: restrict to operator-weighted targets when any are
         // available. If every weighted target is missing, continue into the
         // normal locality tiers below.
-        if let Some(weights) = self
-            .locality_lb
-            .as_ref()
-            .and_then(|state| state.distribute_weights.as_ref())
-        {
+        if let Some(weights) = locality_lb.and_then(|state| state.distribute_weights.as_ref()) {
             let masked: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
                 .iter()
                 .copied()
@@ -2078,10 +2083,7 @@ impl LoadBalancer {
             return preferred;
         }
 
-        if let Some(matches) = self
-            .locality_lb
-            .as_ref()
-            .and_then(|state| state.failover_target_matches.as_ref())
+        if let Some(matches) = locality_lb.and_then(|state| state.failover_target_matches.as_ref())
         {
             let failover: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
                 .iter()
@@ -2118,8 +2120,9 @@ impl LoadBalancer {
         healthy: &HealthBitset,
         ctx_key: &str,
         algorithm: LoadBalancerAlgorithm,
+        locality_lb: Option<&LocalityLbState>,
     ) -> Option<HealthBitset> {
-        let state = self.locality_lb.as_ref()?;
+        let state = locality_lb?;
         let groups = state.distribute_groups.as_ref()?;
         let mut total = 0u64;
         for group in groups {
@@ -2166,8 +2169,9 @@ impl LoadBalancer {
         candidates: &[(usize, &'a Arc<UpstreamTarget>)],
         ctx_key: &str,
         algorithm: LoadBalancerAlgorithm,
+        locality_lb: Option<&LocalityLbState>,
     ) -> Option<Vec<(usize, &'a Arc<UpstreamTarget>)>> {
-        let state = self.locality_lb.as_ref()?;
+        let state = locality_lb?;
         let groups = state.distribute_groups.as_ref()?;
 
         let mut total = 0u64;
@@ -2231,7 +2235,7 @@ impl LoadBalancer {
         if healthy.is_empty() {
             // All targets unhealthy — degraded mode fallback using all targets.
             let all = HealthBitset::all(n);
-            let all = self.preferred_locality_bitset(&all);
+            let all = self.preferred_locality_bitset(&all, self.locality_lb.as_ref());
             return self
                 .select_with_bitset(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -2240,7 +2244,7 @@ impl LoadBalancer {
                 });
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy);
+        let healthy = self.preferred_locality_bitset(&healthy, self.locality_lb.as_ref());
         self.select_with_bitset(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -2295,7 +2299,8 @@ impl LoadBalancer {
             return None;
         }
 
-        let subset_healthy = self.preferred_locality_bitset(&subset_healthy);
+        let subset_healthy =
+            self.preferred_locality_bitset(&subset_healthy, self.locality_lb.as_ref());
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -2303,6 +2308,7 @@ impl LoadBalancer {
             &self.rr_counter,
             wrr_state,
             hash_ring,
+            self.locality_lb.as_ref(),
         )
         .map(|target| TargetSelection {
             target,
@@ -2332,10 +2338,14 @@ impl LoadBalancer {
 
         let port_healthy =
             self.compute_health_bitset_for_indices(health, &port_state.target_indices);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
 
         if port_healthy.is_empty() {
             let all_port_targets = bitset_for_indices(&port_state.target_indices);
-            let all_port_targets = self.preferred_locality_bitset(&all_port_targets);
+            let all_port_targets = self.preferred_locality_bitset(&all_port_targets, port_locality);
             return self
                 .select_with_bitset_using(
                     ctx_key,
@@ -2344,6 +2354,7 @@ impl LoadBalancer {
                     &port_state.rr_counter,
                     &port_state.wrr_state,
                     &port_state.hash_ring,
+                    port_locality,
                 )
                 .map(|target| TargetSelection {
                     target,
@@ -2351,7 +2362,7 @@ impl LoadBalancer {
                 });
         }
 
-        let port_healthy = self.preferred_locality_bitset(&port_healthy);
+        let port_healthy = self.preferred_locality_bitset(&port_healthy, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_healthy,
@@ -2359,6 +2370,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
         .map(|target| TargetSelection {
             target,
@@ -2411,7 +2423,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let port_subset_healthy = self.preferred_locality_bitset(&port_subset_healthy);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let port_subset_healthy =
+            self.preferred_locality_bitset(&port_subset_healthy, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -2419,6 +2436,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
         .map(|target| TargetSelection {
             target,
@@ -2442,7 +2460,11 @@ impl LoadBalancer {
                 .map(|&idx| (idx, &self.targets[idx]))
                 .collect();
         }
-        let candidates = self.preferred_locality_candidates(candidates);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let candidates = self.preferred_locality_candidates(candidates, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2451,6 +2473,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
         .map(|target| TargetSelection {
             target,
@@ -2474,7 +2497,11 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
-        let candidates = self.preferred_locality_candidates(candidates);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let candidates = self.preferred_locality_candidates(candidates, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2483,6 +2510,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
         .map(|target| TargetSelection {
             target,
@@ -2513,7 +2541,8 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
-        let subset_healthy = self.preferred_locality_candidates(subset_healthy);
+        let subset_healthy =
+            self.preferred_locality_candidates(subset_healthy, self.locality_lb.as_ref());
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2522,6 +2551,7 @@ impl LoadBalancer {
             &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
+            self.locality_lb.as_ref(),
         )
         .map(|target| TargetSelection {
             target,
@@ -2611,9 +2641,11 @@ impl LoadBalancer {
             &self.rr_counter,
             &self.wrr_state,
             &self.hash_ring,
+            self.locality_lb.as_ref(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_with_bitset_using(
         &self,
         ctx_key: &str,
@@ -2622,12 +2654,14 @@ impl LoadBalancer {
         rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
         hash_ring: &[(u64, usize)],
+        locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
         if healthy.is_empty() {
             return None;
         }
         let distributed;
-        let healthy = if let Some(mask) = self.distribute_group_bitset(healthy, ctx_key, algorithm)
+        let healthy = if let Some(mask) =
+            self.distribute_group_bitset(healthy, ctx_key, algorithm, locality_lb)
         {
             distributed = mask;
             &distributed
@@ -2679,7 +2713,7 @@ impl LoadBalancer {
         let healthy = self.healthy_targets_vec(health);
         if healthy.is_empty() {
             let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
-            let all = self.preferred_locality_candidates(all);
+            let all = self.preferred_locality_candidates(all, self.locality_lb.as_ref());
             return self
                 .select_from_candidates_vec(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -2687,7 +2721,7 @@ impl LoadBalancer {
                     is_fallback: true,
                 });
         }
-        let healthy = self.preferred_locality_candidates(healthy);
+        let healthy = self.preferred_locality_candidates(healthy, self.locality_lb.as_ref());
         self.select_from_candidates_vec(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -2708,9 +2742,11 @@ impl LoadBalancer {
             &self.rr_counter,
             &self.wrr_state,
             &self.hash_ring,
+            self.locality_lb.as_ref(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_from_candidates_vec_using(
         &self,
         ctx_key: &str,
@@ -2719,13 +2755,14 @@ impl LoadBalancer {
         rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
         hash_ring: &[(u64, usize)],
+        locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
         }
         let distributed;
         let candidates = if let Some(masked) =
-            self.distribute_group_candidates(candidates, ctx_key, algorithm)
+            self.distribute_group_candidates(candidates, ctx_key, algorithm, locality_lb)
         {
             distributed = masked;
             distributed.as_slice()
@@ -2794,13 +2831,13 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_bitset(&fallback);
+            let fallback = self.preferred_locality_bitset(&fallback, self.locality_lb.as_ref());
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = fallback.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy);
+        let healthy = self.preferred_locality_bitset(&healthy, self.locality_lb.as_ref());
         self.select_with_bitset(ctx_key, &healthy)
     }
 
@@ -2839,6 +2876,10 @@ impl LoadBalancer {
             healthy.clear(ei);
         }
 
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
         if healthy.is_empty() {
             let mut fallback = bitset_for_indices(&port_state.target_indices);
             if let Some(ei) = exclude_idx {
@@ -2847,7 +2888,7 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_bitset(&fallback);
+            let fallback = self.preferred_locality_bitset(&fallback, port_locality);
             return self.select_with_bitset_using(
                 ctx_key,
                 &fallback,
@@ -2855,10 +2896,11 @@ impl LoadBalancer {
                 &port_state.rr_counter,
                 &port_state.wrr_state,
                 &port_state.hash_ring,
+                port_locality,
             );
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy);
+        let healthy = self.preferred_locality_bitset(&healthy, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &healthy,
@@ -2866,6 +2908,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
     }
 
@@ -2917,7 +2960,8 @@ impl LoadBalancer {
             return None;
         }
 
-        let subset_healthy = self.preferred_locality_bitset(&subset_healthy);
+        let subset_healthy =
+            self.preferred_locality_bitset(&subset_healthy, self.locality_lb.as_ref());
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -2925,6 +2969,7 @@ impl LoadBalancer {
             &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
+            self.locality_lb.as_ref(),
         )
     }
 
@@ -2982,7 +3027,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let port_subset_healthy = self.preferred_locality_bitset(&port_subset_healthy);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let port_subset_healthy =
+            self.preferred_locality_bitset(&port_subset_healthy, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -2990,6 +3040,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
     }
 
@@ -3016,12 +3067,12 @@ impl LoadBalancer {
             if fallback.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_candidates(fallback);
+            let fallback = self.preferred_locality_candidates(fallback, self.locality_lb.as_ref());
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(fallback[idx % fallback.len()].1));
         }
 
-        let healthy = self.preferred_locality_candidates(healthy);
+        let healthy = self.preferred_locality_candidates(healthy, self.locality_lb.as_ref());
         self.select_from_candidates_vec(ctx_key, &healthy)
     }
 
@@ -3049,7 +3100,11 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
-        let candidates = self.preferred_locality_candidates(candidates);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let candidates = self.preferred_locality_candidates(candidates, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -3058,6 +3113,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
     }
 
@@ -3078,7 +3134,11 @@ impl LoadBalancer {
         if candidates.is_empty() {
             return None;
         }
-        let candidates = self.preferred_locality_candidates(candidates);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let candidates = self.preferred_locality_candidates(candidates, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -3087,6 +3147,7 @@ impl LoadBalancer {
             &port_state.rr_counter,
             &port_state.wrr_state,
             &port_state.hash_ring,
+            port_locality,
         )
     }
 
@@ -3114,7 +3175,8 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
-        let subset_healthy = self.preferred_locality_candidates(subset_healthy);
+        let subset_healthy =
+            self.preferred_locality_candidates(subset_healthy, self.locality_lb.as_ref());
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -3123,6 +3185,7 @@ impl LoadBalancer {
             &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
+            self.locality_lb.as_ref(),
         )
     }
 

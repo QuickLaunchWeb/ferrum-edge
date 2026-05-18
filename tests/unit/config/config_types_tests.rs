@@ -229,6 +229,63 @@ fn upstream_locality_lb_setting_round_trips_through_serde() {
 }
 
 #[test]
+fn upstream_port_override_locality_lb_setting_round_trips_through_serde() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::config::types::{
+        LocalityDistribute, LocalityFailover, UpstreamLocalityLbSetting, UpstreamPortOverride,
+    };
+
+    // Default UpstreamPortOverride has no locality_lb_setting and must omit
+    // the key when serialized so old DPs reading new slices see a no-op.
+    let default_override = UpstreamPortOverride::default();
+    let default_json = serde_json::to_value(&default_override).expect("serialize default");
+    let object = default_json.as_object().expect("object");
+    assert!(
+        !object.contains_key("locality_lb_setting"),
+        "UpstreamPortOverride.locality_lb_setting must be omitted when None"
+    );
+
+    let mut to = BTreeMap::new();
+    to.insert("us-west".to_string(), 70u32);
+    to.insert("us-east".to_string(), 30u32);
+    let override_with_locality = UpstreamPortOverride {
+        locality_lb_setting: Some(UpstreamLocalityLbSetting {
+            enabled: true,
+            distribute: vec![LocalityDistribute {
+                from: "us-west/us-west-1/a".to_string(),
+                to,
+            }],
+            failover: vec![LocalityFailover {
+                from: "us-west".to_string(),
+                to: "us-east".to_string(),
+            }],
+        }),
+        ..UpstreamPortOverride::default()
+    };
+
+    let json = serde_json::to_value(&override_with_locality).expect("serialize override");
+    let object = json.as_object().expect("object");
+    assert!(
+        object.contains_key("locality_lb_setting"),
+        "locality_lb_setting must be present when Some"
+    );
+
+    let round_tripped: UpstreamPortOverride =
+        serde_json::from_value(json).expect("round-trip override");
+    let setting = round_tripped
+        .locality_lb_setting
+        .as_ref()
+        .expect("locality_lb_setting present after round-trip");
+    assert!(setting.enabled);
+    assert_eq!(setting.distribute.len(), 1);
+    assert_eq!(setting.distribute[0].from, "us-west/us-west-1/a");
+    assert_eq!(setting.distribute[0].to.get("us-west"), Some(&70u32));
+    assert_eq!(setting.failover[0].from, "us-west");
+    assert_eq!(setting.failover[0].to, "us-east");
+}
+
+#[test]
 fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
     let mut upstream = make_upstream("reviews-u");
     upstream.backend_tls_sni = Some("reviews.mesh.internal".to_string());
