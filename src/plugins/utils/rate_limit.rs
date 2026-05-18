@@ -946,8 +946,7 @@ impl WsFrameRateAlgorithm {
         );
         let limit = self.burst_size as u64;
         let window_seconds = ((self.burst_size / self.frames_per_second).ceil() as u64)
-            .max(1)
-            .min(REDIS_MAX_WINDOW_SECONDS);
+            .clamp(1, REDIS_MAX_WINDOW_SECONDS);
         (window_seconds, limit)
     }
 }
