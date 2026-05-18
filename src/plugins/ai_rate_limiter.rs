@@ -366,13 +366,17 @@ impl Plugin for AiRateLimiter {
         ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        self.evict_stale_entries();
-
         let key = self.rate_key(ctx);
         let outcome = self
             .limiter
             .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
             .await;
+        // Evict AFTER the check so the current request's key cannot be
+        // force-evicted by `enforce_capacity` between insertion and the
+        // budget read — that race would let a hot user slip through
+        // against a freshly-allocated zero-usage window. Mirrors
+        // `rate_limiting.rs::check_rate` ordering.
+        self.evict_stale_entries();
 
         if !outcome.allowed {
             let usage = outcome.usage.unwrap_or(0);
