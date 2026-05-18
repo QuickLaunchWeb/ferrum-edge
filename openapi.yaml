@@ -6855,6 +6855,19 @@ components:
                 enum: [rsa-sha256, rsa-sha1]
               default: [rsa-sha256]
               description: Allowed XMLDSig signature algorithms
+            allowed_digest_algorithms:
+              type: array
+              items:
+                type: string
+                enum: [sha256, sha1]
+              default: [sha256]
+              description: |
+                Allowed XMLDSig `<Reference>` digest algorithms. Tracked
+                independently of `allowed_algorithms` so signature method
+                and reference digest can be gated separately — e.g. accept
+                rsa-sha256 signatures over sha1 digests (rare but valid)
+                without also accepting rsa-sha1 signatures. Defaults to
+                sha256 only; add `sha1` to allow legacy reference digests.
             require_signed_timestamp:
               type: boolean
               default: true
@@ -6866,10 +6879,13 @@ components:
             the assertion's `<Signature>` element (XMLDSIG) BEFORE checking any
             attacker-controlled fields. Verification steps, in order:
               1. Locate `<Signature>` inside the assertion (rejected if absent).
+                 More than one `<Assertion>` inside the WS-Security block is
+                 rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
               3. Verify each `<Reference>` digest against the assertion with its own
                  `<Signature>` element removed (XMLDSIG enveloped-signature transform).
-                 At least one Reference must target the enclosing Assertion ID.
+                 The digest algorithm must be in `allowed_digest_algorithms`. At
+                 least one Reference must target the enclosing Assertion ID.
               4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
@@ -6916,7 +6932,20 @@ components:
               description: |
                 XMLDSig signature algorithms accepted on SAML assertions.
                 Defaults to RSA-SHA256 only. Adding `rsa-sha1` accepts legacy
-                IdPs that still emit SHA-1 signatures.
+                IdPs that still emit SHA-1 signatures. Tracked independently
+                of `allowed_digest_algorithms`.
+            allowed_digest_algorithms:
+              type: array
+              items:
+                type: string
+                enum: [sha256, sha1]
+              default: [sha256]
+              description: |
+                XMLDSig `<Reference>` digest algorithms accepted inside the
+                assertion's SignedInfo. Defaults to SHA-256 only. Add `sha1`
+                only to interoperate with IdPs that still emit SHA-1 digests.
+                Independent of `allowed_signature_algorithms` so an operator
+                can choose any combination.
             audience:
               type: string
               description: |

@@ -63,6 +63,19 @@ enum SignatureAlgorithm {
     RsaSha1,
 }
 
+/// XMLDSIG digest algorithm used for `<Reference>` element hashing.
+///
+/// Tracked separately from `SignatureAlgorithm` so the config surface can
+/// gate signature vs digest algorithms independently — overloading a single
+/// "algorithms" knob to mean both signature method and reference digest is
+/// confusing for operators and produces footguns (e.g. accepting SHA-1
+/// digests just because rsa-sha1 is in the allow list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestAlgorithm {
+    Sha256,
+    Sha1,
+}
+
 #[derive(Debug, Clone)]
 struct Credential {
     username: String,
@@ -100,6 +113,7 @@ pub struct SoapWsSecurity {
     x509_enabled: bool,
     trusted_certs: Vec<TrustedCert>,
     allowed_signature_algorithms: Vec<SignatureAlgorithm>,
+    allowed_digest_algorithms: Vec<DigestAlgorithm>,
     require_signed_timestamp: bool,
 
     // SAML assertion validation
@@ -109,6 +123,7 @@ pub struct SoapWsSecurity {
     saml_clock_skew_seconds: u64,
     saml_trusted_signing_certs: Vec<TrustedCert>,
     saml_allowed_signature_algorithms: Vec<SignatureAlgorithm>,
+    saml_allowed_digest_algorithms: Vec<DigestAlgorithm>,
 
     // Nonce replay protection
     nonce_cache: Arc<DashMap<String, NonceEntry>>,
@@ -238,6 +253,35 @@ impl SoapWsSecurity {
             })
             .unwrap_or_else(|| vec![SignatureAlgorithm::RsaSha256]);
 
+        if x509_enabled && allowed_signature_algorithms.is_empty() {
+            return Err(
+                "soap_ws_security: x509_signature.allowed_algorithms must contain at least one of \
+                 'rsa-sha256' or 'rsa-sha1' when x509_signature is enabled"
+                    .to_string(),
+            );
+        }
+
+        let allowed_digest_algorithms: Vec<DigestAlgorithm> = x509_cfg["allowed_digest_algorithms"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| match v.as_str()? {
+                        "sha256" => Some(DigestAlgorithm::Sha256),
+                        "sha1" => Some(DigestAlgorithm::Sha1),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![DigestAlgorithm::Sha256]);
+
+        if x509_enabled && allowed_digest_algorithms.is_empty() {
+            return Err(
+                "soap_ws_security: x509_signature.allowed_digest_algorithms must contain at least \
+                 one of 'sha256' or 'sha1' when x509_signature is enabled"
+                    .to_string(),
+            );
+        }
+
         let require_signed_timestamp = x509_cfg["require_signed_timestamp"]
             .as_bool()
             .unwrap_or(true);
@@ -357,6 +401,28 @@ impl SoapWsSecurity {
             );
         }
 
+        let saml_allowed_digest_algorithms: Vec<DigestAlgorithm> =
+            saml_cfg["allowed_digest_algorithms"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| match v.as_str()? {
+                            "sha256" => Some(DigestAlgorithm::Sha256),
+                            "sha1" => Some(DigestAlgorithm::Sha1),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![DigestAlgorithm::Sha256]);
+
+        if saml_enabled && saml_allowed_digest_algorithms.is_empty() {
+            return Err(
+                "soap_ws_security: saml.allowed_digest_algorithms must contain at least one of \
+                 'sha256' or 'sha1' when SAML is enabled"
+                    .to_string(),
+            );
+        }
+
         // ── Nonce / replay config ───────────────────────────────────────
         let nonce_cfg = config_obj.get("nonce").unwrap_or(&Value::Null);
         let nonce_cache_ttl_seconds = nonce_cfg["cache_ttl_seconds"].as_u64().unwrap_or(300);
@@ -387,6 +453,7 @@ impl SoapWsSecurity {
             x509_enabled,
             trusted_certs,
             allowed_signature_algorithms,
+            allowed_digest_algorithms,
             require_signed_timestamp,
             saml_enabled,
             saml_trusted_issuers,
@@ -394,6 +461,7 @@ impl SoapWsSecurity {
             saml_clock_skew_seconds,
             saml_trusted_signing_certs,
             saml_allowed_signature_algorithms,
+            saml_allowed_digest_algorithms,
             nonce_cache: Arc::new(DashMap::new()),
             nonce_cache_ttl_seconds,
             max_nonce_cache_size,
@@ -731,13 +799,40 @@ impl SoapWsSecurity {
                 return Err(format!("WS-Security: unsupported Reference URI '{}'", uri));
             };
 
-            // Compute and compare digest
+            // Compute and compare digest. The allowed_digest_algorithms list
+            // is checked independently of the signature algorithm list — an
+            // operator who wants rsa-sha256 signatures over sha1 digests
+            // (rare but valid per XMLDSIG) configures both knobs explicitly,
+            // and the default (sha256 only) refuses sha1 digests regardless
+            // of which signature algorithm is in use.
             let computed = match digest_alg_uri.as_str() {
-                XMLDSIG_SHA256 => digest::digest(&digest::SHA256, referenced_content.as_bytes()),
-                XMLDSIG_SHA1 => digest::digest(
-                    &digest::SHA1_FOR_LEGACY_USE_ONLY,
-                    referenced_content.as_bytes(),
-                ),
+                XMLDSIG_SHA256 => {
+                    if !self
+                        .allowed_digest_algorithms
+                        .contains(&DigestAlgorithm::Sha256)
+                    {
+                        return Err(format!(
+                            "WS-Security: digest algorithm '{}' is not allowed",
+                            digest_alg_uri
+                        ));
+                    }
+                    digest::digest(&digest::SHA256, referenced_content.as_bytes())
+                }
+                XMLDSIG_SHA1 => {
+                    if !self
+                        .allowed_digest_algorithms
+                        .contains(&DigestAlgorithm::Sha1)
+                    {
+                        return Err(format!(
+                            "WS-Security: digest algorithm '{}' is not allowed",
+                            digest_alg_uri
+                        ));
+                    }
+                    digest::digest(
+                        &digest::SHA1_FOR_LEGACY_USE_ONLY,
+                        referenced_content.as_bytes(),
+                    )
+                }
                 other => {
                     return Err(format!(
                         "WS-Security: unsupported digest algorithm '{}'",
@@ -860,6 +955,17 @@ impl SoapWsSecurity {
                 };
             }
         };
+
+        // Defense in depth: only ever validate a single assertion. If an
+        // attacker can wedge a second Assertion into the WS-Security block,
+        // downstream consumers that walk all assertions could see an
+        // identity we never verified. Cheap insurance — reject and let the
+        // operator deal with malformed/multi-assertion messages explicitly.
+        if count_elements(security_block, "Assertion") > 1 {
+            return Err(
+                "WS-Security: multiple SAML Assertion elements are not allowed".to_string(),
+            );
+        }
 
         // ── 1. Signature verification ─────────────────────────────────
         // Must run before any other check — every other field is
@@ -1089,12 +1195,21 @@ impl SoapWsSecurity {
 
             let computed = match digest_alg_uri.as_str() {
                 XMLDSIG_SHA256 => {
+                    if !self
+                        .saml_allowed_digest_algorithms
+                        .contains(&DigestAlgorithm::Sha256)
+                    {
+                        return Err(format!(
+                            "WS-Security: SAML digest algorithm '{}' is not allowed",
+                            digest_alg_uri
+                        ));
+                    }
                     digest::digest(&digest::SHA256, assertion_without_signature.as_bytes())
                 }
                 XMLDSIG_SHA1 => {
                     if !self
-                        .saml_allowed_signature_algorithms
-                        .contains(&SignatureAlgorithm::RsaSha1)
+                        .saml_allowed_digest_algorithms
+                        .contains(&DigestAlgorithm::Sha1)
                     {
                         return Err(format!(
                             "WS-Security: SAML digest algorithm '{}' is not allowed",
@@ -1325,6 +1440,20 @@ impl Plugin for SoapWsSecurity {
 /// Returns the full element including its content and closing tag.
 fn find_element_block(xml: &str, local_name: &str) -> Option<String> {
     find_element_block_from(xml, local_name, 0)
+}
+
+/// Count the number of (top-level-scan) occurrences of an element by local
+/// name. Walks the same cursor pattern as the Reference-digest loop so
+/// nested same-named elements aren't double-counted.
+fn count_elements(xml: &str, local_name: &str) -> usize {
+    let mut count = 0usize;
+    let mut search_from = 0;
+    while let Some((_, next_start)) = find_element_block_from_with_end(xml, local_name, search_from)
+    {
+        count += 1;
+        search_from = next_start.max(search_from + 1);
+    }
+    count
 }
 
 /// Find an element block by local name, starting from a given byte offset.
@@ -1592,13 +1721,11 @@ fn extract_saml_signing_cert(sig_block: &str) -> Result<Vec<u8>, String> {
 /// it too. For SAML assertions there is exactly one Signature child, so
 /// taking the first `<Signature>` match is correct.
 fn remove_envelope_signature(xml: &str) -> String {
-    let Some(start) = find_tag_start(xml, "Signature") else {
+    let Some((block, end)) = find_element_block_from_with_end(xml, "Signature", 0) else {
         return xml.to_string();
     };
-    let Some((_, end)) = find_element_block_from_with_end(xml, "Signature", 0) else {
-        return xml.to_string();
-    };
-    let mut out = String::with_capacity(xml.len());
+    let start = end - block.len();
+    let mut out = String::with_capacity(xml.len() - block.len());
     out.push_str(&xml[..start]);
     out.push_str(&xml[end..]);
     out

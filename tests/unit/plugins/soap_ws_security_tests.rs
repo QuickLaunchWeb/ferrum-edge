@@ -759,6 +759,16 @@ mod saml_fixtures {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    // ────────────────────────────────────────────────────────────────────
+    // DO NOT USE IN PRODUCTION.
+    // The RSA private keys below are committed test fixtures generated for
+    // the SOAP WS-Security SAML signature tests. Anyone reading them has
+    // the corresponding private key — they MUST NOT appear in any operator
+    // config, any deployed IdP signing cert list, or any production
+    // trusted_signing_certs path. They live in the test crate and are not
+    // linked into the `ferrum-edge` production binary.
+    // ────────────────────────────────────────────────────────────────────
+
     // 2048-bit RSA test key (PKCS#8 DER, base64) — committed test fixture,
     // never used outside this test suite. Generated with:
     //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048
@@ -817,6 +827,8 @@ wupTEoP8ySU223pQqBOX1E1WVEDcYuvNI+9KTJQUCYlw9bU=
 
     /// A second untrusted RSA keypair + cert. Used to drive
     /// "signing cert is not in the trust list" assertions.
+    ///
+    /// DO NOT USE IN PRODUCTION — same warning as `TEST_IDP_KEY_PKCS8_B64`.
     pub const UNTRUSTED_IDP_KEY_PKCS8_B64: &str = "\
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCdBCN5lkzAC6gM\
 1JA0/uqZd2efAVyJf6xtVQyCOrjryP313oR4kHJy1mbxTSvUM+cIXqLL2ZLsh3HX\
@@ -1452,6 +1464,43 @@ async fn test_saml_signature_must_cover_enclosing_assertion() {
     assert!(
         reject_body(&result).contains("does not target Assertion ID"),
         "expected Reference URI mismatch, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_multiple_assertions_rejected() {
+    // Defense in depth: even when the first Assertion verifies cleanly, a
+    // second Assertion in the same WS-Security block is rejected outright
+    // so downstream consumers that walk all assertions can never see an
+    // identity that wasn't validated against the configured trust list.
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let valid = saml_fixtures::AssertionBuilder::new(
+        "_assertion-valid",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+    // Second assertion: also signed correctly (so the test fails ONLY because
+    // of the multi-assertion rule, not because the second one's signature is
+    // bad). Different ID so URI rewriting picks the right Reference.
+    let second = saml_fixtures::AssertionBuilder::new(
+        "_assertion-second",
+        "https://idp.example.com/metadata",
+        "mallory@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&format!("{}{}", valid, second));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("multiple SAML Assertion elements"),
+        "expected multi-assertion rejection, got: {}",
         reject_body(&result)
     );
 }
