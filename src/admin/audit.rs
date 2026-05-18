@@ -1,8 +1,9 @@
 //! Admin API audit logging.
 //!
 //! Audit events are written through a bounded worker queue per database backend.
-//! The HTTP mutation path waits for the worker acknowledgement so a successful
-//! mutation response means the corresponding audit event is also durable.
+//! The HTTP mutation path never waits for queue capacity; if the bounded queue
+//! is full, enqueue fails fast and the committed mutation response can proceed
+//! after logging the audit failure.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -11,14 +12,17 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::error;
 use uuid::Uuid;
 
 const AUDIT_CHANNEL_CAPACITY: usize = 1024;
+const AUDIT_SINK_STALE_CHECK_INTERVAL_SECONDS: u64 = 60;
 
-static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSink>> = LazyLock::new(DashMap::new);
+static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(DashMap::new);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -86,28 +90,60 @@ struct AuditSink {
     tx: mpsc::Sender<AuditEnvelope>,
 }
 
+#[derive(Clone)]
+struct AuditSinkEntry {
+    backend: Weak<dyn DatabaseBackend>,
+    sink: AuditSink,
+}
+
 struct AuditEnvelope {
     event: AuditEvent,
     ack: oneshot::Sender<Result<(), String>>,
 }
 
 impl AuditSink {
-    fn spawn(db: Arc<dyn DatabaseBackend>) -> Self {
+    fn spawn(key: usize, db: Weak<dyn DatabaseBackend>) -> Self {
         let (tx, mut rx) = mpsc::channel::<AuditEnvelope>(AUDIT_CHANNEL_CAPACITY);
         tokio::spawn(async move {
-            while let Some(envelope) = rx.recv().await {
-                let result = db
-                    .insert_audit_event(&envelope.event)
-                    .await
-                    .map_err(|error| error.to_string());
-                if let Err(ref message) = result {
-                    error!(
-                        audit_event_id = %envelope.event.id,
-                        error = %message,
-                        "Failed to persist admin audit event"
-                    );
+            let mut stale_check =
+                interval(Duration::from_secs(AUDIT_SINK_STALE_CHECK_INTERVAL_SECONDS));
+            stale_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    maybe_envelope = rx.recv() => {
+                        let Some(envelope) = maybe_envelope else {
+                            break;
+                        };
+
+                        let Some(db) = db.upgrade() else {
+                            remove_stale_sink(key);
+                            let _ = envelope
+                                .ack
+                                .send(Err("admin audit backend is unavailable".to_string()));
+                            break;
+                        };
+
+                        let result = db
+                            .insert_audit_event(&envelope.event)
+                            .await
+                            .map_err(|error| error.to_string());
+                        if let Err(ref message) = result {
+                            error!(
+                                audit_event_id = %envelope.event.id,
+                                error = %message,
+                                "Failed to persist admin audit event"
+                            );
+                        }
+                        let _ = envelope.ack.send(result);
+                    }
+                    _ = stale_check.tick() => {
+                        if db.upgrade().is_none() {
+                            remove_stale_sink(key);
+                            break;
+                        }
+                    }
                 }
-                let _ = envelope.ack.send(result);
             }
         });
         Self { tx }
@@ -116,9 +152,14 @@ impl AuditSink {
     async fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
         let (ack, rx) = oneshot::channel();
         self.tx
-            .send(AuditEnvelope { event, ack })
-            .await
-            .map_err(|_| anyhow!("admin audit worker is unavailable"))?;
+            .try_send(AuditEnvelope { event, ack })
+            .map_err(|error| match error {
+                TrySendError::Full(envelope) => anyhow!(
+                    "admin audit queue is full; audit event {} was not enqueued",
+                    envelope.event.id
+                ),
+                TrySendError::Closed(_) => anyhow!("admin audit worker is unavailable"),
+            })?;
         rx.await
             .map_err(|_| anyhow!("admin audit worker stopped before acknowledging event"))?
             .map_err(|message| anyhow!(message))
@@ -126,23 +167,48 @@ impl AuditSink {
 }
 
 fn db_key(db: &Arc<dyn DatabaseBackend>) -> usize {
-    // `AdminState` owns the process-lifetime database Arc and all handler
-    // clones share this inner pointer, so the address is a stable per-backend
-    // worker key. If database ownership becomes reloadable, replace this with
-    // an explicit backend instance id.
+    // Handler clones share this inner pointer, so the address is a stable
+    // per-backend worker key while the backend Arc is alive. Stale entries are
+    // tied to a Weak backend reference and removed once that backend drops.
     Arc::as_ptr(db) as *const () as usize
+}
+
+fn remove_stale_sink(key: usize) {
+    AUDIT_SINKS.remove_if(&key, |_, entry| entry.backend.upgrade().is_none());
+}
+
+fn entry_matches_backend(entry: &AuditSinkEntry, db: &Arc<dyn DatabaseBackend>) -> bool {
+    entry
+        .backend
+        .upgrade()
+        .is_some_and(|existing| Arc::ptr_eq(&existing, db))
 }
 
 fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     let key = db_key(&db);
-    AUDIT_SINKS
-        .entry(key)
-        .or_insert_with(|| AuditSink::spawn(db))
-        .clone()
+    if let Some(entry) = AUDIT_SINKS.get(&key)
+        && entry_matches_backend(&entry, &db)
+    {
+        return entry.sink.clone();
+    }
+
+    remove_stale_sink(key);
+
+    let backend = Arc::downgrade(&db);
+    let sink = AuditSink::spawn(key, backend.clone());
+    AUDIT_SINKS.insert(
+        key,
+        AuditSinkEntry {
+            backend,
+            sink: sink.clone(),
+        },
+    );
+    sink
 }
 
 pub async fn record(db: Arc<dyn DatabaseBackend>, event: AuditEvent) -> Result<(), anyhow::Error> {
-    sink_for_db(db).record(event).await
+    let sink = sink_for_db(Arc::clone(&db));
+    sink.record(event).await
 }
 
 pub fn create_diff(after: Value) -> Value {
