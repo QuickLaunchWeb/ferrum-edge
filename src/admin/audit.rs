@@ -3,7 +3,8 @@
 //! Audit events are written through a bounded worker queue per database backend.
 //! The HTTP mutation path never waits for queue capacity; if the bounded queue
 //! is full, enqueue fails fast and the committed mutation response can proceed
-//! after logging the audit failure.
+//! after logging the audit failure. Audit persistence is best-effort and happens
+//! after the mutation response path has enqueued the event.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -13,8 +14,8 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, LazyLock, Weak};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::error;
 use uuid::Uuid;
@@ -98,7 +99,6 @@ struct AuditSinkEntry {
 
 struct AuditEnvelope {
     event: AuditEvent,
-    ack: oneshot::Sender<Result<(), String>>,
 }
 
 impl AuditSink {
@@ -118,24 +118,24 @@ impl AuditSink {
 
                         let Some(db) = db.upgrade() else {
                             remove_stale_sink(key);
-                            let _ = envelope
-                                .ack
-                                .send(Err("admin audit backend is unavailable".to_string()));
+                            error!(
+                                audit_event_id = %envelope.event.id,
+                                "Dropped admin audit event because the backend is unavailable"
+                            );
                             break;
                         };
 
-                        let result = db
+                        if let Err(message) = db
                             .insert_audit_event(&envelope.event)
                             .await
-                            .map_err(|error| error.to_string());
-                        if let Err(ref message) = result {
+                            .map_err(|error| error.to_string())
+                        {
                             error!(
                                 audit_event_id = %envelope.event.id,
                                 error = %message,
                                 "Failed to persist admin audit event"
                             );
                         }
-                        let _ = envelope.ack.send(result);
                     }
                     _ = stale_check.tick() => {
                         if db.upgrade().is_none() {
@@ -150,19 +150,15 @@ impl AuditSink {
     }
 
     async fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
-        let (ack, rx) = oneshot::channel();
         self.tx
-            .try_send(AuditEnvelope { event, ack })
+            .try_send(AuditEnvelope { event })
             .map_err(|error| match error {
                 TrySendError::Full(envelope) => anyhow!(
                     "admin audit queue is full; audit event {} was not enqueued",
                     envelope.event.id
                 ),
                 TrySendError::Closed(_) => anyhow!("admin audit worker is unavailable"),
-            })?;
-        rx.await
-            .map_err(|_| anyhow!("admin audit worker stopped before acknowledging event"))?
-            .map_err(|message| anyhow!(message))
+            })
     }
 }
 

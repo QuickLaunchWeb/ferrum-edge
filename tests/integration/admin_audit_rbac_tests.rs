@@ -160,6 +160,23 @@ async fn get_json(base: &str, path: &str, bearer: &str) -> (u16, Value) {
     (status, body)
 }
 
+async fn wait_for_audit_total(base: &str, path: &str, bearer: &str, expected: u64) -> Value {
+    let mut last_body = json!({});
+    let mut last_status = 0;
+    for _ in 0..100 {
+        let (status, body) = get_json(base, path, bearer).await;
+        last_status = status;
+        last_body = body;
+        if status == 200 && last_body["total"].as_u64() == Some(expected) {
+            return last_body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "audit list did not reach total={expected}; last status={last_status}, body={last_body:?}"
+    );
+}
+
 #[tokio::test]
 async fn viewer_role_is_rejected_on_admin_mutation() {
     let tmp = TempDir::new().unwrap();
@@ -223,8 +240,7 @@ async fn upstream_mutation_writes_queryable_audit_event() {
     .await;
     assert_eq!(status, 201, "upstream create failed: {body:?}");
 
-    let (status, audit_body) = get_json(&base, "/audit?resource_type=upstream", &admin).await;
-    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
+    let audit_body = wait_for_audit_total(&base, "/audit?resource_type=upstream", &admin, 1).await;
     assert_eq!(audit_body["total"], 1);
 
     let items = audit_body["items"].as_array().expect("audit items");
@@ -284,13 +300,13 @@ async fn partial_batch_mutation_writes_audit_event() {
     assert_eq!(body["created"]["consumers"], 1);
     assert_eq!(body["created"]["upstreams"], 0);
 
-    let (status, audit_body) = get_json(
+    let audit_body = wait_for_audit_total(
         &base,
         "/audit?resource_type=gateway_config&action=batch_create",
         &admin,
+        1,
     )
     .await;
-    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
     assert_eq!(audit_body["total"], 1);
 
     let items = audit_body["items"].as_array().expect("audit items");
