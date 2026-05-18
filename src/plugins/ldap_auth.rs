@@ -658,10 +658,17 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
 /// — are backslash-escaped. Leading/trailing spaces and a leading `#` are also escaped.
 pub fn escape_dn_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 8);
+    // `input.len()` is a *byte* length but `enumerate()` yields a *character*
+    // index. For inputs containing multi-byte UTF-8 characters they disagree
+    // and `i == input.len() - 1` never matches the actual last character, so
+    // the trailing-space escape silently never fires. Compare against the
+    // character count instead.
+    let total_chars = input.chars().count();
     for (i, ch) in input.chars().enumerate() {
+        let is_last = i + 1 == total_chars;
         let needs_escape = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
             || (i == 0 && (ch == ' ' || ch == '#'))
-            || (i == input.len() - 1 && ch == ' ');
+            || (is_last && ch == ' ');
         if needs_escape {
             out.push('\\');
         }
