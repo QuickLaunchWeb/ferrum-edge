@@ -335,14 +335,6 @@ fn service_entry_exported_to_star_is_visible_to_other_namespaces() {
     );
 }
 
-// FIXME(service-entry-export-to): `MeshSlice::from_gateway_config` /
-// `prepare_gateway_config_for_mesh` does not currently filter
-// `ServiceEntry` resources by their `export_to` value against the
-// consuming workload's namespace. Tests expecting namespace-scoped
-// visibility (`export_to: ["specific-ns"]` invisible to another
-// namespace) fail because the entry survives projection unchanged. See
-// PR #860 follow-up.
-#[ignore = "ServiceEntry.export_to namespace filtering is not yet implemented"]
 #[test]
 fn service_entry_with_namespace_scoped_export_only_admits_listed_namespace() {
     // `export_to: ["specific-ns"]` should restrict visibility to that

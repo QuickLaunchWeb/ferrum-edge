@@ -655,6 +655,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, mesh_slice);
+    // Project slice-filtered ServiceEntries back into the prepared mesh
+    // block so introspection consumers (admin diagnostics, projected-config
+    // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
+    // view the runtime serves. The slice has already applied namespace
+    // visibility (`service_entry_exported_to_namespace`), sidecar egress
+    // port narrowing, and ServiceWaypoint binding scoping; without this
+    // back-projection, `config.mesh.service_entries` still carries the
+    // unfiltered set even though DNS rebuild and egress materialization
+    // consume the filtered slice directly. Closes Gap #2.
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.service_entries = mesh_slice.service_entries.clone();
+    }
     config.normalize_fields();
     config.resolve_upstream_tls();
     Ok(config)
