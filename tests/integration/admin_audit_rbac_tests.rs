@@ -254,6 +254,62 @@ async fn upstream_mutation_writes_queryable_audit_event() {
 }
 
 #[tokio::test]
+async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let secret_key = "super-secret-load-test-key";
+    let nested_api_key = "nested-api-key-value";
+    let plugin = json!({
+        "id": "audit-plugin-secret",
+        "plugin_name": "load_testing",
+        "scope": "global",
+        "config": {
+            "key": secret_key,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "nested": {
+                "api_key": nested_api_key,
+                "label": "safe-label"
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+    assert_eq!(body["config"]["key"], secret_key);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=audit-plugin-secret",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(event["diff"]["after"]["config"]["key"], "[REDACTED]");
+    assert_eq!(
+        event["diff"]["after"]["config"]["nested"]["api_key"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        event["diff"]["after"]["config"]["nested"]["label"],
+        "safe-label"
+    );
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(secret_key),
+        "secret key leaked: {event:?}"
+    );
+    assert!(
+        !serialized.contains(nested_api_key),
+        "nested API key leaked: {event:?}"
+    );
+}
+
+#[tokio::test]
 async fn audit_list_rejects_offset_above_backend_range() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);

@@ -84,6 +84,10 @@ pub(crate) trait AdminResource:
         json!(resource)
     }
 
+    fn audit_body(resource: &Self) -> Value {
+        Self::response_body(resource)
+    }
+
     /// Inspect the raw request body *before* it is deserialized into `Self`.
     /// Return `Err` to reject the request with a 400 Bad Request. Default is
     /// a no-op. Override on resources that need schema-specific raw checks.
@@ -319,7 +323,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 R::RESOURCE_NAME.replace(' ', "_"),
                 id,
                 namespace,
-                audit::delete_diff(R::response_body(&existing)),
+                audit::delete_diff(R::audit_body(&existing)),
             );
             if let Err(error) = audit::record(db_arc, event).await {
                 super::log_audit_persist_failure(&error);
@@ -430,6 +434,50 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     }
 
     Ok(errors)
+}
+
+fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
+    let mut body = json!(resource);
+    if let Some(config) = body.get_mut("config") {
+        redact_sensitive_plugin_config_fields(config);
+    }
+    body
+}
+
+fn redact_sensitive_plugin_config_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_plugin_config_key(key) {
+                    *child = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+                } else {
+                    redact_sensitive_plugin_config_fields(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_plugin_config_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_plugin_config_key(key: &str) -> bool {
+    if crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key(key) {
+        return true;
+    }
+
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "key"
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("access_key")
+        || normalized.contains("client_secret")
+        || normalized.contains("credential")
+        || normalized.contains("private_key")
+        || normalized.contains("webhook")
 }
 
 pub(crate) async fn check_port_available(
@@ -738,6 +786,10 @@ impl AdminResource for PluginConfig {
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
         &config.plugin_configs
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        plugin_config_audit_body(resource)
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
@@ -1439,15 +1491,15 @@ async fn handle_write<R: AdminResource>(
     }
 
     let (audit_action, diff) = match action {
-        WriteAction::Create => ("create", audit::create_diff(R::response_body(&resource))),
+        WriteAction::Create => ("create", audit::create_diff(R::audit_body(&resource))),
         WriteAction::Update { .. } => {
             let before = existing
                 .as_ref()
-                .map(R::response_body)
+                .map(R::audit_body)
                 .unwrap_or_else(|| json!(null));
             (
                 "update",
-                audit::update_diff(before, R::response_body(&resource)),
+                audit::update_diff(before, R::audit_body(&resource)),
             )
         }
     };
