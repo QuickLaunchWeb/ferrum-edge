@@ -84,6 +84,12 @@ fn write_http2_pool_key(
     let _ = write!(buf, "{}|{}|", host, port);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
+    // Subset name partitions H2 pools so two proxies that share
+    // `(host, port, dns_override)` but select different DestinationRule
+    // subsets cannot share an H2 sender even when their TLS material is
+    // byte-identical. Empty when the proxy has no `upstream_subset`.
+    buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+    buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,

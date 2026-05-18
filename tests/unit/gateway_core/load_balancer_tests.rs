@@ -237,6 +237,7 @@ fn test_load_balancer_cache() {
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -616,6 +617,7 @@ fn test_least_latency_cache_record_and_select() {
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1052,6 +1054,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1094,6 +1097,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         backend_tls_server_ca_cert_path: None,
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1864,6 +1868,7 @@ fn subset_traffic_policy_overrides_parent_algorithm() {
         labels: HashMap::from([("version".into(), "v2".into())]),
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::LeastConnections),
+            tls: None,
         }),
     }];
 

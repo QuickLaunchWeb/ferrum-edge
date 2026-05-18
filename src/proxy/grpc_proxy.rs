@@ -204,6 +204,13 @@ fn write_grpc_pool_key(
     let _ = write!(buf, "{}|{}|{}|", host, port, tls);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
+    // Subset name partitions gRPC pools so two proxies that share
+    // `(host, port, scheme, dns_override)` but select different
+    // DestinationRule subsets cannot share an H2 gRPC sender even when their
+    // TLS material is byte-identical. Empty when the proxy has no
+    // `upstream_subset`.
+    buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+    buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,

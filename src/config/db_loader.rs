@@ -5661,6 +5661,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
         backend_tls_sni,
         backend_tls_san_allow_list,
+        // Per-subset TLS overlays are derived state populated by mesh
+        // `apply_destination_rules`; SQL backends do not persist them, so SQL
+        // rows always start with an empty map.
+        resolved_subset_tls: std::collections::HashMap::new(),
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.

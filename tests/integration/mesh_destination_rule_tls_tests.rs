@@ -130,6 +130,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_server_ca_cert_path: None,
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
         port_overrides: HashMap::new(),
         source_locality: None,
         locality_lb_setting: None,
@@ -440,11 +441,10 @@ fn dr_without_tls_block_yields_none_on_slice() {
 }
 
 #[test]
-fn dr_tls_subset_traffic_policy_carries_tls_block() {
-    // Subset-level tls block: present on the MeshSubset but cold-path
-    // application happens only at the top level today (subset-level
-    // projection is tracked separately and surfaced as a translator
-    // warning).
+fn dr_tls_subset_traffic_policy_carries_tls_block_without_warning() {
+    // Subset-level tls block: parsed onto the `MeshSubset.traffic_policy.tls`
+    // AND applied per-subset by the cold-path apply
+    // (`resolve_subset_traffic_policy_tls`). No translator warning expected.
     let result = translate_k8s_objects(
         &[istio_object(
             "DestinationRule",
@@ -480,12 +480,181 @@ fn dr_tls_subset_traffic_policy_carries_tls_block() {
     assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
 
     assert!(
-        result
+        !result
             .warnings
             .iter()
             .any(|w| w.contains("trafficPolicy.tls is parsed but not yet applied per-subset")),
-        "subset-level tls must produce a translator warning: {:?}",
+        "subset-level tls must NOT emit the 'not applied per-subset' warning: {:?}",
         result.warnings
+    );
+}
+
+#[test]
+fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
+    // GAP-3B core scenario: a single upstream carrying two DR subsets — v1 and
+    // v2 — each with a distinct CA. After cold-path apply + resolve_upstream_tls,
+    // two proxies that select the v1 vs v2 subset must:
+    //   1. Land on different `BackendTlsConfig` values via `Proxy.resolved_tls`.
+    //   2. Produce different backend pool keys across HTTP / H2 / gRPC / H3.
+    //
+    // The combined TLS-identity + `subset_name` partitioning is what guarantees
+    // distinct TLS identities never share connections (see CLAUDE.md
+    // "Connection Pool Keys").
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+
+    let result = translate_k8s_objects(
+        &[istio_object(
+            "DestinationRule",
+            "reviews",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [
+                    {
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "tls": {
+                                "mode": "SIMPLE",
+                                "caCertificates": "/etc/certs/ca-v1.pem"
+                            }
+                        }
+                    },
+                    {
+                        "name": "v2",
+                        "labels": {"version": "v2"},
+                        "trafficPolicy": {
+                            "tls": {
+                                "mode": "SIMPLE",
+                                "caCertificates": "/etc/certs/ca-v2.pem"
+                            }
+                        }
+                    }
+                ]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("translation succeeds");
+    let mut config = result.config;
+
+    // Attach the matching upstream (same FQDN, single target) so the cold-path
+    // DR application has something to project onto.
+    config.upstreams.push(build_matching_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+
+    // Two proxies — one per subset — sharing the upstream.
+    let proxy_v1: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "p-v1",
+        "hosts": ["v1.example.com"],
+        "backend_host": "",
+        "backend_port": 0,
+        "upstream_id": "reviews-u",
+        "upstream_subset": "v1",
+    }))
+    .expect("p-v1");
+    let proxy_v2: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "p-v2",
+        "hosts": ["v2.example.com"],
+        "backend_host": "",
+        "backend_port": 0,
+        "upstream_id": "reviews-u",
+        "upstream_subset": "v2",
+    }))
+    .expect("p-v2");
+    config.proxies.push(proxy_v1);
+    config.proxies.push(proxy_v2);
+
+    // Run the full mesh preparation: apply_destination_rules +
+    // normalize_fields + resolve_upstream_tls. This is the same pipeline the
+    // DP uses on each slice apply.
+    let prepared = prepare_gateway_config_for_mesh(config, &test_runtime())
+        .expect("mesh preparation succeeds");
+
+    // ── 1. Upstream carries per-subset resolved TLS for both subsets. ──
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream present");
+    let v1_tls = upstream
+        .resolved_subset_tls
+        .get("v1")
+        .and_then(|r| r.tls.as_ref())
+        .expect("v1 has resolved tls");
+    let v2_tls = upstream
+        .resolved_subset_tls
+        .get("v2")
+        .and_then(|r| r.tls.as_ref())
+        .expect("v2 has resolved tls");
+    assert_eq!(
+        v1_tls.server_ca_cert_path.as_deref(),
+        Some("/etc/certs/ca-v1.pem")
+    );
+    assert_eq!(
+        v2_tls.server_ca_cert_path.as_deref(),
+        Some("/etc/certs/ca-v2.pem")
+    );
+
+    // ── 2. Each proxy's `resolved_tls` reflects its subset's CA. ──
+    let p_v1 = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id == "p-v1")
+        .expect("p-v1");
+    let p_v2 = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id == "p-v2")
+        .expect("p-v2");
+    assert_eq!(
+        p_v1.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/etc/certs/ca-v1.pem"),
+        "p-v1.resolved_tls reflects subset v1 CA"
+    );
+    assert_eq!(
+        p_v2.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/etc/certs/ca-v2.pem"),
+        "p-v2.resolved_tls reflects subset v2 CA"
+    );
+
+    // ── 3. HTTP/3 pool keys differ across the two subsets. The H3 pool key
+    //       is the most exhaustive (includes host:port + dns_override + subset
+    //       + the full TLS material). If H3 partitions cleanly, the reqwest
+    //       HTTP/H2/gRPC pool keys (which use the same TLS-field appender)
+    //       also partition — both the CA path AND the subset name differ.
+    let pool_v1 = Http3ConnectionPool::pool_key_for_target(
+        p_v1,
+        "reviews.default.svc.cluster.local",
+        8080,
+        0,
+    );
+    let pool_v2 = Http3ConnectionPool::pool_key_for_target(
+        p_v2,
+        "reviews.default.svc.cluster.local",
+        8080,
+        0,
+    );
+    assert_ne!(
+        pool_v1, pool_v2,
+        "two-subset upstream with distinct CAs must fragment backend H3 pool key"
+    );
+    assert!(
+        pool_v1.contains("ca-v1.pem"),
+        "v1 pool key must carry v1 CA: {pool_v1}"
+    );
+    assert!(
+        pool_v2.contains("ca-v2.pem"),
+        "v2 pool key must carry v2 CA: {pool_v2}"
+    );
+    assert!(
+        pool_v1.contains("|v1|"),
+        "v1 pool key must carry subset marker: {pool_v1}"
+    );
+    assert!(
+        pool_v2.contains("|v2|"),
+        "v2 pool key must carry subset marker: {pool_v2}"
     );
 }
 

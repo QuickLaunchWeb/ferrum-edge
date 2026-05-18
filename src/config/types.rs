@@ -203,6 +203,18 @@ pub struct SubsetTrafficPolicy {
     /// Override the upstream's load balancer algorithm for this subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
+    /// Override the upstream's backend TLS posture for targets selected via
+    /// this subset (Istio `subsets[].trafficPolicy.tls`). The cold-path
+    /// `apply_destination_rules` overlays this on the upstream-level TLS and
+    /// stores the resulting `BackendTlsConfig` in
+    /// [`Upstream::resolved_subset_tls`], where it is projected onto
+    /// `Proxy.resolved_tls` for proxies whose `upstream_subset` selects this
+    /// subset. Nested as `MeshTrafficPolicyTls` (mode / SNI / CA / mTLS
+    /// material / SAN allow-list / `insecureSkipVerify`) to keep this struct
+    /// small and to share the SVID/SAN/SNI projection logic with the
+    /// upstream-level apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::modes::mesh::config::MeshTrafficPolicyTls>,
 }
 
 /// Per-destination-port traffic policy overrides on an upstream.
@@ -285,6 +297,43 @@ pub struct SubsetDefinition {
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy: Option<SubsetTrafficPolicy>,
+}
+
+/// Cold-path projection of a `SubsetTrafficPolicy` onto a resolved hot-path
+/// slot.
+///
+/// Same pattern as [`ResolvedPortOverride`]: the upstream owns the mesh-derived
+/// policy ([`SubsetTrafficPolicy`]) and the gateway pre-computes the resolved
+/// view at cold-path apply so request dispatch never re-derives the
+/// DestinationRule TLS overlay. Currently carries only `tls`; future fields
+/// (subset-scoped connectionPool, outlierDetection, etc.) live here too.
+///
+/// Stored on [`Upstream::resolved_subset_tls`] keyed by subset name and
+/// projected onto `Proxy.resolved_tls` by
+/// [`GatewayConfig::resolve_upstream_tls`] when a proxy's `upstream_subset`
+/// selects a subset that carries a TLS override.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedSubsetTrafficPolicy {
+    /// Subset-resolved backend TLS posture. `Some` when the subset's
+    /// `trafficPolicy.tls` overlay produced a non-empty override (subset TLS
+    /// is layered over the upstream-level TLS and stored fully resolved here,
+    /// so the hot path can swap one `BackendTlsConfig` for another without
+    /// re-running the overlay).
+    pub tls: Option<BackendTlsConfig>,
+}
+
+impl ResolvedSubsetTrafficPolicy {
+    /// Build from a fully-resolved subset `BackendTlsConfig`. Returns `None`
+    /// when the resolved policy carries no fields (so callers can skip
+    /// inserting empty entries into [`Upstream::resolved_subset_tls`]).
+    pub fn from_tls(tls: Option<BackendTlsConfig>) -> Option<Self> {
+        let resolved = Self { tls };
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tls.is_none()
+    }
 }
 
 /// A single backend target within an upstream group.
@@ -801,6 +850,15 @@ pub struct Upstream {
     /// DestinationRule `trafficPolicy.tls.subjectAltNames`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backend_tls_san_allow_list: Vec<String>,
+    /// Cold-path projection of each subset's `SubsetTrafficPolicy.tls` overlay
+    /// onto a fully-resolved `BackendTlsConfig`. Keyed by subset name. Built by
+    /// the mesh `apply_destination_rules` final pass after upstream-level TLS
+    /// has been settled; consulted by
+    /// [`GatewayConfig::resolve_upstream_tls`] when projecting each proxy's
+    /// effective `resolved_tls`. Not serialized — derived from
+    /// `Upstream.subsets[].traffic_policy.tls`.
+    #[serde(skip)]
+    pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1905,6 +1963,14 @@ impl GatewayConfig {
     /// Must be called after loading/mutating config and before any proxy traffic flows.
     /// Called by `normalize_fields()` callers, `update_config()`, `apply_incremental()`,
     /// and admin API mutation handlers.
+    ///
+    /// Proxies with `upstream_subset` set consult the upstream's
+    /// `resolved_subset_tls` map first; when the named subset has a resolved
+    /// TLS overlay, it replaces the upstream-level TLS as the proxy's
+    /// `resolved_tls`. A subset reference that doesn't resolve (unknown
+    /// subset, or subset present but carrying no TLS overlay) falls back to
+    /// the upstream-level TLS — same behaviour as a proxy with no
+    /// `upstream_subset` at all.
     pub fn resolve_upstream_tls(&mut self) {
         // Build a map of upstream_id → TLS config for O(1) lookups.
         let upstream_tls: HashMap<&str, BackendTlsConfig> = self
@@ -1913,11 +1979,34 @@ impl GatewayConfig {
             .map(|u| (u.id.as_str(), BackendTlsConfig::from_upstream(u)))
             .collect();
 
+        // Parallel map of (upstream_id, subset_name) → subset-resolved TLS,
+        // populated only for subsets that produced a non-empty TLS overlay at
+        // mesh apply time. Empty in the non-mesh / no-per-subset-TLS common
+        // case, so the per-proxy projection below pays at most one HashMap
+        // miss when `upstream_subset` is set.
+        let subset_tls: HashMap<(&str, &str), &BackendTlsConfig> = self
+            .upstreams
+            .iter()
+            .flat_map(|u| {
+                u.resolved_subset_tls
+                    .iter()
+                    .filter_map(move |(subset_name, resolved)| {
+                        resolved
+                            .tls
+                            .as_ref()
+                            .map(|tls| ((u.id.as_str(), subset_name.as_str()), tls))
+                    })
+            })
+            .collect();
+
         for proxy in &mut self.proxies {
             proxy.resolved_tls = if let Some(ref uid) = proxy.upstream_id {
-                upstream_tls
-                    .get(uid.as_str())
-                    .cloned()
+                let subset_override = proxy
+                    .upstream_subset
+                    .as_deref()
+                    .and_then(|name| subset_tls.get(&(uid.as_str(), name)).copied().cloned());
+                subset_override
+                    .or_else(|| upstream_tls.get(uid.as_str()).cloned())
                     .unwrap_or_else(BackendTlsConfig::default_verify)
             } else {
                 BackendTlsConfig::from_proxy(proxy)

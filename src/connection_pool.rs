@@ -158,6 +158,12 @@ impl PoolManager for ReqwestPoolManager {
         let _ = write!(buf, "{}|", scheme_disc);
         buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
         buf.push('|');
+        // Subset name partitions backend pools so two proxies that share
+        // `upstream_id` but select different DestinationRule subsets cannot
+        // share a client even when their TLS material happens to be
+        // byte-identical. Empty when the proxy has no `upstream_subset`.
+        buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+        buf.push('|');
         let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
         let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
             .global_env_config
@@ -265,11 +271,11 @@ impl ConnectionPool {
     /// `warmup_connection_pools` composes this with the per-target
     /// `host:port` to dedup reqwest HEAD warmup tasks. Including the
     /// pool key (which carries the TLS-aware client identity:
-    /// `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}`) in
-    /// the dedup means proxies that share `(scheme, host, port)` but
-    /// have divergent TLS configs each get their own warmup task —
-    /// matching the fact that they end up with separate
-    /// `reqwest::Client`s at runtime.
+    /// `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{verify}`)
+    /// in the dedup means proxies that share `(scheme, host, port)` but
+    /// have divergent TLS configs or different `upstream_subset` selectors
+    /// each get their own warmup task — matching the fact that they end
+    /// up with separate `reqwest::Client`s at runtime.
     pub fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().pool_key_owned(proxy)
     }
