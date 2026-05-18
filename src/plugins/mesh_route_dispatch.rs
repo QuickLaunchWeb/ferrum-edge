@@ -104,7 +104,18 @@ impl MeshRouteDispatchConfig {
         }
         for (idx, rule) in self.rules.iter_mut().enumerate() {
             normalize_header_match_keys(idx, &mut rule.match_.headers)?;
-            if rule.match_.is_empty() {
+            // Empty match is normally rejected because it would silently
+            // shadow later rules. The exception is a "transform catch-all":
+            // a rule emitted by the K8s VirtualService translator for a
+            // URI-only `match.uri` whose http[] carries header transforms.
+            // Such a rule has no routing effect (its destination is the
+            // proxy's default) but carries the per-rule transform Arcs.
+            // `rule_matches` treats empty match as "match all" only when
+            // transforms are present, so this stays a no-op for any other
+            // operator config.
+            let has_transforms =
+                !rule.request_transform.is_empty() || !rule.response_transform.is_empty();
+            if rule.match_.is_empty() && !has_transforms {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
                      methods / headers / query_params (an empty match would silently \
@@ -432,7 +443,7 @@ impl Plugin for MeshRouteDispatch {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         for rule in &self.config.rules {
-            if rule_matches(&rule.match_, ctx, headers) {
+            if rule_matches(rule, ctx, headers) {
                 // Route overrides are a whole-destination decision, not a
                 // field-wise merge. If an earlier plugin instance matched,
                 // this matching instance intentionally replaces all four
@@ -493,16 +504,17 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn rule_matches(
-    m: &MatchCriteria,
-    ctx: &RequestContext,
-    headers: &HashMap<String, String>,
-) -> bool {
+fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
+    let m = &rule.match_;
     if m.is_empty() {
-        // Unreachable in normal config — `new()` rejects empty match at
-        // load time. Defense in depth in case a construction path skips
-        // the constructor (e.g., a future hot-reload that mutates rules).
-        return false;
+        // Empty match means "match all". `normalize_and_validate` accepts
+        // this only when the rule carries route-level transforms — that
+        // narrow shape comes from the K8s VirtualService translator's
+        // catch-all rule for URI-only matches. `compile_transform_field`
+        // returns `None` for empty input, so an `Arc` is only present when
+        // there is at least one rule to apply.
+        return rule.request_transform_compiled.is_some()
+            || rule.response_transform_compiled.is_some();
     }
     if !m.methods.is_empty()
         && !m
@@ -1232,6 +1244,45 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("request_transform"), "got: {err}");
         assert!(err.contains("CR or LF"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn empty_match_with_transforms_matches_all() {
+        // Translator-generated catch-all for URI-only VirtualService routes:
+        // empty match + transforms must publish the transform Arc on every
+        // request (the proxy's listen_path filter already gates traffic).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Api-Version", "value": "v1"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        for method in ["GET", "POST", "DELETE"] {
+            let mut ctx = ctx_with(method, "/v1/anything");
+            let mut headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert!(
+                ctx.route_override_request_transform.is_some(),
+                "empty-match catch-all must fire for {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_match_without_transforms() {
+        // The empty-match exception is narrow: only allowed when transforms
+        // are present. A rule with empty match AND no transforms is still
+        // rejected (it would be a silent no-op otherwise).
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {}, "destination": {"upstream_id": "x"}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("match requires at least one"), "got: {err}");
     }
 
     #[test]

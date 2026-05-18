@@ -59,12 +59,6 @@ struct HeaderRule {
 pub struct ResponseTransformer {
     header_rules: Vec<HeaderRule>,
     body_rules: Vec<BodyRule>,
-    /// Set by config field `apply_route_overrides`. When `true` the plugin
-    /// accepts a zero-rule config so the K8s VirtualService translator can
-    /// auto-emit a `response_transformer` instance for per-rule
-    /// `mesh_route_dispatch` route-level transforms when the proxy carries
-    /// no operator-configured response_transformer.
-    apply_route_overrides: bool,
 }
 
 fn parse_op(op: &str) -> Option<HeaderOp> {
@@ -250,10 +244,17 @@ impl ResponseTransformer {
             );
         }
 
+        // `apply_route_overrides` is parsed and validated above so the
+        // K8s VirtualService translator can auto-emit a `response_transformer`
+        // with zero static rules whose only purpose is to consume
+        // `ctx.route_override_response_transform` Arcs in `after_proxy`.
+        // The flag is config-time only — the runtime path consults `ctx`
+        // unconditionally — so we drop it after construction.
+        let _ = apply_route_overrides;
+
         Ok(Self {
             header_rules,
             body_rules,
-            apply_route_overrides,
         })
     }
 }

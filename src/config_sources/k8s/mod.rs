@@ -1269,6 +1269,66 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         rules.push(Value::Object(rule));
     }
 
+    // URI-only catch-all carrying the http[]-level transforms. Without this,
+    // a VirtualService whose `match` is purely URI-based (e.g. only
+    // `{uri: {prefix: "/v1"}}`) would generate no `mesh_route_dispatch` rule
+    // at all and the per-rule transform channel would have no carrier — the
+    // header `set` / `add` / `remove` directives would be silently dropped.
+    // The rule is emitted LAST so explicit-predicate rules (from this http[]
+    // or stashed siblings) get first-match-wins evaluation; the empty match
+    // is a "default" that catches every other request on this proxy. Per-rule
+    // policy (timeout / retry) and destination are carried so the catch-all
+    // behaves like the regular path. `route_destination` and `route_policy`
+    // already describe the proxy's default backend, so the catch-all is a
+    // semantic no-op for routing — its sole purpose is to publish the
+    // transform Arcs onto `RequestContext`.
+    let needs_catch_all = has_uri_only_match
+        && (!route_request_transform.is_empty() || !route_response_transform.is_empty());
+    if needs_catch_all {
+        let mut destination = serde_json::Map::new();
+        if let Some(uid) = route_destination.upstream_id {
+            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+        } else {
+            destination.insert(
+                "backend_host".to_string(),
+                Value::String(route_destination.backend_host.to_string()),
+            );
+            destination.insert(
+                "backend_port".to_string(),
+                serde_json::json!(route_destination.backend_port),
+            );
+        }
+        let mut rule = serde_json::Map::new();
+        rule.insert("match".to_string(), Value::Object(serde_json::Map::new()));
+        rule.insert("destination".to_string(), Value::Object(destination));
+        if let Some(timeout_ms) = route_policy.timeout_ms {
+            rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        } else if route_policy.timeout_disabled {
+            rule.insert("timeout_disabled".to_string(), Value::Bool(true));
+        }
+        if let Some(retry) = route_policy.retry {
+            rule.insert(
+                "retry".to_string(),
+                serde_json::to_value(retry).expect("RetryConfig serializes"),
+            );
+        } else if route_policy.retry_disabled {
+            rule.insert("retry_disabled".to_string(), Value::Bool(true));
+        }
+        if !route_request_transform.is_empty() {
+            rule.insert(
+                "request_transform".to_string(),
+                Value::Array(route_request_transform),
+            );
+        }
+        if !route_response_transform.is_empty() {
+            rule.insert(
+                "response_transform".to_string(),
+                Value::Array(route_response_transform),
+            );
+        }
+        rules.push(Value::Object(rule));
+    }
+
     (rules, has_uri_only_match)
 }
 
@@ -1297,35 +1357,6 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
         add,
         remove.as_deref(),
     )
-}
-
-/// True when a VirtualService `http[]` entry carries any
-/// `headers.{request,response}.{set,add,remove}` directive that the
-/// translator projects onto dispatch rules. The K8s translator uses this to
-/// auto-emit a `request_transformer` / `response_transformer` instance on
-/// proxies that do not already carry one.
-pub(crate) fn vs_route_has_header_transforms(http: &Value, direction: &str) -> bool {
-    let Some(headers) = http
-        .get("headers")
-        .and_then(Value::as_object)
-        .and_then(|h| h.get(direction))
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-    let set_non_empty = headers
-        .get("set")
-        .and_then(Value::as_object)
-        .is_some_and(|m| !m.is_empty());
-    let add_non_empty = headers
-        .get("add")
-        .and_then(Value::as_object)
-        .is_some_and(|m| !m.is_empty());
-    let remove_non_empty = headers
-        .get("remove")
-        .and_then(Value::as_array)
-        .is_some_and(|arr| arr.iter().any(|v| v.is_string()));
-    set_non_empty || add_non_empty || remove_non_empty
 }
 
 pub(crate) fn mesh_route_dispatch_plugin_from_rules(
