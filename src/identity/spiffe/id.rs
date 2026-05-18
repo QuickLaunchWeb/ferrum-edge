@@ -96,6 +96,26 @@ impl SpiffeId {
         // `filter` suppresses it so the iterator is empty for root SPIFFE IDs.
         self.path().split('/').filter(|s| !s.is_empty())
     }
+
+    /// Return the Kubernetes service-account name encoded into this SPIFFE ID
+    /// per the Istio convention `<...>/sa/<service-account>`.
+    ///
+    /// Returns the segment immediately following the first `sa` segment in the
+    /// path. Returns `None` when the path does not contain an `sa` segment or
+    /// when `sa` is the trailing segment. Only the first `sa` segment is
+    /// considered — a path like `sa/foo/sa/bar` resolves to `Some("foo")`, not
+    /// `Some("bar")`, because Istio places `sa/<name>` at a single canonical
+    /// position and accepting later `sa/...` patterns would weaken identity
+    /// checks built on top of this helper.
+    pub fn service_account(&self) -> Option<&str> {
+        let mut segments = self.path_segments();
+        while let Some(segment) = segments.next() {
+            if segment == "sa" {
+                return segments.next();
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Display for SpiffeId {

@@ -43,6 +43,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         xds_primary_retry_secs: 300,
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
+        trusted_hbone_assertors: Vec::new(),
         // Workload labels — must match the ProxyConfig selector below to
         // trigger workload-scoped resolution.
         workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),

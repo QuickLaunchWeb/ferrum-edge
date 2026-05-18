@@ -231,6 +231,13 @@ pub struct MeshRuntimeConfig {
     /// same-trust-domain match. Mirror of Istio
     /// `MeshConfig.trustDomainAliases`.
     pub trust_domain_aliases: Vec<crate::identity::TrustDomain>,
+    /// Identity-asserting infrastructure SVIDs trusted to rewrite the authz
+    /// principal via HBONE baggage `source.principal`. Empty means
+    /// `mesh_authz`'s built-in defaults of `["ztunnel", "waypoint"]` apply.
+    /// Operator-configured entries replace the defaults. Sourced from
+    /// `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Each entry is either a bare
+    /// Kubernetes service-account name or a full SPIFFE id.
+    pub trusted_hbone_assertors: Vec<String>,
     /// Workload labels for this mesh data plane. Used by `mesh_authz`'s
     /// PolicyScope filter (and by `MeshSlice::from_gateway_config`'s
     /// WorkloadSelector matching) to decide which policies apply to this
@@ -381,6 +388,33 @@ impl MeshRuntimeConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("FERRUM_MESH_TRUST_DOMAIN_ALIASES: {e}"))?;
 
+        // Validate each entry early so a typo in the env var fails startup
+        // with a clear message instead of failing later inside the plugin
+        // constructor. We keep the raw strings here and let mesh_authz do the
+        // real parsing — this is just an admission gate.
+        for raw in &env_config.mesh_trusted_hbone_assertors {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entries must not be empty".to_string(),
+                );
+            }
+            if let Some(rest) = trimmed.strip_prefix("spiffe://") {
+                let _ = rest;
+                crate::identity::SpiffeId::new(trimmed).map_err(|e| {
+                    format!(
+                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: invalid SPIFFE id '{trimmed}': {e}"
+                    )
+                })?;
+            } else if trimmed.contains("://") {
+                return Err(format!(
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry '{trimmed}' looks like a URI \
+                     but is not a 'spiffe://' SPIFFE id"
+                ));
+            }
+        }
+        let trusted_hbone_assertors = env_config.mesh_trusted_hbone_assertors.clone();
+
         let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(DEFAULT_DNS_ENABLED);
@@ -457,6 +491,7 @@ impl MeshRuntimeConfig {
             xds_primary_retry_secs: env_config.dp_cp_failover_primary_retry_secs,
             xds_connect_timeout_seconds,
             trust_domain_aliases,
+            trusted_hbone_assertors,
             workload_labels,
             workload_svid_cert_path,
             workload_svid_key_path,
@@ -1993,15 +2028,29 @@ fn inject_mesh_global_plugins(
         .iter()
         .map(|td| td.as_str().to_string())
         .collect();
+    let mut mesh_authz_config = serde_json::json!({
+        "mesh_slice": mesh_slice,
+        "trust_domain_aliases": trust_domain_aliases,
+        "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
+    });
+    // Only thread the operator-set assertor list when present; otherwise
+    // let mesh_authz fall back to its built-in defaults (ztunnel, waypoint).
+    // Passing an empty array would lock baggage rewriting down entirely, so
+    // unset and `=` need to remain distinguishable surfaces.
+    if !runtime.trusted_hbone_assertors.is_empty() {
+        mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(
+            runtime
+                .trusted_hbone_assertors
+                .iter()
+                .map(|raw| serde_json::Value::String(raw.clone()))
+                .collect(),
+        );
+    }
     ensure_global_plugin(
         config,
         MESH_AUTHZ_PLUGIN_ID,
         "mesh_authz",
-        serde_json::json!({
-            "mesh_slice": mesh_slice,
-            "trust_domain_aliases": trust_domain_aliases,
-            "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
-        }),
+        mesh_authz_config,
         &runtime.namespace,
     );
 
@@ -3925,6 +3974,61 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_config_parses_trusted_hbone_assertors() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                (
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                    "ztunnel , default-waypoint, \
+                     spiffe://cluster.local/ns/istio-system/sa/ztunnel ,",
+                ),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert_eq!(
+                    runtime.trusted_hbone_assertors,
+                    vec![
+                        "ztunnel".to_string(),
+                        "default-waypoint".to_string(),
+                        "spiffe://cluster.local/ns/istio-system/sa/ztunnel".to_string(),
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_rejects_trusted_hbone_assertor_with_wrong_scheme() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                (
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                    "https://cluster.local/ns/x/sa/y",
+                ),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let err = MeshRuntimeConfig::from_env_config(&env).unwrap_err();
+                assert!(err.contains("FERRUM_MESH_TRUSTED_HBONE_ASSERTORS"));
+            },
+        );
+    }
+
+    #[test]
     fn mesh_runtime_config_rejects_workload_label_without_equals() {
         with_mesh_env(
             &[
@@ -4054,6 +4158,7 @@ mod tests {
             xds_primary_retry_secs: 300,
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
+            trusted_hbone_assertors: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -4152,6 +4257,7 @@ mod tests {
             xds_primary_retry_secs: 300,
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
+            trusted_hbone_assertors: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
