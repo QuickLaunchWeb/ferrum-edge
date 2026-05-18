@@ -16,18 +16,21 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsFd;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::Ebpf;
+use aya::programs::{CgroupSockAddr, SchedClassifier, SockOps, SockOpsLinkId, TcAttachType};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::{CgroupSockAddr, SchedClassifier, TcAttachType};
+use aya::{Ebpf, EbpfLoader};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use super::{EbpfBackend, PodInfo};
+use super::{
+    BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_PROGRAM_SOCK_OPS,
+    BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, PodInfo,
+};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use ferrum_ebpf_common::BpfCaptureConfig;
+use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 const DEFAULT_BPF_ELF_PATH: &str = concat!(
@@ -59,6 +62,11 @@ pub struct AyaEbpfBackend {
     bpf: Option<Ebpf>,
     maps: Option<BpfMaps>,
     pod_links: HashMap<String, PodLinks>,
+    /// Link id for the global SOCK_OPS attach. Set on first successful
+    /// `attach_sock_ops`; cleared by `cleanup_all` (the link is detached
+    /// implicitly when `Ebpf` is dropped, but holding the id lets future
+    /// callers detach explicitly if needed).
+    sock_ops_link_id: Option<SockOpsLinkId>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -68,6 +76,7 @@ impl AyaEbpfBackend {
             bpf: None,
             maps: None,
             pod_links: HashMap::new(),
+            sock_ops_link_id: None,
         }
     }
 
@@ -92,7 +101,16 @@ impl EbpfBackend for AyaEbpfBackend {
                 .unwrap_or_else(|| DEFAULT_BPF_ELF_PATH.to_string());
         let bpf_elf = fs::read(&bpf_elf_path)
             .map_err(|e| format!("Failed to read BPF ELF '{bpf_elf_path}': {e}"))?;
-        let mut bpf = Ebpf::load(&bpf_elf).map_err(|e| format!("Failed to load BPF ELF: {e}"))?;
+
+        // Size the SOCK_OPS event ringbuf from operator config. The kernel
+        // baked a 4 MiB default into the ELF; `set_max_entries` rewrites
+        // the descriptor at load time so the actual kernel object honors
+        // FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES without rebuilding the ELF.
+        let ringbuf_bytes = resolve_sock_ops_ringbuf_bytes();
+        let mut bpf = EbpfLoader::new()
+            .set_max_entries(BPF_MAP_SOCK_OPS_EVENTS, ringbuf_bytes)
+            .load(&bpf_elf)
+            .map_err(|e| format!("Failed to load BPF ELF: {e}"))?;
 
         if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
             warn!("Failed to initialize eBPF logger (non-fatal): {e}");
@@ -117,6 +135,39 @@ impl EbpfBackend for AyaEbpfBackend {
         tc.load()
             .map_err(|e| format!("Failed to load BPF program '{TC_PROGRAM}': {e}"))?;
         debug!(program = TC_PROGRAM, "BPF tc program loaded");
+
+        // Load the SOCK_OPS observability program. Best-effort: failing
+        // to load this program does NOT break capture — it only loses
+        // TCP-layer telemetry. The attach + pin happens in
+        // `attach_sock_ops`, which the node-agent calls once at startup.
+        if let Some(prog_ref) = bpf.program_mut(BPF_PROGRAM_SOCK_OPS) {
+            match TryInto::<&mut SockOps>::try_into(prog_ref) {
+                Ok(prog) => {
+                    if let Err(e) = prog.load() {
+                        warn!(
+                            program = BPF_PROGRAM_SOCK_OPS,
+                            error = %e,
+                            "Failed to load SOCK_OPS program (TCP-layer observability disabled)"
+                        );
+                    } else {
+                        debug!(
+                            program = BPF_PROGRAM_SOCK_OPS,
+                            ringbuf_bytes, "BPF sock_ops program loaded"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    program = BPF_PROGRAM_SOCK_OPS,
+                    error = %e,
+                    "SOCK_OPS program type mismatch (TCP-layer observability disabled)"
+                ),
+            }
+        } else {
+            warn!(
+                program = BPF_PROGRAM_SOCK_OPS,
+                "SOCK_OPS program not present in ELF (TCP-layer observability disabled)"
+            );
+        }
 
         self.maps = Some(BpfMaps::from_ebpf(&bpf)?);
         self.bpf = Some(bpf);
@@ -224,11 +275,127 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.insert_port_exclude(port)
     }
 
+    fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
+        if self.sock_ops_link_id.is_some() {
+            // Already attached — idempotent, no-op.
+            return Ok(());
+        }
+
+        let cgroup_fd = File::open(cgroup_root)
+            .map_err(|e| format!("Failed to open cgroup root '{cgroup_root}': {e}"))?;
+
+        let bpf = self.bpf_mut()?;
+
+        // Look up the program before we try to attach. The program may
+        // not be present (load failed best-effort above) — that's
+        // surfaced as a clean error instead of an unwrap panic.
+        let Some(prog_ref) = bpf.program_mut(BPF_PROGRAM_SOCK_OPS) else {
+            return Err(format!(
+                "SOCK_OPS program '{BPF_PROGRAM_SOCK_OPS}' not loaded; cannot attach"
+            ));
+        };
+        let prog: &mut SockOps = prog_ref
+            .try_into()
+            .map_err(|e| format!("'{BPF_PROGRAM_SOCK_OPS}' is not a SockOps program: {e}"))?;
+
+        let link_id = prog
+            .attach(cgroup_fd.as_fd())
+            .map_err(|e| format!("Failed to attach SOCK_OPS to '{cgroup_root}': {e}"))?;
+        self.sock_ops_link_id = Some(link_id);
+
+        if let Err(e) = pin_sock_ops_maps(bpf) {
+            warn!(
+                error = %e,
+                "Failed to pin SOCK_OPS maps; mesh-proxy will not be able to consume events"
+            );
+            return Err(e);
+        }
+
+        info!(
+            cgroup_root,
+            pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+            "SOCK_OPS program attached and event ringbuf pinned"
+        );
+        Ok(())
+    }
+
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.pod_links.clear();
+        self.sock_ops_link_id = None;
         self.maps = None;
         self.bpf = None;
+        // Best-effort: unpin the SOCK_OPS maps so a stale pin doesn't
+        // mislead a future mesh-proxy start. Missing pin is fine.
+        let _ = fs::remove_file(BPF_SOCK_OPS_EVENTS_PIN_PATH);
+        let _ = fs::remove_file(BPF_SOCK_OPS_STATS_PIN_PATH);
         info!("BPF programs and maps cleaned up");
         Ok(())
     }
+}
+
+/// Resolve `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` with the kernel-default
+/// fallback. Invalid (non-numeric / zero / non-power-of-two) values are
+/// rejected with a `warn!` and silently fall back to the default so the
+/// gateway never refuses to start over an observability tuning knob.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn resolve_sock_ops_ringbuf_bytes() -> u32 {
+    let Some(raw) =
+        crate::config::conf_file::resolve_ferrum_var("FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES")
+    else {
+        return SOCK_OPS_RINGBUF_DEFAULT_BYTES;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(n) if n >= 4096 && n.is_power_of_two() => n,
+        Ok(n) => {
+            warn!(
+                value = n,
+                "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES must be a power of two >= 4096; using default {}",
+                SOCK_OPS_RINGBUF_DEFAULT_BYTES
+            );
+            SOCK_OPS_RINGBUF_DEFAULT_BYTES
+        }
+        Err(e) => {
+            warn!(
+                raw = %raw,
+                error = %e,
+                "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES is not a valid u32; using default {}",
+                SOCK_OPS_RINGBUF_DEFAULT_BYTES
+            );
+            SOCK_OPS_RINGBUF_DEFAULT_BYTES
+        }
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
+    // Ensure the parent dir exists. /sys/fs/bpf must already be mounted
+    // (bpffs); we only need to create the /ferrum subdirectory.
+    if let Some(parent) = std::path::Path::new(BPF_SOCK_OPS_EVENTS_PIN_PATH).parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "Failed to create pin parent dir '{}': {e}",
+            parent.display()
+        ));
+    }
+    pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS, BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
+    pin_map_at(bpf, BPF_MAP_SOCK_OPS_STATS, BPF_SOCK_OPS_STATS_PIN_PATH)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), String> {
+    // If a stale pin exists (e.g. previous run did not clean up), remove
+    // it so the new map gets pinned fresh. Best-effort: missing path is
+    // fine, only surface real errors.
+    if std::path::Path::new(pin_path).exists()
+        && let Err(e) = fs::remove_file(pin_path)
+    {
+        return Err(format!("Failed to remove stale pin '{pin_path}': {e}"));
+    }
+    let map = bpf
+        .map_mut(map_name)
+        .ok_or_else(|| format!("BPF map '{map_name}' not found"))?;
+    map.pin(pin_path)
+        .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
 }
