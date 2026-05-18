@@ -17,12 +17,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::admin::AdminState;
 use crate::admin::api_specs::extractor::{MAX_YAML_EXPANDED_NODES, count_value_nodes};
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
 };
+use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
+use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -2008,6 +2009,7 @@ fn json_resp(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
 pub async fn handle_post_api_spec(
     req: Request<Incoming>,
     state: &AdminState,
+    actor: &AuditActor,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
@@ -2078,6 +2080,18 @@ pub async fn handle_post_api_spec(
         "spec_version": spec.spec_version,
     });
 
+    let event = audit::AuditEvent::new(
+        actor,
+        "create",
+        "api_spec",
+        &spec_id,
+        namespace,
+        audit::create_diff(resp_body.clone()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
     // Build the body + standard headers via the shared `json_resp` helper, then
     // inject the `Location` header. This keeps body-serialisation and header
     // policy consistent with every other JSON response in this module.
@@ -2095,6 +2109,7 @@ pub async fn handle_post_api_spec(
 pub async fn handle_put_api_spec(
     req: Request<Incoming>,
     state: &AdminState,
+    actor: &AuditActor,
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -2225,6 +2240,24 @@ pub async fn handle_put_api_spec(
         "content_hash": spec.content_hash,
         "spec_version": spec.spec_version,
     });
+
+    let before = json!({
+        "id": existing_spec.id,
+        "proxy_id": existing_spec.proxy_id,
+        "content_hash": existing_spec.content_hash,
+        "spec_version": existing_spec.spec_version,
+    });
+    let event = audit::AuditEvent::new(
+        actor,
+        "update",
+        "api_spec",
+        id,
+        namespace,
+        audit::update_diff(before, resp_body.clone()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
 
     Ok(json_resp(StatusCode::OK, &resp_body))
 }
@@ -2357,6 +2390,7 @@ pub async fn handle_list_api_specs(
 
 pub async fn handle_delete_api_spec(
     state: &AdminState,
+    actor: &AuditActor,
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -2369,12 +2403,36 @@ pub async fn handle_delete_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    let existing = match db.get_api_spec(namespace, id).await {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
+
     match db.delete_api_spec(namespace, id).await {
-        Ok(true) => Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header("Cache-Control", "no-store")
-            .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))),
+        Ok(true) => {
+            let event = audit::AuditEvent::new(
+                actor,
+                "delete",
+                "api_spec",
+                id,
+                namespace,
+                audit::delete_diff(json!({
+                    "id": existing.id,
+                    "proxy_id": existing.proxy_id,
+                    "content_hash": existing.content_hash,
+                    "spec_version": existing.spec_version,
+                })),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
+            Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("Cache-Control", "no-store")
+                .body(Full::new(Bytes::new()))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
+        }
         Ok(false) => Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => Ok(error_response(classify_db_error(e))),
     }

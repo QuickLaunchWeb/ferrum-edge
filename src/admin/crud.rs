@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
+use crate::admin::audit::{self, AuditActor, AuditEvent};
+use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
@@ -81,6 +83,14 @@ pub(crate) trait AdminResource:
 
     fn response_body(resource: &Self) -> Value {
         json!(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, _role: AdminRole) -> Value {
+        Self::response_body(resource)
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        Self::response_body(resource)
     }
 
     /// Inspect the raw request body *before* it is deserialized into `Self`.
@@ -176,12 +186,17 @@ pub(crate) trait AdminResource:
 pub(crate) async fn handle_list<R: AdminResource>(
     state: &AdminState,
     pagination: &super::PaginationParams,
+    role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
         match R::db_list(db.as_ref(), namespace, pagination).await {
             Ok(result) => {
-                let items: Vec<Value> = result.items.iter().map(R::response_body).collect();
+                let items: Vec<Value> = result
+                    .items
+                    .iter()
+                    .map(|resource| R::response_body_for_role(resource, role))
+                    .collect();
                 let body = super::paginate_db_response(&items, result.total, pagination);
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
@@ -199,7 +214,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
         let items: Vec<Value> = R::cached_items(&config)
             .iter()
             .filter(|resource| resource.namespace() == namespace)
-            .map(R::response_body)
+            .map(|resource| R::response_body_for_role(resource, role))
             .collect();
         let body = super::paginate_response(&json!(items), pagination);
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
@@ -214,6 +229,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
 pub(crate) async fn handle_get<R: AdminResource>(
     state: &AdminState,
     id: &str,
+    role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
@@ -222,7 +238,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 if resource.namespace() != namespace {
                     return Ok(not_found_response::<R>());
                 }
-                let body = R::response_body(&resource);
+                let body = R::response_body_for_role(&resource, role);
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
             Ok(None) => {
@@ -244,7 +260,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
             .find(|resource| resource.id() == id && resource.namespace() == namespace)
         {
             Some(resource) => {
-                let body = R::response_body(resource);
+                let body = R::response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
             None => Ok(not_found_response::<R>()),
@@ -259,23 +275,26 @@ pub(crate) async fn handle_get<R: AdminResource>(
 
 pub(crate) async fn handle_create<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, body, namespace, WriteAction::Create).await
+    handle_write::<R>(state, actor, body, namespace, WriteAction::Create).await
 }
 
 pub(crate) async fn handle_update<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     id: &str,
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, body, namespace, WriteAction::Update { id }).await
+    handle_write::<R>(state, actor, body, namespace, WriteAction::Update { id }).await
 }
 
 pub(crate) async fn handle_delete<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     id: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -283,8 +302,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(response);
     }
 
-    let db = match state.db.as_ref() {
-        Some(db) => db.as_ref(),
+    let db_arc = match state.db.as_ref() {
+        Some(db) => db.clone(),
         None => {
             return Ok(super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -292,8 +311,9 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             ));
         }
     };
+    let db = db_arc.as_ref();
 
-    match R::db_get(db, id).await {
+    let existing = match R::db_get(db, id).await {
         Ok(Some(resource)) if resource.namespace() != namespace => {
             return Ok(not_found_response::<R>());
         }
@@ -303,11 +323,24 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Err(error) => {
             return Ok(R::map_precheck_db_error(&error));
         }
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(resource)) => resource,
+    };
 
     match R::db_delete(db, id).await {
-        Ok(true) => Ok(super::json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            let event = AuditEvent::new(
+                actor,
+                "delete",
+                R::RESOURCE_NAME.replace(' ', "_"),
+                id,
+                namespace,
+                audit::delete_diff(R::audit_body(&existing)),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
+                super::log_audit_enqueue_failure(&error);
+            }
+            Ok(super::json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
@@ -412,6 +445,63 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     }
 
     Ok(errors)
+}
+
+fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
+    let mut body = json!(resource);
+    if let Some(config) = body.get_mut("config") {
+        redact_sensitive_plugin_config_fields(config);
+    }
+    body
+}
+
+fn upstream_audit_body(resource: &Upstream) -> Value {
+    let mut body = json!(resource);
+    if let Some(token) = body
+        .get_mut("service_discovery")
+        .and_then(|sd| sd.get_mut("consul"))
+        .and_then(|consul| consul.get_mut("token"))
+        && !token.is_null()
+    {
+        *token = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+    }
+    body
+}
+
+fn redact_sensitive_plugin_config_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_plugin_config_key(key) {
+                    *child = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+                } else {
+                    redact_sensitive_plugin_config_fields(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_plugin_config_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_plugin_config_key(key: &str) -> bool {
+    if crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key(key) {
+        return true;
+    }
+
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "key"
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("access_key")
+        || normalized.contains("client_secret")
+        || normalized.contains("credential")
+        || normalized.contains("private_key")
+        || normalized.contains("webhook")
 }
 
 pub(crate) async fn check_port_available(
@@ -539,6 +629,18 @@ impl AdminResource for Upstream {
     fn normalize(&mut self) {
         self.api_spec_id = None;
         self.normalize_fields();
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        upstream_audit_body(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+        if role == AdminRole::Admin {
+            Self::response_body(resource)
+        } else {
+            upstream_audit_body(resource)
+        }
     }
 
     fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
@@ -720,6 +822,18 @@ impl AdminResource for PluginConfig {
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
         &config.plugin_configs
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        plugin_config_audit_body(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+        if role == AdminRole::Admin {
+            Self::response_body(resource)
+        } else {
+            plugin_config_audit_body(resource)
+        }
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
@@ -1255,6 +1369,7 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
 
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
+    actor: &AuditActor,
     body: &[u8],
     namespace: &str,
     action: WriteAction<'_>,
@@ -1263,8 +1378,8 @@ async fn handle_write<R: AdminResource>(
         return Ok(response);
     }
 
-    let db = match state.db.as_ref() {
-        Some(db) => db.as_ref(),
+    let db_arc = match state.db.as_ref() {
+        Some(db) => db.clone(),
         None => {
             return Ok(super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1272,6 +1387,7 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    let db = db_arc.as_ref();
 
     if let Err(message) = R::validate_raw_body(body) {
         return Ok(super::json_response(
@@ -1418,7 +1534,32 @@ async fn handle_write<R: AdminResource>(
         );
     }
 
-    let body = R::response_body(&resource);
+    let (audit_action, diff) = match action {
+        WriteAction::Create => ("create", audit::create_diff(R::audit_body(&resource))),
+        WriteAction::Update { .. } => {
+            let before = existing
+                .as_ref()
+                .map(R::audit_body)
+                .unwrap_or_else(|| json!(null));
+            (
+                "update",
+                audit::update_diff(before, R::audit_body(&resource)),
+            )
+        }
+    };
+    let event = AuditEvent::new(
+        actor,
+        audit_action,
+        R::RESOURCE_NAME.replace(' ', "_"),
+        resource.id(),
+        namespace,
+        diff,
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
+        super::log_audit_enqueue_failure(&error);
+    }
+
+    let body = R::response_body_for_role(&resource, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,

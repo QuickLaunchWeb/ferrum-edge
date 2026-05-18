@@ -111,6 +111,17 @@ fn test_redact_jwt_secret() {
 }
 
 #[test]
+fn test_redact_keyauth_key() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("keyauth".to_string(), json!({"key": "api-key-value"}));
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    let keyauth = redacted.credentials.get("keyauth").unwrap();
+    assert_eq!(keyauth["key"], "[REDACTED]");
+}
+
+#[test]
 fn test_redact_multiple_credential_types() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
@@ -131,14 +142,12 @@ fn test_redact_multiple_credential_types() {
         "[REDACTED]"
     );
     assert_eq!(redacted.credentials["hmac_auth"]["secret"], "[REDACTED]");
-    // keyauth key should NOT be redacted (it's the lookup key, not a secret)
-    assert_eq!(redacted.credentials["keyauth"]["key"], "api-key-value");
+    assert_eq!(redacted.credentials["keyauth"]["key"], "[REDACTED]");
 }
 
 #[test]
-fn test_redact_no_secrets_present() {
+fn test_redact_mtls_identity_unchanged() {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("keyauth".to_string(), json!({"key": "my-api-key"}));
     credentials.insert(
         "mtls_auth".to_string(),
         json!({"identity": "CN=client.example.com"}),
@@ -146,7 +155,6 @@ fn test_redact_no_secrets_present() {
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
-    assert_eq!(redacted.credentials["keyauth"]["key"], "my-api-key");
     assert_eq!(
         redacted.credentials["mtls_auth"]["identity"],
         "CN=client.example.com"

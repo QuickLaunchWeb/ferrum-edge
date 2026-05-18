@@ -70,6 +70,7 @@ fn auth_header(jwt_secret: &str, jwt_issuer: &str) -> String {
     let claims = json!({
         "iss": jwt_issuer,
         "sub": "test-admin",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

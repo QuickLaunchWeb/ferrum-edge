@@ -42,7 +42,9 @@ mod inner {
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
-    use mongodb::bson::{Binary, Bson, Document, doc, spec::BinarySubtype};
+    use mongodb::bson::{
+        Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
+    };
     use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -610,6 +612,10 @@ mod inner {
             self.db().collection("api_specs")
         }
 
+        fn audit_events(&self) -> Collection<Document> {
+            self.db().collection("audit_events")
+        }
+
         // -------------------------------------------------------------------
         // Internal helpers
         // -------------------------------------------------------------------
@@ -1144,6 +1150,36 @@ mod inner {
             }),
         );
         Ok(doc)
+    }
+
+    fn audit_event_to_doc(
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<Document, anyhow::Error> {
+        let mut doc = mongodb::bson::to_document(event)?;
+        doc.insert("_id", event.id.as_str());
+        doc.insert(
+            "ts",
+            Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
+        );
+        Ok(doc)
+    }
+
+    fn doc_to_audit_event(
+        mut doc: Document,
+    ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
+        doc.remove("_id");
+        match doc.remove("ts") {
+            Some(Bson::DateTime(ts)) => {
+                let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
+                    .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+                doc.insert("ts", ts.to_rfc3339());
+            }
+            Some(other) => {
+                doc.insert("ts", other);
+            }
+            None => {}
+        }
+        Ok(mongodb::bson::from_document(doc)?)
     }
 
     fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
@@ -2745,6 +2781,25 @@ mod inner {
                 )
                 .await?;
 
+            // audit_events indexes (admin-only mutation log).
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "ts": -1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(IndexModel::builder().keys(doc! { "actor": 1 }).build())
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+
             info!("MongoDB indexes ensured");
             Ok(())
         }
@@ -3550,11 +3605,87 @@ mod inner {
             self.check_slow_query("delete_api_spec", start);
             Ok(true)
         }
+
+        async fn insert_audit_event(
+            &self,
+            event: &crate::admin::audit::AuditEvent,
+        ) -> Result<(), anyhow::Error> {
+            let start = std::time::Instant::now();
+            self.audit_events()
+                .insert_one(audit_event_to_doc(event)?)
+                .await?;
+            self.check_slow_query("insert_audit_event", start);
+            Ok(())
+        }
+
+        async fn list_audit_events(
+            &self,
+            namespace: &str,
+            filter: &crate::admin::audit::AuditListFilter,
+        ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let mut filter_doc = doc! { "namespace": namespace };
+            if let Some(ref value) = filter.actor {
+                filter_doc.insert("actor", value.as_str());
+            }
+            if let Some(ref value) = filter.action {
+                filter_doc.insert("action", value.as_str());
+            }
+            if let Some(ref value) = filter.resource_type {
+                filter_doc.insert("resource_type", value.as_str());
+            }
+            if let Some(ref value) = filter.resource_id {
+                filter_doc.insert("resource_id", value.as_str());
+            }
+            if let Some(ts_range) = audit_ts_range_filter(filter) {
+                filter_doc.insert("ts", ts_range);
+            }
+
+            let total = self
+                .audit_events()
+                .count_documents(filter_doc.clone())
+                .await? as i64;
+            let options = FindOptions::builder()
+                .sort(doc! { "ts": -1, "_id": -1 })
+                .skip(Some(filter.offset as u64))
+                .limit(Some(filter.limit as i64))
+                .build();
+            let mut cursor = self
+                .audit_events()
+                .find(filter_doc)
+                .with_options(options)
+                .await?;
+            let mut items = Vec::new();
+            while cursor.advance().await? {
+                items.push(doc_to_audit_event(cursor.deserialize_current()?)?);
+            }
+            self.check_slow_query("list_audit_events", start);
+            Ok(PaginatedResult { items, total })
+        }
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn audit_ts_range_filter(filter: &crate::admin::audit::AuditListFilter) -> Option<Document> {
+        let mut ts_range = Document::new();
+        if let Some(value) = filter.start.as_ref() {
+            ts_range.insert("$gte", audit_ts_bound(value));
+        }
+        if let Some(value) = filter.end.as_ref() {
+            ts_range.insert("$lte", audit_ts_bound(value));
+        }
+        if ts_range.is_empty() {
+            None
+        } else {
+            Some(ts_range)
+        }
+    }
+
+    fn audit_ts_bound(value: &DateTime<Utc>) -> Bson {
+        Bson::DateTime(BsonDateTime::from_millis(value.timestamp_millis()))
+    }
 
     impl MongoStore {
         /// Load all `_id` values from a collection (for deletion detection).
@@ -3756,6 +3887,65 @@ mod inner {
     mod tests {
         use super::*;
         use std::collections::HashSet;
+
+        #[test]
+        fn audit_ts_range_filter_uses_bson_datetimes() {
+            let start = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("start timestamp")
+                .with_timezone(&Utc);
+            let end = DateTime::parse_from_rfc3339("2026-05-18T02:00:00Z")
+                .expect("end timestamp")
+                .with_timezone(&Utc);
+            let filter = crate::admin::audit::AuditListFilter {
+                start: Some(start),
+                end: Some(end),
+                ..Default::default()
+            };
+
+            let range = audit_ts_range_filter(&filter).expect("timestamp range");
+
+            assert_eq!(
+                range.get("$gte"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    start.timestamp_millis()
+                )))
+            );
+            assert_eq!(
+                range.get("$lte"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    end.timestamp_millis()
+                )))
+            );
+        }
+
+        #[test]
+        fn audit_event_to_doc_stores_ts_as_bson_datetime() {
+            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let event = crate::admin::audit::AuditEvent {
+                id: "audit-1".to_string(),
+                ts,
+                actor: "operator".to_string(),
+                action: "update".to_string(),
+                resource_type: "proxy".to_string(),
+                resource_id: "proxy-1".to_string(),
+                namespace: "ferrum".to_string(),
+                diff: serde_json::json!({"changed": true}),
+            };
+
+            let doc = audit_event_to_doc(&event).expect("audit event document");
+
+            assert_eq!(
+                doc.get("ts"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    ts.timestamp_millis()
+                )))
+            );
+
+            let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
+            assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
+        }
 
         // -------------------------------------------------------------------
         // diff_removed tests

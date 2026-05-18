@@ -42,6 +42,7 @@ fn encode_admin_jwt(secret: &str, issuer: &str) -> String {
     let claims = serde_json::json!({
         "iss": issuer,
         "sub": "test-admin-secrets",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

@@ -28,7 +28,7 @@ use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
@@ -4617,6 +4617,118 @@ impl DatabaseStore {
         self.check_slow_query("list_spec_owned_upstreams", start);
         Ok(upstreams)
     }
+
+    pub async fn insert_audit_event(
+        &self,
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<(), anyhow::Error> {
+        let start = std::time::Instant::now();
+        let diff = serde_json::to_string(&event.diff)?;
+        sqlx::query(&self.q("INSERT INTO audit_events \
+             (id, ts, actor, action, resource_type, resource_id, namespace, diff) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+        .bind(&event.id)
+        .bind(audit_ts_string(&event.ts))
+        .bind(&event.actor)
+        .bind(&event.action)
+        .bind(&event.resource_type)
+        .bind(&event.resource_id)
+        .bind(&event.namespace)
+        .bind(diff)
+        .execute(&self.pool())
+        .await?;
+        self.check_slow_query("insert_audit_event", start);
+        Ok(())
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
+
+        if filter.actor.is_some() {
+            conditions.push("actor = ?");
+        }
+        if filter.action.is_some() {
+            conditions.push("action = ?");
+        }
+        if filter.resource_type.is_some() {
+            conditions.push("resource_type = ?");
+        }
+        if filter.resource_id.is_some() {
+            conditions.push("resource_id = ?");
+        }
+        if filter.start.is_some() {
+            conditions.push("ts >= ?");
+        }
+        if filter.end.is_some() {
+            conditions.push("ts <= ?");
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let count_sql = self.q(&format!(
+            "SELECT COUNT(*) AS cnt FROM audit_events WHERE {where_clause}"
+        ));
+        let mut count_query = sqlx::query(&count_sql).bind(namespace);
+        if let Some(ref value) = filter.actor {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.action {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_type {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_id {
+            count_query = count_query.bind(value);
+        }
+        if let Some(ref value) = filter.start {
+            count_query = count_query.bind(audit_ts_string(value));
+        }
+        if let Some(ref value) = filter.end {
+            count_query = count_query.bind(audit_ts_string(value));
+        }
+        let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
+
+        let sql = self.q(&format!(
+            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
+             FROM audit_events WHERE {where_clause} \
+             ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        ));
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(ref value) = filter.actor {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.action {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_type {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.resource_id {
+            query = query.bind(value);
+        }
+        if let Some(ref value) = filter.start {
+            query = query.bind(audit_ts_string(value));
+        }
+        if let Some(ref value) = filter.end {
+            query = query.bind(audit_ts_string(value));
+        }
+        let rows = query
+            .bind(filter.limit as i64)
+            .bind(filter.offset as i64)
+            .fetch_all(&self.rpool())
+            .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(row_to_audit_event(row)?);
+        }
+        self.check_slow_query("list_audit_events", start);
+        Ok(PaginatedResult { items, total })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5066,6 +5178,21 @@ impl DatabaseBackend for DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         DatabaseStore::list_spec_owned_upstreams(self, namespace, spec_id).await
+    }
+
+    async fn insert_audit_event(
+        &self,
+        event: &crate::admin::audit::AuditEvent,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::insert_audit_event(self, event).await
+    }
+
+    async fn list_audit_events(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        DatabaseStore::list_audit_events(self, namespace, filter).await
     }
 }
 
@@ -5653,6 +5780,33 @@ fn row_to_api_spec_with_content(
     })
 }
 
+fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
+    let id: String = row.try_get("id")?;
+    let diff_raw: String = row.try_get("diff")?;
+    let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
+        warn!(
+            audit_event_id = %id,
+            error = %e,
+            "Audit event diff column is not valid JSON; returning empty diff"
+        );
+        serde_json::json!({})
+    });
+    Ok(crate::admin::audit::AuditEvent {
+        id,
+        ts: parse_datetime_column(row, "ts"),
+        actor: row.try_get("actor")?,
+        action: row.try_get("action")?,
+        resource_type: row.try_get("resource_type")?,
+        resource_id: row.try_get("resource_id")?,
+        namespace: row.try_get("namespace")?,
+        diff,
+    })
+}
+
+fn audit_ts_string(ts: &DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
 /// Parse a datetime column from a database row, falling back to `Utc::now()` if
 /// the column is missing or the value cannot be parsed. Database stores timestamps
 /// as RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
@@ -5696,7 +5850,19 @@ mod proxy_insert_sql_drift_tests {
     //!      the constants. If the bind chain is missing a column, sqlx will
     //!      surface "wrong number of parameters" at execute time (caught by
     //!      the existing integration tests).
-    use super::DatabaseStore;
+    use super::{DatabaseStore, audit_ts_string};
+
+    #[test]
+    fn audit_ts_string_is_fixed_width_and_lexically_ordered() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-18T03:00:00Z")
+            .expect("base timestamp")
+            .with_timezone(&chrono::Utc);
+        let later = base + chrono::Duration::milliseconds(100);
+
+        assert_eq!(audit_ts_string(&base), "2026-05-18T03:00:00.000000000Z");
+        assert_eq!(audit_ts_string(&later), "2026-05-18T03:00:00.100000000Z");
+        assert!(audit_ts_string(&base) < audit_ts_string(&later));
+    }
 
     #[test]
     fn proxy_insert_sql_placeholder_count_matches_const() {

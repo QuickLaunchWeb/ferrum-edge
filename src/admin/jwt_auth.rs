@@ -18,6 +18,40 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminRole {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+impl AdminRole {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "viewer" => Ok(Self::Viewer),
+            "operator" => Ok(Self::Operator),
+            "admin" => Ok(Self::Admin),
+            _ => Err(format!(
+                "Invalid admin role claim '{}'; expected viewer, operator, or admin",
+                value
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn allows(self, required: Self) -> bool {
+        self >= required
+    }
+}
+
 /// JWT Claims for Admin API
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminClaims {
@@ -36,6 +70,28 @@ pub struct AdminClaims {
     /// Additional claims
     #[serde(flatten)]
     pub additional: serde_json::Value,
+}
+
+impl AdminClaims {
+    /// Effective admin role. The `role` claim is required so tokens fail closed
+    /// when RBAC intent is absent.
+    pub fn admin_role(&self) -> Result<AdminRole, String> {
+        let Some(obj) = self.additional.as_object() else {
+            return Err(
+                "Missing admin role claim; expected viewer, operator, or admin".to_string(),
+            );
+        };
+        match obj.get("role") {
+            None => {
+                Err("Missing admin role claim; expected viewer, operator, or admin".to_string())
+            }
+            Some(serde_json::Value::String(role)) => AdminRole::parse(role),
+            Some(_) => Err(
+                "Invalid admin role claim type; expected viewer, operator, or admin string"
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 /// JWT Configuration
