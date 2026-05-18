@@ -466,12 +466,16 @@ fn route_parent_ref_keys(object: &K8sObject) -> Vec<String> {
             let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
             let name = string_field(parent, "name").unwrap_or("*");
             let section = string_field(parent, "sectionName").unwrap_or("*");
-            format!("{group}/{kind}/{namespace}/{name}/{section}")
+            let port = parent
+                .get("port")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "*".to_string(), |port| port.to_string());
+            format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
         })
         .collect();
     if refs.is_empty() {
         refs.push(format!(
-            "gateway.networking.k8s.io/Gateway/{}/{}/*",
+            "gateway.networking.k8s.io/Gateway/{}/{}/*/*",
             object.metadata.namespace, "*"
         ));
     }
@@ -772,7 +776,7 @@ fn descriptor_conflicts_for_host(
     descriptor: &RouteMatchDescriptor,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
-    parent_refs.iter().all(|parent_ref| {
+    parent_refs.iter().any(|parent_ref| {
         losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
             route_family: route_family.to_string(),
             parent_ref: parent_ref.clone(),
@@ -1352,6 +1356,47 @@ mod tests {
     }
 
     #[test]
+    fn http_route_conflicts_include_parent_ref_port() {
+        let mut port_80_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge", "port": 80}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-http", "port": 8080}]
+                }]
+            }),
+        );
+        port_80_route.metadata.name = "api-http".to_string();
+        port_80_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut port_8080_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge", "port": 8080}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-alt", "port": 8081}]
+                }]
+            }),
+        );
+        port_8080_route.metadata.name = "api-alt".to_string();
+        port_8080_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[port_80_route, port_8080_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(
+            result.warnings.is_empty(),
+            "port-distinct parentRefs must not conflict: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
     fn conflicting_http_route_skips_only_conflicting_rule() {
         let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
         let mut mixed = object(
@@ -1384,6 +1429,33 @@ mod tests {
         assert!(result.config.proxies.iter().any(|proxy| {
             proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/admin")
         }));
+        assert!(!result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+    }
+
+    #[test]
+    fn conflicting_http_route_skips_match_that_loses_on_any_parent_ref() {
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        let mut mixed_parent_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}, {"name": "edge-alt"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api-b", "port": 8080}]
+                }]
+            }),
+        );
+        mixed_parent_route.metadata.name = "api-b".to_string();
+        mixed_parent_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[older, mixed_parent_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(result.config.proxies[0].id.contains("api-a"));
         assert!(!result.config.proxies.iter().any(|proxy| {
             proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
         }));
