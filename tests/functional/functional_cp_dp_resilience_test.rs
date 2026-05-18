@@ -177,6 +177,7 @@ fn build_cp_admin_state(
         cached_config: Some(cached_config),
         mode: "cp".into(),
         read_only: false,
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
@@ -212,6 +213,7 @@ fn build_dp_admin_state(
         cached_config: Some(proxy_state.config.clone()),
         mode: "dp".into(),
         read_only: true,
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
@@ -256,6 +258,7 @@ fn generate_admin_token() -> String {
     let claims = json!({
         "iss": "ferrum-edge",
         "sub": "resilience-test",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

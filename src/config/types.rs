@@ -3504,6 +3504,9 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     if let Some(jwt) = redacted.credentials.get_mut("jwt") {
         redact_field(jwt, "secret");
     }
+    if let Some(key) = redacted.credentials.get_mut("keyauth") {
+        redact_field(key, "key");
+    }
 
     redacted
 }

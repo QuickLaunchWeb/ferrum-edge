@@ -118,7 +118,16 @@ impl AiRateLimiter {
 
     fn evict_stale_entries(&self) {
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
-            self.limiter.retain_active_at(Instant::now());
+            // `enforce_capacity` first calls `retain_active_at` to drop
+            // entries whose token-usage window has fully expired, then —
+            // if the map is still over capacity — forcibly removes
+            // additional keys until the hard cap holds. Plain
+            // `retain_active_at` is not enough on its own: when traffic
+            // is sustained, every tracked key keeps reporting "active"
+            // and nothing gets evicted, so the DashMap can grow without
+            // bound past `MAX_STATE_ENTRIES`.
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
         }
     }
 
@@ -254,6 +263,22 @@ impl AiRateLimiter {
             {
                 completion_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
             }
+
+            // Cohere v2 streaming: message-end event nests counts under
+            // `delta.usage.tokens.*` instead of root `usage`. Reuse
+            // `extract_response_usage` so we share Cohere v2's shape logic.
+            if json.get("type").and_then(|value| value.as_str()) == Some("message-end") {
+                let usage = extract_response_usage(&json, AiProvider::Cohere);
+                if usage.prompt_tokens.is_some() {
+                    prompt_tokens = usage.prompt_tokens;
+                }
+                if usage.completion_tokens.is_some() {
+                    completion_tokens = usage.completion_tokens;
+                }
+                if usage.total_tokens.is_some() {
+                    total_tokens = usage.total_tokens;
+                }
+            }
         }
 
         if total_tokens.is_none() {
@@ -357,13 +382,17 @@ impl Plugin for AiRateLimiter {
         ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        self.evict_stale_entries();
-
         let key = self.rate_key(ctx);
         let outcome = self
             .limiter
             .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
             .await;
+        // Evict AFTER the check so the current request's key cannot be
+        // force-evicted by `enforce_capacity` between insertion and the
+        // budget read — that race would let a hot user slip through
+        // against a freshly-allocated zero-usage window. Mirrors
+        // `rate_limiting.rs::check_rate` ordering.
+        self.evict_stale_entries();
 
         if !outcome.allowed {
             let usage = outcome.usage.unwrap_or(0);

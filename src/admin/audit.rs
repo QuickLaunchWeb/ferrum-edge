@@ -1,10 +1,11 @@
 //! Admin API audit logging.
 //!
-//! Audit events are written through a bounded worker queue per database backend.
-//! The HTTP mutation path never waits for queue capacity; if the bounded queue
-//! is full, enqueue fails fast and the committed mutation response can proceed
-//! after logging the audit failure. Audit persistence is best-effort and happens
-//! after the mutation response path has enqueued the event.
+//! When enabled, audit events are written through a bounded worker queue per
+//! database backend. The HTTP mutation path never waits for queue capacity; if
+//! the bounded queue is full, enqueue fails fast and the committed mutation
+//! response can proceed after logging the audit failure. Audit persistence is
+//! best-effort and happens after the mutation response path has enqueued the
+//! event.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -149,7 +150,7 @@ impl AuditSink {
         Self { tx }
     }
 
-    async fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
+    fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
         self.tx
             .try_send(AuditEnvelope { event })
             .map_err(|error| match error {
@@ -182,14 +183,33 @@ fn entry_matches_backend(entry: &AuditSinkEntry, db: &Arc<dyn DatabaseBackend>) 
 
 fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     let key = db_key(&db);
+    // Fast path: live entry for this exact backend pointer.
     if let Some(entry) = AUDIT_SINKS.get(&key)
         && entry_matches_backend(&entry, &db)
     {
         return entry.sink.clone();
     }
 
-    remove_stale_sink(key);
+    // Slow path: take the entry write lock so the spawn-and-insert is atomic.
+    // Without this, two threads can both miss the `get`, both spawn a worker,
+    // and only one survives — leaving the other's mpsc Sender to be dropped at
+    // the end of `record`, which closes that orphan worker before its event is
+    // processed. Holding the entry lock across the live-check + spawn + insert
+    // guarantees one worker per backend Arc.
+    let entry = AUDIT_SINKS.entry(key).or_insert_with(|| {
+        let backend = Arc::downgrade(&db);
+        let sink = AuditSink::spawn(key, backend.clone());
+        AuditSinkEntry { backend, sink }
+    });
+    if entry_matches_backend(&entry, &db) {
+        return entry.sink.clone();
+    }
 
+    // The existing entry references a different (stale) backend at the same
+    // address — drop it and retry. Calling `remove` while still holding the
+    // RefMut would deadlock, so release it first.
+    drop(entry);
+    AUDIT_SINKS.remove(&key);
     let backend = Arc::downgrade(&db);
     let sink = AuditSink::spawn(key, backend.clone());
     AUDIT_SINKS.insert(
@@ -202,9 +222,17 @@ fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     sink
 }
 
-pub async fn record(db: Arc<dyn DatabaseBackend>, event: AuditEvent) -> Result<(), anyhow::Error> {
+pub fn record(
+    enabled: bool,
+    db: Arc<dyn DatabaseBackend>,
+    event: AuditEvent,
+) -> Result<(), anyhow::Error> {
+    if !enabled {
+        return Ok(());
+    }
+
     let sink = sink_for_db(Arc::clone(&db));
-    sink.record(event).await
+    sink.record(event)
 }
 
 pub fn create_diff(after: Value) -> Value {

@@ -56,7 +56,7 @@ pub const HTTP_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
-        name: "backend_target_url",
+        name: "backend_target",
         is_timestamp: false,
     },
     FieldMeta {
@@ -120,11 +120,11 @@ pub const HTTP_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
-        name: "request_bytes",
+        name: "bytes_sent",
         is_timestamp: false,
     },
     FieldMeta {
-        name: "response_bytes",
+        name: "bytes_received",
         is_timestamp: false,
     },
     FieldMeta {
@@ -344,10 +344,10 @@ mod tests {
 
     #[test]
     fn lookup_stream_field_not_on_http() {
-        // bytes_sent is only on StreamTransactionSummary.
-        assert!(lookup(SummaryType::Http, "bytes_sent").is_none());
-        assert!(lookup(SummaryType::Stream, "bytes_sent").is_some());
-        assert!(lookup(SummaryType::Both, "bytes_sent").is_some());
+        // protocol is only on StreamTransactionSummary.
+        assert!(lookup(SummaryType::Http, "protocol").is_none());
+        assert!(lookup(SummaryType::Stream, "protocol").is_some());
+        assert!(lookup(SummaryType::Both, "protocol").is_some());
     }
 
     #[test]

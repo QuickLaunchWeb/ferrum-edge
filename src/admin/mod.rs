@@ -66,6 +66,8 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+    /// Enables database-backed audit events for successful admin mutations.
+    pub admin_audit_enabled: bool,
     /// Startup readiness flag — flipped once by the mode after the initial config
     /// is loaded, all caches are built, DNS/pools are warmed, and every listener
     /// (proxy, admin, stream) is bound and accepting connections.
@@ -391,10 +393,10 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
     ))
 }
 
-pub(crate) fn log_audit_persist_failure(error: &anyhow::Error) {
-    error!(
+pub(crate) fn log_audit_enqueue_failure(error: &anyhow::Error) {
+    warn!(
         error = %error,
-        "Admin mutation persisted but audit write failed"
+        "Admin mutation persisted but audit event was not enqueued"
     );
 }
 
@@ -762,7 +764,7 @@ pub async fn handle_admin_request(
     }
 
     if method == Method::POST
-        && segments_peek.as_slice() == ["restore"]
+        && matches!(segments_peek.as_slice(), ["restore"] | ["batch"])
         && let Some(resp) = require_admin_role(&auth, AdminRole::Admin)
     {
         drop(req.into_body());
@@ -806,7 +808,10 @@ pub async fn handle_admin_request(
     match (method, segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
-            crud::handle_list::<Proxy>(&state, &pagination, &namespace).await
+            crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
+        }
+        (Method::GET, ["proxies", id]) => {
+            crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
         }
         (Method::POST, ["proxies"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -814,7 +819,6 @@ pub async fn handle_admin_request(
             }
             crud::handle_create::<Proxy>(&state, &auth, &body_bytes, &namespace).await
         }
-        (Method::GET, ["proxies", id]) => crud::handle_get::<Proxy>(&state, id, &namespace).await,
         (Method::PUT, ["proxies", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
@@ -830,7 +834,7 @@ pub async fn handle_admin_request(
 
         // Consumers CRUD
         (Method::GET, ["consumers"]) => {
-            crud::handle_list::<Consumer>(&state, &pagination, &namespace).await
+            crud::handle_list::<Consumer>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["consumers"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -839,7 +843,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<Consumer>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["consumers", id]) => {
-            crud::handle_get::<Consumer>(&state, id, &namespace).await
+            crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["consumers", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -907,7 +911,7 @@ pub async fn handle_admin_request(
         // Plugins
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
-            crud::handle_list::<PluginConfig>(&state, &pagination, &namespace).await
+            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -916,7 +920,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<PluginConfig>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["plugins", "config", id]) => {
-            crud::handle_get::<PluginConfig>(&state, id, &namespace).await
+            crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -933,7 +937,7 @@ pub async fn handle_admin_request(
 
         // Upstreams CRUD
         (Method::GET, ["upstreams"]) => {
-            crud::handle_list::<Upstream>(&state, &pagination, &namespace).await
+            crud::handle_list::<Upstream>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["upstreams"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -942,7 +946,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<Upstream>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["upstreams", id]) => {
-            crud::handle_get::<Upstream>(&state, id, &namespace).await
+            crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -959,18 +963,20 @@ pub async fn handle_admin_request(
 
         // Batch create
         (Method::POST, ["batch"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
-                return Ok(resp);
-            }
+            // Role check happens before body buffering (see pre-buffer gate above).
             handle_batch_create(&state, &auth, &body_bytes, &namespace).await
         }
 
         // Backup & Restore
-        (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref(), &namespace).await,
-        (Method::POST, ["restore"]) => {
+        (Method::GET, ["backup"]) => {
+            // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            handle_backup(&state, query.as_deref(), &namespace).await
+        }
+        (Method::POST, ["restore"]) => {
+            // Role check happens before body buffering (see pre-buffer gate above).
             handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
         }
 
@@ -1490,8 +1496,8 @@ async fn handle_update_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1537,8 +1543,8 @@ async fn handle_delete_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1639,8 +1645,8 @@ async fn handle_append_credential(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1731,8 +1737,8 @@ async fn handle_delete_credential_by_index(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -2377,23 +2383,25 @@ async fn handle_batch_create(
                 namespace,
                 audit::create_diff(response["created"].clone()),
             );
-            if let Err(error) = audit::record(db.clone(), event).await {
-                log_audit_persist_failure(&error);
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
             }
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
-    let event = audit::AuditEvent::new(
-        actor,
-        "batch_create",
-        "gateway_config",
-        namespace,
-        namespace,
-        audit::create_diff(response["created"].clone()),
-    );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if created.any() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "batch_create",
+            "gateway_config",
+            namespace,
+            namespace,
+            audit::create_diff(response["created"].clone()),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
+        }
     }
 
     Ok(json_response(StatusCode::CREATED, &response))
@@ -2691,6 +2699,9 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
+        // Restore always wipes the namespace before re-inserting (Phase 3 above),
+        // so even a zero-success-count restore must produce an audit row — the
+        // namespace state has already changed regardless of which inserts failed.
         let event = audit::AuditEvent::new(
             actor,
             "restore",
@@ -2702,8 +2713,8 @@ async fn handle_restore(
                 response["restored"].clone(),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
@@ -2719,8 +2730,8 @@ async fn handle_restore(
             response["restored"].clone(),
         ),
     );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
     }
 
     Ok(json_response(StatusCode::OK, &response))

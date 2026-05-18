@@ -303,8 +303,7 @@ fn test_redact_consumer_no_credentials() {
 }
 
 #[test]
-fn test_redact_consumer_keyauth_unchanged() {
-    // keyauth has no secret field to redact
+fn test_redact_consumer_keyauth_key_redacted() {
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(
         "keyauth".into(),
@@ -312,11 +311,7 @@ fn test_redact_consumer_keyauth_unchanged() {
     );
     let redacted = redact_consumer_credentials(&consumer);
     let keyauth = redacted.credentials.get("keyauth").unwrap();
-    assert_eq!(
-        keyauth[0]["key"].as_str().unwrap(),
-        "my-api-key-123",
-        "keyauth key should NOT be redacted"
-    );
+    assert_eq!(keyauth[0]["key"].as_str().unwrap(), "[REDACTED]");
 }
 
 #[test]
@@ -415,10 +410,10 @@ fn test_redact_consumer_multiple_credential_types_all_redacted() {
             .unwrap(),
         "[REDACTED]"
     );
-    // keyauth key NOT redacted
+    // keyauth key redacted
     assert_eq!(
         redacted.credentials["keyauth"][0]["key"].as_str().unwrap(),
-        "my-key"
+        "[REDACTED]"
     );
 }
 

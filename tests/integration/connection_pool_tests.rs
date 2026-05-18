@@ -82,6 +82,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         admin_tls_key_path: None,
         admin_bind_address: "0.0.0.0".into(),
         admin_read_only: false,
+        admin_audit_enabled: false,
         admin_jwt_secret: None,
         db_type: None,
         db_url: None,

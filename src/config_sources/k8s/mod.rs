@@ -475,6 +475,13 @@ pub(crate) fn translate_k8s_objects_with_filter<F>(
 where
     F: Fn(&K8sObject) -> bool,
 {
+    // Performance follow-up: each K8sObject carries the entire `spec`/`status`
+    // `serde_json::Value` (HTTPRoute/VirtualService specs can be tens of KB).
+    // Cloning every included object once per reconcile is bounded by reconcile
+    // cadence (~30s on the CP) but unnecessary — every downstream consumer
+    // borrows immutably. Migrating this to `Vec<&K8sObject>` requires
+    // `gateway_api::route_conflicts` (and any future `&[K8sObject]` consumers)
+    // to take `&[&K8sObject]`; left as a follow-up to keep this slice focused.
     let included_objects: Vec<K8sObject> = objects
         .iter()
         .filter(|object| include(object))
@@ -974,6 +981,7 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct MeshRouteDispatchPolicy<'a> {
     pub timeout_ms: Option<u64>,
+    pub timeout_disabled: bool,
     pub retry: Option<&'a RetryConfig>,
     pub retry_disabled: bool,
 }
@@ -1173,6 +1181,8 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         rule.insert("destination".to_string(), Value::Object(destination));
         if let Some(timeout_ms) = route_policy.timeout_ms {
             rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        } else if route_policy.timeout_disabled {
+            rule.insert("timeout_disabled".to_string(), Value::Bool(true));
         }
         if let Some(retry) = route_policy.retry {
             rule.insert(

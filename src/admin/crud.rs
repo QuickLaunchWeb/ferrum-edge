@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
+use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
@@ -82,6 +83,10 @@ pub(crate) trait AdminResource:
 
     fn response_body(resource: &Self) -> Value {
         json!(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, _role: AdminRole) -> Value {
+        Self::response_body(resource)
     }
 
     fn audit_body(resource: &Self) -> Value {
@@ -181,12 +186,17 @@ pub(crate) trait AdminResource:
 pub(crate) async fn handle_list<R: AdminResource>(
     state: &AdminState,
     pagination: &super::PaginationParams,
+    role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
         match R::db_list(db.as_ref(), namespace, pagination).await {
             Ok(result) => {
-                let items: Vec<Value> = result.items.iter().map(R::response_body).collect();
+                let items: Vec<Value> = result
+                    .items
+                    .iter()
+                    .map(|resource| R::response_body_for_role(resource, role))
+                    .collect();
                 let body = super::paginate_db_response(&items, result.total, pagination);
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
@@ -204,7 +214,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
         let items: Vec<Value> = R::cached_items(&config)
             .iter()
             .filter(|resource| resource.namespace() == namespace)
-            .map(R::response_body)
+            .map(|resource| R::response_body_for_role(resource, role))
             .collect();
         let body = super::paginate_response(&json!(items), pagination);
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
@@ -219,6 +229,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
 pub(crate) async fn handle_get<R: AdminResource>(
     state: &AdminState,
     id: &str,
+    role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
@@ -227,7 +238,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 if resource.namespace() != namespace {
                     return Ok(not_found_response::<R>());
                 }
-                let body = R::response_body(&resource);
+                let body = R::response_body_for_role(&resource, role);
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
             Ok(None) => {
@@ -249,7 +260,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
             .find(|resource| resource.id() == id && resource.namespace() == namespace)
         {
             Some(resource) => {
-                let body = R::response_body(resource);
+                let body = R::response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
             None => Ok(not_found_response::<R>()),
@@ -325,8 +336,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 namespace,
                 audit::delete_diff(R::audit_body(&existing)),
             );
-            if let Err(error) = audit::record(db_arc, event).await {
-                super::log_audit_persist_failure(&error);
+            if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
+                super::log_audit_enqueue_failure(&error);
             }
             Ok(super::json_response(StatusCode::NO_CONTENT, &json!({})))
         }
@@ -440,6 +451,19 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
         redact_sensitive_plugin_config_fields(config);
+    }
+    body
+}
+
+fn upstream_audit_body(resource: &Upstream) -> Value {
+    let mut body = json!(resource);
+    if let Some(token) = body
+        .get_mut("service_discovery")
+        .and_then(|sd| sd.get_mut("consul"))
+        .and_then(|consul| consul.get_mut("token"))
+        && !token.is_null()
+    {
+        *token = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
     }
     body
 }
@@ -605,6 +629,18 @@ impl AdminResource for Upstream {
     fn normalize(&mut self) {
         self.api_spec_id = None;
         self.normalize_fields();
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        upstream_audit_body(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+        if role == AdminRole::Admin {
+            Self::response_body(resource)
+        } else {
+            upstream_audit_body(resource)
+        }
     }
 
     fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
@@ -790,6 +826,14 @@ impl AdminResource for PluginConfig {
 
     fn audit_body(resource: &Self) -> Value {
         plugin_config_audit_body(resource)
+    }
+
+    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+        if role == AdminRole::Admin {
+            Self::response_body(resource)
+        } else {
+            plugin_config_audit_body(resource)
+        }
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
@@ -1511,11 +1555,11 @@ async fn handle_write<R: AdminResource>(
         namespace,
         diff,
     );
-    if let Err(error) = audit::record(db_arc, event).await {
-        super::log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
+        super::log_audit_enqueue_failure(&error);
     }
 
-    let body = R::response_body(&resource);
+    let body = R::response_body_for_role(&resource, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,

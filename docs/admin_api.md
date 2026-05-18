@@ -13,7 +13,7 @@ See also:
 
 All endpoints (except `/health`, `/status`, `/overload`, and exact `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/metrics/runtime` requires JWT authentication because it exposes process and host diagnostics. `/charges` also requires JWT authentication because it exposes customer and billing data.
 
-Admin JWTs may include a string `role` claim:
+Admin JWTs must include a string `role` claim:
 
 | Role | Access |
 | --- | --- |
@@ -21,13 +21,13 @@ Admin JWTs may include a string `role` claim:
 | `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, and mesh egress-scope test operations |
 | `admin` | Full access, including consumers, credentials, API specs, batch/restore, and audit logs |
 
-Tokens without a `role` claim are treated as `admin` during the build-out phase so existing externally minted admin tokens continue to work.
+Tokens without a valid `role` claim are rejected.
 
 Generate a token:
 ```bash
-# Using any JWT library; payload can be minimal
+# Using any JWT library; include an explicit role
 # Example using Node.js jsonwebtoken:
-node -e "console.log(require('jsonwebtoken').sign({sub:'admin'}, 'my-super-secret-jwt-key'))"
+node -e "console.log(require('jsonwebtoken').sign({sub:'admin', role:'admin'}, 'my-super-secret-jwt-key'))"
 ```
 
 ## Health Check (Unauthenticated)
@@ -233,7 +233,7 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-Successful admin mutations enqueue a database-backed audit event before the mutation response is returned. Audit persistence is best-effort after the mutation commits: if the audit write fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` and `POST /restore` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` and `POST /restore` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
 
@@ -365,9 +365,15 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 ```
 
-**Prometheus format** returns two counter families:
-- `ferrum_api_chargeable_calls_total` — call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`
-- `ferrum_api_charges_total` — monetary charges with an additional `currency` label
+**Prometheus format** returns counter families:
+- `ferrum_api_chargeable_calls_total` — HTTP call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code` (HTTP-family proxies only)
+- `ferrum_api_charges_total` — HTTP per-call monetary charges with an additional `currency` label
+- `ferrum_api_stream_connections_total` — stream session counts (TCP/TCP+TLS/UDP/DTLS proxies)
+- `ferrum_api_stream_connection_charges_total` — stream per-session monetary charges
+- `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` — bandwidth byte counters aggregated per `consumer`/`proxy_id`/`protocol_family`
+- `ferrum_api_bandwidth_charges_total` — bandwidth monetary charges, labelled with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`
+
+All families include a `namespace` label.
 
 **JSON format** returns a nested breakdown:
 ```json
@@ -376,16 +382,43 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
   "generated_at": "2025-01-15T10:30:00Z",
   "consumers": {
     "alice": {
-      "total_charges": 1.50,
-      "total_calls": 150000,
+      "total_charges": 1.55,
+      "total_calls": 150042,
+      "per_call_charges": 1.50,
+      "stream_connection_charges": 0.021,
+      "bandwidth_charges": 0.029,
       "proxies": {
         "proxy-abc": {
           "proxy_name": "Payments API",
-          "total_charges": 1.50,
+          "protocol_family": "http",
+          "total_charges": 1.5105,
           "total_calls": 150000,
           "by_status": {
             "200": { "calls": 145000, "charges": 1.45 },
             "201": { "calls": 5000, "charges": 0.05 }
+          },
+          "bandwidth": {
+            "bytes_sent": 1500000,
+            "bytes_received": 4500000,
+            "charge_sent": 0.0015,
+            "charge_received": 0.009
+          }
+        },
+        "tcp-edge": {
+          "proxy_name": "TCP Edge",
+          "protocol_family": "stream",
+          "total_charges": 0.0397,
+          "total_calls": 42,
+          "by_status": {},
+          "bandwidth": {
+            "bytes_sent": 95000,
+            "bytes_received": 184000,
+            "charge_sent": 0.0095,
+            "charge_received": 0.0092
+          },
+          "stream": {
+            "connections": 42,
+            "connection_charges": 0.021
           }
         }
       }

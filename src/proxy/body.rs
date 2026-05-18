@@ -59,7 +59,7 @@ pub struct ProxyBody {
     /// `CoalescingH3Body`, `DirectH2Body`, or `DirectH3Body`, those inner
     /// adapters MUST count bytes only on receipt from the backend (never on
     /// the flush side of the coalescing buffer). Double-counting on drain
-    /// inflates `bytes_streamed` / `response_bytes` by the
+    /// inflates `bytes_streamed` / `bytes_received` by the
     /// coalescing overlap — matches the design rule preserved from the
     /// original deferred-log investigation.
     bytes_streamed: AtomicU64,
@@ -584,7 +584,7 @@ impl SizeLimitedIncoming {
     /// counter with the summary builder.
     ///
     /// Retained as public API; internal callers use `new_with_counter` so
-    /// they can plumb `ctx.request_bytes_observed` directly.
+    /// they can plumb `ctx.bytes_sent_observed` directly.
     #[allow(dead_code)]
     pub fn new(incoming: Incoming, max_bytes: usize, exceeded: Arc<AtomicBool>) -> Self {
         Self::new_with_counter(
@@ -597,16 +597,16 @@ impl SizeLimitedIncoming {
 
     /// Construct with a caller-supplied byte counter.
     ///
-    /// Typical usage pattern (summary builder needing `request_bytes`):
+    /// Typical usage pattern (summary builder needing `bytes_sent`):
     /// ```ignore
     /// let limited = SizeLimitedIncoming::new_with_counter(
     ///     body,
     ///     max_bytes,
     ///     exceeded,
-    ///     Arc::clone(&ctx.request_bytes_observed),
+    ///     Arc::clone(&ctx.bytes_sent_observed),
     /// );
     /// req_builder.body(limited.into_reqwest_body());
-    /// // ... request completes; ctx.request_bytes_observed now reflects the
+    /// // ... request completes; ctx.bytes_sent_observed now reflects the
     /// // total bytes polled out of the client body.
     /// ```
     ///
@@ -719,7 +719,7 @@ impl http_body::Body for SizeLimitedIncoming {
 ///
 /// Used on streaming request paths where no size cap applies (or where the
 /// cap is enforced elsewhere) but the summary builder still needs to observe
-/// the total request body size via `TransactionSummary.request_bytes`.
+/// the total request body size via `TransactionSummary.bytes_sent`.
 ///
 /// Share the counter via [`bytes_seen_handle`](Self::bytes_seen_handle) before
 /// moving `self` into a downstream body consumer (e.g., reqwest's request
@@ -740,7 +740,7 @@ impl CountingIncoming {
     /// should use [`new_with_counter`](Self::new_with_counter) instead.
     ///
     /// Retained as public API; internal callers use `new_with_counter` so
-    /// they can plumb `ctx.request_bytes_observed` directly.
+    /// they can plumb `ctx.bytes_sent_observed` directly.
     #[allow(dead_code)]
     pub fn new(incoming: Incoming) -> Self {
         Self::new_with_counter(incoming, Arc::new(std::sync::atomic::AtomicU64::new(0)))
@@ -751,7 +751,7 @@ impl CountingIncoming {
     /// ```ignore
     /// let counting = CountingIncoming::new_with_counter(
     ///     incoming,
-    ///     Arc::clone(&ctx.request_bytes_observed),
+    ///     Arc::clone(&ctx.bytes_sent_observed),
     /// );
     /// req_builder.body(counting.into_reqwest_body());
     /// ```

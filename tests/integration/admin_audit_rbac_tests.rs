@@ -69,7 +69,7 @@ async fn make_store(dir: &TempDir) -> DatabaseStore {
         .expect("connect sqlite store")
 }
 
-fn admin_state(db: DatabaseStore) -> AdminState {
+fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> AdminState {
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: jwt_manager(),
@@ -77,6 +77,7 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        admin_audit_enabled,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
@@ -92,6 +93,10 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
+}
+
+fn admin_state(db: DatabaseStore) -> AdminState {
+    admin_state_with_audit(db, true)
 }
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -198,6 +203,58 @@ async fn viewer_role_is_rejected_on_admin_mutation() {
 }
 
 #[tokio::test]
+async fn token_without_role_claim_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let no_role = token("legacy-token", None);
+    let (status, body) = get_json(&base, "/upstreams", &no_role).await;
+
+    assert_eq!(status, 401, "missing-role token body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Missing admin role claim"),
+        "unexpected missing-role error body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_admin_cannot_read_backup_unredacted_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) = get_json(&base, "/backup", &viewer).await;
+    assert_eq!(status, 403, "viewer backup body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+
+    let operator = token("op-user", Some("operator"));
+    let (status, body) = get_json(&base, "/backup", &operator).await;
+    assert_eq!(status, 403, "operator backup body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+
+    let admin = token("security-admin", Some("admin"));
+    let (status, _body) = get_json(&base, "/backup", &admin).await;
+    assert_eq!(status, 200, "admin backup must succeed");
+}
+
+#[tokio::test]
 async fn viewer_restore_is_rejected_before_large_body_buffering() {
     let tmp = TempDir::new().unwrap();
     let mut state = admin_state(make_store(&tmp).await);
@@ -254,6 +311,28 @@ async fn upstream_mutation_writes_queryable_audit_event() {
 }
 
 #[tokio::test]
+async fn disabled_admin_audit_skips_mutation_events() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state_with_audit(make_store(&tmp).await, false);
+    let (base, _shutdown) = start_admin(state).await;
+    let operator = token("mesh-operator", Some("operator"));
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = post_json(
+        &base,
+        "/upstreams",
+        &operator,
+        &upstream_payload("audit-disabled-u1"),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, audit_body) = get_json(&base, "/audit?resource_type=upstream", &admin).await;
+    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
+    assert_eq!(audit_body["total"], 0);
+}
+
+#[tokio::test]
 async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
@@ -306,6 +385,220 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     assert!(
         !serialized.contains(nested_api_key),
         "nested API key leaked: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let secret_key = "read-secret-load-test-key";
+    let nested_api_key = "read-nested-api-key-value";
+    let plugin = json!({
+        "id": "read-plugin-secret",
+        "plugin_name": "load_testing",
+        "scope": "global",
+        "config": {
+            "key": secret_key,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "nested": {
+                "api_key": nested_api_key,
+                "label": "safe-label"
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let (status, viewer_body) =
+        get_json(&base, "/plugins/config/read-plugin-secret", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
+    assert_eq!(viewer_body["config"]["nested"]["api_key"], "[REDACTED]");
+    assert!(
+        !viewer_body.to_string().contains(secret_key),
+        "viewer response leaked plugin secret: {viewer_body:?}"
+    );
+    assert!(
+        !viewer_body.to_string().contains(nested_api_key),
+        "viewer response leaked nested plugin secret: {viewer_body:?}"
+    );
+
+    let (status, operator_body) =
+        get_json(&base, "/plugins/config/read-plugin-secret", &operator).await;
+    assert_eq!(status, 200, "operator plugin get failed: {operator_body:?}");
+    assert_eq!(operator_body["config"]["key"], "[REDACTED]");
+
+    let (status, admin_body) = get_json(&base, "/plugins/config/read-plugin-secret", &admin).await;
+    assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
+    assert_eq!(admin_body["config"]["key"], secret_key);
+    assert_eq!(admin_body["config"]["nested"]["api_key"], nested_api_key);
+
+    let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
+    assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+}
+
+#[tokio::test]
+async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consumer = json!({
+        "id": "audit-keyauth-consumer",
+        "username": "audit-keyauth-user",
+        "credentials": {}
+    });
+    let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
+    assert_eq!(status, 201, "consumer create failed: {body:?}");
+
+    let plaintext_key = "super-secret-keyauth-api-key-do-not-leak";
+    let cred = json!([{ "key": plaintext_key }]);
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base}/consumers/audit-keyauth-consumer/credentials/keyauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&cred)
+        .send()
+        .await
+        .expect("PUT credentials");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "PUT keyauth failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer_credentials&resource_id=audit-keyauth-consumer",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["credentials"]["keyauth"][0]["key"], "[REDACTED]",
+        "keyauth key not redacted in audit diff: {event:?}"
+    );
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(plaintext_key),
+        "plaintext keyauth key leaked into audit diff: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_consul_token_redacted_in_audit_diff() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consul_token = "super-secret-consul-acl-token-do-not-leak";
+    let upstream = json!({
+        "id": "audit-consul-upstream",
+        "name": "upstream-consul",
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin",
+        "service_discovery": {
+            "provider": "consul",
+            "consul": {
+                "address": "http://consul.local:8500",
+                "service_name": "my-service",
+                "token": consul_token
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/upstreams", &admin, &upstream).await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=upstream&resource_id=audit-consul-upstream",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["service_discovery"]["consul"]["token"], "[REDACTED]",
+        "consul ACL token not redacted in audit diff: {event:?}"
+    );
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(consul_token),
+        "plaintext consul token leaked into audit diff: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_admin_upstream_reads_redact_consul_token() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let consul_token = "read-secret-consul-acl-token";
+    let upstream = json!({
+        "id": "read-consul-upstream",
+        "name": "read-upstream-consul",
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin",
+        "service_discovery": {
+            "provider": "consul",
+            "consul": {
+                "address": "http://consul.local:8500",
+                "service_name": "my-service",
+                "token": consul_token
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/upstreams", &admin, &upstream).await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, viewer_body) = get_json(&base, "/upstreams/read-consul-upstream", &viewer).await;
+    assert_eq!(status, 200, "viewer upstream get failed: {viewer_body:?}");
+    assert_eq!(
+        viewer_body["service_discovery"]["consul"]["token"],
+        "[REDACTED]"
+    );
+    assert!(
+        !viewer_body.to_string().contains(consul_token),
+        "viewer response leaked consul token: {viewer_body:?}"
+    );
+
+    let (status, operator_body) =
+        get_json(&base, "/upstreams/read-consul-upstream", &operator).await;
+    assert_eq!(
+        status, 200,
+        "operator upstream get failed: {operator_body:?}"
+    );
+    assert_eq!(
+        operator_body["service_discovery"]["consul"]["token"],
+        "[REDACTED]"
+    );
+
+    let (status, admin_body) = get_json(&base, "/upstreams/read-consul-upstream", &admin).await;
+    assert_eq!(status, 200, "admin upstream get failed: {admin_body:?}");
+    assert_eq!(
+        admin_body["service_discovery"]["consul"]["token"],
+        consul_token
     );
 }
 

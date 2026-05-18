@@ -565,6 +565,15 @@ pub struct EnvConfig {
     /// Default empty: strict same-trust-domain match. Each entry must parse
     /// as a valid `TrustDomain` (lowercase host-form, no path).
     pub mesh_trust_domain_aliases: Vec<String>,
+    /// Identity-asserting infrastructure SVIDs trusted to rewrite the authz
+    /// principal via HBONE baggage `source.principal`. Each entry is either a
+    /// bare Kubernetes service-account name (Istio convention,
+    /// `ns/<ns>/sa/<sa>`) or a full SPIFFE id pinning a specific assertor
+    /// identity. Default empty: mesh_authz uses its built-in defaults of
+    /// `["ztunnel", "waypoint"]`. Operators with custom waypoint SA names
+    /// (Gateway-managed waypoints often use `<gateway-name>` or
+    /// `<gateway-name>-istio`) must set this to include their names.
+    pub mesh_trusted_hbone_assertors: Vec<String>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -816,6 +825,8 @@ pub struct EnvConfig {
     pub tls_no_verify: bool,
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
+    /// Enable database-backed Admin API mutation audit events. Default: false.
+    pub admin_audit_enabled: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -1401,6 +1412,7 @@ impl Default for EnvConfig {
             mesh_cert_ttl_seconds: 3600,
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
+            mesh_trusted_hbone_assertors: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -1474,6 +1486,7 @@ impl Default for EnvConfig {
             admin_tls_client_ca_bundle_path: None,
             tls_no_verify: false,
             admin_read_only: false,
+            admin_audit_enabled: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             dtls_cert_path: None,
@@ -1636,6 +1649,7 @@ impl EnvConfig {
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
+            admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
         }
 
         env_config! {
@@ -1710,6 +1724,7 @@ impl EnvConfig {
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
+            mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -2091,6 +2106,7 @@ impl EnvConfig {
             mesh_cert_ttl_seconds,
             mesh_config_protocol,
             mesh_trust_domain_aliases,
+            mesh_trusted_hbone_assertors,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -2164,6 +2180,7 @@ impl EnvConfig {
             admin_tls_client_ca_bundle_path,
             tls_no_verify,
             admin_read_only,
+            admin_audit_enabled,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,

@@ -73,15 +73,18 @@ pub struct AdminClaims {
 }
 
 impl AdminClaims {
-    /// Effective admin role. Tokens without a `role` claim are treated as
-    /// `admin` during the build-out phase so existing externally minted admin
-    /// tokens remain usable until operators rotate them.
+    /// Effective admin role. The `role` claim is required so tokens fail closed
+    /// when RBAC intent is absent.
     pub fn admin_role(&self) -> Result<AdminRole, String> {
         let Some(obj) = self.additional.as_object() else {
-            return Ok(AdminRole::Admin);
+            return Err(
+                "Missing admin role claim; expected viewer, operator, or admin".to_string(),
+            );
         };
         match obj.get("role") {
-            None => Ok(AdminRole::Admin),
+            None => {
+                Err("Missing admin role claim; expected viewer, operator, or admin".to_string())
+            }
             Some(serde_json::Value::String(role)) => AdminRole::parse(role),
             Some(_) => Err(
                 "Invalid admin role claim type; expected viewer, operator, or admin string"

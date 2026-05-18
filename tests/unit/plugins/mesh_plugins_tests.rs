@@ -253,6 +253,301 @@ async fn mesh_authz_reads_materialized_hbone_baggage_source_identity() {
 }
 
 #[tokio::test]
+async fn mesh_authz_ignores_hbone_baggage_from_untrusted_assertor() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/other"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+    ctx.materialize_headers();
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // The peer (sa/client) is not a trusted assertor — the baggage's claim of
+    // sa/other must be dropped and surfaced through transaction-log metadata
+    // so operators can detect impersonation attempts.
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("untrusted_assertor")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.untrusted_assertor")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_default_trusts_waypoint_service_account() {
+    // The default trusted_hbone_assertors list includes both ztunnel and
+    // waypoint — a waypoint peer asserting baggage on behalf of a workload
+    // must be honored, with no ignored-baggage diagnostic.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
+    // Operators with Gateway-managed waypoints (SA names like
+    // "default-waypoint") configure the allow-list to cover their custom
+    // names. The configured SA must be treated as a trusted assertor.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": ["default-waypoint"],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/default-waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn mesh_authz_trusted_hbone_assertors_accepts_exact_spiffe_id() {
+    // Operators pinning a specific assertor identity supply the full SPIFFE
+    // id. Matching is exact — bare SA-name semantics do not apply.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [
+            "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn mesh_authz_trusted_hbone_assertors_exact_spiffe_id_rejects_other_trust_domains() {
+    // Pinned-by-SPIFFE-id mode must NOT honor an `sa/ztunnel` peer from a
+    // different trust domain. Baggage is dropped, peer identity is used, and
+    // the policy (which only allows `sa/client`) denies the resulting
+    // request. We verify the diagnostic chain end-to-end.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [
+            "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://partner.local/ns/istio-system/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    // Baggage drop + peer-cert fallback + policy mismatch = Reject.
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.untrusted_assertor")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_trusted_assertor_honors_trust_domain_alias() {
+    // A trusted assertor in an aliased trust domain may still assert a
+    // baggage identity from the local trust domain. The trust_domain_aliases
+    // check remains in force alongside the trusted-assertor gate.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trust_domain_aliases": ["cluster.local"],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://partner.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn mesh_authz_empty_trusted_hbone_assertors_drops_all_baggage() {
+    // An operator-set empty list locks down baggage rewriting entirely — even
+    // ztunnel peers see their baggage dropped, fall back to peer-cert
+    // identity, and are subject to the implicit-deny floor when the policy
+    // doesn't cover the peer SPIFFE id.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    // The baggage's `sa/client` would have been allowed if honored, so a
+    // Reject proves the baggage was dropped.
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.untrusted_assertor")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_untrusted_assertor_without_baggage_is_silent() {
+    // An untrusted-but-authenticated HBONE peer that does NOT send a baggage
+    // source identity should not trip the diagnostic — there is nothing
+    // observable to report. The peer cert identity authorises normally.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+    assert!(
+        !ctx.metadata
+            .contains_key("mesh_authz.ignored_baggage.untrusted_assertor")
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_trusted_hbone_assertors_non_string_entries() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [42],
+    })) {
+        Ok(_) => panic!("plugin config should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("trusted_hbone_assertors"),
+        "error should mention the field: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_trusted_hbone_assertors_invalid_uri_scheme() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": ["https://cluster.local/ns/x/sa/y"],
+    })) {
+        Ok(_) => panic!("plugin config should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("trusted_hbone_assertors"),
+        "error should mention the field: {err}"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)]

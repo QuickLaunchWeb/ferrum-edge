@@ -17,7 +17,7 @@ fn make_full_summary() -> TransactionSummary {
         request_path: "/v1/users".to_string(),
         proxy_id: Some("proxy-users".to_string()),
         proxy_name: Some("Users API".to_string()),
-        backend_target_url: Some("http://users-svc:3000/v1/users".to_string()),
+        backend_target: Some("http://users-svc:3000/v1/users".to_string()),
         backend_resolved_ip: Some("10.244.1.42".to_string()),
         response_status_code: 201,
         latency_total_ms: 45.5,
@@ -33,8 +33,8 @@ fn make_full_summary() -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        request_bytes: 0,
-        response_bytes: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
         mirror: false,
         metadata: HashMap::new(),
     }
@@ -72,7 +72,7 @@ fn test_summary_json_contains_backend_fields() {
     let summary = make_full_summary();
     let json = serde_json::to_string(&summary).unwrap();
 
-    assert!(json.contains(r#""backend_target_url":"http://users-svc:3000/v1/users""#));
+    assert!(json.contains(r#""backend_target":"http://users-svc:3000/v1/users""#));
     assert!(json.contains(r#""backend_resolved_ip":"10.244.1.42""#));
 }
 
@@ -85,10 +85,7 @@ fn test_summary_deserialization_roundtrip() {
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["backend_resolved_ip"], "10.244.1.42");
-    assert_eq!(
-        parsed["backend_target_url"],
-        "http://users-svc:3000/v1/users"
-    );
+    assert_eq!(parsed["backend_target"], "http://users-svc:3000/v1/users");
     assert_eq!(parsed["http_method"], "POST");
     assert_eq!(parsed["request_path"], "/v1/users");
     assert_eq!(parsed["proxy_id"], "proxy-users");

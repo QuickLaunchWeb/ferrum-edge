@@ -602,6 +602,15 @@ fn set_dispatch_reject_unmatched(plugin: &mut PluginConfig, reject_unmatched: bo
     }
 }
 
+/// Overlay the new proxy's "default route" fields onto an existing proxy that
+/// is being preserved across a same-path collapse. The fields listed here are
+/// the only ones the route-translation layer can supply — listener identity
+/// (id, namespace, hosts, listen_path, listen_port, protocol family),
+/// plugin-set state (resolved_tls, dispatch_kind), and frontend / pool /
+/// admission policy come from elsewhere and must NOT be overwritten by a
+/// dispatch-rule collapse. If a future field becomes route-derivable, it must
+/// be added here AND a regression test added; otherwise traffic for the
+/// collapsed default route silently retains stale per-proxy policy.
 fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
     existing.backend_host.clone_from(&proxy.backend_host);
     existing.backend_port = proxy.backend_port;
@@ -876,7 +885,10 @@ fn http_route_resources(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<HttpRouteResources, K8sTranslateError> {
-    let hostnames = string_array(&object.spec, "hostnames");
+    let hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| hostname.to_ascii_lowercase())
+        .collect();
     let conflict_hostnames = route_hostnames(object);
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
@@ -1130,7 +1142,7 @@ fn descriptor_conflicts_for_host(
     descriptor: &RouteMatchDescriptor,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
-    parent_refs.iter().all(|parent_ref| {
+    parent_refs.iter().any(|parent_ref| {
         losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
             route_family: route_family.to_string(),
             parent_ref: parent_ref.clone(),
@@ -1820,6 +1832,30 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_http_route_drops_match_when_any_parent_ref_loses() {
+        let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
+
+        let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}, {"name": "edge-b"}]);
+
+        let result =
+            translate_k8s_objects(&[loser, winner], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-old"),
+            "route losing on one parentRef must not materialize an unscoped proxy"
+        );
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("api-new")
+                && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
+                && warning.contains("winner is default/api-old")
+        }));
+    }
+
+    #[test]
     fn http_route_conflicts_preserve_match_predicates_per_path() {
         let mut get_route = object(
             "HTTPRoute",
@@ -2113,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_keeps_match_with_surviving_parent_ref() {
+    fn conflicting_http_route_drops_match_with_surviving_parent_ref() {
         let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
         let mut mixed_parent_route = object(
             "HTTPRoute",
@@ -2132,13 +2168,14 @@ mod tests {
         let result = translate_k8s_objects(&[older, mixed_parent_route], options())
             .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 2);
+        assert_eq!(result.config.proxies.len(), 1);
         assert!(result.config.proxies.iter().any(|proxy| {
             proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
         }));
-        assert!(result.config.proxies.iter().any(|proxy| {
+        assert!(!result.config.proxies.iter().any(|proxy| {
             proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
         }));
+        assert!(result.config.validate_unique_listen_paths().is_ok());
     }
 
     #[test]

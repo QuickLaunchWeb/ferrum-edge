@@ -7,8 +7,8 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys,
-    gateway_api_route_conflicts, resource_id, translate_k8s_objects_with_filter,
+    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys, resource_id,
+    translate_k8s_objects_with_filter,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -1002,7 +1002,9 @@ fn gateway_class_is_managed_by_ferrum(object: &K8sObject) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions};
+    use crate::config_sources::k8s::{
+        K8sMetadata, K8sTranslationOptions, gateway_api_route_conflicts,
+    };
     use crate::identity::spiffe::TrustDomain;
 
     fn options() -> K8sTranslationOptions {

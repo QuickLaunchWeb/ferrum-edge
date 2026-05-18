@@ -89,7 +89,7 @@ pub enum DerivedKind {
     /// `"2xx"`/`"3xx"`/`"4xx"`/`"5xx"`/`"other"` from `response_status_code`.
     /// On stream summaries (no HTTP status), emits `"none"`.
     StatusClass,
-    /// Hostname extracted from `backend_target_url` (HTTP) or
+    /// Hostname extracted from `backend_target` (HTTP) or
     /// `backend_target` (stream).
     BackendHost,
     /// `"http"` or `"stream"` — useful for unified pipelines.
@@ -956,9 +956,9 @@ mod tests {
     fn http_schema_rejects_stream_only_field() {
         let e = err(json!({
             "summary_type": "http",
-            "omit": ["bytes_sent"]
+            "omit": ["protocol"]
         }));
-        assert!(e.contains("unknown field 'bytes_sent'"), "got: {e}");
+        assert!(e.contains("unknown field 'protocol'"), "got: {e}");
     }
 
     #[test]

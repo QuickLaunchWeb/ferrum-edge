@@ -975,12 +975,14 @@ fn test_env_config_tls_flags() {
             ("FERRUM_TLS_NO_VERIFY", "true"),
             ("FERRUM_ADMIN_TLS_NO_VERIFY", "true"),
             ("FERRUM_ADMIN_READ_ONLY", "true"),
+            ("FERRUM_ADMIN_AUDIT_ENABLED", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.tls_no_verify);
             assert!(config.admin_tls_no_verify);
             assert!(config.admin_read_only);
+            assert!(config.admin_audit_enabled);
         },
     );
 }
@@ -996,11 +998,13 @@ fn test_env_config_tls_flags_default_false() {
             remove_var("FERRUM_TLS_NO_VERIFY");
             remove_var("FERRUM_ADMIN_TLS_NO_VERIFY");
             remove_var("FERRUM_ADMIN_READ_ONLY");
+            remove_var("FERRUM_ADMIN_AUDIT_ENABLED");
 
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.tls_no_verify);
             assert!(!config.admin_tls_no_verify);
             assert!(!config.admin_read_only);
+            assert!(!config.admin_audit_enabled);
         },
     );
 }

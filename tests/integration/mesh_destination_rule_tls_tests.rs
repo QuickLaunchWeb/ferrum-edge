@@ -82,6 +82,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         xds_primary_retry_secs: 300,
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
+        trusted_hbone_assertors: Vec::new(),
         workload_labels: Default::default(),
         dns_enabled: false,
         dns_listen_addr: test_addr("127.0.0.1:15053"),

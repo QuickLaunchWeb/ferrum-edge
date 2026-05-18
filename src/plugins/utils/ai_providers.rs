@@ -80,6 +80,21 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::Anthropic);
     }
 
+    // Cohere v2 (`/v2/chat`, the format `ai_federation` uses by default)
+    // reports `{"usage": {"tokens": {"input_tokens": ..., "output_tokens": ...}}}`.
+    // Cohere v1 (`/v1/generate`) reported it under `meta.tokens.*`. Accept
+    // both — place this above the OpenAI / Bedrock branches so any future
+    // broadening of those checks (which also key off `usage.*`) can't
+    // accidentally claim a v2 response. Canonical shapes are disjoint today.
+    if json
+        .get("usage")
+        .and_then(|usage| usage.get("tokens"))
+        .and_then(|tokens| tokens.get("input_tokens"))
+        .is_some()
+    {
+        return Some(AiProvider::Cohere);
+    }
+
     if json
         .get("meta")
         .and_then(|meta| meta.get("tokens"))
@@ -109,13 +124,29 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
 
 pub fn detect_sse_provider(json: &Value) -> Option<AiProvider> {
     // Check streaming-specific provider shapes before the buffered-response
-    // fallback below; Anthropic's `message_*` events are the most load-bearing.
+    // fallback below. Anthropic uses underscore-separated event types
+    // (`message_start` / `message_delta` / `message_stop` /
+    // `content_block_start` / `content_block_delta` / `content_block_stop` /
+    // `ping`); Cohere v2 uses hyphen-separated types (`message-start` /
+    // `message-end` / `content-start` / `content-delta` / `content-end`).
+    // Match on the exact separator so v2 streams don't get mis-classified as
+    // Anthropic (the previous `starts_with("message")` swallowed both).
     if json
         .get("type")
         .and_then(|value| value.as_str())
-        .is_some_and(|t| t.starts_with("message") || t.starts_with("content_block") || t == "ping")
+        .is_some_and(|t| {
+            t.starts_with("message_") || t.starts_with("content_block_") || t == "ping"
+        })
     {
         return Some(AiProvider::Anthropic);
+    }
+
+    if json
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|t| t.starts_with("message-") || t.starts_with("content-"))
+    {
+        return Some(AiProvider::Cohere);
     }
 
     if json
@@ -378,7 +409,20 @@ fn extract_google_usage(json: &Value) -> AiTokenUsage {
 }
 
 fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
-    let tokens = json.get("meta").and_then(|value| value.get("tokens"));
+    // Cohere v2 buffered (`/v2/chat`) returns counts at `usage.tokens.*`.
+    // Cohere v2 streaming nests them under the `message-end` event's
+    // `delta.usage.tokens.*`. Cohere v1 (`/v1/generate`) returned them at
+    // `meta.tokens.*`. Try buffered v2 first, then streaming v2, then v1 so
+    // legacy deployments continue to report usage.
+    let tokens = json
+        .get("usage")
+        .and_then(|value| value.get("tokens"))
+        .or_else(|| {
+            json.get("delta")
+                .and_then(|delta| delta.get("usage"))
+                .and_then(|usage| usage.get("tokens"))
+        })
+        .or_else(|| json.get("meta").and_then(|value| value.get("tokens")));
     let prompt = tokens
         .and_then(|value| value.get("input_tokens"))
         .and_then(|value| value.as_u64());
@@ -427,8 +471,8 @@ fn sum_pair(prompt: Option<u64>, completion: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiProvider, detect_response_provider, extract_response_texts, extract_response_usage,
-        for_each_response_text_mut,
+        AiProvider, detect_response_provider, detect_sse_provider, extract_response_texts,
+        extract_response_usage, for_each_response_text_mut,
     };
     use serde_json::json;
 
@@ -442,8 +486,16 @@ mod tests {
             detect_response_provider(&json!({"usage": {"input_tokens": 1}})),
             Some(AiProvider::Anthropic)
         );
+        // Cohere v1 (`/v1/generate`)
         assert_eq!(
             detect_response_provider(&json!({"meta": {"tokens": {"input_tokens": 1}}})),
+            Some(AiProvider::Cohere)
+        );
+        // Cohere v2 (`/v2/chat` — what `ai_federation` uses by default)
+        assert_eq!(
+            detect_response_provider(
+                &json!({"usage": {"tokens": {"input_tokens": 1, "output_tokens": 2}}})
+            ),
             Some(AiProvider::Cohere)
         );
         assert_eq!(
@@ -454,6 +506,136 @@ mod tests {
             detect_response_provider(&json!({"usage": {"prompt_tokens": 1}})),
             Some(AiProvider::OpenAi)
         );
+    }
+
+    #[test]
+    fn extracts_cohere_v2_usage_from_usage_tokens_path() {
+        // Canonical Cohere v2 `/v2/chat` body — model identity is returned via
+        // HTTP response headers, not the body, so `model` is absent here.
+        let usage = extract_response_usage(
+            &json!({
+                "id": "abc-123",
+                "finish_reason": "COMPLETE",
+                "usage": {
+                    "tokens": {
+                        "input_tokens": 17,
+                        "output_tokens": 9
+                    }
+                }
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.prompt_tokens, Some(17));
+        assert_eq!(usage.completion_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(26));
+        assert!(usage.model.is_none());
+    }
+
+    #[test]
+    fn extracts_cohere_v2_model_when_body_includes_it() {
+        // Some OpenAI-compatible wrappers in front of Cohere v2 echo `model`
+        // into the body. The extractor is intentionally tolerant — if the
+        // field is present, surface it.
+        let usage = extract_response_usage(
+            &json!({
+                "usage": {
+                    "tokens": {
+                        "input_tokens": 17,
+                        "output_tokens": 9
+                    }
+                },
+                "model": "command-r-plus"
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.model.as_deref(), Some("command-r-plus"));
+    }
+
+    #[test]
+    fn extracts_cohere_v2_streaming_usage_from_message_end() {
+        // Cohere v2 streaming `message-end` event nests counts under
+        // `delta.usage.tokens.*` instead of root `usage`.
+        let usage = extract_response_usage(
+            &json!({
+                "type": "message-end",
+                "delta": {
+                    "finish_reason": "COMPLETE",
+                    "usage": {
+                        "tokens": {
+                            "input_tokens": 23,
+                            "output_tokens": 41
+                        }
+                    }
+                }
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.prompt_tokens, Some(23));
+        assert_eq!(usage.completion_tokens, Some(41));
+        assert_eq!(usage.total_tokens, Some(64));
+        assert!(usage.model.is_none());
+    }
+
+    #[test]
+    fn sse_detection_distinguishes_anthropic_underscores_from_cohere_v2_hyphens() {
+        // Anthropic SSE event types use underscore separators.
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "message_start"})),
+            Some(AiProvider::Anthropic)
+        );
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "message_delta"})),
+            Some(AiProvider::Anthropic)
+        );
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "content_block_delta"})),
+            Some(AiProvider::Anthropic)
+        );
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "ping"})),
+            Some(AiProvider::Anthropic)
+        );
+
+        // Cohere v2 SSE event types use hyphen separators. Regression guard
+        // for the previous `starts_with("message")` check that swallowed
+        // `message-start` / `message-end` as Anthropic.
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "message-start"})),
+            Some(AiProvider::Cohere)
+        );
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "message-end"})),
+            Some(AiProvider::Cohere)
+        );
+        assert_eq!(
+            detect_sse_provider(&json!({"type": "content-delta"})),
+            Some(AiProvider::Cohere)
+        );
+    }
+
+    #[test]
+    fn extracts_cohere_v1_usage_from_meta_tokens_path() {
+        // Backwards compatibility: legacy `/v1/generate` callers.
+        let usage = extract_response_usage(
+            &json!({
+                "meta": {
+                    "tokens": {
+                        "input_tokens": 3,
+                        "output_tokens": 4
+                    }
+                },
+                "model": "command-light"
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.prompt_tokens, Some(3));
+        assert_eq!(usage.completion_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(7));
+        assert_eq!(usage.model.as_deref(), Some("command-light"));
     }
 
     #[test]

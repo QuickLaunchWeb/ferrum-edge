@@ -314,6 +314,58 @@ impl AiPromptShield {
             .collect()
     }
 
+    /// Parse the body as JSON, apply mode-appropriate redaction, and return
+    /// the mutated `Value`. Returns `None` when the body isn't valid JSON,
+    /// is over `max_scan_bytes`, or contains no PII to redact (so callers
+    /// don't waste serialization on a no-op).
+    ///
+    /// Shared between `before_proxy` (which uses this to update
+    /// `ctx.metadata["request_body"]` so downstream `before_proxy` plugins
+    /// see redacted text) and `transform_request_body` (which uses the
+    /// returned `Value` to rewrite the wire body on the backend dispatch
+    /// path). Keeping the two paths in lockstep guarantees both see the
+    /// same redacted bytes regardless of which path actually runs.
+    fn apply_redaction_in_place(&self, body: &str) -> Option<Value> {
+        if body.len() > self.max_scan_bytes {
+            return None;
+        }
+        let mut json: Value = serde_json::from_str(body).ok()?;
+
+        if self.scan_mode == ScanMode::All {
+            // Single DFA pass to short-circuit when no pattern matches.
+            if !self.detection_set.is_match(body) {
+                return None;
+            }
+            // Run structured redaction first on known prompt-content
+            // fields (messages[].content) so recognized chat-completion
+            // shapes are handled with the correct template. Then run the
+            // recursive walker to cover any PII in sibling fields
+            // (metadata, tool arguments, custom top-level strings) that
+            // the structured redactor doesn't touch. The recursive walker
+            // honors STRUCTURAL_KEYS so model names, IDs, and system
+            // parameters remain untouched. Running structured first is
+            // safe because its [REDACTED:...] placeholders do not match
+            // any PII regex on the subsequent recursive pass.
+            let has_known_messages = json
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+            if has_known_messages {
+                self.redact_body(&mut json);
+            }
+            redact_json_strings(&mut json, &self.patterns);
+            return Some(json);
+        }
+
+        // Content mode: only redact within messages
+        let texts = self.extract_scan_text(&json);
+        if self.detect_pii(&texts).is_empty() {
+            return None;
+        }
+        self.redact_body(&mut json);
+        Some(json)
+    }
+
     /// Apply redaction to message content fields in the JSON body.
     fn redact_body(&self, json: &mut Value) {
         if let Some(messages) = json.get_mut("messages").and_then(|v| v.as_array_mut()) {
@@ -494,10 +546,50 @@ impl Plugin for AiPromptShield {
                 PluginResult::Continue
             }
             ShieldAction::Redact => {
-                // Detection done — actual redaction happens in transform_request_body.
-                // Store detected types for observability.
+                // Materialize the redacted body NOW (not just in
+                // `transform_request_body`) so we can overwrite
+                // `ctx.metadata["request_body"]`. Downstream `before_proxy`
+                // plugins read the buffered body from that metadata key
+                // and act on its contents — most importantly,
+                // `ai_federation` (priority 2985) consumes the body as-is
+                // to dispatch a direct provider request and then returns
+                // `RejectBinary`. `RejectBinary` short-circuits the
+                // backend dispatch path entirely, so
+                // `transform_request_body` never runs and the un-redacted
+                // bytes would otherwise be forwarded to the AI provider.
+                // Updating the metadata here ensures every downstream
+                // consumer — whether they reach the backend dispatch path
+                // or terminate the request from another `before_proxy`
+                // plugin — sees the redacted form.
+                //
+                // Re-fetch the body as an owned `String` rather than
+                // reusing the earlier `&str` borrow on `ctx.metadata`:
+                // the borrow checker can't see that the existing borrow
+                // ends before the upcoming mutations, and cloning the
+                // body once on this path is cheap relative to the JSON
+                // parse + regex walk we're about to do.
+                //
+                // `transform_request_body` still runs on the normal
+                // backend dispatch path and re-applies the same redaction
+                // to the wire body. The double walk is cheap because
+                // `[REDACTED:...]` placeholders don't match any PII
+                // pattern, so the second pass is a no-op on already
+                // redacted strings.
+                let original_body = ctx
+                    .metadata
+                    .get("request_body")
+                    .cloned()
+                    .unwrap_or_default();
+                let redacted_body = self
+                    .apply_redaction_in_place(&original_body)
+                    .and_then(|json| serde_json::to_string(&json).ok());
+
                 ctx.metadata
                     .insert("ai_shield_redacted".to_string(), detected.join(","));
+                if let Some(serialized) = redacted_body {
+                    ctx.metadata.insert("request_body".to_string(), serialized);
+                }
+
                 PluginResult::Continue
             }
         }
@@ -524,43 +616,8 @@ impl Plugin for AiPromptShield {
             return None;
         }
 
-        let mut json: Value = serde_json::from_slice(body).ok()?;
-
-        if self.scan_mode == ScanMode::All {
-            // Single DFA pass to short-circuit when no pattern matches.
-            let body_str = std::str::from_utf8(body).ok()?;
-            if !self.detection_set.is_match(body_str) {
-                return None;
-            }
-            // Run structured redaction first on known prompt-content
-            // fields (messages[].content) so recognized chat-completion
-            // shapes are handled with the correct template. Then run the
-            // recursive walker to cover any PII in sibling fields
-            // (metadata, tool arguments, custom top-level strings) that
-            // the structured redactor doesn't touch. The recursive walker
-            // honors STRUCTURAL_KEYS so model names, IDs, and system
-            // parameters remain untouched. Running structured first is
-            // safe because its [REDACTED:...] placeholders do not match
-            // any PII regex on the subsequent recursive pass.
-            let has_known_messages = json
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .is_some_and(|arr| !arr.is_empty());
-            if has_known_messages {
-                self.redact_body(&mut json);
-            }
-            redact_json_strings(&mut json, &self.patterns);
-            return serde_json::to_vec(&json).ok();
-        }
-
-        // Content mode: only redact within messages
-        let texts = self.extract_scan_text(&json);
-        let has_pii = !self.detect_pii(&texts).is_empty();
-        if !has_pii {
-            return None;
-        }
-
-        self.redact_body(&mut json);
+        let body_str = std::str::from_utf8(body).ok()?;
+        let json = self.apply_redaction_in_place(body_str)?;
         serde_json::to_vec(&json).ok()
     }
 }

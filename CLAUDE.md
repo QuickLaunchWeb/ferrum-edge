@@ -48,12 +48,22 @@ cargo fmt --all && cargo fmt --all -- --check
 
 **Prerequisite**: `protoc`. `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
+### Cargo target-dir isolation across parallel checkouts
+
+If two git worktrees or clones of this repo share a single `CARGO_TARGET_DIR`, concurrent `cargo build`/`test`/`clippy` invocations across them stall on the shared target-dir lock — symptom is `Blocking waiting for file lock on build directory`, or a cargo invocation that hangs with no output. With no `CARGO_TARGET_DIR` override, Cargo's default puts artifacts in `<worktree>/target/` and each checkout gets its own isolated target dir for free. **Fix at the shell-profile level: leave `CARGO_TARGET_DIR` unset.** Env vars beat `.cargo/config.toml`, and the tracked config can't carry a per-worktree absolute path, so this is the only place to fix it.
+
+`SCCACHE_DIR` (if set) is safe to share — sccache is concurrency-safe and amortizes dependency builds across worktrees. The repo's `.cargo/config.toml` wires `rustc-wrapper = "sccache"` already, so a shared sccache dir gives you compile reuse without the target-dir contention.
+
+Within a single workspace, still run `fmt` → `clippy` → `test` sequentially (not via `&` / parallel shells) — they share *that* workspace's target dir and will lock each other.
+
+If a shell inherited a stale `CARGO_TARGET_DIR`, `env | grep CARGO_TARGET_DIR` confirms it; `unset CARGO_TARGET_DIR` in the same invocation as the `cargo` command works around it for that one call (agent shells are typically fresh per command, so the `unset` and `cargo` must share the call).
+
 ### Local testing — targeted, not exhaustive
 
 CI runs the full matrix on every PR (format, clippy, all test crates, perf regression, 5 build targets). Locally, test only what you changed and let CI catch the rest — don't run the whole suite after every iteration.
 
 **Before pushing, choose by change type:**
-- Rust changes → `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + the targeted tests below
+- Rust changes → `cargo fmt --all -- --check` + targeted clippy (`cargo clippy --lib --tests -p ferrum-edge -- -D warnings`) + the targeted tests below. Reserve `cargo clippy --all-targets -- -D warnings` for the "full suite" trigger conditions below — `--all-targets` pulls in benches and every test crate, i.e. a near-full build, and is what most often clashes with concurrent agents.
 - Docs/comment-only → `git diff --check` plus any relevant doc formatter/linter if one exists
 - Config/schema/spec/template changes → validate the changed surface (`ferrum-edge validate`, OpenAPI/schema checks, or targeted config/admin tests) and run Rust fmt/clippy only if Rust files changed
 
@@ -164,7 +174,7 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Mesh plugin injection** (`mod.rs::inject_mesh_global_plugins()`): auto-injects reserved-ID global plugins at slice-apply time: `__mesh_spiffe_identity` (940), `__mesh_authz` (2075), `__mesh_workload_metrics`, `__mesh_request_auth` (only when JWT rules present), `__mesh_access_log`. Operator-managed globals of the same type override mesh-injected ones.
 
-**HBONE trust-domain gating** (`hbone.rs`): HTTP/2 CONNECT over mTLS on port 15008. Baggage `source.principal` honored only when its trust domain matches the peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`; mismatches fall back to peer cert identity with audit metadata. Fallback key aliases enumerated in `HboneIdentity::from_headers()`.
+**HBONE trust-domain gating** (`hbone.rs` + `mesh_authz`): HTTP/2 CONNECT over mTLS on port 15008. Baggage `source.principal` is rewritten onto the authz principal only when (a) the authenticated peer is on `mesh_authz`'s `trusted_hbone_assertors` allow-list AND (b) the baggage identity's trust domain matches the peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`. Authenticated peers that are NOT trusted assertors keep their own peer-cert identity even when they carry baggage; the dropped baggage is surfaced as `mesh_authz.ignored_baggage.untrusted_assertor=true` in transaction logs (and contributes `mesh_authz.deny_policy=untrusted_assertor` when policy denies the resulting request). Trust-domain mismatches behave the same way with the existing `trust_domain_mismatch` reason. The trusted-assertor list defaults to the Istio ambient ztunnel/waypoint SAs (`["ztunnel", "waypoint"]`); operators with custom waypoint SA names (Gateway-managed waypoints often use `<gateway-name>` or `<gateway-name>-istio`) override via `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` (comma-separated; each entry is a bare service-account name OR a full `spiffe://...` id for exact-identity pinning). Configuring a `mesh_authz` global plugin with an explicit empty `trusted_hbone_assertors: []` disables baggage rewriting entirely. Fallback baggage key aliases enumerated in `HboneIdentity::from_headers()`.
 
 **PeerAuthentication inbound mTLS**: by default, resolved once at startup from the initial slice. With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only the resolved mTLS mode and frontend client CA verifier may hot-swap on slice apply; frontend cert/key paths remain static restart-required inputs. `Disable` is rejected for Ambient and EgressGateway slice updates and keeps the last good config. See [docs/mesh.md](docs/mesh.md#peerauthentication).
 

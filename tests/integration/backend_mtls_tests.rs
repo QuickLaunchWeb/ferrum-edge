@@ -101,6 +101,7 @@ fn create_test_env_config_with_mtls(
         admin_tls_key_path: None,
         admin_bind_address: "0.0.0.0".into(),
         admin_read_only: false,
+        admin_audit_enabled: false,
         admin_tls_client_ca_bundle_path: None,
         admin_tls_no_verify: false,
         tls_no_verify: false,

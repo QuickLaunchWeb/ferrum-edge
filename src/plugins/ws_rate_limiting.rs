@@ -38,6 +38,18 @@ impl WsRateLimiting {
         let burst_size = optional_positive_u64(config, "burst_size")?
             .map_or(frames_per_second, |value| value as f64);
 
+        // The Redis sliding-window approximation assumes burst >= fps so the
+        // derived window length stays >= 1 second and the average sustained
+        // rate matches frames_per_second. Without this, burst<fps configs
+        // would diverge between local (token bucket refills independently of
+        // capacity) and Redis (window floors to 1s, sustained = burst fps).
+        if burst_size < frames_per_second {
+            return Err(format!(
+                "ws_rate_limiting: 'burst_size' ({}) must be >= 'frames_per_second' ({})",
+                burst_size as u64, frames_per_second as u64
+            ));
+        }
+
         let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Frame rate exceeded")
             .to_string();
@@ -91,7 +103,19 @@ impl WsRateLimiting {
             count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
 
         if over_capacity || periodic {
-            self.limiter.retain_active_at(Instant::now());
+            // `enforce_capacity` first calls `retain_active_at` to drop
+            // inactive entries, then — if the map is still over the cap —
+            // force-evicts remaining keys until it holds. Plain
+            // `retain_active_at` isn't enough under sustained traffic:
+            // every tracked connection's TokenBucket keeps reporting
+            // active, so nothing gets evicted and the map stays pinned at
+            // `MAX_STATE_ENTRIES + 1`. The `over_capacity &&
+            // !contains_local_key` branch in `on_ws_frame` would then
+            // reject every new WebSocket connection indefinitely — a
+            // service-degradation bug. Mirrors `ai_rate_limiter.rs` and
+            // `rate_limiting.rs`.
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
         }
 
         self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES

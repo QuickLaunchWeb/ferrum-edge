@@ -65,6 +65,7 @@ fn make_token(config: &TestConfig) -> String {
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
@@ -93,6 +94,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
