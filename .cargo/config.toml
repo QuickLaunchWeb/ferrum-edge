@@ -19,6 +19,7 @@
 # Install: `cargo install sccache` (local) or `setup-sccache` action (CI).
 [build]
 rustc-wrapper = "sccache"
+incremental = false       # prevent cache corruption on concurrent/agent builds and external APFS volumes
 
 # ── Fast linkers (per-platform) ─────────────────────────────────────────
 # 2-5x faster link times on Linux (mold), modest improvement on macOS (lld).
