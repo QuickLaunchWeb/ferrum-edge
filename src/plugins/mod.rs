@@ -381,6 +381,19 @@ pub struct RequestContext {
     /// no override; `Some(None)` intentionally clears the selected proxy's
     /// retry policy for this route.
     pub route_override_retry: Option<Option<RetryConfig>>,
+    /// Per-rule request header transforms published by `mesh_route_dispatch`
+    /// when a matching rule carries `request_transform` rules (Istio
+    /// `VirtualService.http[].headers.request.{set,add,remove}`). The
+    /// `request_transformer` plugin applies these after its own static
+    /// header rules. Shared via `Arc` so the dispatch hot path clones a
+    /// pointer rather than the rule list.
+    pub route_override_request_transform:
+        Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
+    /// Per-rule response header transforms; counterpart to
+    /// `route_override_request_transform`. Applied by `response_transformer`
+    /// after its own static header rules.
+    pub route_override_response_transform:
+        Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -433,6 +446,8 @@ impl RequestContext {
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
             route_override_retry: None,
+            route_override_request_transform: None,
+            route_override_response_transform: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
         }

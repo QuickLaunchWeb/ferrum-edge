@@ -945,6 +945,32 @@ impl PluginCache {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, &self.http_client) {
                             Ok(Some(plugin)) => {
+                                // Detect when an auto-emitted plugin instance
+                                // (Istio VirtualService translator helpers) is
+                                // about to shadow an operator-configured global
+                                // of the same name. The operator's global will
+                                // not apply to this proxy, which may surprise
+                                // operators who expected the global's static
+                                // rules to also run for VS-translated routes.
+                                // Emit a warn so the silent shadowing is at
+                                // least operator-visible.
+                                if pc.id.starts_with("__istio_vs_") {
+                                    let shadowed = merged.iter().any(|p| {
+                                        p.name() == plugin.name()
+                                            && global_ptrs
+                                                .contains(&(Arc::as_ptr(p) as *const () as usize))
+                                    });
+                                    if shadowed {
+                                        warn!(
+                                            proxy = %proxy.id,
+                                            plugin = plugin.name(),
+                                            auto_emit_id = %pc.id,
+                                            "Istio VirtualService translator auto-emitted a proxy-scoped {} instance to consume route-level header transforms; this shadows the operator-configured global {} on this proxy. Move the global's rules to the VirtualService or pre-create a proxy-scoped instance with the merged ruleset to retain both behaviors.",
+                                            plugin.name(),
+                                            plugin.name(),
+                                        );
+                                    }
+                                }
                                 // Remove only GLOBAL plugins of the same name
                                 merged.retain(|p| {
                                     p.name() != plugin.name()

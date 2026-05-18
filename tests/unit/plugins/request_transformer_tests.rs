@@ -1060,3 +1060,124 @@ async fn test_request_transformer_rejects_missing_target() {
     .expect("expected error for missing target");
     assert!(err.contains("'target' is required"), "got: {err}");
 }
+
+// ── Route-level transform overrides (`apply_route_overrides`) ──────────────
+//
+// `mesh_route_dispatch` publishes per-rule Arcs onto
+// `ctx.route_override_request_transform`. The transformer plugin always
+// consumes them at the end of `before_proxy`. When the proxy has no
+// operator-configured `request_transformer`, the K8s VirtualService
+// translator auto-emits an instance with `apply_route_overrides: true` and
+// no static rules; that instance must still be valid and must declare
+// `modifies_request_headers() == true` so the dispatcher clones headers.
+
+use ferrum_edge::plugins::utils::route_header_transform::{
+    RawRouteHeaderTransformRule, parse_route_header_transforms,
+};
+use std::sync::Arc;
+
+#[tokio::test]
+async fn test_request_transformer_apply_route_overrides_accepts_empty_rules() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .expect("apply_route_overrides=true allows zero static rules");
+    assert!(
+        plugin.modifies_request_headers(),
+        "apply_route_overrides=true must declare modifies_request_headers so the dispatcher clones headers"
+    );
+}
+
+#[tokio::test]
+async fn test_request_transformer_empty_rules_without_opt_in_still_errors() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [],
+    }))
+    .err()
+    .expect("zero rules without apply_route_overrides must error");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_route_override_applies_after_static_rules() {
+    // Static rule sets X-Trace=static; route-level override sets
+    // X-Trace=route. Per the documented precedence (static first, then
+    // per-rule), the route override must win.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "X-Trace", "value": "static"}
+        ]
+    }))
+    .unwrap();
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Trace", "value": "route"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    let mut ctx = make_ctx();
+    ctx.route_override_request_transform = Some(route_rules);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(headers.get("x-trace").map(String::as_str), Some("route"));
+    // Plugin must consume the Arc so a subsequent transformer instance in
+    // the chain does not re-apply the same list.
+    assert!(ctx.route_override_request_transform.is_none());
+}
+
+#[tokio::test]
+async fn test_request_transformer_apply_route_overrides_no_static_rules_applies_overrides() {
+    // The translator's auto-emitted instance: no static rules, only
+    // consumes per-context overrides.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .unwrap();
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Api-Version", "value": "v1"},
+        {"operation": "remove", "target": "header", "key": "X-Debug"},
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    let mut ctx = make_ctx();
+    ctx.route_override_request_transform = Some(route_rules);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("x-debug".to_string(), "yes".to_string());
+
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-api-version").map(String::as_str), Some("v1"));
+    assert!(!headers.contains_key("x-debug"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_route_override_absent_is_no_op() {
+    // Static rules continue to apply when no per-context override is
+    // published — this is the steady-state path on every other request.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "X-Static", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-static").map(String::as_str), Some("1"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_apply_route_overrides_invalid_type_rejected() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": "yes",
+    }))
+    .err()
+    .expect("non-boolean apply_route_overrides must error");
+    assert!(err.contains("must be a boolean"), "got: {err}");
+}

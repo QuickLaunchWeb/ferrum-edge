@@ -15,13 +15,38 @@
 //!   does not dispatch on target strings per request, and so
 //!   [`modifies_request_headers`] returns an accurate answer (which lets the
 //!   handler skip cloning `ctx.headers` for query-only or body-only configs).
+//!
+//! ## Per-rule overrides from `mesh_route_dispatch`
+//!
+//! When `mesh_route_dispatch` matches a rule that carries
+//! `request_transform`, it publishes a pre-compiled `Arc` onto
+//! [`RequestContext::route_override_request_transform`]. This plugin always
+//! consults that field at the end of `before_proxy` — i.e. **static rules
+//! run first, then per-rule overrides**. The ordering is deterministic so
+//! operators can predict the final header state when both surfaces are in
+//! use simultaneously (e.g. a proxy-wide `set X-Trace: gateway` plus a
+//! route-level `set X-Trace: canary`: the route-level write wins because it
+//! runs last).
+//!
+//! ## `apply_route_overrides` opt-in
+//!
+//! Setting `apply_route_overrides: true` on the plugin config lets the
+//! instance carry zero static `rules`. The K8s VirtualService translator
+//! uses this to auto-emit a `request_transformer` on proxies that do not
+//! already have one, so per-rule route-level transforms still find a
+//! consumer. Direct operator configs without static rules and without this
+//! flag continue to be rejected.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
+use super::utils::route_header_transform::{
+    RouteHeaderTransformRule, apply_route_header_transforms,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,6 +90,13 @@ pub struct RequestTransformer {
     header_rules: Vec<HeaderRule>,
     query_rules: Vec<QueryRule>,
     body_rules: Vec<BodyRule>,
+    /// Set by config field `apply_route_overrides`. When `true` the plugin
+    /// instance accepts a zero-rule config and declares
+    /// `modifies_request_headers() == true` so the dispatcher clones request
+    /// headers for it. The K8s VirtualService translator uses this opt-in
+    /// when auto-emitting a `request_transformer` whose sole purpose is to
+    /// apply per-rule `mesh_route_dispatch` route-level transforms.
+    apply_route_overrides: bool,
 }
 
 fn parse_op(op: &str) -> Option<(HeaderOp, QueryOp)> {
@@ -221,7 +253,21 @@ impl RequestTransformer {
         let body_rules = body_transform::parse_body_rules(config)
             .map_err(|e| format!("request_transformer: {e}"))?;
 
-        if header_rules.is_empty() && query_rules.is_empty() && body_rules.is_empty() {
+        let apply_route_overrides = match config.get("apply_route_overrides") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Null) | None => false,
+            Some(_) => {
+                return Err(
+                    "request_transformer: 'apply_route_overrides' must be a boolean".to_string(),
+                );
+            }
+        };
+
+        if header_rules.is_empty()
+            && query_rules.is_empty()
+            && body_rules.is_empty()
+            && !apply_route_overrides
+        {
             return Err(
                 "request_transformer: no 'rules' configured — plugin will have no effect"
                     .to_string(),
@@ -232,6 +278,7 @@ impl RequestTransformer {
             header_rules,
             query_rules,
             body_rules,
+            apply_route_overrides,
         })
     }
 }
@@ -251,7 +298,14 @@ impl Plugin for RequestTransformer {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        !self.header_rules.is_empty()
+        // Per-rule overrides (`apply_route_overrides=true`) can mutate
+        // headers even when this instance has no static `header_rules`, so
+        // the dispatcher must clone request headers for it. Returning
+        // `false` here would let the dispatcher hand `ctx.headers` itself
+        // to plugins via `mem::take`, which both breaks the gateway-wide
+        // "ctx.headers is the original inbound headers" invariant and (on
+        // some paths) silently drops route-level header writes.
+        !self.header_rules.is_empty() || self.apply_route_overrides
     }
 
     fn modifies_request_body(&self) -> bool {
@@ -321,6 +375,16 @@ impl Plugin for RequestTransformer {
                     }
                 }
             }
+        }
+        // Per-rule header transforms published by `mesh_route_dispatch`
+        // run AFTER this plugin's static rules so route-level writes win on
+        // conflict — see the module docstring for the precedence rationale.
+        // Take the Arc out of ctx so a future plugin instance in the chain
+        // does not re-apply the same list.
+        let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
+            ctx.route_override_request_transform.take();
+        if let Some(route_rules) = route_rules {
+            apply_route_header_transforms(route_rules.as_ref(), headers);
         }
         PluginResult::Continue
     }

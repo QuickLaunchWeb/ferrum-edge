@@ -24,6 +24,7 @@ use super::{
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
+    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
     workload_entry_service_key_from_host,
 };
@@ -1532,6 +1533,42 @@ fn materialize_route_candidate(
         ));
     }
 
+    // Auto-emit request_/response_transformer instances when any dispatch
+    // rule carries route-level header transforms and this route does not
+    // already carry an operator-configured request_transformer /
+    // response_transformer. The mesh_route_dispatch plugin publishes the
+    // per-rule transforms onto `RequestContext` at match time; without a
+    // consumer plugin on the proxy, those overrides would never apply.
+    //
+    // Operator-configured proxy-scoped plugins win because we only emit
+    // when none exists in `route_plugins`. Operators who configure a global
+    // request_transformer on the gateway should be aware that a VS-driven
+    // proxy will use the auto-emitted instance (proxy-scope replaces same-
+    // named global) — keep route-level transforms out of the VS when that
+    // is undesired.
+    let dispatch_rules_have_request_transform =
+        dispatch_rules_carry_transform(&dispatch_rules, "request_transform");
+    let dispatch_rules_have_response_transform =
+        dispatch_rules_carry_transform(&dispatch_rules, "response_transform");
+    if dispatch_rules_have_request_transform
+        && !route_plugins
+            .iter()
+            .any(|p| p.plugin_name == "request_transformer")
+    {
+        route_plugins.push(route_request_transformer_plugin_for_proxy(
+            &proxy.id, namespace,
+        ));
+    }
+    if dispatch_rules_have_response_transform
+        && !route_plugins
+            .iter()
+            .any(|p| p.plugin_name == "response_transformer")
+    {
+        route_plugins.push(route_response_transformer_plugin_for_proxy(
+            &proxy.id, namespace,
+        ));
+    }
+
     let reject_unmatched = reject_unmatched || force_terminate;
     if let Some(plugin) = mesh_route_dispatch_plugin_from_rules(
         &proxy.id,
@@ -1550,6 +1587,18 @@ fn materialize_route_candidate(
         plugins.extend(route_plugins);
         proxies.push(proxy);
     }
+}
+
+/// Returns `true` if any rule in `dispatch_rules` carries a non-empty array
+/// under `field` (`"request_transform"` or `"response_transform"`). Used to
+/// decide whether the translator must auto-emit a transformer plugin
+/// instance on the proxy.
+fn dispatch_rules_carry_transform(dispatch_rules: &[Value], field: &str) -> bool {
+    dispatch_rules.iter().any(|rule| {
+        rule.get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+    })
 }
 
 fn virtual_service_routes(

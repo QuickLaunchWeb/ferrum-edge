@@ -12,14 +12,29 @@
 //! - Header values with CR/LF characters are rejected (defence against
 //!   header injection via config).
 //! - Header keys are pre-lowercased.
+//!
+//! ## Per-rule overrides from `mesh_route_dispatch`
+//!
+//! `mesh_route_dispatch` publishes per-rule
+//! `route_override_response_transform` Arcs onto `RequestContext`. This
+//! plugin applies them at the end of `after_proxy` — i.e. **static rules
+//! run first, then per-rule overrides** — so route-level writes win on
+//! conflict. The `apply_route_overrides: true` opt-in mirrors the
+//! `request_transformer` counterpart: it lets the K8s VirtualService
+//! translator auto-emit a `response_transformer` with zero static rules
+//! whose only job is to act as a consumer for per-rule overrides.
 
 use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
+use super::utils::route_header_transform::{
+    RouteHeaderTransformRule, apply_route_header_transforms,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,12 +227,30 @@ impl ResponseTransformer {
         let body_rules = body_transform::parse_body_rules(config)
             .map_err(|e| format!("response_transformer: {e}"))?;
 
-        if header_rules.is_empty() && body_rules.is_empty() {
+        let apply_route_overrides = match config.get("apply_route_overrides") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Null) | None => false,
+            Some(_) => {
+                return Err(
+                    "response_transformer: 'apply_route_overrides' must be a boolean".to_string(),
+                );
+            }
+        };
+
+        if header_rules.is_empty() && body_rules.is_empty() && !apply_route_overrides {
             return Err(
                 "response_transformer: no 'rules' configured — plugin will have no effect"
                     .to_string(),
             );
         }
+
+        // `apply_route_overrides` is parsed and validated above so the
+        // K8s VirtualService translator can auto-emit a `response_transformer`
+        // with zero static rules whose only purpose is to consume
+        // `ctx.route_override_response_transform` Arcs in `after_proxy`.
+        // The flag is config-time only — the runtime path consults `ctx`
+        // unconditionally — so we drop it after construction.
+        let _ = apply_route_overrides;
 
         Ok(Self {
             header_rules,
@@ -256,7 +289,7 @@ impl Plugin for ResponseTransformer {
 
     async fn after_proxy(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
@@ -292,6 +325,15 @@ impl Plugin for ResponseTransformer {
                     }
                 }
             }
+        }
+        // Per-rule overrides published by `mesh_route_dispatch` run AFTER
+        // static rules so route-level writes win on conflict — see module
+        // docstring. Take the Arc out so a later response_transformer
+        // instance in the chain does not re-apply the same list.
+        let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
+            ctx.route_override_response_transform.take();
+        if let Some(route_rules) = route_rules {
+            apply_route_header_transforms(route_rules.as_ref(), response_headers);
         }
         PluginResult::Continue
     }
