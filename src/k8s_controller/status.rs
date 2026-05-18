@@ -300,7 +300,7 @@ fn route_status(
 
     let mut parents = retained_existing_parent_statuses(&object.status, managed_parent_refs);
     for parent_ref in managed_parent_refs {
-        let existing_parent_status = existing_parent_status(&object.status, parent_ref);
+        let existing_parent_status = existing_parent_status(&object.status, object, parent_ref);
         let parent_ref_key = route_parent_ref_key(object, parent_ref);
         let parent_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
             .iter()
@@ -370,7 +370,7 @@ fn route_status(
                 if resolved_refs {
                     "ResolvedRefs"
                 } else {
-                    "BackendRefNotPermitted"
+                    reason
                 },
                 if resolved_refs {
                     "All backendRefs accepted by Ferrum"
@@ -472,7 +472,12 @@ fn condition_at(
     })
 }
 
-fn existing_parent_status<'a>(status: &'a Value, parent_ref: &Value) -> Option<&'a [Value]> {
+fn existing_parent_status<'a>(
+    status: &'a Value,
+    object: &K8sObject,
+    parent_ref: &Value,
+) -> Option<&'a [Value]> {
+    let parent_ref_key = route_parent_ref_key(object, parent_ref);
     status
         .get("parents")
         .and_then(Value::as_array)
@@ -480,7 +485,9 @@ fn existing_parent_status<'a>(status: &'a Value, parent_ref: &Value) -> Option<&
             parents.iter().find(|parent| {
                 parent.get("controllerName").and_then(Value::as_str)
                     == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
-                    && parent.get("parentRef") == Some(parent_ref)
+                    && parent.get("parentRef").is_some_and(|existing_ref| {
+                        route_parent_ref_key(object, existing_ref) == parent_ref_key
+                    })
             })
         })
         .and_then(|parent| parent.get("conditions"))
@@ -1212,6 +1219,49 @@ mod tests {
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
         assert!(parents.is_empty());
+    }
+
+    #[test]
+    fn route_status_matches_existing_parent_refs_after_defaulting() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        route.status = json!({
+            "parents": [{
+                "parentRef": {
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "default",
+                    "name": "edge"
+                },
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "observedGeneration": 7,
+                    "reason": "Accepted",
+                    "message": "Ferrum accepted and programmed this route",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }]
+            }]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_eq!(
+            find_condition(conditions, "Accepted")["lastTransitionTime"].as_str(),
+            Some("2026-01-01T00:00:00Z")
+        );
     }
 
     #[test]
