@@ -187,21 +187,22 @@ fn node_waypoint_topology_injects_bpf_metrics() {
     );
 }
 
-// FIXME(registry-only-injection): When the mesh runtime's
-// `outbound_traffic_policy` is `RegistryOnly`, the slice-apply path is
-// expected to auto-inject `mesh_outbound_registry` so the sidecar rejects
-// unknown destinations. The injection wiring is currently missing from
-// `prepare_gateway_config_for_mesh`, so the projected `plugin_configs`
-// never contain the registry plugin and this assertion fails. See PR
-// #859 follow-up.
-#[ignore = "REGISTRY_ONLY outbound injection of mesh_outbound_registry not wired yet"]
 #[test]
 fn registry_only_outbound_policy_injects_outbound_registry_plugin_for_sidecar() {
     // When the runtime requests `REGISTRY_ONLY` outbound traffic, the
     // slice-apply path must inject `mesh_outbound_registry` so the
     // sidecar rejects unknown destinations with `reject_status`.
+    //
+    // Note: `runtime_for_topology` uses `outbound_listen_addr: 127.0.0.1:0`
+    // for ephemeral binding in tests that spawn real listeners. The mesh
+    // injection path correctly skips the plugin when the outbound listener
+    // port is 0 (no listener to enforce against — see
+    // `inject_mesh_global_plugins_skips_outbound_registry_when_outbound_port_is_zero`).
+    // Override to a concrete production-shaped port so the projection path
+    // injects the plugin.
     let mut runtime = runtime_for_topology(MeshTopology::Sidecar);
     runtime.outbound_traffic_policy = OutboundTrafficPolicy::RegistryOnly;
+    runtime.outbound_listen_addr = "127.0.0.1:15001".parse().expect("addr");
     let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
     let service = service_for("reviews", "default", &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
