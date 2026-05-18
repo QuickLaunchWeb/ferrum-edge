@@ -2863,7 +2863,7 @@ components:
         udp_max_response_amplification_factor:
           type: [number, "null"]
           format: float
-          minimum: 0
+          exclusiveMinimum: 0
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
@@ -3245,9 +3245,11 @@ components:
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             hmac_auth, ldap_auth, mtls_auth, access_control,
             tcp_connection_throttle, ip_restriction, mesh_authz,
-            mesh_outbound_registry) block gateway startup in file mode if their
-            config is invalid; in database/CP mode the invalid config is warned
-            and skipped to keep the rest of the gateway online. See
+            mesh_outbound_registry) are validation-fatal: invalid config blocks
+            gateway startup in file mode, and on DB/CP polling the new config
+            snapshot is rejected as a whole (the gateway keeps serving the
+            prior good config). Non-security plugins with invalid config are
+            logged and skipped instead. See
             `PluginConfigs` section for per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
@@ -4503,11 +4505,11 @@ components:
         mode:
           type: string
           enum: [database, file, cp, dp]
+          description: Operating mode (set by FERRUM_MODE)
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
           example: "0.9.0"
-          description: Operating mode (set by FERRUM_MODE)
         uptime_seconds:
           type: integer
           format: int64
@@ -6528,6 +6530,15 @@ components:
         plugin id `__mesh_workload_metrics`. Standalone use is supported on
         non-mesh gateways that want Istio-style workload labels in logs.
       properties:
+        node_id:
+          type: string
+          description: Mesh node identifier attached to workload metadata.
+        topology:
+          type: string
+          description: Mesh topology name attached to workload metadata.
+        namespace:
+          type: string
+          description: Mesh namespace attached to workload metadata and used when deriving the default `service_name`.
         workload_spiffe_id:
           type: string
           description: This workload's SPIFFE ID (e.g., `spiffe://cluster.local/ns/default/sa/api`).
@@ -6557,20 +6568,44 @@ components:
           additionalProperties:
             type: string
           description: Custom tags populated from request headers (`tag_name -> header_name`).
-        metric_tag_overrides:
-          type: array
-          items:
-            type: object
-            description: |
-              Telemetry CRD metric tag override entry. One of `remove`,
-              `rename`, or `set` — applied to the metric tags emitted via
-              `workload_metrics`-driven counters/histograms.
-          description: Per-metric tag overrides translated from the Istio Telemetry CRD.
-        disabled_metrics:
-          type: array
-          items:
-            type: string
-          description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+        metrics:
+          type: object
+          description: |
+            Istio Telemetry-CRD-style metrics customization. Both fields are
+            optional and additive; unknown fields are ignored.
+          properties:
+            tag_overrides:
+              type: array
+              items:
+                type: object
+                required: [name, operation]
+                properties:
+                  name:
+                    type: string
+                    description: Tag name to override.
+                  operation:
+                    type: object
+                    required: [type]
+                    description: |
+                      One of `{"type": "remove"}`,
+                      `{"type": "rename", "new_name": "..."}`, or
+                      `{"type": "set", "value": "..."}`.
+                    properties:
+                      type:
+                        type: string
+                        enum: [remove, rename, set]
+                      new_name:
+                        type: string
+                        description: Replacement tag name when `type` is `rename`.
+                      value:
+                        type: string
+                        description: Replacement tag value when `type` is `set`.
+              description: Per-metric tag overrides translated from the Istio Telemetry CRD.
+            disabled_metrics:
+              type: array
+              items:
+                type: string
+              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
         tracing_providers:
           type: array
           items:
@@ -6579,6 +6614,11 @@ components:
             Per-provider tracing exporters surfaced from the Istio Telemetry
             CRD via the mesh slice. Also enables trace-context propagation
             when span reporting is disabled.
+        tracing_provider:
+          type: object
+          description: |
+            Singular tracing exporter fallback. Ignored when
+            `tracing_providers` is present.
         span_reporting_disabled:
           type: boolean
           default: false
@@ -7081,7 +7121,7 @@ components:
       properties:
         limit_by:
           type: string
-          enum: [ip, consumer, spiffe_identity]
+          enum: [ip, consumer, spiffe_identity, spiffe]
           default: ip
           description: |
             Rate limit key:
@@ -9085,5 +9125,5 @@ components:
             Verbose error message — for `MalformedExtension` includes the
             offending extension name and the underlying serde error; for
             `Plugin*` codes includes the plugin id; for `InvalidTagName`
-            includes the offending tag name and character.
-          description: Full error text including field paths and values where applicable
+            includes the offending tag name and character. Includes field
+            paths and values where applicable.
