@@ -26,6 +26,7 @@ fn k8s_object(
             name: name.to_string(),
             namespace: namespace.to_string(),
             labels: Default::default(),
+            creation_timestamp: None,
             deletion_timestamp: None,
             annotations: Default::default(),
         },

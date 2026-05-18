@@ -90,6 +90,7 @@ impl SvidFetchHandle {
     }
 
     fn install(&self, bundle: SvidBundle) {
+        record_fetch_bundle_metrics(&bundle);
         self.current.store(Arc::new(Some(bundle)));
         let was_first = self
             .has_first
@@ -159,6 +160,7 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                                 handle.install(bundle);
                             }
                             Err(e) => {
+                                record_workload_api_rotation_failure(&handle);
                                 warn!(error = %e, "SVID fetch stream error — reconnecting");
                                 break;
                             }
@@ -166,16 +168,51 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                     }
                 }
                 Err(e) => {
+                    record_workload_api_rotation_failure(&handle);
                     error!(error = %e, "Workload API stream RPC failed");
                 }
             },
             Err(e) => {
+                record_workload_api_rotation_failure(&handle);
                 error!(error = %e, "failed to connect to Workload API agent");
             }
         }
 
         sleep(backoff).await;
         backoff = (backoff * 2).min(config.max_reconnect_backoff);
+    }
+}
+
+fn record_workload_api_rotation_failure(handle: &SvidFetchHandle) {
+    let spiffe_id = handle
+        .snapshot()
+        .as_ref()
+        .as_ref()
+        .map(|bundle| bundle.spiffe_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+        &spiffe_id,
+        "workload_api",
+    );
+}
+
+fn record_fetch_bundle_metrics(bundle: &SvidBundle) {
+    crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_seconds(
+        &bundle.spiffe_id,
+        "workload_api",
+        time_until_expiry(bundle).as_secs(),
+    );
+    crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
+        bundle.trust_bundles.local.trust_domain.as_str(),
+        "workload_api",
+        bundle.trust_bundles.local.x509_authorities.as_slice(),
+    );
+    for federated in bundle.trust_bundles.federated.values() {
+        crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
+            federated.trust_domain.as_str(),
+            "workload_api",
+            federated.x509_authorities.as_slice(),
+        );
     }
 }
 

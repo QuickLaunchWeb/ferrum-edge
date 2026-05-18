@@ -131,12 +131,20 @@ impl SpireAgentCa {
         if !first_received.load(std::sync::atomic::Ordering::Acquire) {
             match tokio::time::timeout(INITIAL_SVID_TIMEOUT, notified).await {
                 Ok(()) => {
+                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                        "spire_agent",
+                        true,
+                    );
                     info!(
                         socket = %config.socket_path,
                         "SPIRE agent CA: received initial SVID"
                     );
                 }
                 Err(_) => {
+                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                        "spire_agent",
+                        false,
+                    );
                     warn!(
                         socket = %config.socket_path,
                         timeout_secs = INITIAL_SVID_TIMEOUT.as_secs(),
@@ -211,6 +219,11 @@ async fn stream_loop(
                                     spiffe_id = %bundle.spiffe_id,
                                     "SPIRE agent CA: received SVID"
                                 );
+                                record_spire_bundle_metrics(&bundle);
+                                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                                    "spire_agent",
+                                    true,
+                                );
                                 let snapshot = AgentSnapshot { bundle };
                                 current.store(Arc::new(Some(snapshot)));
 
@@ -221,6 +234,14 @@ async fn stream_loop(
                                 }
                             }
                             Err(e) => {
+                                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                                    "spire_agent",
+                                    false,
+                                );
+                                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                                    "unknown",
+                                    "spire_agent",
+                                );
                                 warn!(
                                     error = %e,
                                     "SPIRE agent CA: stream error — reconnecting"
@@ -231,6 +252,14 @@ async fn stream_loop(
                     }
                 }
                 Err(e) => {
+                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                        "spire_agent",
+                        false,
+                    );
+                    crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                        "unknown",
+                        "spire_agent",
+                    );
                     error!(
                         error = %e,
                         "SPIRE agent CA: stream RPC failed"
@@ -238,6 +267,11 @@ async fn stream_loop(
                 }
             },
             Err(e) => {
+                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", false);
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    "unknown",
+                    "spire_agent",
+                );
                 error!(
                     error = %e,
                     socket = %socket_path,
@@ -266,6 +300,28 @@ fn leaf_not_after(cert_chain_der: &[Vec<u8>]) -> Result<chrono::DateTime<chrono:
                 "SPIRE leaf cert notAfter is outside supported timestamp range".to_string(),
             )
         })
+}
+
+fn record_spire_bundle_metrics(bundle: &crate::identity::SvidBundle) {
+    if let Ok(not_after) = leaf_not_after(&bundle.cert_chain_der) {
+        crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+            &bundle.spiffe_id,
+            "spire_agent",
+            &not_after,
+        );
+    }
+    crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
+        bundle.trust_bundles.local.trust_domain.as_str(),
+        "spire_agent",
+        bundle.trust_bundles.local.x509_authorities.as_slice(),
+    );
+    for federated in bundle.trust_bundles.federated.values() {
+        crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
+            federated.trust_domain.as_str(),
+            "spire_agent",
+            federated.x509_authorities.as_slice(),
+        );
+    }
 }
 
 #[async_trait]
@@ -305,6 +361,12 @@ impl CertificateAuthority for SpireAgentCa {
         }
 
         let not_after = leaf_not_after(&snap.bundle.cert_chain_der)?;
+        crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+            &snap.bundle.spiffe_id,
+            "spire_agent",
+            &not_after,
+        );
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", true);
 
         Ok(SignedSvid {
             spiffe_id: snap.bundle.spiffe_id.clone(),
@@ -326,11 +388,17 @@ impl CertificateAuthority for SpireAgentCa {
             .get(td)
             .ok_or_else(|| CaError::UnknownTrustDomain(td.to_string()))?;
 
-        Ok(PublishedTrustBundle {
+        let published = PublishedTrustBundle {
             trust_domain: bundle.trust_domain.clone(),
             roots_der: bundle.x509_authorities.clone(),
             refresh_hint_secs: bundle.refresh_hint_seconds,
-        })
+        };
+        crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle(
+            &published,
+            "spire_agent",
+        );
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", true);
+        Ok(published)
     }
 
     async fn jwt_authorities(

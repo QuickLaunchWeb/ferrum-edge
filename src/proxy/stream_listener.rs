@@ -120,6 +120,8 @@ pub struct StreamListenerManager {
     ktls_enabled: bool,
     /// Enable io_uring-based splice.
     io_uring_splice_enabled: bool,
+    /// Whether frontend TCP TLS handshake failures should increment mesh mTLS metrics.
+    record_mesh_mtls_metric: bool,
     /// SO_BUSY_POLL duration in microseconds for UDP sockets.
     so_busy_poll_us: u32,
     /// Enable UDP GRO on frontend sockets.
@@ -166,6 +168,7 @@ impl StreamListenerManager {
         overload: Arc<crate::overload::OverloadState>,
         ktls_enabled: bool,
         io_uring_splice_enabled: bool,
+        record_mesh_mtls_metric: bool,
         so_busy_poll_us: u32,
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
@@ -196,6 +199,7 @@ impl StreamListenerManager {
             overload,
             ktls_enabled,
             io_uring_splice_enabled,
+            record_mesh_mtls_metric,
             so_busy_poll_us,
             udp_gro_enabled,
             udp_gso_enabled,
@@ -229,6 +233,7 @@ impl StreamListenerManager {
         overload: Arc<crate::overload::OverloadState>,
         ktls_enabled: bool,
         io_uring_splice_enabled: bool,
+        record_mesh_mtls_metric: bool,
         so_busy_poll_us: u32,
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
@@ -264,6 +269,7 @@ impl StreamListenerManager {
             overload,
             ktls_enabled,
             io_uring_splice_enabled,
+            record_mesh_mtls_metric,
             so_busy_poll_us,
             udp_gro_enabled,
             udp_gso_enabled,
@@ -641,6 +647,7 @@ impl StreamListenerManager {
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
+                let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
@@ -672,6 +679,7 @@ impl StreamListenerManager {
                         overload,
                         ktls_enabled,
                         io_uring_splice_enabled,
+                        record_mesh_mtls_metric,
                     })
                     .await
                     {

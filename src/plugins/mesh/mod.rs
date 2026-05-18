@@ -6,6 +6,7 @@ pub mod authz;
 pub mod bpf_metrics;
 pub mod outbound_registry;
 pub mod prometheus_helpers;
+pub mod service_graph;
 pub mod spiffe_identity;
 pub mod workload_metrics;
 

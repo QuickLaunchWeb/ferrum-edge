@@ -83,6 +83,7 @@ use std::time::{Duration, Instant};
 use tracing::info;
 use url::{Url, form_urlencoded};
 
+use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
 
@@ -301,10 +302,14 @@ impl Plugin for LoadTesting {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only trigger when the key header matches
+        // Only trigger when the key header matches. Use constant-time
+        // comparison: a recovered trigger key gives an unauthenticated
+        // attacker a high-cost privileged operation (spawns concurrent
+        // loopback requests, can fan out to peer nodes, runs for up to
+        // an hour) so timing-leak-driven discovery has real impact.
         let key_matches = headers
             .get("x-loadtesting-key")
-            .map(|k| k == &self.key)
+            .map(|k| constant_time_eq(k.as_bytes(), self.key.as_bytes()))
             .unwrap_or(false);
 
         if !key_matches {

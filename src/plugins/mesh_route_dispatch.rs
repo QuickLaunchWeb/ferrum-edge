@@ -36,6 +36,10 @@
 //! warning and skip the instance, preserving the existing "drop the
 //! header/method match" behavior. The CP can emit the plugin instances
 //! unconditionally — they're a no-op on old binaries.
+//! `retry_disabled` / `timeout_disabled` are intentionally build-out-era
+//! additive config: older DPs that do know this plugin but do not know those
+//! fields will ignore them, so operators must upgrade DPs before relying on
+//! collapsed routes that clear inherited retry or timeout policy.
 
 use std::collections::HashMap;
 
@@ -44,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::types::{
-    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
@@ -105,6 +109,24 @@ impl MeshRouteDispatchConfig {
                     "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
                      a direct backend override (backend_host and backend_port); backend_tls \
                      may only accompany a direct backend"
+                ));
+            }
+            if rule.retry.is_some() && rule.retry_disabled {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}] cannot set both retry and retry_disabled"
+                ));
+            }
+            if rule.timeout_ms.is_some() && rule.timeout_disabled {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}] cannot set both timeout_ms and timeout_disabled"
+                ));
+            }
+            if let Some(retry) = &rule.retry
+                && let Err(errors) = retry.validate_fields()
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].retry: {}",
+                    errors.join("; ")
                 ));
             }
             if let Some(port) = rule.destination.backend_port
@@ -222,6 +244,25 @@ pub struct RouteRule {
     /// What to override on a matching request. At least one override field
     /// MUST be set; otherwise the rule would be a no-op.
     pub destination: RouteDestination,
+    /// Override the proxy's backend response/read timeout for this rule.
+    /// Istio `VirtualService.http[].timeout` is projected here when route
+    /// candidates are collapsed into a shared Ferrum proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Explicitly clear the selected proxy's backend response/read timeout
+    /// for this rule. Translator-generated collapsed rules use this when the
+    /// source VirtualService route omits `timeout`, because Istio's default is
+    /// timeout-disabled and the selected fallback proxy may carry a timeout.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timeout_disabled: bool,
+    /// Override the proxy's retry policy for this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
+    /// Explicitly clear the selected proxy's retry policy for this rule.
+    /// Translator-generated collapsed rules use this to prevent a later
+    /// fallback route's retry policy from leaking onto an earlier route.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retry_disabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,6 +398,17 @@ impl Plugin for MeshRouteDispatch {
                 ctx.route_override_backend_host = rule.destination.backend_host.clone();
                 ctx.route_override_backend_port = rule.destination.backend_port;
                 ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
+                ctx.route_override_backend_read_timeout_ms =
+                    if rule.timeout_ms.is_some() || rule.timeout_disabled {
+                        Some(rule.timeout_ms.unwrap_or(0))
+                    } else {
+                        None
+                    };
+                ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
+                    Some(rule.retry.clone())
+                } else {
+                    None
+                };
                 return PluginResult::Continue;
             }
         }
@@ -375,6 +427,10 @@ impl Plugin for MeshRouteDispatch {
         }
         PluginResult::Continue
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn rule_matches(
@@ -483,6 +539,24 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("duplicate header"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_timeout_ms_with_timeout_disabled() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "timeout_ms": 250,
+                "timeout_disabled": true
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.contains("cannot set both timeout_ms and timeout_disabled"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -726,6 +800,25 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+    }
+
+    #[tokio::test]
+    async fn method_match_can_clear_backend_read_timeout() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "timeout_disabled": true
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+        assert_eq!(ctx.route_override_backend_read_timeout_ms, Some(0));
     }
 
     #[tokio::test]

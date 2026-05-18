@@ -182,6 +182,61 @@ async fn test_cohere_format() {
     assert_eq!(ctx.metadata.get("ai_model").unwrap(), "command-r-plus");
 }
 
+#[tokio::test]
+async fn test_cohere_v2_buffered_format() {
+    // Cohere v2 `/v2/chat` puts counts at `usage.tokens.*` (the v1 layout
+    // was `meta.tokens.*`). Auto-detection must distinguish v2 from
+    // OpenAI / Bedrock which also key off `usage.*`.
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "id": "abc-123",
+        "finish_reason": "COMPLETE",
+        "usage": {
+            "tokens": {
+                "input_tokens": 17,
+                "output_tokens": 9
+            }
+        }
+    }))
+    .unwrap();
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+
+    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "cohere");
+    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "26");
+    assert_eq!(ctx.metadata.get("ai_prompt_tokens").unwrap(), "17");
+    assert_eq!(ctx.metadata.get("ai_completion_tokens").unwrap(), "9");
+}
+
+#[tokio::test]
+async fn test_cohere_v2_streaming_format() {
+    // Cohere v2 SSE: the terminal `message-end` event carries counts under
+    // `delta.usage.tokens.*`. The previous SSE detector classified all
+    // `message*` events as Anthropic and dropped these.
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    let sse = concat!(
+        "data: {\"type\":\"message-start\",\"id\":\"abc\"}\n\n",
+        "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"hi\"}}}}\n\n",
+        "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":23,\"output_tokens\":41}}}}\n\n",
+    )
+    .as_bytes();
+
+    plugin.on_response_body(&mut ctx, 200, &headers, sse).await;
+
+    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "cohere");
+    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "64");
+    assert_eq!(ctx.metadata.get("ai_prompt_tokens").unwrap(), "23");
+    assert_eq!(ctx.metadata.get("ai_completion_tokens").unwrap(), "41");
+}
+
 // ─── Bedrock format ─────────────────────────────────────────────────────
 
 #[tokio::test]

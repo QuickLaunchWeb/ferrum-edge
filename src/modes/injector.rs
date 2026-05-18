@@ -533,6 +533,7 @@ pub async fn run(
                                     stream,
                                     config.tls_handshake_timeout_seconds,
                                     &remote_addr,
+                                    false,
                                 )
                                 .await
                                 {

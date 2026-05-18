@@ -87,6 +87,13 @@ observability:
   enabled: false
   dashboards:
     enabled: true
+  alerts:
+    enabled: true
+    certExpiringSeconds: 604800
+    cpStaleConfigSeconds: 300
+    policyDenyRatePerSecond: 1
+    mtlsHandshakeFailureRatePerSecond: 0
+    injectorFailureRatePerSecond: 0
 
 nodeAgent:
   enabled: false
