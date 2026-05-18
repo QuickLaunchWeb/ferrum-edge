@@ -1,0 +1,71 @@
+[package]
+name = "mesh-hbone-e2e-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "hbone_backend"
+path = "src/bin/hbone_backend.rs"
+
+[[bin]]
+name = "hbone_sidecar"
+path = "src/bin/hbone_sidecar.rs"
+
+[[bin]]
+name = "hbone_loadgen"
+path = "src/bin/hbone_loadgen.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1"
+
+# h2 — direct HTTP/2 for CONNECT control of the tunnel
+# SYNC: keep in step with root Cargo.toml h2 version when the gateway uses h2
+# features that the sidecar must mirror (e.g. HTTP/2 flow control defaults).
+h2 = "0.4"
+
+# TLS
+# SYNC: rustls major version must match root Cargo.toml.
+rustls = { version = "0.23", features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Metrics
+hdrhistogram = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Common
+bytes = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+futures-util = "0.3"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
