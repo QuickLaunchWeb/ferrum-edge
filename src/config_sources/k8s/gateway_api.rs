@@ -76,7 +76,12 @@ pub(super) fn translate(
             }
             Ok(true)
         }
-        "HTTPRoute" | "GRPCRoute" => {
+        "HTTPRoute" => {
+            let (proxies, plugins) = http_route_resources(object, acc)?;
+            upsert_http_route_resources(acc, proxies, plugins);
+            Ok(true)
+        }
+        "GRPCRoute" => {
             let (proxies, plugins) = http_route_resources(object, acc)?;
             for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
@@ -322,8 +327,151 @@ fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     keys
 }
 
-fn route_conflict_match_signature(_descriptor: &RouteMatchDescriptor) -> String {
-    "{}".to_string()
+fn route_conflict_match_signature(descriptor: &RouteMatchDescriptor) -> String {
+    descriptor.match_signature.clone()
+}
+
+fn upsert_http_route_resources(
+    acc: &mut K8sAccumulator,
+    proxies: Vec<Proxy>,
+    plugins: Vec<PluginConfig>,
+) {
+    let mut plugins_by_proxy: HashMap<String, Vec<PluginConfig>> = HashMap::new();
+    for plugin in plugins {
+        if let Some(proxy_id) = plugin.proxy_id.clone() {
+            plugins_by_proxy.entry(proxy_id).or_default().push(plugin);
+        } else {
+            acc.config.plugin_configs.push(plugin);
+        }
+    }
+
+    for proxy in proxies {
+        let route_plugins = plugins_by_proxy.remove(&proxy.id).unwrap_or_default();
+        if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins) {
+            acc.upsert_proxy(proxy, SourceKind::GatewayApi);
+            acc.config.plugin_configs.extend(route_plugins);
+        }
+    }
+
+    for (_, plugins) in plugins_by_proxy {
+        acc.config.plugin_configs.extend(plugins);
+    }
+}
+
+fn merge_http_route_proxy(
+    acc: &mut K8sAccumulator,
+    proxy: Proxy,
+    route_plugins: &[PluginConfig],
+) -> bool {
+    let Some(existing_index) = acc
+        .config
+        .proxies
+        .iter()
+        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy))
+    else {
+        return false;
+    };
+
+    let new_dispatch = route_plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch");
+    let existing_id = acc.config.proxies[existing_index].id.clone();
+    let existing_dispatch_index = dispatch_plugin_index(&acc.config.plugin_configs, &existing_id);
+    if new_dispatch.is_none() && existing_dispatch_index.is_none() {
+        return false;
+    }
+
+    let new_has_default = dispatch_reject_unmatched(new_dispatch) == Some(false)
+        || (new_dispatch.is_none() && route_plugins.is_empty());
+    let existing_has_default = existing_dispatch_index
+        .and_then(|index| dispatch_reject_unmatched(Some(&acc.config.plugin_configs[index])))
+        != Some(true);
+
+    if new_has_default {
+        replace_proxy_default_route(&mut acc.config.proxies[existing_index], &proxy);
+    }
+
+    if let Some(plugin) = new_dispatch {
+        let new_rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(index) = existing_dispatch_index {
+            append_dispatch_rules(&mut acc.config.plugin_configs[index], new_rules);
+            set_dispatch_reject_unmatched(
+                &mut acc.config.plugin_configs[index],
+                !(existing_has_default || new_has_default),
+            );
+        } else {
+            let mut plugin = retarget_dispatch_plugin(plugin.clone(), &existing_id);
+            set_dispatch_reject_unmatched(&mut plugin, false);
+            attach_route_plugins_to_proxy(
+                &mut acc.config.proxies[existing_index],
+                std::slice::from_ref(&plugin),
+            );
+            acc.config.plugin_configs.push(plugin);
+        }
+    } else if let Some(index) = existing_dispatch_index {
+        set_dispatch_reject_unmatched(&mut acc.config.plugin_configs[index], false);
+    }
+
+    true
+}
+
+fn can_merge_http_route_proxy(acc: &K8sAccumulator, existing: &Proxy, proxy: &Proxy) -> bool {
+    acc.proxy_sources.get(&existing.id) == Some(&SourceKind::GatewayApi)
+        && existing.namespace == proxy.namespace
+        && existing.listen_path == proxy.listen_path
+        && existing.hosts == proxy.hosts
+}
+
+fn dispatch_plugin_index(plugins: &[PluginConfig], proxy_id: &str) -> Option<usize> {
+    plugins.iter().position(|plugin| {
+        plugin.plugin_name == "mesh_route_dispatch" && plugin.proxy_id.as_deref() == Some(proxy_id)
+    })
+}
+
+fn dispatch_reject_unmatched(plugin: Option<&PluginConfig>) -> Option<bool> {
+    plugin.and_then(|plugin| {
+        plugin
+            .config
+            .get("reject_unmatched")
+            .and_then(Value::as_bool)
+    })
+}
+
+fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginConfig {
+    plugin.id = format!("istio-vs-mrd-{proxy_id}");
+    plugin.proxy_id = Some(proxy_id.to_string());
+    plugin
+}
+
+fn append_dispatch_rules(plugin: &mut PluginConfig, rules: Vec<Value>) {
+    if rules.is_empty() {
+        return;
+    }
+    if let Some(existing_rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut) {
+        existing_rules.extend(rules);
+    }
+}
+
+fn set_dispatch_reject_unmatched(plugin: &mut PluginConfig, reject_unmatched: bool) {
+    if let Some(config) = plugin.config.as_object_mut() {
+        config.insert(
+            "reject_unmatched".to_string(),
+            Value::Bool(reject_unmatched),
+        );
+    }
+}
+
+fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
+    existing.backend_host.clone_from(&proxy.backend_host);
+    existing.backend_port = proxy.backend_port;
+    existing.upstream_id.clone_from(&proxy.upstream_id);
+    existing.retry.clone_from(&proxy.retry);
+    existing.backend_read_timeout_ms = proxy.backend_read_timeout_ms;
 }
 
 fn route_match_descriptors(object: &K8sObject, rule: &Value) -> Vec<RouteMatchDescriptor> {
@@ -1348,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_conflicts_collapse_match_predicates_per_path() {
+    fn http_route_conflicts_preserve_match_predicates_per_path() {
         let mut get_route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -1387,15 +1535,37 @@ mod tests {
             .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
-        assert!(result.config.proxies[0].id.contains("api-get"));
         assert!(
-            result.warnings.iter().any(|warning| {
-                warning.contains("api-post")
-                    && warning.contains("path=/api")
-                    && warning.contains("winner is default/api-get")
-            }),
-            "same host/path routes must collapse to avoid router shadowing: {:?}",
+            result.config.validate_unique_listen_paths().is_ok(),
+            "merged predicate routes must not produce duplicate host/path proxies"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("api-post")),
+            "distinct match predicates must not conflict: {:?}",
             result.warnings
+        );
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("merged predicate routes need dispatch rules");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8080));
+        assert_eq!(rules[1]["match"]["methods"][0].as_str(), Some("POST"));
+        assert!(
+            rules[1]["destination"]["backend_port"].as_u64() == Some(8081),
+            "POST route must keep its own backend destination"
         );
     }
 
