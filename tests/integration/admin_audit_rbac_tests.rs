@@ -203,6 +203,39 @@ async fn viewer_role_is_rejected_on_admin_mutation() {
 }
 
 #[tokio::test]
+async fn non_admin_cannot_read_backup_unredacted_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) = get_json(&base, "/backup", &viewer).await;
+    assert_eq!(status, 403, "viewer backup body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+
+    let operator = token("op-user", Some("operator"));
+    let (status, body) = get_json(&base, "/backup", &operator).await;
+    assert_eq!(status, 403, "operator backup body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+
+    let admin = token("security-admin", Some("admin"));
+    let (status, _body) = get_json(&base, "/backup", &admin).await;
+    assert_eq!(status, 200, "admin backup must succeed");
+}
+
+#[tokio::test]
 async fn viewer_restore_is_rejected_before_large_body_buffering() {
     let tmp = TempDir::new().unwrap();
     let mut state = admin_state(make_store(&tmp).await);
@@ -375,14 +408,60 @@ async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     .await;
     let event = &audit_body["items"].as_array().expect("audit items")[0];
     assert_eq!(
-        event["diff"]["after"]["credentials"]["keyauth"][0]["key"],
-        "[REDACTED]",
+        event["diff"]["after"]["credentials"]["keyauth"][0]["key"], "[REDACTED]",
         "keyauth key not redacted in audit diff: {event:?}"
     );
     let serialized = event["diff"].to_string();
     assert!(
         !serialized.contains(plaintext_key),
         "plaintext keyauth key leaked into audit diff: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_consul_token_redacted_in_audit_diff() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consul_token = "super-secret-consul-acl-token-do-not-leak";
+    let upstream = json!({
+        "id": "audit-consul-upstream",
+        "name": "upstream-consul",
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin",
+        "service_discovery": {
+            "provider": "consul",
+            "consul": {
+                "address": "http://consul.local:8500",
+                "service_name": "my-service",
+                "token": consul_token
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/upstreams", &admin, &upstream).await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=upstream&resource_id=audit-consul-upstream",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["service_discovery"]["consul"]["token"], "[REDACTED]",
+        "consul ACL token not redacted in audit diff: {event:?}"
+    );
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(consul_token),
+        "plaintext consul token leaked into audit diff: {event:?}"
     );
 }
 

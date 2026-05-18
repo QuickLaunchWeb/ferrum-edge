@@ -966,7 +966,13 @@ pub async fn handle_admin_request(
         }
 
         // Backup & Restore
-        (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref(), &namespace).await,
+        (Method::GET, ["backup"]) => {
+            // Backup returns unredacted credentials and consul tokens — Admin only.
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_backup(&state, query.as_deref(), &namespace).await
+        }
         (Method::POST, ["restore"]) => {
             // Role check happens before body buffering (see pre-buffer gate above).
             handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
@@ -2382,16 +2388,18 @@ async fn handle_batch_create(
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
 
-    let event = audit::AuditEvent::new(
-        actor,
-        "batch_create",
-        "gateway_config",
-        namespace,
-        namespace,
-        audit::create_diff(response["created"].clone()),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
+    if created.any() {
+        let event = audit::AuditEvent::new(
+            actor,
+            "batch_create",
+            "gateway_config",
+            namespace,
+            namespace,
+            audit::create_diff(response["created"].clone()),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
+        }
     }
 
     Ok(json_response(StatusCode::CREATED, &response))
@@ -2689,21 +2697,22 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
-        if created.any() {
-            let event = audit::AuditEvent::new(
-                actor,
-                "restore",
-                "gateway_config",
-                namespace,
-                namespace,
-                audit::update_diff(
-                    json!({"replaced_namespace": namespace}),
-                    response["restored"].clone(),
-                ),
-            );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-                log_audit_enqueue_failure(&error);
-            }
+        // Restore always wipes the namespace before re-inserting (Phase 3 above),
+        // so even a zero-success-count restore must produce an audit row — the
+        // namespace state has already changed regardless of which inserts failed.
+        let event = audit::AuditEvent::new(
+            actor,
+            "restore",
+            "gateway_config",
+            namespace,
+            namespace,
+            audit::update_diff(
+                json!({"replaced_namespace": namespace}),
+                response["restored"].clone(),
+            ),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }

@@ -444,6 +444,19 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     body
 }
 
+fn upstream_audit_body(resource: &Upstream) -> Value {
+    let mut body = json!(resource);
+    if let Some(token) = body
+        .get_mut("service_discovery")
+        .and_then(|sd| sd.get_mut("consul"))
+        .and_then(|consul| consul.get_mut("token"))
+        && !token.is_null()
+    {
+        *token = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+    }
+    body
+}
+
 fn redact_sensitive_plugin_config_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -605,6 +618,10 @@ impl AdminResource for Upstream {
     fn normalize(&mut self) {
         self.api_spec_id = None;
         self.normalize_fields();
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        upstream_audit_body(resource)
     }
 
     fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {

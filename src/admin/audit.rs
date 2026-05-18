@@ -183,14 +183,33 @@ fn entry_matches_backend(entry: &AuditSinkEntry, db: &Arc<dyn DatabaseBackend>) 
 
 fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     let key = db_key(&db);
+    // Fast path: live entry for this exact backend pointer.
     if let Some(entry) = AUDIT_SINKS.get(&key)
         && entry_matches_backend(&entry, &db)
     {
         return entry.sink.clone();
     }
 
-    remove_stale_sink(key);
+    // Slow path: take the entry write lock so the spawn-and-insert is atomic.
+    // Without this, two threads can both miss the `get`, both spawn a worker,
+    // and only one survives — leaving the other's mpsc Sender to be dropped at
+    // the end of `record`, which closes that orphan worker before its event is
+    // processed. Holding the entry lock across the live-check + spawn + insert
+    // guarantees one worker per backend Arc.
+    let entry = AUDIT_SINKS.entry(key).or_insert_with(|| {
+        let backend = Arc::downgrade(&db);
+        let sink = AuditSink::spawn(key, backend.clone());
+        AuditSinkEntry { backend, sink }
+    });
+    if entry_matches_backend(&entry, &db) {
+        return entry.sink.clone();
+    }
 
+    // The existing entry references a different (stale) backend at the same
+    // address — drop it and retry. Calling `remove` while still holding the
+    // RefMut would deadlock, so release it first.
+    drop(entry);
+    AUDIT_SINKS.remove(&key);
     let backend = Arc::downgrade(&db);
     let sink = AuditSink::spawn(key, backend.clone());
     AUDIT_SINKS.insert(
