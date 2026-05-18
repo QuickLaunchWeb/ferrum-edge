@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use mesh_dns_e2e_perf::dns_wire::{QTYPE_A, QTYPE_AAAA, parse_response};
+use mesh_dns_e2e_perf::dns_wire::{QTYPE_A, QTYPE_AAAA, QTYPE_OPT, parse_response};
 use tokio::net::UdpSocket;
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,7 @@ fn build_stub_response(packet: &[u8]) -> Option<Vec<u8>> {
     }
     let qtype = extract_first_qtype(packet)?;
     let qname_end = find_qname_end(packet, 12)?;
+    let client_opt_payload = extract_client_opt_payload_size(packet, qname_end + 4);
 
     let mut reply = Vec::with_capacity(packet.len() + 32);
     reply.extend_from_slice(&packet[..12]);
@@ -80,8 +81,64 @@ fn build_stub_response(packet: &[u8]) -> Option<Vec<u8>> {
         reply[7] = 0;
     }
 
+    // Echo an OPT record back when the client advertised one (RFC 6891
+    // §6.1.1). Mirroring the client's payload size keeps the response
+    // shape closer to what a real upstream would emit, so the gateway's
+    // OPT-echo / cache-keying paths exercise representative data.
+    let mut arcount: u16 = 0;
+    if let Some(payload_size) = client_opt_payload {
+        arcount += 1;
+        reply.push(0); // root name
+        reply.extend_from_slice(&QTYPE_OPT.to_be_bytes());
+        reply.extend_from_slice(&payload_size.to_be_bytes());
+        reply.extend_from_slice(&0u32.to_be_bytes()); // extended rcode + version + flags
+        reply.extend_from_slice(&0u16.to_be_bytes()); // RDLEN
+    }
+    reply[10] = (arcount >> 8) as u8;
+    reply[11] = (arcount & 0xff) as u8;
+
     debug_assert!(parse_response(&reply).is_some());
     Some(reply)
+}
+
+/// Walk the request's additional section looking for an OPT pseudo-RR.
+/// Returns the OPT CLASS field (the requestor's UDP payload size) when
+/// present. Defensive: returns None on malformed input.
+fn extract_client_opt_payload_size(packet: &[u8], mut cursor: usize) -> Option<u16> {
+    // Header byte 10..12 is ARCOUNT. We only look at additional RRs.
+    let arcount = u16::from_be_bytes([*packet.get(10)?, *packet.get(11)?]);
+    // Skip authority RRs (NSCOUNT) — none expected in a query, but be safe.
+    let nscount = u16::from_be_bytes([*packet.get(8)?, *packet.get(9)?]);
+    for _ in 0..nscount {
+        cursor = skip_rr(packet, cursor)?;
+    }
+    for _ in 0..arcount {
+        let name_end = find_qname_end(packet, cursor)?;
+        if name_end + 10 > packet.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
+        let class = u16::from_be_bytes([packet[name_end + 2], packet[name_end + 3]]);
+        if rtype == QTYPE_OPT {
+            return Some(class);
+        }
+        cursor = skip_rr(packet, cursor)?;
+    }
+    None
+}
+
+/// Skip a single resource record (NAME + 10-byte fixed header + RDATA).
+fn skip_rr(packet: &[u8], cursor: usize) -> Option<usize> {
+    let name_end = find_qname_end(packet, cursor)?;
+    if name_end + 10 > packet.len() {
+        return None;
+    }
+    let rdlength = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
+    let next = name_end + 10 + rdlength;
+    if next > packet.len() {
+        return None;
+    }
+    Some(next)
 }
 
 fn find_qname_end(packet: &[u8], start: usize) -> Option<usize> {
@@ -104,5 +161,8 @@ fn extract_first_qtype(packet: &[u8]) -> Option<u16> {
     if packet.len() < qname_end + 4 {
         return None;
     }
-    Some(u16::from_be_bytes([packet[qname_end], packet[qname_end + 1]]))
+    Some(u16::from_be_bytes([
+        packet[qname_end],
+        packet[qname_end + 1],
+    ]))
 }

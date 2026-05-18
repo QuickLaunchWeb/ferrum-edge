@@ -41,8 +41,8 @@ struct Args {
     protocol: ProtocolMode,
 
     /// Set an EDNS(0) OPT record advertising this UDP payload size.
-    /// 0 = no OPT record. Range 512..=4096.
-    #[arg(long, default_value_t = 0)]
+    /// 0 = no OPT record, otherwise must be in 512..=4096.
+    #[arg(long, default_value_t = 0, value_parser = parse_edns)]
     edns: u16,
 
     /// Per-query timeout in milliseconds.
@@ -66,6 +66,19 @@ enum ProtocolMode {
     Both,
 }
 
+fn parse_edns(raw: &str) -> Result<u16, String> {
+    let value: u16 = raw
+        .parse()
+        .map_err(|e| format!("--edns must be a u16: {e}"))?;
+    if value == 0 || (512..=4096).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "--edns must be 0 (disabled) or in 512..=4096, got {value}"
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -78,7 +91,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let names: Vec<(&str, NameClass)> = workload_names()
         .iter()
         .copied()
-        .filter(|(_, class)| !(args.skip_mesh && !matches!(class, NameClass::UpstreamForward)))
+        .filter(|(_, class)| !args.skip_mesh || matches!(class, NameClass::UpstreamForward))
         .collect();
     if names.is_empty() {
         return Err(anyhow!("no name classes selected; check --skip-mesh"));
@@ -135,10 +148,8 @@ async fn run_phase(
             let args = args.clone();
             let stop = stop.clone();
             let txid_seq = txid_seq.clone();
-            let names: Vec<(String, NameClass)> = names
-                .iter()
-                .map(|(n, c)| ((*n).to_string(), *c))
-                .collect();
+            let names: Vec<(String, NameClass)> =
+                names.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
             tokio::spawn(async move {
                 worker_loop(worker_id, args, target, transport, names, stop, txid_seq).await
             })
@@ -201,7 +212,7 @@ async fn worker_loop(
         local_idx = local_idx.wrapping_add(1);
 
         let txid = next_txid(&txid_seq);
-        let packet = if args.edns >= 512 {
+        let packet = if args.edns != 0 {
             build_query_with_edns(name, QTYPE_A, txid, args.edns)
         } else {
             build_query(name, QTYPE_A, txid)
@@ -264,9 +275,12 @@ async fn tcp_query(
     packet: &[u8],
     timeout_ms: u64,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let mut stream = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(target))
-        .await
-        .map_err(|_| anyhow!("tcp connect timed out"))??;
+    let mut stream = timeout(
+        Duration::from_millis(timeout_ms),
+        TcpStream::connect(target),
+    )
+    .await
+    .map_err(|_| anyhow!("tcp connect timed out"))??;
     stream.set_nodelay(true)?;
     let framed = frame_for_tcp(packet);
     stream.write_all(&framed).await?;

@@ -42,7 +42,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Ports
+# Ports. Sidecar topology only binds inbound/outbound/HBONE; east-west /
+# egress addresses are still exported below so that a future topology swap
+# (or a node-waypoint variant) does not collide with whatever the operator
+# is running on those ports. They are otherwise unused.
 GATEWAY_DNS_PORT=15053
 UPSTREAM_STUB_PORT=17053
 CP_STUB_PORT=17070
