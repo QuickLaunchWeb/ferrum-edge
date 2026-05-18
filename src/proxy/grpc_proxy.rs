@@ -377,9 +377,12 @@ impl GrpcConnectionPool {
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
-    /// Currently unused post-refactor; see `pool_key_owned`.
+    /// `pub` for parity with `Http2ConnectionPool::pool_key_for_warmup` so
+    /// external integration/unit tests can verify pool-key partitioning
+    /// behavior (e.g., GAP-3B subset partitioning regression guard in
+    /// `tests/unit/gateway_core/pool_key_tests.rs`).
     #[allow(dead_code)]
-    pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
+    pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
     }
 

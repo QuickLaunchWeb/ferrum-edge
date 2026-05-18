@@ -1401,3 +1401,123 @@ fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
         "proxy backend host/port should appear when no target is supplied: {key_without_target}"
     );
 }
+
+// ── Per-subset pool key partitioning (GAP-3B regression guard) ─────────
+//
+// Two proxies pointing at the same `(host, port, dns_override, tls)` but
+// selecting different DestinationRule subsets MUST land on distinct pool
+// entries. The subset segment is independently written by each of the four
+// pool key builders (HTTP/H2/gRPC/H3); if any builder is refactored and
+// forgets the segment, two subsets with distinct TLS material would silently
+// share a connection. These four tests pin every builder.
+
+#[tokio::test]
+async fn connection_pool_key_partitions_by_upstream_subset() {
+    let pool = pool_with_defaults();
+    let mut p_v1 = minimal_proxy();
+    p_v1.upstream_subset = Some("v1".to_string());
+    let mut p_v2 = minimal_proxy();
+    p_v2.upstream_subset = Some("v2".to_string());
+    let mut p_none = minimal_proxy();
+    p_none.upstream_subset = None;
+
+    let key_v1 = pool.pool_key_for_warmup(&p_v1);
+    let key_v2 = pool.pool_key_for_warmup(&p_v2);
+    let key_none = pool.pool_key_for_warmup(&p_none);
+
+    assert_ne!(
+        key_v1, key_v2,
+        "v1 and v2 subsets must not share HTTP pool entries: {key_v1} vs {key_v2}"
+    );
+    assert_ne!(
+        key_v1, key_none,
+        "v1 subset and no-subset must not share: {key_v1} vs {key_none}"
+    );
+    assert_ne!(
+        key_v2, key_none,
+        "v2 subset and no-subset must not share: {key_v2} vs {key_none}"
+    );
+}
+
+#[test]
+fn http2_pool_key_partitions_by_upstream_subset() {
+    let mut p_v1 = minimal_proxy();
+    p_v1.upstream_subset = Some("v1".to_string());
+    let mut p_v2 = minimal_proxy();
+    p_v2.upstream_subset = Some("v2".to_string());
+    let mut p_none = minimal_proxy();
+    p_none.upstream_subset = None;
+
+    let key_v1 = Http2ConnectionPool::pool_key_for_warmup(&p_v1);
+    let key_v2 = Http2ConnectionPool::pool_key_for_warmup(&p_v2);
+    let key_none = Http2ConnectionPool::pool_key_for_warmup(&p_none);
+
+    assert_ne!(
+        key_v1, key_v2,
+        "v1 and v2 subsets must not share H2 pool entries: {key_v1} vs {key_v2}"
+    );
+    assert_ne!(
+        key_v1, key_none,
+        "v1 subset and no-subset must not share H2 pool: {key_v1} vs {key_none}"
+    );
+    assert_ne!(
+        key_v2, key_none,
+        "v2 subset and no-subset must not share H2 pool: {key_v2} vs {key_none}"
+    );
+}
+
+#[test]
+fn grpc_pool_key_partitions_by_upstream_subset() {
+    use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
+
+    let mut p_v1 = minimal_proxy();
+    p_v1.upstream_subset = Some("v1".to_string());
+    let mut p_v2 = minimal_proxy();
+    p_v2.upstream_subset = Some("v2".to_string());
+    let mut p_none = minimal_proxy();
+    p_none.upstream_subset = None;
+
+    let key_v1 = GrpcConnectionPool::pool_key_for_warmup(&p_v1);
+    let key_v2 = GrpcConnectionPool::pool_key_for_warmup(&p_v2);
+    let key_none = GrpcConnectionPool::pool_key_for_warmup(&p_none);
+
+    assert_ne!(
+        key_v1, key_v2,
+        "v1 and v2 subsets must not share gRPC pool entries: {key_v1} vs {key_v2}"
+    );
+    assert_ne!(
+        key_v1, key_none,
+        "v1 subset and no-subset must not share gRPC pool: {key_v1} vs {key_none}"
+    );
+    assert_ne!(
+        key_v2, key_none,
+        "v2 subset and no-subset must not share gRPC pool: {key_v2} vs {key_none}"
+    );
+}
+
+#[test]
+fn http3_pool_key_partitions_by_upstream_subset() {
+    let mut p_v1 = minimal_proxy();
+    p_v1.upstream_subset = Some("v1".to_string());
+    let mut p_v2 = minimal_proxy();
+    p_v2.upstream_subset = Some("v2".to_string());
+    let mut p_none = minimal_proxy();
+    p_none.upstream_subset = None;
+
+    let key_v1 = Http3ConnectionPool::pool_key(&p_v1, 0);
+    let key_v2 = Http3ConnectionPool::pool_key(&p_v2, 0);
+    let key_none = Http3ConnectionPool::pool_key(&p_none, 0);
+
+    assert_ne!(
+        key_v1, key_v2,
+        "v1 and v2 subsets must not share H3 pool entries: {key_v1} vs {key_v2}"
+    );
+    assert_ne!(
+        key_v1, key_none,
+        "v1 subset and no-subset must not share H3 pool: {key_v1} vs {key_none}"
+    );
+    assert_ne!(
+        key_v2, key_none,
+        "v2 subset and no-subset must not share H3 pool: {key_v2} vs {key_none}"
+    );
+}

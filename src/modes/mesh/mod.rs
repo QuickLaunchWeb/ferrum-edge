@@ -1320,7 +1320,7 @@ fn apply_destination_rules(
     // upstream's `resolved_subset_tls` map. Runs once after all DRs are
     // applied so subset TLS layers over the FINAL upstream-level TLS rather
     // than whatever value a mid-loop pass would have observed.
-    resolve_subset_traffic_policy_tls(config, runtime);
+    resolve_subset_traffic_policy_tls(config, runtime)?;
 
     Ok(())
 }
@@ -1331,7 +1331,17 @@ fn apply_destination_rules(
 /// `Upstream.resolved_subset_tls` keyed by subset name; consulted by
 /// [`GatewayConfig::resolve_upstream_tls`] for proxies whose
 /// `upstream_subset` selects that subset.
-fn resolve_subset_traffic_policy_tls(config: &mut GatewayConfig, runtime: &MeshRuntimeConfig) {
+///
+/// Fail-closed: any subset whose `trafficPolicy.tls` cannot be resolved
+/// (e.g., `ISTIO_MUTUAL` requested without SVID material) rejects the entire
+/// slice via `Err`, matching [`apply_traffic_policy_tls_to_upstream`]'s
+/// upstream-level semantics. Silently degrading to upstream-level TLS would
+/// turn an operator-requested mTLS posture into whatever the upstream defaults
+/// to (potentially `SIMPLE` with a public CA).
+fn resolve_subset_traffic_policy_tls(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Result<(), anyhow::Error> {
     for upstream in &mut config.upstreams {
         let Some(subsets) = upstream.subsets.as_ref() else {
             // No subsets — make sure any stale map from a previous apply
@@ -1351,26 +1361,24 @@ fn resolve_subset_traffic_policy_tls(config: &mut GatewayConfig, runtime: &MeshR
             };
             let identity = format!("{}/{}", upstream.id, subset.name);
             let mut slot = upstream_base_tls.clone();
-            match apply_traffic_policy_tls_to_backend_config(
+            apply_traffic_policy_tls_to_backend_config(
                 &mut slot, subset_tls, runtime, &identity,
-            ) {
-                Ok(()) => {
-                    if let Some(resolved) = ResolvedSubsetTrafficPolicy::from_tls(Some(slot)) {
-                        resolved_map.insert(subset.name.clone(), resolved);
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        upstream = %upstream.id,
-                        subset = %subset.name,
-                        error = %error,
-                        "DestinationRule subset trafficPolicy.tls projection failed; subset falls back to upstream-level TLS"
-                    );
-                }
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
+                    upstream.id,
+                    subset.name,
+                    e
+                )
+            })?;
+            if let Some(resolved) = ResolvedSubsetTrafficPolicy::from_tls(Some(slot)) {
+                resolved_map.insert(subset.name.clone(), resolved);
             }
         }
         upstream.resolved_subset_tls = resolved_map;
     }
+    Ok(())
 }
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.

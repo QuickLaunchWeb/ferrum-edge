@@ -782,3 +782,43 @@ fn dr_tls_translation_rejects_istio_mutual_with_explicit_cert() {
         "got: {err}"
     );
 }
+
+#[test]
+fn dr_subset_istio_mutual_without_runtime_svid_fails_closed() {
+    // GAP-3B fail-closed regression guard: a subset configured for
+    // `ISTIO_MUTUAL` without SVID material must REJECT the slice, not
+    // silently fall back to upstream-level TLS. The upstream-level path
+    // already does this (see `dr_istio_mutual_without_runtime_svid_fails_mesh_preparation`);
+    // the subset-level path must match to prevent an operator's
+    // "v1 MUST use mTLS" requirement from quietly degrading to the
+    // upstream's posture (which may be `SIMPLE` with a public CA).
+    let (mut config, _tls) = translate_dr(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {
+                "tls": {"mode": "ISTIO_MUTUAL"}
+            }
+        }]
+    }));
+
+    let upstream = build_matching_upstream("reviews-u", "reviews.default.svc.cluster.local");
+    config.upstreams.push(upstream);
+    let mut proxy = build_proxy("reviews-p-v1", "reviews-u");
+    proxy.upstream_subset = Some("v1".to_string());
+    config.proxies.push(proxy);
+
+    let err = prepare_gateway_config_for_mesh(config, &test_runtime())
+        .expect_err("subset ISTIO_MUTUAL without runtime SVID must reject the slice");
+
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("subset trafficPolicy.tls projection failed"),
+        "expected fail-closed subset projection error, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("v1") && err_str.contains("reviews-u"),
+        "error should identify the offending subset and upstream, got: {err_str}"
+    );
+}
