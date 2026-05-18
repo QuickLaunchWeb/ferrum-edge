@@ -21,7 +21,7 @@ services:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: sqlite
       FERRUM_DB_URL: sqlite:////data/ferrum.db?mode=rwc
-      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     volumes:
       - ferrum_data:/data
@@ -43,7 +43,7 @@ services:
     environment:
       POSTGRES_DB: ferrum
       POSTGRES_USER: ferrum
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-password-change-in-production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -75,8 +75,8 @@ services:
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: postgres
-      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
-      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
       FERRUM_DB_POLL_INTERVAL: 30
       # FERRUM_DB_FAILOVER_URLS: postgres://ferrum:${POSTGRES_PASSWORD}@postgres-standby:5432/ferrum
@@ -135,7 +135,7 @@ services:
       FERRUM_DB_TYPE: mongodb
       FERRUM_DB_URL: mongodb://ferrum:${MONGO_PASSWORD:-dev-password-change-in-production}@mongodb:27017/?authSource=admin
       FERRUM_MONGO_DATABASE: ferrum
-      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
       FERRUM_DB_POLL_INTERVAL: 30
     networks:
@@ -170,10 +170,10 @@ services:
     environment:
       FERRUM_MODE: cp
       FERRUM_DB_TYPE: postgres
-      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
-      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
-      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network
@@ -206,7 +206,7 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
-      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network
@@ -238,7 +238,7 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
-      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network
