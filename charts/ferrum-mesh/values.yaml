@@ -91,9 +91,27 @@ ca:
     FERRUM_MESH_PRODUCTION_MODE: "true"
 
 observability:
+  # Master switch for the observability subtree. Default `false` so a fresh
+  # install does not assume the cluster runs Prometheus / a Grafana sidecar.
+  # Flip to `true` to render `PrometheusRule` + dashboard `ConfigMap`s.
   enabled: false
   dashboards:
+    # When `observability.enabled` is `true`, render a `ConfigMap` that
+    # contains the five bundled Grafana dashboards
+    # (gateway-overview, mesh-overview, certificate-posture, egress-scope,
+    # policy-deny). The ConfigMap carries the `grafana_dashboard: "1"` label
+    # that the Grafana sidecar (`kiwigrid/k8s-sidecar`) and the Grafana
+    # Operator both pick up automatically.
     enabled: true
+    # Sidecar label key/value override — only needed if your Grafana install
+    # uses a custom label (e.g. `grafana_dashboard_my-org`). The default is
+    # the upstream Grafana sidecar convention.
+    # sidecarLabel: grafana_dashboard
+    # sidecarLabelValue: "1"
+    # Extra labels and annotations stamped on the dashboard ConfigMap.
+    # Useful for `grafana.com/folder`-style annotations or routing labels.
+    # labels: {}
+    # annotations: {}
   alerts:
     enabled: true
     certExpiringSeconds: 604800
