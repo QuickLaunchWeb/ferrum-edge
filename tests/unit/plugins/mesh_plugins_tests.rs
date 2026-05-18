@@ -4,6 +4,7 @@ use std::sync::Arc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{BackendScheme, Proxy};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
     WorkloadSelector,
@@ -1337,6 +1338,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         tls_client_cert_der: Some(Arc::new(vec![1, 2, 3])),
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -2187,5 +2189,121 @@ async fn mesh_authz_per_pod_scoping_disabled_path_preserves_construction_filter(
     assert!(
         matches!(result, PluginResult::Continue),
         "construction filter must drop team-a policy from a team-b proxy, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
+    // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`
+    // before the plugin chain runs, and `workload_metrics` then surfaces it
+    // as `mesh.direction = "inbound"` in transaction metadata so the log
+    // path can decide CLIENT vs SERVER span kind.
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("mesh.direction").map(String::as_str),
+        Some("inbound")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_outbound_listener_stamps_mesh_direction_outbound() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("mesh.direction").map(String::as_str),
+        Some("outbound")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_unstamped_request_does_not_emit_direction_metadata() {
+    // Non-mesh listeners (file / db / cp / dp) leave `mesh_direction = None`.
+    // The plugin must not invent a value, since downstream consumers rely on
+    // "absent" as the signal that no mesh listener stamped this request.
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = HashMap::new();
+
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(!ctx.metadata.contains_key("mesh.direction"));
+}
+
+#[tokio::test]
+async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: None,
+        listen_port: 15432,
+        backend_scheme: BackendScheme::Tcp,
+        consumer_index: Arc::new(ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: Some(MeshTrafficDirection::Inbound),
+    };
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let metadata = ctx.metadata.expect("stream metadata");
+    assert_eq!(
+        metadata.get("mesh.direction").map(String::as_str),
+        Some("inbound")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_direction_emit_back_compat_default_is_server_only() {
+    // When `direction_emit` is absent, the plugin must default to the
+    // pre-GAP-3F server_only behaviour so existing deployments keep emitting
+    // exactly the spans they did before.
+    let plugin = WorkloadMetrics::new(&json!({})).expect("default plugin config");
+    let mut ctx = request_context(None);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // The metadata stamp still records the listener-provided direction so the
+    // outbound direction is observable in logs even on a server_only plugin.
+    assert_eq!(
+        ctx.metadata.get("mesh.direction").map(String::as_str),
+        Some("outbound")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_direction_emit_rejects_garbage_value() {
+    // direction_emit accepts only known booleans; a wrong shape must be a
+    // hard config error rather than silently defaulting to server_only.
+    let result = WorkloadMetrics::new(&json!({
+        "direction_emit": "client"
+    }));
+    let err = match result {
+        Ok(_) => panic!("string direction_emit must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("direction_emit"),
+        "config error must mention the field: {err}"
     );
 }

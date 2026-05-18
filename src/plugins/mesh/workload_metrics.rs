@@ -12,11 +12,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::identity::{SpiffeId, TrustDomain};
+use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::TracingProvider;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh::authz::parse_trust_domain_aliases;
 use crate::plugins::otel_tracing::{
-    OtelTracing, SpanData, TraceExporter, build_traceparent, ensure_trace_metadata,
+    OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
     trace_exporters_from_providers, trace_is_sampled,
 };
 use crate::plugins::utils::PluginHttpClient;
@@ -29,8 +30,91 @@ const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
 const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
 const MESH_SOURCE_NAMESPACE: &str = "mesh.source.namespace";
 const MESH_SOURCE_SERVICE_ACCOUNT: &str = "mesh.source.service_account";
+const MESH_DIRECTION_METADATA: &str = "mesh.direction";
+const MESH_DIRECTION_INBOUND: &str = "inbound";
+const MESH_DIRECTION_OUTBOUND: &str = "outbound";
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
+
+fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
+    match direction {
+        MeshTrafficDirection::Inbound => MESH_DIRECTION_INBOUND,
+        MeshTrafficDirection::Outbound => MESH_DIRECTION_OUTBOUND,
+    }
+}
+
+/// Parse a `mesh.direction` metadata value emitted by this plugin. `None`
+/// when the metadata is absent or unrecognized so callers fall back to the
+/// pre-GAP-3F SERVER-only behaviour.
+fn parse_mesh_direction_metadata(value: &str) -> Option<MeshTrafficDirection> {
+    match value {
+        MESH_DIRECTION_INBOUND => Some(MeshTrafficDirection::Inbound),
+        MESH_DIRECTION_OUTBOUND => Some(MeshTrafficDirection::Outbound),
+        _ => None,
+    }
+}
+
+/// Which directions of a mesh hop should produce tracing spans.
+///
+/// Mirrors Istio `Telemetry.tracing[].match.mode`:
+///
+/// - `{ server: true, client: false }` — SERVER (default, back-compat)
+/// - `{ server: false, client: true }` — CLIENT-only
+/// - `{ server: true, client: true }` — CLIENT_AND_SERVER
+///
+/// The Istio translator pre-computes this from the merged `tracing[]`
+/// entries; operator-supplied direct configurations can also set it
+/// explicitly via the `direction_emit` JSON object. Default preserves the
+/// pre-GAP-3F behaviour where every workload_metrics instance emits SERVER
+/// spans only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct DirectionEmit {
+    #[serde(default = "DirectionEmit::default_server")]
+    pub(crate) server: bool,
+    #[serde(default)]
+    pub(crate) client: bool,
+}
+
+impl DirectionEmit {
+    fn default_server() -> bool {
+        true
+    }
+
+    /// Back-compat default: emit SERVER spans only. Matches the behaviour of
+    /// every workload_metrics instance before GAP-3F shipped.
+    pub(crate) fn server_only() -> Self {
+        Self {
+            server: true,
+            client: false,
+        }
+    }
+
+    /// Both CLIENT and SERVER spans — emitted on any mesh listener.
+    #[allow(dead_code)]
+    pub(crate) fn both() -> Self {
+        Self {
+            server: true,
+            client: true,
+        }
+    }
+
+    /// Whether this plugin instance should emit a span for the given listener
+    /// direction. An unstamped `direction` (`None`) preserves SERVER-emit
+    /// behaviour so non-mesh modes and pre-stamping listeners keep working.
+    pub(crate) fn emits_for(self, direction: Option<MeshTrafficDirection>) -> bool {
+        match direction {
+            Some(MeshTrafficDirection::Inbound) => self.server,
+            Some(MeshTrafficDirection::Outbound) => self.client,
+            None => self.server,
+        }
+    }
+}
+
+impl Default for DirectionEmit {
+    fn default() -> Self {
+        Self::server_only()
+    }
+}
 
 #[derive(Default)]
 pub struct WorkloadMetrics {
@@ -55,6 +139,9 @@ pub struct WorkloadMetrics {
     trace_exporters: Vec<Arc<dyn TraceExporter>>,
     span_reporting_disabled: bool,
     service_name: String,
+    /// Which directions of a mesh hop this plugin instance should emit spans
+    /// for. Defaults to SERVER-only.
+    direction_emit: DirectionEmit,
 }
 
 #[derive(Debug)]
@@ -155,6 +242,7 @@ impl WorkloadMetrics {
             trace_exporters_from_providers(&tracing_providers, &service_name, config, http_client)
                 .map_err(|e| format!("workload_metrics: invalid tracing exporter config: {e}"))?
         };
+        let direction_emit = parse_direction_emit(config)?;
 
         Ok(Self {
             node_id: string_config(config, "node_id"),
@@ -172,6 +260,7 @@ impl WorkloadMetrics {
             trace_exporters,
             span_reporting_disabled,
             service_name,
+            direction_emit,
         })
     }
 
@@ -269,6 +358,12 @@ impl WorkloadMetrics {
             "mesh.request_protocol".to_string(),
             request_protocol(ctx, headers).to_string(),
         );
+        if let Some(direction) = ctx.mesh_direction {
+            ctx.metadata.insert(
+                MESH_DIRECTION_METADATA.to_string(),
+                mesh_direction_str(direction).to_string(),
+            );
+        }
         if let Some(identity) = source_identity.as_ref() {
             insert_source_spiffe_labels(&mut ctx.metadata, identity);
         }
@@ -499,11 +594,18 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        let stamped_direction = ctx.mesh_direction;
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
         if self.trace_context_enabled() && trace_is_sampled(metadata) {
             ensure_trace_metadata(metadata, &HashMap::new());
+        }
+        if let Some(direction) = stamped_direction {
+            metadata.insert(
+                MESH_DIRECTION_METADATA.to_string(),
+                mesh_direction_str(direction).to_string(),
+            );
         }
         metadata.insert(
             "mesh.connection_security_policy".to_string(),
@@ -537,7 +639,22 @@ impl Plugin for WorkloadMetrics {
         if !self.should_export_metadata(&summary.metadata) {
             return;
         }
-        self.export_span(SpanData::from_stream_summary(summary, &self.service_name));
+        let direction = summary
+            .metadata
+            .get(MESH_DIRECTION_METADATA)
+            .and_then(|value| parse_mesh_direction_metadata(value));
+        if !self.direction_emit.emits_for(direction) {
+            return;
+        }
+        let kind = match direction {
+            Some(MeshTrafficDirection::Outbound) => SpanKind::Client,
+            _ => SpanKind::Server,
+        };
+        self.export_span(SpanData::from_stream_summary_with_kind(
+            summary,
+            &self.service_name,
+            kind,
+        ));
     }
 
     async fn log(&self, summary: &TransactionSummary) {
@@ -546,9 +663,21 @@ impl Plugin for WorkloadMetrics {
         if !self.should_export_metadata(&summary.metadata) {
             return;
         }
-        self.export_span(SpanData::from_transaction_summary(
+        let direction = summary
+            .metadata
+            .get(MESH_DIRECTION_METADATA)
+            .and_then(|value| parse_mesh_direction_metadata(value));
+        if !self.direction_emit.emits_for(direction) {
+            return;
+        }
+        let kind = match direction {
+            Some(MeshTrafficDirection::Outbound) => SpanKind::Client,
+            _ => SpanKind::Server,
+        };
+        self.export_span(SpanData::from_transaction_summary_with_kind(
             summary,
             &self.service_name,
+            kind,
         ));
     }
 
@@ -566,6 +695,14 @@ fn string_config(config: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
+    match config.get("direction_emit") {
+        None | Some(Value::Null) => Ok(DirectionEmit::server_only()),
+        Some(value) => serde_json::from_value::<DirectionEmit>(value.clone())
+            .map_err(|e| format!("workload_metrics: invalid direction_emit config: {e}")),
+    }
 }
 
 fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, String> {

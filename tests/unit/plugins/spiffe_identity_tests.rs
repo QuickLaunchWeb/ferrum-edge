@@ -42,6 +42,7 @@ fn empty_stream_ctx(cert_der: Option<Vec<u8>>) -> StreamConnectionContext {
         tls_client_cert_der: cert_der.map(Arc::new),
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     }
 }
 

@@ -27,6 +27,7 @@ fn create_stream_context(
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
+        mesh_direction: None,
     }
 }
 

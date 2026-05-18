@@ -2272,6 +2272,16 @@ fn inject_mesh_global_plugins(
             // when span_reporting_disabled makes WorkloadMetrics skip exporters.
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
+        // GAP-3F: project `Telemetry.tracing[].match.mode` into the plugin's
+        // `direction_emit` so a single auto-injected workload_metrics instance
+        // can serve both directions. Default (no explicit mode) preserves the
+        // pre-GAP-3F SERVER-only emit behaviour.
+        if let Some(mode) = tracing.mode {
+            workload_metrics_config["direction_emit"] = serde_json::json!({
+                "server": mode.emits_server(),
+                "client": mode.emits_client(),
+            });
+        }
     }
     if let Some(metrics) = &merged_telemetry.metrics {
         workload_metrics_config["metrics"] = serde_json::json!(metrics);
@@ -3012,6 +3022,7 @@ async fn serve_mesh_runtime(
                     addr,
                     state,
                     shutdown,
+                    Some(direction),
                     Some(started_tx),
                 )
                 .await
@@ -3021,15 +3032,23 @@ async fn serve_mesh_runtime(
                     state,
                     shutdown,
                     tls_config,
+                    Some(direction),
                     Some(started_tx),
                 )
                 .await
             } else {
-                proxy::start_proxy_listener_with_tls_and_signal(
+                // Outbound capture (plaintext) — non-mTLS mesh listener. Use the
+                // generic listener entry but stamp direction by routing through
+                // the mesh mTLS variant with `record_mesh_mtls_metric=false`.
+                // We accomplish that by constructing the underlying call
+                // directly so we can pass `mesh_direction` even though TLS
+                // termination is disabled.
+                proxy::start_mesh_plaintext_listener_with_signal(
                     addr,
                     state,
                     shutdown,
                     tls_config,
+                    Some(direction),
                     Some(started_tx),
                 )
                 .await

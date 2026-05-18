@@ -94,6 +94,7 @@ use crate::config::types::{
     BackendScheme, BackendTlsConfig, Consumer, Proxy, ResolvedPortOverride, RetryConfig, Upstream,
 };
 use crate::consumer_index::ConsumerIndex;
+use crate::modes::mesh::MeshTrafficDirection;
 
 /// Protocol categories that plugins can declare support for.
 ///
@@ -412,6 +413,16 @@ pub struct RequestContext {
     /// the shared listener carries no single proxy identity that fits
     /// the slice-level filter that other topologies use.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Mesh traffic direction stamped by the listener that accepted this
+    /// request. `Some(Inbound)` for mesh inbound mTLS / HBONE termination
+    /// listeners; `Some(Outbound)` for the outbound capture listener;
+    /// `None` for non-mesh listeners (file/db/cp/dp HTTP entrypoints).
+    ///
+    /// Mesh-aware plugins (e.g., `workload_metrics`) gate span emission
+    /// on this so a single plugin instance can serve both directions and
+    /// CLIENT vs SERVER span kinds reflect which side of the hop the
+    /// listener represents.
+    pub mesh_direction: Option<MeshTrafficDirection>,
 }
 
 impl RequestContext {
@@ -450,6 +461,7 @@ impl RequestContext {
             route_override_response_transform: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
+            mesh_direction: None,
         }
     }
 
@@ -1221,6 +1233,10 @@ pub struct StreamConnectionContext {
     /// Populated only for proxies with `passthrough: true`. Available to plugins for
     /// logging, routing, or access control without requiring TLS termination.
     pub sni_hostname: Option<String>,
+    /// Mesh traffic direction stamped by the stream listener that accepted this
+    /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream
+    /// proxies that are not part of a mesh listener.
+    pub mesh_direction: Option<MeshTrafficDirection>,
 }
 
 impl StreamConnectionContext {

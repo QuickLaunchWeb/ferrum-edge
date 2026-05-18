@@ -879,6 +879,7 @@ async fn run_tcp_accept_loop(
                         tls_client_cert_der: None,
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
+                        mesh_direction: None,
                     };
 
                     let result = handle_tcp_connection(
