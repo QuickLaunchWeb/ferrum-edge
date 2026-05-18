@@ -1060,7 +1060,7 @@ fn descriptor_conflicts_for_host(
     descriptor: &RouteMatchDescriptor,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
-    parent_refs.iter().any(|parent_ref| {
+    parent_refs.iter().all(|parent_ref| {
         losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
             route_family: route_family.to_string(),
             parent_ref: parent_ref.clone(),
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_skips_match_that_loses_on_any_parent_ref() {
+    fn conflicting_http_route_keeps_match_with_surviving_parent_ref() {
         let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
         let mut mixed_parent_route = object(
             "HTTPRoute",
@@ -1985,9 +1985,11 @@ mod tests {
         let result = translate_k8s_objects(&[older, mixed_parent_route], options())
             .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert!(result.config.proxies[0].id.contains("api-a"));
-        assert!(!result.config.proxies.iter().any(|proxy| {
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
             proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
         }));
     }
