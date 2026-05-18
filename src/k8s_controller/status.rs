@@ -601,7 +601,11 @@ fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {
         .get("sectionName")
         .and_then(Value::as_str)
         .unwrap_or("*");
-    format!("{group}/{kind}/{namespace}/{name}/{section}")
+    let port = parent_ref
+        .get("port")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "*".to_string(), |port| port.to_string());
+    format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
 }
 
 fn gateway_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
@@ -957,6 +961,29 @@ mod tests {
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Conflicted")
         );
+    }
+
+    #[test]
+    fn newer_conflicting_route_with_parent_ref_port_reports_conflicted() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
+        older.spec["parentRefs"] = json!([{"name": "edge", "port": 80}]);
+        let mut newer = route_with_created_at("api-b", "2026-01-02T00:00:00Z");
+        newer.spec["parentRefs"] = json!([{"name": "edge", "port": 80}]);
+
+        let updates =
+            plan_gateway_api_status_updates(&[gateway_class, gateway, newer, older], options());
+        let newer_update = updates
+            .iter()
+            .find(|update| update.name == "api-b")
+            .expect("newer route status");
+        let parents = newer_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+
+        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "Programmed", "False");
+        assert_condition(conditions, "Conflicted", "True");
     }
 
     #[test]
