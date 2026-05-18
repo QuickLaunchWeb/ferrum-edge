@@ -100,7 +100,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **HMAC** — request signature verification with body integrity protection via Digest header (RFC 9421 / RFC 3230)
 - **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
 - **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
-- **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection
+- **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, timestamp freshness, and nonce replay protection (SAML assertion validation is not currently supported — pending XMLDSIG signature verification)
 
 ### Authorization & Security Plugins
 

@@ -241,6 +241,26 @@ impl SoapWsSecurity {
             );
         }
 
+        // `validate_saml_assertion` currently only checks the Issuer / NotBefore
+        // / NotOnOrAfter / Audience values inside the assertion XML. It does
+        // NOT cryptographically verify the assertion's `<Signature>`, so an
+        // attacker who can submit a SOAP body can forge an assertion claiming
+        // to be issued by any trusted issuer string and pass validation
+        // without holding the issuer's private key. Refuse to start with
+        // `saml.enabled: true` until proper XMLDSIG signature verification
+        // is plumbed in — running with this surface enabled provides only
+        // illusory authentication and is worse than not running it at all.
+        if saml_enabled {
+            return Err(
+                "soap_ws_security: saml.enabled is not currently supported — \
+                 the plugin does not yet cryptographically verify SAML \
+                 assertion signatures, so accepting them would be trivially \
+                 spoofable. Disable saml or wait for XMLDSIG signature \
+                 verification to land."
+                    .to_string(),
+            );
+        }
+
         let saml_audience = saml_cfg["audience"].as_str().map(String::from);
         let saml_clock_skew_seconds = saml_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
 
