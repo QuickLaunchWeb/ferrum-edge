@@ -173,7 +173,7 @@ fn gateway_class_status(object: &K8sObject) -> Value {
     ];
 
     let mut status = object.status.clone();
-    ensure_status_object(&mut status).insert("conditions".to_string(), Value::Array(conditions));
+    merge_status_conditions(&mut status, &["Accepted", "SupportedVersion"], conditions);
     status
 }
 
@@ -250,7 +250,11 @@ fn gateway_status(
     ];
 
     let mut status = object.status.clone();
-    ensure_status_object(&mut status).insert("conditions".to_string(), Value::Array(conditions));
+    merge_status_conditions(
+        &mut status,
+        &["Accepted", "ResolvedRefs", "Programmed", "Conflicted"],
+        conditions,
+    );
     status
 }
 
@@ -273,6 +277,28 @@ fn ensure_status_object(status: &mut Value) -> &mut serde_json::Map<String, Valu
         Value::Object(map) => map,
         _ => unreachable!("status was normalized to an object"),
     }
+}
+
+fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Vec<Value>) {
+    let status_object = ensure_status_object(status);
+    let mut conditions = status_object
+        .get("conditions")
+        .and_then(Value::as_array)
+        .map(|existing| {
+            existing
+                .iter()
+                .filter(|condition| {
+                    let Some(condition_type) = condition.get("type").and_then(Value::as_str) else {
+                        return true;
+                    };
+                    !owned_types.contains(&condition_type)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    conditions.extend(desired);
+    status_object.insert("conditions".to_string(), Value::Array(conditions));
 }
 
 fn route_status(
@@ -1283,6 +1309,48 @@ mod tests {
             Some("10.0.0.10")
         );
         assert!(gateway_update.status["conditions"].is_array());
+    }
+
+    #[test]
+    fn gateway_status_preserves_non_ferrum_conditions() {
+        let gateway_class = ferrum_gateway_class();
+        let mut gateway = ferrum_gateway("edge");
+        gateway.status = json!({
+            "conditions": [
+                {
+                    "type": "example.com/ExternalReady",
+                    "status": "True",
+                    "observedGeneration": 7,
+                    "reason": "ExternalReady",
+                    "message": "owned by another controller",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                },
+                {
+                    "type": "Accepted",
+                    "status": "False",
+                    "observedGeneration": 1,
+                    "reason": "OldValue",
+                    "message": "stale Ferrum condition",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+
+        assert_condition(conditions, "example.com/ExternalReady", "True");
+        assert_condition(conditions, "Accepted", "True");
+        assert_eq!(
+            conditions
+                .iter()
+                .filter(
+                    |condition| condition.get("type").and_then(Value::as_str) == Some("Accepted")
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]
