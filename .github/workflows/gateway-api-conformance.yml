@@ -17,6 +17,13 @@ on:
 permissions:
   contents: read
 
+# Both runs are useful artifact bundles, so keep both — but serialize them so
+# a Monday cron tick doesn't race a manual workflow_dispatch on the same
+# resource budget.
+concurrency:
+  group: gateway-api-conformance
+  cancel-in-progress: false
+
 env:
   FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
   KIND_VERSION: v0.27.0
@@ -74,9 +81,18 @@ jobs:
           set -euo pipefail
           gateway_api_version="${{ steps.inputs.outputs.gateway_api_version }}"
           kubectl apply --server-side=true -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${gateway_api_version}/standard-install.yaml"
-          kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=120s
-          kubectl wait --for=condition=Established crd/gateways.gateway.networking.k8s.io --timeout=120s
-          kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=120s
+          # Wait on every standard-install CRD that the controller watches or
+          # writes status to. If we wait on only three, the controller's first
+          # reflector loop logs a noisy discovery warning before the others
+          # become Established.
+          for crd in \
+            gatewayclasses.gateway.networking.k8s.io \
+            gateways.gateway.networking.k8s.io \
+            httproutes.gateway.networking.k8s.io \
+            grpcroutes.gateway.networking.k8s.io \
+            referencegrants.gateway.networking.k8s.io; do
+            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+          done
 
       - name: Deploy Ferrum mesh controller
         run: |
@@ -95,7 +111,17 @@ jobs:
             --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
             --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
-          kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s || true
+          # The conformance test step is intentionally non-gating, but the
+          # control plane never becoming ready is an infrastructure failure
+          # (image pull error, RBAC misconfig, crashloop). Surface that
+          # explicitly instead of silently running tests against a dead
+          # controller and reporting a wall of unrelated failures.
+          if ! kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s; then
+            kubectl -n ferrum describe pods || true
+            kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=200 || true
+            echo "::error title=Control plane never reached Ready::skipping conformance run"
+            exit 1
+          fi
 
       - name: Create Ferrum GatewayClass
         run: |

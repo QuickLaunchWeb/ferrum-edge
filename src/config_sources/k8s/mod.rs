@@ -179,6 +179,11 @@ impl std::error::Error for K8sTranslateError {}
 pub struct K8sTranslation {
     pub config: GatewayConfig,
     pub warnings: Vec<String>,
+    /// Gateway API route conflicts computed over the routes that survived
+    /// translator validation. Invalid routes are excluded so the status writer
+    /// does not mark a valid (and materialized) route as `Conflicted=True`
+    /// against an older sibling that the translator already dropped.
+    pub route_conflicts: Vec<GatewayApiRouteConflict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +264,11 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    /// Flat copy of the Gateway API route conflicts computed over the
+    /// translator's filtered object set. Reused by the status writer so
+    /// invalid routes (which the translator skips) cannot push a valid
+    /// sibling into `Conflicted=True`.
+    gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
 }
 
 impl K8sAccumulator {
@@ -281,6 +291,7 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_route_conflicts: Vec::new(),
         }
     }
 
@@ -423,6 +434,7 @@ impl K8sAccumulator {
         K8sTranslation {
             config: self.config,
             warnings: self.warnings,
+            route_conflicts: self.gateway_api_route_conflicts,
         }
     }
 }
@@ -494,7 +506,7 @@ where
     }
 
     let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
-    for conflict in gateway_api_route_conflicts {
+    for conflict in &gateway_api_route_conflicts {
         let skipped_reason = if conflict.loser.kind == "GRPCRoute"
             && conflict.key.match_signature == "{}"
         {
@@ -518,8 +530,9 @@ where
         acc.gateway_api_conflict_losers
             .entry(conflict.loser.clone())
             .or_default()
-            .push(conflict);
+            .push(conflict.clone());
     }
+    acc.gateway_api_route_conflicts = gateway_api_route_conflicts;
 
     for object in &included_objects {
         if !includes_object_namespace(&acc.options, object) {

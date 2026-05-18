@@ -363,7 +363,13 @@ async fn do_reconcile(
         swap_merged_k8s_translation(ctx.config_arc, &translation.config, &managed_namespaces)
     else {
         debug!("No config changes detected, skipping swap");
-        patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options).await;
+        patch_gateway_api_statuses(
+            ctx.gateway_status_writer,
+            &objects,
+            options,
+            &translation.route_conflicts,
+        )
+        .await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
@@ -379,7 +385,13 @@ async fn do_reconcile(
         new_config.clone(),
         ctx.mesh_registry,
     );
-    patch_gateway_api_statuses(ctx.gateway_status_writer, &objects, options).await;
+    patch_gateway_api_statuses(
+        ctx.gateway_status_writer,
+        &objects,
+        options,
+        &translation.route_conflicts,
+    )
+    .await;
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
@@ -400,11 +412,12 @@ async fn patch_gateway_api_statuses(
     writer: Option<&GatewayApiStatusWriter>,
     objects: &[K8sObject],
     options: K8sTranslationOptions,
+    route_conflicts: &[crate::config_sources::k8s::GatewayApiRouteConflict],
 ) {
     let Some(writer) = writer else {
         return;
     };
-    let updates = plan_gateway_api_status_updates(objects, options);
+    let updates = plan_gateway_api_status_updates(objects, options, route_conflicts);
     if updates.is_empty() {
         return;
     }

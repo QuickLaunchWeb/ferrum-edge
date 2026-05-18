@@ -1763,6 +1763,29 @@ mod tests {
     }
 
     #[test]
+    fn translation_surfaces_conflict_list_to_status_writer() {
+        // The status writer reuses `K8sTranslation.route_conflicts` so it
+        // doesn't recompute conflicts (and so invalid, translator-skipped
+        // routes don't leak into a valid sibling's `Conflicted` condition).
+        // Guard the wiring: the same conflict that drove the warning must
+        // also appear on the translation's exposed conflict list.
+        let newer = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+
+        let result =
+            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+
+        assert!(
+            result
+                .route_conflicts
+                .iter()
+                .any(|conflict| conflict.loser.name == "api-b" && conflict.winner.name == "api-a"),
+            "translator must surface conflict for the losing route on K8sTranslation: {:?}",
+            result.route_conflicts
+        );
+    }
+
+    #[test]
     fn conflicting_http_route_timestamp_tie_uses_name_winner() {
         let right = route_with_name_and_created_at("api-b", "2026-01-01T00:00:00Z");
         let left = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");

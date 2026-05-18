@@ -36,6 +36,8 @@ impl GatewayApiStatusWriter {
         &self,
         updates: &[GatewayApiStatusUpdate],
     ) -> Result<(), kube::Error> {
+        // Build one future per update that captures its identity so partial
+        // failures can be logged with the resource they failed on.
         let futures = updates.iter().filter_map(|update| {
             let Some(ar) = api_resource_for_update(update) else {
                 warn!(
@@ -53,34 +55,60 @@ impl GatewayApiStatusWriter {
                 Api::namespaced_with(self.client.clone(), &update.namespace, &ar)
             };
             let name = update.name.clone();
+            let kind = update.kind.clone();
+            let namespace = update.namespace.clone();
             Some(async move {
-                let live = api.get_status(&name).await?;
-                let patch = status_patch_for_update(update, live.data.get("status"));
-                let params = PatchParams {
-                    field_manager: Some(FERRUM_GATEWAY_CONTROLLER_NAME.to_string()),
-                    ..PatchParams::default()
-                };
-                api.patch_status(&name, &params, &Patch::Merge(&patch))
-                    .await
-                    .map(|_| ())
+                let result = async {
+                    let live = api.get_status(&name).await?;
+                    let patch = status_patch_for_update(update, live.data.get("status"));
+                    // TODO(ssa): switch to Patch::Apply once the chart guarantees the
+                    // status subresource accepts server-side apply. JSON Merge Patch
+                    // (RFC 7396) replaces arrays wholesale, leaving a narrow TOCTOU
+                    // window between `get_status` and `patch_status` against other
+                    // controllers writing the same `parents[]` array.
+                    let params = PatchParams {
+                        field_manager: Some(FERRUM_GATEWAY_CONTROLLER_NAME.to_string()),
+                        ..PatchParams::default()
+                    };
+                    api.patch_status(&name, &params, &Patch::Merge(&patch))
+                        .await
+                        .map(|_| ())
+                }
+                .await;
+                (kind, namespace, name, result)
             })
         });
         // Patch each Gateway API status in parallel. The Kubernetes API server
         // serializes mutations through resourceVersion conflicts; this only
         // pipelines independent objects so each round-trip's RTT does not
         // serialize the reconciler loop on large clusters.
-        for result in join_all(futures).await {
-            result?;
+        let mut first_error: Option<kube::Error> = None;
+        for (kind, namespace, name, result) in join_all(futures).await {
+            if let Err(error) = result {
+                warn!(
+                    %kind,
+                    %namespace,
+                    %name,
+                    error = %error,
+                    "Gateway API status patch failed"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 pub fn plan_gateway_api_status_updates(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
+    route_conflicts: &[GatewayApiRouteConflict],
 ) -> Vec<GatewayApiStatusUpdate> {
-    let conflicts = gateway_api_route_conflicts(objects, &options);
     objects
         .iter()
         .filter(|object| is_status_kind(&object.kind))
@@ -98,7 +126,7 @@ pub fn plan_gateway_api_status_updates(
                 .iter()
                 .map(|parent_ref| route_parent_ref_key(object, parent_ref))
                 .collect();
-            let route_conflicts: Vec<&GatewayApiRouteConflict> = conflicts
+            let object_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
                 .iter()
                 .filter(|conflict| {
                     conflict.loser == resource_key
@@ -118,7 +146,7 @@ pub fn plan_gateway_api_status_updates(
                 objects,
                 object,
                 options.clone(),
-                &route_conflicts,
+                &object_conflicts,
                 &route_keys,
                 &managed_parent_refs,
             );
@@ -592,12 +620,31 @@ fn condition_at(
                 None
             }
         })
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        .unwrap_or_else(|| {
+            // Match the Kubernetes API server's `Z`-suffixed RFC 3339 form so a
+            // re-emitted, value-unchanged condition compares equal to what the
+            // server persisted on the previous reconcile and the existing
+            // `lastTransitionTime` can be preserved.
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        });
+
+    let observed_generation = match object.metadata.generation {
+        Some(generation) => generation,
+        None => {
+            warn!(
+                kind = %object.kind,
+                namespace = %object.metadata.namespace,
+                name = %object.metadata.name,
+                "Gateway API resource missing metadata.generation; reporting observedGeneration=1"
+            );
+            1
+        }
+    };
 
     json!({
         "type": condition_type,
         "status": status,
-        "observedGeneration": object.metadata.generation.unwrap_or_default(),
+        "observedGeneration": observed_generation,
         "reason": reason,
         "message": message,
         "lastTransitionTime": last_transition_time,
@@ -630,7 +677,15 @@ fn merge_condition_entries(
                 .iter()
                 .find(|condition| condition_type(condition) == Some(existing_type))
         {
-            merged.push(desired_condition.clone());
+            // If the desired condition's value matches the existing one,
+            // preserve the existing `lastTransitionTime` — the merge target may
+            // be a freshly re-read live status whose timestamp is fresher than
+            // (or differently formatted from) the snapshot value we computed
+            // earlier in the planning pass.
+            merged.push(preserve_unchanged_transition_time(
+                desired_condition.clone(),
+                existing_condition,
+            ));
         }
     }
 
@@ -645,6 +700,25 @@ fn merge_condition_entries(
     }
 
     merged
+}
+
+fn preserve_unchanged_transition_time(mut desired: Value, existing: &Value) -> Value {
+    let same_value = desired.get("status").and_then(Value::as_str)
+        == existing.get("status").and_then(Value::as_str)
+        && desired.get("reason").and_then(Value::as_str)
+            == existing.get("reason").and_then(Value::as_str)
+        && desired.get("message").and_then(Value::as_str)
+            == existing.get("message").and_then(Value::as_str);
+    if !same_value {
+        return desired;
+    }
+    let Some(existing_time) = existing.get("lastTransitionTime").cloned() else {
+        return desired;
+    };
+    if let Value::Object(map) = &mut desired {
+        map.insert("lastTransitionTime".to_string(), existing_time);
+    }
+    desired
 }
 
 fn condition_type(condition: &Value) -> Option<&str> {
@@ -845,60 +919,40 @@ fn gateway_programmed(object: &K8sObject, config: &crate::config::types::Gateway
 }
 
 fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
-    let candidate_ids = route_proxy_id_candidates(object);
-    config.proxies.iter().any(|proxy| {
-        proxy.namespace == object.metadata.namespace && candidate_ids.contains(&proxy.id)
-    })
-}
-
-fn route_proxy_id_candidates(object: &K8sObject) -> HashSet<String> {
+    // Route proxy IDs follow `gwapi-route-{ns}-{name}-{route_kind}-{rule_idx}[-{match_idx}][-host{host_idx}]`
+    // (see `gateway_api::http_route_resources`). Requiring the route_kind segment
+    // to be immediately followed by a digit disambiguates routes whose names
+    // start with another route's name (e.g. `api` vs `api-httproute`, where both
+    // proxy IDs share `gwapi-route-{ns}-api-httproute-`). This avoids
+    // materialising O(rules × matches × hostnames) candidate strings per route
+    // and per reconcile — the previous HashSet approach generated ~1500 strings
+    // for a 5-rule × 5-match × 50-hostname route just to membership-test them.
+    // TODO: replace this naming-convention reconstruction with a typed
+    // back-reference on `Proxy` (e.g., `Proxy.metadata.k8s_source`) populated by
+    // the translator. Until then, any change to `gateway_api::http_route_resources`
+    // proxy-id format must be mirrored here.
     let route_kind = object.kind.to_ascii_lowercase();
-    let host_scope_count = object
-        .spec
-        .get("hostnames")
-        .and_then(Value::as_array)
-        .map_or(1, |hostnames| hostnames.len().max(1));
-    let mut candidates = HashSet::new();
-
-    for (rule_index, rule) in object
-        .spec
-        .get("rules")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let mut suffixes = vec![format!("{route_kind}-{rule_index}")];
-        if let Some(matches) = rule.get("matches").and_then(Value::as_array)
-            && matches.len() > 1
-        {
-            suffixes.extend(
-                matches
-                    .iter()
-                    .enumerate()
-                    .map(|(match_index, _)| format!("{route_kind}-{rule_index}-{match_index}")),
-            );
+    let prefix = format!(
+        "{}-",
+        resource_id(
+            "gwapi-route",
+            &object.metadata.namespace,
+            &object.metadata.name,
+            &route_kind,
+        )
+    );
+    config.proxies.iter().any(|proxy| {
+        if proxy.namespace != object.metadata.namespace {
+            return false;
         }
-
-        for suffix in suffixes {
-            candidates.insert(resource_id(
-                "gwapi-route",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &suffix,
-            ));
-            for host_index in 0..host_scope_count {
-                candidates.insert(resource_id(
-                    "gwapi-route",
-                    &object.metadata.namespace,
-                    &object.metadata.name,
-                    &format!("{suffix}-host{host_index}"),
-                ));
-            }
-        }
-    }
-
-    candidates
+        let Some(remainder) = proxy.id.strip_prefix(&prefix) else {
+            return false;
+        };
+        remainder
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
@@ -956,6 +1010,19 @@ mod tests {
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    /// Convenience wrapper that recomputes conflicts over the supplied
+    /// `objects`. In production the reconciler instead threads the
+    /// translator's filtered conflict list through, but the existing tests
+    /// don't exercise the invalid-route case and the full-set computation
+    /// gives them the same answer.
+    fn plan_status_updates(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+    ) -> Vec<GatewayApiStatusUpdate> {
+        let conflicts = gateway_api_route_conflicts(objects, &options);
+        plan_gateway_api_status_updates(objects, options, &conflicts)
     }
 
     fn object(kind: &str, name: &str, spec: Value) -> K8sObject {
@@ -1035,7 +1102,7 @@ mod tests {
     fn gateway_class_status_reports_accepted_for_ferrum_controller() {
         let gateway_class = ferrum_gateway_class();
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class], options());
+        let updates = plan_status_updates(&[gateway_class], options());
 
         assert_eq!(updates.len(), 1);
         let conditions = updates[0].status["conditions"].as_array().unwrap();
@@ -1047,7 +1114,7 @@ mod tests {
     fn gateway_class_status_skips_other_controllers() {
         let gateway_class = other_gateway_class();
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class], options());
+        let updates = plan_status_updates(&[gateway_class], options());
 
         assert!(updates.is_empty());
     }
@@ -1064,7 +1131,7 @@ mod tests {
             }),
         );
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
 
         assert!(updates.is_empty());
     }
@@ -1089,7 +1156,7 @@ mod tests {
             }),
         );
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         assert!(updates.is_empty());
     }
@@ -1106,7 +1173,7 @@ mod tests {
             }),
         );
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         assert!(updates.iter().all(|update| update.kind != "HTTPRoute"));
     }
@@ -1116,7 +1183,7 @@ mod tests {
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
 
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let conditions = gateway_update.status["conditions"].as_array().unwrap();
@@ -1151,7 +1218,7 @@ mod tests {
             ]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
 
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let conditions = gateway_update.status["conditions"].as_array().unwrap();
@@ -1176,7 +1243,7 @@ mod tests {
             }]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class], options());
+        let updates = plan_status_updates(&[gateway_class], options());
 
         let conditions = updates[0].status["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
@@ -1202,7 +1269,7 @@ mod tests {
 
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1237,7 +1304,7 @@ mod tests {
 
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1249,6 +1316,43 @@ mod tests {
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Accepted")
         );
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("RefNotPermitted")
+        );
+    }
+
+    #[test]
+    fn route_status_reports_unresolved_non_service_backend_ref() {
+        // Guards the second prong of `error_is_reference_resolution` against
+        // wording drift in the translator's "only core Service backendRefs are
+        // supported" error. A change to that message would silently flip this
+        // route from `Accepted=True, ResolvedRefs=False` to `Accepted=False`.
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{
+                        "group": "example.com",
+                        "kind": "ExternalService",
+                        "name": "api",
+                        "port": 8080
+                    }]
+                }]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "False");
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("RefNotPermitted")
@@ -1274,7 +1378,7 @@ mod tests {
 
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1304,7 +1408,7 @@ mod tests {
 
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1344,7 +1448,7 @@ mod tests {
 
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
-        let updates = plan_gateway_api_status_updates(
+        let updates = plan_status_updates(
             &[gateway_class, gateway, empty_route, programmed_overlap],
             options(),
         );
@@ -1367,8 +1471,7 @@ mod tests {
         let older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
         let newer = route_with_created_at("api-b", "2026-01-02T00:00:00Z");
 
-        let updates =
-            plan_gateway_api_status_updates(&[gateway_class, gateway, newer, older], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, newer, older], options());
         let newer_update = updates
             .iter()
             .find(|update| update.name == "api-b")
@@ -1394,8 +1497,7 @@ mod tests {
         let mut newer = route_with_created_at("api-b", "2026-01-02T00:00:00Z");
         newer.spec["parentRefs"] = json!([{"name": "edge", "port": 80}]);
 
-        let updates =
-            plan_gateway_api_status_updates(&[gateway_class, gateway, newer, older], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, newer, older], options());
         let newer_update = updates
             .iter()
             .find(|update| update.name == "api-b")
@@ -1433,8 +1535,7 @@ mod tests {
         );
         mixed.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let updates =
-            plan_gateway_api_status_updates(&[gateway_class, gateway, mixed, older], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, mixed, older], options());
         let mixed_update = updates
             .iter()
             .find(|update| update.name == "api-b")
@@ -1448,14 +1549,67 @@ mod tests {
     }
 
     #[test]
+    fn translator_filtered_conflicts_keep_valid_route_unconflicted() {
+        // When the translator drops an older sibling for invalid backendRefs,
+        // its conflict list excludes that route. The status planner should
+        // honour that filtered view rather than recomputing conflicts over
+        // the full object set — otherwise a valid, materialized route ends
+        // up with `Conflicted=True` against a sibling the data plane never
+        // saw.
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut invalid_older = object(
+            "HTTPRoute",
+            "api-old",
+            json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                }]
+            }),
+        );
+        invalid_older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut valid_newer = object(
+            "HTTPRoute",
+            "api-new",
+            json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        valid_newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let objects = vec![gateway_class, gateway, valid_newer, invalid_older];
+        // Simulate the translator's filtered conflict list: with the invalid
+        // route skipped, the only surviving route has no peers to conflict
+        // with, so the list is empty.
+        let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+
+        let valid_update = updates
+            .iter()
+            .find(|update| update.name == "api-new")
+            .expect("valid route status");
+        let parents = valid_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+        assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
     fn conflict_tie_breaker_uses_route_name_when_timestamps_match() {
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
         let left = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
         let right = route_with_created_at("api-b", "2026-01-01T00:00:00Z");
 
-        let updates =
-            plan_gateway_api_status_updates(&[gateway_class, gateway, right, left], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, right, left], options());
         let loser = updates
             .iter()
             .find(|update| update.name == "api-b")
@@ -1483,13 +1637,13 @@ mod tests {
                 }]
             }),
         );
-        let first = plan_gateway_api_status_updates(
+        let first = plan_status_updates(
             &[gateway_class.clone(), gateway.clone(), route.clone()],
             options(),
         );
         route.status = update_for(&first, "HTTPRoute", "api").status.clone();
 
-        let second = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let second = plan_status_updates(&[gateway_class, gateway, route], options());
 
         assert!(second.iter().all(|update| update.kind != "HTTPRoute"));
     }
@@ -1502,7 +1656,7 @@ mod tests {
             "addresses": [{"type": "IPAddress", "value": "10.0.0.10"}]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
         let gateway_update = update_for(&updates, "Gateway", "edge");
 
         assert_eq!(
@@ -1537,7 +1691,7 @@ mod tests {
             ]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway], options());
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let conditions = gateway_update.status["conditions"].as_array().unwrap();
 
@@ -1581,7 +1735,7 @@ mod tests {
             }]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1623,7 +1777,7 @@ mod tests {
             }]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1662,7 +1816,7 @@ mod tests {
             ]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1701,7 +1855,7 @@ mod tests {
             }]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1740,7 +1894,7 @@ mod tests {
             }]
         });
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
 
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
@@ -1755,7 +1909,7 @@ mod tests {
     fn emitted_conditions_include_observed_generation() {
         let gateway_class = ferrum_gateway_class();
 
-        let updates = plan_gateway_api_status_updates(&[gateway_class], options());
+        let updates = plan_status_updates(&[gateway_class], options());
 
         let conditions = updates[0].status["conditions"].as_array().unwrap();
         assert_eq!(
