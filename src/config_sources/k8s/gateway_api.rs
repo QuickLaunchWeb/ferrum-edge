@@ -310,7 +310,7 @@ fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
                         parent_ref: parent_ref.clone(),
                         hostname: hostname.clone(),
                         listen_path: descriptor.listen_path.clone(),
-                        match_signature: descriptor.match_signature.clone(),
+                        match_signature: route_conflict_match_signature(&descriptor),
                     });
                 }
             }
@@ -320,6 +320,10 @@ fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+fn route_conflict_match_signature(_descriptor: &RouteMatchDescriptor) -> String {
+    "{}".to_string()
 }
 
 fn route_match_descriptors(object: &K8sObject, rule: &Value) -> Vec<RouteMatchDescriptor> {
@@ -782,7 +786,7 @@ fn descriptor_conflicts_for_host(
             parent_ref: parent_ref.clone(),
             hostname: hostname.to_string(),
             listen_path: descriptor.listen_path.clone(),
-            match_signature: descriptor.match_signature.clone(),
+            match_signature: route_conflict_match_signature(descriptor),
         })
     })
 }
@@ -1309,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_conflicts_include_match_predicates() {
+    fn http_route_conflicts_collapse_match_predicates_per_path() {
         let mut get_route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -1347,10 +1351,15 @@ mod tests {
         let result = translate_k8s_objects(&[get_route, post_route], options())
             .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 2);
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(result.config.proxies[0].id.contains("api-get"));
         assert!(
-            result.warnings.is_empty(),
-            "method-distinct matches must not conflict: {:?}",
+            result.warnings.iter().any(|warning| {
+                warning.contains("api-post")
+                    && warning.contains("path=/api")
+                    && warning.contains("winner is default/api-get")
+            }),
+            "same host/path routes must collapse to avoid router shadowing: {:?}",
             result.warnings
         );
     }
