@@ -13,6 +13,7 @@ use crate::plugins::TransactionSummary;
 use crate::plugins::mesh::prometheus_helpers::{MeshRequestKey, mesh_request_key};
 
 const SNAPSHOT_REFRESH_MIN_MS: u64 = 1_000;
+const EDGE_RETENTION_MS: u64 = 5 * 60 * 1_000;
 
 static GLOBAL_SERVICE_GRAPH: LazyLock<Arc<ServiceGraphRegistry>> =
     LazyLock::new(|| Arc::new(ServiceGraphRegistry::default()));
@@ -197,6 +198,12 @@ impl ServiceGraphRegistry {
     fn rebuild_snapshot(&self, generated_at_unix_ms: u64) {
         self.last_snapshot_unix_ms
             .store(generated_at_unix_ms, Ordering::Relaxed);
+        self.edges.retain(|_, counters| {
+            edge_is_fresh(
+                counters.last_seen_unix_ms.load(Ordering::Relaxed),
+                generated_at_unix_ms,
+            )
+        });
         let mut edges: Vec<ServiceGraphEdge> = self
             .edges
             .iter()
@@ -226,9 +233,14 @@ impl ServiceGraphRegistry {
 
     #[cfg(test)]
     fn force_rebuild_snapshot(&self) {
-        let now = now_unix_ms();
-        self.last_snapshot_unix_ms.store(now, Ordering::Relaxed);
-        self.rebuild_snapshot(now);
+        self.force_rebuild_snapshot_at(now_unix_ms());
+    }
+
+    #[cfg(test)]
+    fn force_rebuild_snapshot_at(&self, generated_at_unix_ms: u64) {
+        self.last_snapshot_unix_ms
+            .store(generated_at_unix_ms, Ordering::Relaxed);
+        self.rebuild_snapshot(generated_at_unix_ms);
     }
 
     #[cfg(test)]
@@ -297,6 +309,10 @@ fn duration_micros(latency_total_ms: f64) -> u64 {
     (latency_total_ms * 1_000.0)
         .round()
         .clamp(0.0, u64::MAX as f64) as u64
+}
+
+fn edge_is_fresh(last_seen_unix_ms: u64, generated_at_unix_ms: u64) -> bool {
+    generated_at_unix_ms.saturating_sub(last_seen_unix_ms) <= EDGE_RETENTION_MS
 }
 
 fn now_unix_ms() -> u64 {
@@ -401,6 +417,32 @@ mod tests {
                 .iter()
                 .any(|edge| edge.source_workload == "checkout" && edge.duration_ms_total == 20.0)
         );
+    }
+
+    #[test]
+    fn snapshot_rebuild_evicts_stale_edges() {
+        let registry = ServiceGraphRegistry::default();
+        registry.record_transaction(&summary(
+            "spiffe://cluster.local/ns/default/sa/frontend",
+            "spiffe://cluster.local/ns/default/sa/reviews",
+            200,
+            10.0,
+        ));
+        let last_seen = registry
+            .edges
+            .iter()
+            .next()
+            .expect("seeded edge")
+            .value()
+            .last_seen_unix_ms
+            .load(Ordering::Relaxed);
+
+        registry.force_rebuild_snapshot_at(last_seen + EDGE_RETENTION_MS);
+        assert_eq!(registry.snapshot().edge_count, 1);
+
+        registry.force_rebuild_snapshot_at(last_seen + EDGE_RETENTION_MS + 1);
+        assert_eq!(registry.snapshot().edge_count, 0);
+        assert!(registry.edges.is_empty());
     }
 
     #[test]
