@@ -209,20 +209,7 @@ impl ServiceGraphRegistry {
             .iter()
             .map(|entry| entry.value().snapshot(entry.key()))
             .collect();
-        edges.sort_by(|left, right| {
-            left.source_principal
-                .cmp(&right.source_principal)
-                .then_with(|| left.destination_principal.cmp(&right.destination_principal))
-                .then_with(|| left.source_workload.cmp(&right.source_workload))
-                .then_with(|| left.source_namespace.cmp(&right.source_namespace))
-                .then_with(|| left.destination_workload.cmp(&right.destination_workload))
-                .then_with(|| left.destination_namespace.cmp(&right.destination_namespace))
-                .then_with(|| left.request_protocol.cmp(&right.request_protocol))
-                .then_with(|| {
-                    left.connection_security_policy
-                        .cmp(&right.connection_security_policy)
-                })
-        });
+        edges.sort_by(compare_service_graph_edges);
         self.snapshot.store(Arc::new(ServiceGraphSnapshot {
             generated_at_unix_ms,
             generated_at: unix_ms_rfc3339(generated_at_unix_ms),
@@ -292,6 +279,28 @@ pub struct ServiceGraphEdge {
     pub duration_ms_avg: f64,
     pub last_seen_unix_ms: u64,
     pub last_seen: String,
+}
+
+fn compare_service_graph_edges(
+    left: &ServiceGraphEdge,
+    right: &ServiceGraphEdge,
+) -> std::cmp::Ordering {
+    left.source_principal
+        .cmp(&right.source_principal)
+        .then_with(|| left.destination_principal.cmp(&right.destination_principal))
+        .then_with(|| left.source_workload.cmp(&right.source_workload))
+        .then_with(|| left.source_namespace.cmp(&right.source_namespace))
+        .then_with(|| left.source_app.cmp(&right.source_app))
+        .then_with(|| left.source_service.cmp(&right.source_service))
+        .then_with(|| left.destination_workload.cmp(&right.destination_workload))
+        .then_with(|| left.destination_namespace.cmp(&right.destination_namespace))
+        .then_with(|| left.destination_app.cmp(&right.destination_app))
+        .then_with(|| left.destination_service.cmp(&right.destination_service))
+        .then_with(|| left.request_protocol.cmp(&right.request_protocol))
+        .then_with(|| {
+            left.connection_security_policy
+                .cmp(&right.connection_security_policy)
+        })
 }
 
 fn service_graph_error(summary: &TransactionSummary, mesh_key: &MeshRequestKey) -> bool {
@@ -417,6 +426,23 @@ mod tests {
                 .iter()
                 .any(|edge| edge.source_workload == "checkout" && edge.duration_ms_total == 20.0)
         );
+    }
+
+    #[test]
+    fn edge_sort_includes_app_and_service_labels() {
+        let base = service_graph_edge_for_sort("frontend", "frontend", "reviews", "reviews");
+
+        for edge in [
+            service_graph_edge_for_sort("checkout", "frontend", "reviews", "reviews"),
+            service_graph_edge_for_sort("frontend", "checkout", "reviews", "reviews"),
+            service_graph_edge_for_sort("frontend", "frontend", "ratings", "reviews"),
+            service_graph_edge_for_sort("frontend", "frontend", "reviews", "ratings"),
+        ] {
+            assert_ne!(
+                compare_service_graph_edges(&base, &edge),
+                std::cmp::Ordering::Equal
+            );
+        }
     }
 
     #[test]
@@ -553,5 +579,33 @@ mod tests {
                 "mutual_tls".to_string(),
             ),
         ])
+    }
+
+    fn service_graph_edge_for_sort(
+        source_app: &str,
+        source_service: &str,
+        destination_app: &str,
+        destination_service: &str,
+    ) -> ServiceGraphEdge {
+        ServiceGraphEdge {
+            source_principal: "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+            source_workload: "frontend".to_string(),
+            source_namespace: "default".to_string(),
+            source_app: source_app.to_string(),
+            source_service: source_service.to_string(),
+            destination_principal: "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+            destination_workload: "reviews".to_string(),
+            destination_namespace: "default".to_string(),
+            destination_app: destination_app.to_string(),
+            destination_service: destination_service.to_string(),
+            request_protocol: "http".to_string(),
+            connection_security_policy: "mutual_tls".to_string(),
+            requests_total: 1,
+            errors_total: 0,
+            duration_ms_total: 1.0,
+            duration_ms_avg: 1.0,
+            last_seen_unix_ms: 0,
+            last_seen: unix_ms_rfc3339(0),
+        }
     }
 }
