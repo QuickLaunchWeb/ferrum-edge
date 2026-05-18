@@ -764,7 +764,7 @@ pub async fn handle_admin_request(
     }
 
     if method == Method::POST
-        && segments_peek.as_slice() == ["restore"]
+        && matches!(segments_peek.as_slice(), ["restore"] | ["batch"])
         && let Some(resp) = require_admin_role(&auth, AdminRole::Admin)
     {
         drop(req.into_body());
@@ -961,18 +961,14 @@ pub async fn handle_admin_request(
 
         // Batch create
         (Method::POST, ["batch"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
-                return Ok(resp);
-            }
+            // Role check happens before body buffering (see pre-buffer gate above).
             handle_batch_create(&state, &auth, &body_bytes, &namespace).await
         }
 
         // Backup & Restore
         (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref(), &namespace).await,
         (Method::POST, ["restore"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
-                return Ok(resp);
-            }
+            // Role check happens before body buffering (see pre-buffer gate above).
             handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
         }
 
@@ -1492,7 +1488,7 @@ async fn handle_update_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
             log_audit_enqueue_failure(&error);
         }
     }
@@ -1539,7 +1535,7 @@ async fn handle_delete_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
             log_audit_enqueue_failure(&error);
         }
     }
@@ -1641,7 +1637,7 @@ async fn handle_append_credential(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
             log_audit_enqueue_failure(&error);
         }
     }
@@ -1733,7 +1729,7 @@ async fn handle_delete_credential_by_index(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
             log_audit_enqueue_failure(&error);
         }
     }
@@ -2379,7 +2375,7 @@ async fn handle_batch_create(
                 namespace,
                 audit::create_diff(response["created"].clone()),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -2394,7 +2390,7 @@ async fn handle_batch_create(
         namespace,
         audit::create_diff(response["created"].clone()),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -2705,7 +2701,7 @@ async fn handle_restore(
                     response["restored"].clone(),
                 ),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -2723,7 +2719,7 @@ async fn handle_restore(
             response["restored"].clone(),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
