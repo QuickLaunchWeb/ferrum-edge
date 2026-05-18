@@ -520,3 +520,155 @@ async fn test_stream_connect_delay_100_percent() {
     assert_eq!(metadata.get("fault_injected").unwrap(), "true");
     assert_eq!(metadata.get("fault_type").unwrap(), "delay");
 }
+
+// === GAP-3E: RTDS overlay-driven percentages ===
+
+#[test]
+fn test_runtime_overlay_scope_accepted() {
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0 },
+        "runtime_overlay_scope": "checkout"
+    }));
+    assert!(plugin.is_ok(), "non-empty scope must be accepted");
+}
+
+#[test]
+fn test_reject_empty_runtime_overlay_scope() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0 },
+        "runtime_overlay_scope": "   "
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("runtime_overlay_scope"));
+}
+
+#[test]
+fn test_reject_non_string_runtime_overlay_scope() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0 },
+        "runtime_overlay_scope": 42
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("runtime_overlay_scope"));
+}
+
+// The four cases below share the process-global RTDS overlay ArcSwap, so
+// running them as separate `#[tokio::test]` functions in parallel races
+// each other's `reset_for_test()` calls. They are collapsed into one
+// async block whose sub-steps run serially behind a local mutex — the
+// behaviours under test (overlay zero, overlay full, missing scope,
+// partial override) stay independent and each step still asserts its own
+// expectation.
+#[tokio::test]
+async fn test_runtime_overlay_behaviours_are_observable_end_to_end() {
+    use ferrum_edge::modes::mesh::config::{
+        FractionalPercentDenominator, MeshRuntimeOverlay, RuntimeFractionalPercent, RuntimeValue,
+    };
+    use ferrum_edge::plugins::fault_injection::runtime_overlay;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    static GUARD: Mutex<()> = Mutex::const_new(());
+    let _guard = GUARD.lock().await;
+
+    // ── Case 1: overlay drops abort rate to ~0% ───────────────────────
+    runtime_overlay::reset_for_test();
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 100.0 },
+        "runtime_overlay_scope": "overlay_zero_abort"
+    }))
+    .unwrap();
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.fault_injection.overlay_zero_abort.abort_percent".to_string(),
+        RuntimeValue::Number(0.001),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut continues = 0;
+    for _ in 0..1000 {
+        let mut ctx = make_ctx();
+        if matches!(
+            run_before_proxy(&plugin, &mut ctx).await,
+            PluginResult::Continue
+        ) {
+            continues += 1;
+        }
+    }
+    assert!(
+        continues >= 990,
+        "overlay should drop abort rate to ~0%, saw {continues}/1000 continues"
+    );
+
+    // ── Case 2: overlay pushes abort rate to 100% via FractionalPercent ─
+    runtime_overlay::reset_for_test();
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 1.0 },
+        "runtime_overlay_scope": "overlay_full_abort"
+    }))
+    .unwrap();
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.fault_injection.overlay_full_abort.abort_percent".to_string(),
+        RuntimeValue::FractionalPercent(RuntimeFractionalPercent {
+            numerator: 100,
+            denominator: FractionalPercentDenominator::Hundred,
+        }),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut ctx = make_ctx();
+    match run_before_proxy(&plugin, &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        other => panic!("expected Reject when overlay forces 100% abort, got {other:?}"),
+    }
+
+    // ── Case 3: plugin without scope ignores overlay entries ──────────
+    runtime_overlay::reset_for_test();
+    // Seed an overlay with an unrelated scope.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.fault_injection.someone_else.abort_percent".to_string(),
+        RuntimeValue::Number(0.001),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 100.0 }
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        run_before_proxy(&plugin, &mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // ── Case 4: partial overlay (abort dropped, delay untouched) ──────
+    runtime_overlay::reset_for_test();
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 100.0 },
+        "delay": { "duration_ms": 1, "percentage": 100.0 },
+        "runtime_overlay_scope": "partial_override"
+    }))
+    .unwrap();
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.fault_injection.partial_override.abort_percent".to_string(),
+        RuntimeValue::Number(0.001),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        run_before_proxy(&plugin, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("fault_injected").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("fault_type").map(String::as_str),
+        Some("delay")
+    );
+
+    runtime_overlay::reset_for_test();
+}

@@ -23,13 +23,28 @@
 //!   "delay": {
 //!     "duration_ms": 2000,
 //!     "percentage": 25.0
-//!   }
+//!   },
+//!   "runtime_overlay_scope": "checkout"
 //! }
 //! ```
 //!
 //! At least one of `abort` or `delay` must be present. When both are
 //! configured and both trigger on the same request, the delay executes
 //! first, then the abort fires.
+//!
+//! ## RTDS overlay
+//!
+//! When `runtime_overlay_scope: "<scope>"` is set, the plugin reads its
+//! `abort.percentage` and `delay.percentage` from the RTDS-driven
+//! [`MeshRuntimeOverlay`](crate::modes::mesh::config::MeshRuntimeOverlay)
+//! at request time. Reserved keys:
+//!
+//! - `ferrum.fault_injection.<scope>.abort_percent`
+//! - `ferrum.fault_injection.<scope>.delay_percent`
+//!
+//! Each accepts either a `Number(0..=100)` or a `FractionalPercent` value.
+//! Missing / malformed entries fall back to the static config so a partial
+//! overlay never silently disables the plugin.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -37,6 +52,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use runtime_overlay::FaultOverridesSnapshot;
+
+pub mod runtime_overlay;
 
 const MAX_DELAY_MS: u64 = 3_600_000;
 const PROBABILITY_DENOMINATOR: u64 = 1 << 32;
@@ -57,6 +75,12 @@ pub struct FaultInjectionPlugin {
     abort: Option<AbortFault>,
     delay: Option<DelayFault>,
     counter: AtomicU64,
+    /// Optional RTDS overlay scope. When set, the plugin reads its
+    /// `abort.percentage` and `delay.percentage` from
+    /// `ferrum.fault_injection.<scope>.{abort,delay}_percent` on every
+    /// request and falls back to the static config when the overlay does
+    /// not carry the key. Empty string is rejected at construction.
+    runtime_overlay_scope: Option<String>,
 }
 
 impl FaultInjectionPlugin {
@@ -64,7 +88,11 @@ impl FaultInjectionPlugin {
         let obj = config
             .as_object()
             .ok_or("fault_injection: config must be an object")?;
-        reject_unknown_keys(obj.keys(), &["abort", "delay"], "config")?;
+        reject_unknown_keys(
+            obj.keys(),
+            &["abort", "delay", "runtime_overlay_scope"],
+            "config",
+        )?;
 
         let abort = match obj.get("abort") {
             Some(Value::Object(abort_obj)) => {
@@ -160,10 +188,54 @@ impl FaultInjectionPlugin {
             );
         }
 
+        let runtime_overlay_scope = match obj.get("runtime_overlay_scope") {
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err(
+                        "fault_injection: runtime_overlay_scope must be a non-empty string"
+                            .to_string(),
+                    );
+                }
+                Some(trimmed.to_string())
+            }
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err("fault_injection: runtime_overlay_scope must be a string".to_string());
+            }
+        };
+
         Ok(Self {
             abort,
             delay,
             counter: AtomicU64::new(0),
+            runtime_overlay_scope,
+        })
+    }
+
+    /// Resolve the abort percentage for this request, preferring the
+    /// RTDS-driven overlay when the plugin has a configured scope and the
+    /// overlay carries the matching key. Returns `None` when no abort
+    /// fault is configured at all.
+    fn effective_abort_percentage(&self, overrides: &FaultOverridesSnapshot) -> Option<f64> {
+        self.abort.as_ref().map(|abort| {
+            self.runtime_overlay_scope
+                .as_deref()
+                .and_then(|scope| overrides.abort_percent(scope))
+                .unwrap_or(abort.percentage)
+        })
+    }
+
+    /// Resolve the delay percentage for this request, preferring the
+    /// RTDS-driven overlay when the plugin has a configured scope and the
+    /// overlay carries the matching key. Returns `None` when no delay
+    /// fault is configured at all.
+    fn effective_delay_percentage(&self, overrides: &FaultOverridesSnapshot) -> Option<f64> {
+        self.delay.as_ref().map(|delay| {
+            self.runtime_overlay_scope
+                .as_deref()
+                .and_then(|scope| overrides.delay_percent(scope))
+                .unwrap_or(delay.percentage)
         })
     }
 }
@@ -224,18 +296,16 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 impl FaultInjectionPlugin {
-    fn decide_faults(&self) -> (bool, bool) {
+    fn decide_faults(&self, overrides: &FaultOverridesSnapshot) -> (bool, bool) {
         let sample = splitmix64(self.counter.fetch_add(1, Ordering::Relaxed));
         let delay_sample = (sample >> 32) as u32;
         let abort_sample = sample as u32;
         let delay_triggered = self
-            .delay
-            .as_ref()
-            .is_some_and(|d| probability_hit(delay_sample, d.percentage));
+            .effective_delay_percentage(overrides)
+            .is_some_and(|pct| probability_hit(delay_sample, pct));
         let abort_triggered = self
-            .abort
-            .as_ref()
-            .is_some_and(|a| probability_hit(abort_sample, a.percentage));
+            .effective_abort_percentage(overrides)
+            .is_some_and(|pct| probability_hit(abort_sample, pct));
         (delay_triggered, abort_triggered)
     }
 
@@ -283,7 +353,8 @@ impl Plugin for FaultInjectionPlugin {
             return PluginResult::Continue;
         }
 
-        let (delay_triggered, abort_triggered) = self.decide_faults();
+        let overrides = runtime_overlay::current_overrides();
+        let (delay_triggered, abort_triggered) = self.decide_faults(&overrides);
 
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;
@@ -327,7 +398,8 @@ impl Plugin for FaultInjectionPlugin {
             return PluginResult::Continue;
         }
 
-        let (delay_triggered, abort_triggered) = self.decide_faults();
+        let overrides = runtime_overlay::current_overrides();
+        let (delay_triggered, abort_triggered) = self.decide_faults(&overrides);
 
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;

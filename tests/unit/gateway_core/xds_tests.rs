@@ -15,8 +15,8 @@ use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
     AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
-    LDS_TYPE_URL, MeshSlice, MeshSliceRequest, RDS_TYPE_URL, SDS_TYPE_URL, XdsNonceTracker,
-    XdsSnapshotCache, translate_mesh_slice_to_snapshot,
+    LDS_TYPE_URL, MeshSlice, MeshSliceRequest, RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL,
+    XdsNonceTracker, XdsSnapshotCache, translate_mesh_slice_to_snapshot, translate_rtds_layer,
 };
 
 fn workload(name: &str, app: &str) -> Workload {
@@ -648,4 +648,271 @@ fn mesh_extension_config_default_value_when_field_omitted() {
     });
     let parsed: MeshExtensionConfig = serde_json::from_value(json).expect("omitted decode");
     assert!(parsed.value.is_empty());
+}
+
+// ── GAP-3E: RTDS subscription + MeshRuntimeOverlay round-trip ─────────────
+
+#[test]
+fn rtds_type_url_is_registered_for_subscription() {
+    let inventory: Vec<&str> = ferrum_edge::xds::XDS_TYPE_URLS.to_vec();
+    assert!(
+        inventory.contains(&RTDS_TYPE_URL),
+        "RTDS_TYPE_URL must be in XDS_TYPE_URLS so the ADS client subscribes to runtime layers"
+    );
+}
+
+#[test]
+fn translate_rtds_layer_maps_numeric_string_bool_and_fractional_percent() {
+    use ferrum_edge::modes::mesh::config::{
+        FractionalPercentDenominator, RuntimeFractionalPercent, RuntimeValue,
+    };
+    use ferrum_edge::xds::runtime_proto;
+    use runtime_proto::value::Kind;
+
+    let mut fields = std::collections::HashMap::new();
+    fields.insert(
+        "envoy.reloadable_features.allow_multiplexed_response".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::BoolValue(true)),
+        },
+    );
+    fields.insert(
+        "envoy.reloadable_features.use_observable_cluster_name".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NumberValue(0.25)),
+        },
+    );
+    fields.insert(
+        "envoy.access_loggers.json_default_log_level".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("warn".to_string())),
+        },
+    );
+    let mut fractional_fields = std::collections::HashMap::new();
+    fractional_fields.insert(
+        "numerator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NumberValue(30.0)),
+        },
+    );
+    fractional_fields.insert(
+        "denominator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("HUNDRED".to_string())),
+        },
+    );
+    fields.insert(
+        "ferrum.testing.fault_injection".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StructValue(runtime_proto::Struct {
+                fields: fractional_fields,
+            })),
+        },
+    );
+    // Unsupported kinds (null + list) should be silently skipped, not
+    // produce placeholder entries — GAP-3E intentionally avoids fabricating
+    // a semantics until a consumer needs it.
+    fields.insert(
+        "ferrum.testing.null".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NullValue(0)),
+        },
+    );
+    fields.insert(
+        "ferrum.testing.list".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::ListValue(runtime_proto::ListValue {
+                values: Vec::new(),
+            })),
+        },
+    );
+
+    let layer = runtime_proto::Runtime {
+        name: "rtds_layer0".to_string(),
+        layer: Some(runtime_proto::Struct { fields }),
+    };
+
+    let overlay = translate_rtds_layer(&layer);
+    assert_eq!(overlay.fields.len(), 4, "5th + 6th entries are skipped");
+
+    assert_eq!(
+        overlay
+            .fields
+            .get("envoy.reloadable_features.allow_multiplexed_response"),
+        Some(&RuntimeValue::Bool(true))
+    );
+    assert_eq!(
+        overlay
+            .fields
+            .get("envoy.reloadable_features.use_observable_cluster_name"),
+        Some(&RuntimeValue::Number(0.25))
+    );
+    assert_eq!(
+        overlay
+            .fields
+            .get("envoy.access_loggers.json_default_log_level"),
+        Some(&RuntimeValue::String("warn".to_string()))
+    );
+    assert_eq!(
+        overlay.fields.get("ferrum.testing.fault_injection"),
+        Some(&RuntimeValue::FractionalPercent(RuntimeFractionalPercent {
+            numerator: 30,
+            denominator: FractionalPercentDenominator::Hundred,
+        }))
+    );
+}
+
+#[test]
+fn translate_rtds_layer_skips_malformed_fractional_percent_structs() {
+    use ferrum_edge::xds::runtime_proto;
+    use runtime_proto::value::Kind;
+
+    let mut malformed_fields = std::collections::HashMap::new();
+    malformed_fields.insert(
+        "numerator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("not-a-number".to_string())),
+        },
+    );
+    malformed_fields.insert(
+        "denominator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("HUNDRED".to_string())),
+        },
+    );
+    let mut wrong_denominator = std::collections::HashMap::new();
+    wrong_denominator.insert(
+        "numerator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NumberValue(10.0)),
+        },
+    );
+    wrong_denominator.insert(
+        "denominator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("UNKNOWN".to_string())),
+        },
+    );
+    let mut extra_field = std::collections::HashMap::new();
+    extra_field.insert(
+        "numerator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NumberValue(10.0)),
+        },
+    );
+    extra_field.insert(
+        "denominator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StringValue("HUNDRED".to_string())),
+        },
+    );
+    extra_field.insert(
+        "extra".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::NumberValue(1.0)),
+        },
+    );
+
+    let mut layer_fields = std::collections::HashMap::new();
+    layer_fields.insert(
+        "bad_numerator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StructValue(runtime_proto::Struct {
+                fields: malformed_fields,
+            })),
+        },
+    );
+    layer_fields.insert(
+        "bad_denominator".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StructValue(runtime_proto::Struct {
+                fields: wrong_denominator,
+            })),
+        },
+    );
+    layer_fields.insert(
+        "extra_struct_field".to_string(),
+        runtime_proto::Value {
+            kind: Some(Kind::StructValue(runtime_proto::Struct {
+                fields: extra_field,
+            })),
+        },
+    );
+
+    let overlay = translate_rtds_layer(&runtime_proto::Runtime {
+        name: "rtds_layer_malformed".to_string(),
+        layer: Some(runtime_proto::Struct {
+            fields: layer_fields,
+        }),
+    });
+    assert!(overlay.is_empty(), "malformed structs must be dropped");
+}
+
+#[test]
+fn translate_rtds_layer_with_empty_payload_yields_empty_overlay() {
+    use ferrum_edge::xds::runtime_proto;
+    let layer = runtime_proto::Runtime {
+        name: "rtds_layer_empty".to_string(),
+        layer: None,
+    };
+    assert!(translate_rtds_layer(&layer).is_empty());
+}
+
+#[test]
+fn mesh_slice_serde_round_trips_runtime_overlay() {
+    use ferrum_edge::modes::mesh::config::{
+        FractionalPercentDenominator, MeshRuntimeOverlay, RuntimeFractionalPercent, RuntimeValue,
+    };
+
+    let mut fields = std::collections::HashMap::new();
+    fields.insert("k_bool".to_string(), RuntimeValue::Bool(true));
+    fields.insert("k_num".to_string(), RuntimeValue::Number(0.5));
+    fields.insert(
+        "k_str".to_string(),
+        RuntimeValue::String("info".to_string()),
+    );
+    fields.insert(
+        "k_frac".to_string(),
+        RuntimeValue::FractionalPercent(RuntimeFractionalPercent {
+            numerator: 42,
+            denominator: FractionalPercentDenominator::TenThousand,
+        }),
+    );
+    let original = MeshSlice {
+        version: "v-runtime".to_string(),
+        runtime_overlay: MeshRuntimeOverlay { fields },
+        ..MeshSlice::default()
+    };
+
+    let json = serde_json::to_string(&original).expect("serialize");
+    let parsed: MeshSlice = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed.runtime_overlay, original.runtime_overlay);
+    assert!(
+        json.contains("\"runtime_overlay\""),
+        "non-empty overlay must serialize"
+    );
+}
+
+#[test]
+fn mesh_slice_without_runtime_overlay_decodes_via_serde_default() {
+    // The legacy slice payload (no `runtime_overlay` key at all) must keep
+    // decoding so a DP running an older CP or an older serialized blob
+    // doesn't crash on `Missing field`. The default is an empty overlay.
+    let legacy_payload = serde_json::json!({
+        "node_id": "node-a",
+        "namespace": "default",
+        "version": "v1",
+    });
+    let parsed: MeshSlice =
+        serde_json::from_value(legacy_payload).expect("legacy slice must round-trip");
+    assert!(
+        parsed.runtime_overlay.is_empty(),
+        "missing field must default to empty overlay"
+    );
+    // Re-serialize: empty overlay must be elided (skip_serializing_if).
+    let json = serde_json::to_string(&parsed).expect("re-serialize");
+    assert!(
+        !json.contains("runtime_overlay"),
+        "empty overlay must be elided to keep non-RTDS deployments byte-identical"
+    );
 }

@@ -1010,6 +1010,11 @@ pub async fn handle_admin_request(
         // Mesh trust-bundle federation status (GAP-3C).
         (Method::GET, ["mesh", "federation"]) => handle_mesh_federation_get(&state).await,
 
+        // GAP-3E: xDS RTDS overlay inspection. Read-only operator view of the
+        // runtime knobs the CP has shipped via RTDS. 404 outside mesh mode or
+        // before the first slice — same shape as `/mesh/egress-scope`.
+        (Method::GET, ["mesh", "runtime-overlay"]) => handle_mesh_runtime_overlay_get(&state).await,
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -1166,6 +1171,38 @@ async fn handle_mesh_service_graph_get(
     }
     let snapshot = crate::plugins::mesh::service_graph::global_service_graph().snapshot();
     Ok(json_response(StatusCode::OK, &json!(snapshot.as_ref())))
+}
+
+async fn handle_mesh_runtime_overlay_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime overlay"}),
+        ));
+    };
+    // Read the lock-free ArcSwap snapshot once; consumers (fault injection,
+    // transformer gates, log level) read the same overlay via
+    // `runtime_overlay_consumers::apply_overlay` at slice install. Returning
+    // 404 before the first slice arrives mirrors `/mesh/egress-scope` so
+    // operators can distinguish "no slice yet" from "slice carries an empty
+    // overlay".
+    let slice = mesh_runtime.snapshot();
+    let Some(slice) = slice.as_ref().as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime overlay"}),
+        ));
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "namespace": slice.namespace,
+            "version": slice.version,
+            "runtime_overlay": &slice.runtime_overlay,
+        }),
+    ))
 }
 
 async fn handle_mesh_egress_scope_test(

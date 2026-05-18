@@ -23,6 +23,15 @@
 //! `request_transformer` counterpart: it lets the K8s VirtualService
 //! translator auto-emit a `response_transformer` with zero static rules
 //! whose only job is to act as a consumer for per-rule overrides.
+//!
+//! ## RTDS overlay
+//!
+//! When `runtime_overlay_scope: "<scope>"` is set, the plugin reads
+//! `ferrum.response_transformer.<scope>.enabled` from the mesh runtime
+//! overlay at request time. A `false` value short-circuits rule
+//! application (static rules AND route-overlay overrides). A missing
+//! entry falls back to `default_enabled` (defaults to `true` —
+//! fail-open).
 
 use async_trait::async_trait;
 use http::header::HeaderName;
@@ -36,6 +45,8 @@ use super::utils::route_header_transform::{
     RouteHeaderTransformRule, apply_route_header_transforms,
 };
 use super::{Plugin, PluginResult, RequestContext};
+
+pub mod runtime_overlay;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HeaderOp {
@@ -59,6 +70,24 @@ struct HeaderRule {
 pub struct ResponseTransformer {
     header_rules: Vec<HeaderRule>,
     body_rules: Vec<BodyRule>,
+    /// When `Some`, the plugin reads
+    /// `ferrum.response_transformer.<scope>.enabled` from the mesh
+    /// runtime overlay on every request before applying rules.
+    runtime_overlay_scope: Option<String>,
+    /// Fallback when [`runtime_overlay_scope`] is set but the overlay
+    /// does not carry the matching key. Defaults to `true` (fail-open).
+    default_enabled: bool,
+}
+
+impl ResponseTransformer {
+    fn rules_enabled(&self) -> bool {
+        let Some(scope) = self.runtime_overlay_scope.as_deref() else {
+            return true;
+        };
+        runtime_overlay::current_gates()
+            .gate(scope)
+            .unwrap_or(self.default_enabled)
+    }
 }
 
 fn parse_op(op: &str) -> Option<HeaderOp> {
@@ -252,9 +281,38 @@ impl ResponseTransformer {
         // unconditionally — so we drop it after construction.
         let _ = apply_route_overrides;
 
+        let runtime_overlay_scope = match config.get("runtime_overlay_scope") {
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err(
+                        "response_transformer: runtime_overlay_scope must be a non-empty string"
+                            .to_string(),
+                    );
+                }
+                Some(trimmed.to_string())
+            }
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(
+                    "response_transformer: runtime_overlay_scope must be a string".to_string(),
+                );
+            }
+        };
+
+        let default_enabled = match config.get("default_enabled") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Null) | None => true,
+            Some(_) => {
+                return Err("response_transformer: default_enabled must be a boolean".to_string());
+            }
+        };
+
         Ok(Self {
             header_rules,
             body_rules,
+            runtime_overlay_scope,
+            default_enabled,
         })
     }
 }
@@ -293,6 +351,9 @@ impl Plugin for ResponseTransformer {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if !self.rules_enabled() {
+            return PluginResult::Continue;
+        }
         for rule in &self.header_rules {
             match rule.operation {
                 HeaderOp::Add => {
@@ -348,6 +409,9 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.rules_enabled() {
+            return None;
+        }
         if let Some(ct) = content_type
             && !body_transform::is_json_content_type(ct)
         {

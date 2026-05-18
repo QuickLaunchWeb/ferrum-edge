@@ -3,7 +3,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use super::proto;
+use super::runtime_proto;
 use super::snapshot::{XdsResource, XdsSnapshot};
+use crate::modes::mesh::config::{
+    FractionalPercentDenominator, MeshRuntimeOverlay, RuntimeFractionalPercent, RuntimeValue,
+};
 use crate::modes::mesh::slice::MeshSlice;
 
 pub const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
@@ -13,6 +17,7 @@ pub const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.Clu
 pub const SDS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 pub const ECDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig";
+pub const RTDS_TYPE_URL: &str = "type.googleapis.com/envoy.service.runtime.v3.Runtime";
 
 /// Inner `type_url` Ferrum uses for the DestinationRule-carrier ECDS payload.
 /// CPs that want full DR semantics across xDS wrap the original DR JSON in a
@@ -21,13 +26,14 @@ pub const ECDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.core.v3.TypedE
 pub const FERRUM_ECDS_DESTINATION_RULE_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier";
 
-pub const XDS_TYPE_URLS: [&str; 6] = [
+pub const XDS_TYPE_URLS: [&str; 7] = [
     LDS_TYPE_URL,
     RDS_TYPE_URL,
     CDS_TYPE_URL,
     EDS_TYPE_URL,
     SDS_TYPE_URL,
     ECDS_TYPE_URL,
+    RTDS_TYPE_URL,
 ];
 
 pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
@@ -292,4 +298,83 @@ fn per_resource_version(resource: &XdsResource) -> String {
     hasher.update([0]);
     hasher.update(&resource.value);
     hex::encode(&hasher.finalize()[..8])
+}
+
+/// Translate one Envoy `envoy.service.runtime.v3.Runtime` resource (one RTDS
+/// "layer") into a `MeshRuntimeOverlay`.
+///
+/// This is the single decode site for RTDS resources. The overlay is then
+/// carried on `MeshSlice.runtime_overlay` and fanned out to consumers
+/// (fault injection, request/response transformer gates, tracing log level)
+/// at slice install via `runtime_overlay_consumers::apply_overlay`.
+///
+/// Top-level fields in the Runtime's `layer` struct are flattened into
+/// `MeshRuntimeOverlay.fields` keyed by field name. Field values are mapped:
+///
+///   - `number_value`        → `RuntimeValue::Number`
+///   - `string_value`        → `RuntimeValue::String`
+///   - `bool_value`          → `RuntimeValue::Bool`
+///   - struct shaped like an Envoy `FractionalPercent`
+///     (`numerator: number, denominator: "HUNDRED"|"TEN_THOUSAND"|"MILLION"`)
+///     → `RuntimeValue::FractionalPercent`
+///   - other struct / list / null values are silently skipped (RTDS layers
+///     don't ship them in practice; avoid inventing placeholder semantics
+///     until a consumer needs them)
+pub fn translate_rtds_layer(layer: &runtime_proto::Runtime) -> MeshRuntimeOverlay {
+    let Some(layer_struct) = layer.layer.as_ref() else {
+        return MeshRuntimeOverlay::default();
+    };
+    let mut overlay = MeshRuntimeOverlay::default();
+    for (key, value) in &layer_struct.fields {
+        if let Some(runtime_value) = runtime_value_from_proto(value) {
+            overlay.fields.insert(key.clone(), runtime_value);
+        }
+    }
+    overlay
+}
+
+fn runtime_value_from_proto(value: &runtime_proto::Value) -> Option<RuntimeValue> {
+    use runtime_proto::value::Kind;
+    match value.kind.as_ref()? {
+        Kind::NumberValue(number) => Some(RuntimeValue::Number(*number)),
+        Kind::StringValue(string) => Some(RuntimeValue::String(string.clone())),
+        Kind::BoolValue(boolean) => Some(RuntimeValue::Bool(*boolean)),
+        Kind::StructValue(structure) => fractional_percent_from_struct(structure),
+        Kind::NullValue(_) | Kind::ListValue(_) => None,
+    }
+}
+
+fn fractional_percent_from_struct(structure: &runtime_proto::Struct) -> Option<RuntimeValue> {
+    let numerator_value = structure.fields.get("numerator")?;
+    let denominator_value = structure.fields.get("denominator")?;
+
+    let numerator = match numerator_value.kind.as_ref()? {
+        runtime_proto::value::Kind::NumberValue(number) if number.is_finite() && *number >= 0.0 => {
+            *number as u32
+        }
+        _ => return None,
+    };
+    let denominator_token = match denominator_value.kind.as_ref()? {
+        runtime_proto::value::Kind::StringValue(text) => text.as_str(),
+        _ => return None,
+    };
+    let denominator = match denominator_token {
+        "HUNDRED" => FractionalPercentDenominator::Hundred,
+        "TEN_THOUSAND" => FractionalPercentDenominator::TenThousand,
+        "MILLION" => FractionalPercentDenominator::Million,
+        _ => return None,
+    };
+
+    // Only accept structs that look like an Envoy FractionalPercent
+    // (numerator + denominator and nothing else). Larger structs would have
+    // been a different `Value::struct_value` payload; rejecting them keeps
+    // the mapping unambiguous and reversible.
+    if structure.fields.len() != 2 {
+        return None;
+    }
+
+    Some(RuntimeValue::FractionalPercent(RuntimeFractionalPercent {
+        numerator,
+        denominator,
+    }))
 }

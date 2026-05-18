@@ -33,6 +33,7 @@ mod k8s_controller;
 #[allow(dead_code)]
 mod lazy_timeout;
 mod load_balancer;
+mod logging;
 mod metrics;
 mod modes;
 mod notifications;
@@ -66,6 +67,7 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
@@ -211,9 +213,16 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
             .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
             .unwrap_or(true);
 
+    // GAP-3E: wrap the fmt-layer filter in a `reload::Layer` so the
+    // mesh RTDS log-level consumer can rebuild it at runtime. The
+    // log-counter layer keeps its own filter — its sole job is per-target
+    // metric counting, and reloading two filters from one RTDS knob would
+    // double-charge events that count once and surface twice. Only the
+    // visible fmt filter responds to `ferrum.log.level`.
     let installed = if log_counter_enabled {
         let fmt_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let (fmt_reload_layer, fmt_handle) = reload::Layer::new(fmt_filter);
         let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let fmt_layer = tracing_subscriber::fmt::layer()
@@ -222,11 +231,11 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
                 stdout: stdout_writer.clone(),
                 stderr: stderr_writer.clone(),
             })
-            .with_filter(fmt_filter);
+            .with_filter(fmt_reload_layer);
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
-        tracing_subscriber::registry()
+        let init_ok = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(
                 crate::runtime_metrics_tracing_layer::CountingLayer::new(
@@ -236,7 +245,11 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
                 .with_filter(log_counter_level_filter),
             )
             .try_init()
-            .is_ok()
+            .is_ok();
+        if init_ok {
+            register_log_level_reloader(fmt_handle);
+        }
+        init_ok
     } else {
         false
     };
@@ -244,17 +257,57 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
     if !installed {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let (reload_layer, fallback_handle) = reload::Layer::new(env_filter);
         let fmt_layer = tracing_subscriber::fmt::layer()
             .json()
             .with_writer(SeverityWriter {
                 stdout: stdout_writer,
                 stderr: stderr_writer,
             })
-            .with_filter(env_filter);
-        let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+            .with_filter(reload_layer);
+        if tracing_subscriber::registry()
+            .with(fmt_layer)
+            .try_init()
+            .is_ok()
+        {
+            register_log_level_reloader(fallback_handle);
+        }
     }
 
     (stdout_guard, stderr_guard)
+}
+
+/// Adapter that turns a `tracing_subscriber::reload::Handle` into the
+/// process-global `crate::logging::LogLevelReloader` consumed by the mesh
+/// RTDS overlay path. Kept in `main.rs` so the binary owns the concrete
+/// subscriber type and the library stays subscriber-generic.
+struct EnvFilterReloader<S>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    handle: reload::Handle<EnvFilter, S>,
+}
+
+impl<S> crate::logging::LogLevelReloader for EnvFilterReloader<S>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    fn reload(&self, directive: &str) -> Result<(), String> {
+        let filter = EnvFilter::try_new(directive)
+            .map_err(|e| format!("invalid filter directive '{directive}': {e}"))?;
+        self.handle
+            .reload(filter)
+            .map_err(|e| format!("tracing reload failed: {e}"))
+    }
+}
+
+fn register_log_level_reloader<S>(handle: reload::Handle<EnvFilter, S>)
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    // Best-effort: a second registration loses the new handle quietly so
+    // an internal init bug never panics the binary at startup.
+    let _ = crate::logging::set_log_level_reloader(Box::new(EnvFilterReloader { handle }));
 }
 
 /// Runs startup secret resolution, logging init, env-config parsing, and the

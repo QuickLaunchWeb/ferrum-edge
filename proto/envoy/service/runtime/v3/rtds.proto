@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package envoy.service.runtime.v3;
+
+// Minimal, wire-compatible RTDS surface for GAP-3E.
+//
+// The CP ships `Runtime` resources (one per RTDS "layer") through the same
+// ADS stream as CDS/EDS/LDS/RDS/SDS/ECDS. Each Runtime carries a
+// google.protobuf.Struct payload whose top-level fields name runtime knobs
+// (e.g. `envoy.reloadable_features.allow_multiplexed_response`) and whose
+// values are typed (numeric, string, bool, or a nested FractionalPercent
+// struct).
+//
+// To keep Phase B compilation self-contained, this file inlines a minimal
+// Struct/Value/ListValue shim instead of importing
+// google/protobuf/struct.proto. The wire layout (field numbers and tag
+// encodings) matches google.protobuf.Struct exactly, so a real RTDS layer
+// emitted by Istio / Envoy CP decodes cleanly here. If the broader xDS
+// surface ever moves to the upstream well-known types, this file should be
+// retired alongside the discovery.proto Any/Status shims.
+//
+// Subscription-side scope is deliberately narrow: GAP-3E parses these
+// resources into `MeshRuntimeOverlay` and exposes them via the mesh slice
+// only. Downstream consumers (fault rates, log levels, header filters) are
+// explicit follow-ups.
+
+message Runtime {
+  string name = 1;
+  Struct layer = 2;
+}
+
+message Struct {
+  map<string, Value> fields = 1;
+}
+
+message Value {
+  oneof kind {
+    NullValue null_value = 1;
+    double number_value = 2;
+    string string_value = 3;
+    bool bool_value = 4;
+    Struct struct_value = 5;
+    ListValue list_value = 6;
+  }
+}
+
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+message ListValue {
+  repeated Value values = 1;
+}

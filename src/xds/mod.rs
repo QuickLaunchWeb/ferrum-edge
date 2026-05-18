@@ -21,6 +21,21 @@ pub mod proto {
     tonic::include_proto!("envoy.service.discovery.v3");
 }
 
+pub mod runtime_proto {
+    // GAP-3E: vendored `envoy.service.runtime.v3.Runtime` plus a minimal
+    // `google.protobuf.Struct`-shaped payload (field numbers match the
+    // upstream well-known types, so layers emitted by real Envoy / Istio
+    // CPs decode cleanly here).
+    //
+    // The `Value::Kind` oneof variants (`NullValue`, `NumberValue`, ...)
+    // mirror the upstream `google.protobuf.Value` exactly. Renaming them
+    // to satisfy `clippy::enum_variant_names` would break that one-to-one
+    // mapping — suppress the lint at the module level so the prost
+    // generated code stays drop-in compatible.
+    #![allow(clippy::enum_variant_names)]
+    tonic::include_proto!("envoy.service.runtime.v3");
+}
+
 // Public re-exports are used by library consumers/tests even when the binary
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
@@ -33,5 +48,6 @@ pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]
 pub use translator::{
     CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
-    RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_mesh_slice_to_snapshot,
+    RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_mesh_slice_to_snapshot,
+    translate_rtds_layer,
 };

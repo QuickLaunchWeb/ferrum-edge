@@ -2103,3 +2103,120 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
         .map(|(key, value)| (key.to_ascii_lowercase(), value))
         .collect();
 }
+
+// ── MeshRuntimeOverlay (GAP-3E) ───────────────────────────────────────────
+
+/// Mesh runtime knobs sourced from xDS RTDS (`envoy.service.runtime.v3.Runtime`)
+/// layers.
+///
+/// The overlay is carried verbatim on
+/// [`crate::modes::mesh::slice::MeshSlice`]; operators inspect it via
+/// `GET /mesh/runtime-overlay`. Every slice install fans the overlay out to
+/// three live consumers via
+/// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
+/// fault-injection percentages
+/// ([`crate::plugins::fault_injection::runtime_overlay`]), request/response
+/// transformer gates
+/// ([`crate::plugins::request_transformer::runtime_overlay`],
+/// [`crate::plugins::response_transformer::runtime_overlay`]), and the
+/// gateway-wide tracing filter
+/// ([`crate::logging::runtime_overlay`]). Adding a new consumer is a single
+/// `apply_*` call from `runtime_overlay_consumers`.
+///
+/// Wire compatibility: the type is an optional field on `MeshSlice` with
+/// `#[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]`,
+/// so non-RTDS deployments round-trip byte-identical.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshRuntimeOverlay {
+    /// Top-level keys flattened from the RTDS layer's `google.protobuf.Struct`
+    /// payload. Keys are runtime feature names
+    /// (e.g. `envoy.reloadable_features.allow_multiplexed_response`); values
+    /// preserve the typed shape from the wire.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fields: HashMap<String, RuntimeValue>,
+}
+
+impl MeshRuntimeOverlay {
+    /// Cheap emptiness check used by both `skip_serializing_if` and runtime
+    /// callers that want to elide overlay handling when no layer has shipped
+    /// any fields.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+/// Typed runtime value mapped from an RTDS layer field.
+///
+/// Mirrors the subset of `google.protobuf.Value` kinds that RTDS layers ship
+/// in practice. `null` and list values are intentionally absent — Envoy / Istio
+/// CPs do not emit them as runtime knob values today, and inventing a
+/// placeholder semantics here would be a footgun once consumers land.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum RuntimeValue {
+    Number(f64),
+    String(String),
+    Bool(bool),
+    FractionalPercent(RuntimeFractionalPercent),
+}
+
+/// Envoy `type.v3.FractionalPercent`-shaped runtime value. RTDS layers
+/// encode it on the wire as a `google.protobuf.Struct` with two fields,
+/// `numerator: number` and `denominator: string`, where the string is one of
+/// the three named denominators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFractionalPercent {
+    pub numerator: u32,
+    pub denominator: FractionalPercentDenominator,
+}
+
+impl RuntimeFractionalPercent {
+    /// Convert to a 0.0–100.0 percentage. Saturates at 100.0 if the operator
+    /// supplied a numerator larger than the denominator. Used by RTDS
+    /// consumers that work in `f64` percent space (e.g. fault injection).
+    pub fn as_percent(&self) -> f64 {
+        let denom = self.denominator.units_per_full();
+        if denom == 0 {
+            return 0.0;
+        }
+        let pct = (self.numerator as f64 / denom as f64) * 100.0;
+        pct.clamp(0.0, 100.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FractionalPercentDenominator {
+    #[default]
+    Hundred,
+    TenThousand,
+    Million,
+}
+
+impl FractionalPercentDenominator {
+    /// The number of units the `numerator` is expressed against. `Hundred`
+    /// → 100, `TenThousand` → 10_000, `Million` → 1_000_000.
+    pub fn units_per_full(&self) -> u64 {
+        match self {
+            FractionalPercentDenominator::Hundred => 100,
+            FractionalPercentDenominator::TenThousand => 10_000,
+            FractionalPercentDenominator::Million => 1_000_000,
+        }
+    }
+}
+
+/// Extract a `0.0..=100.0` percentage from a [`RuntimeValue`] for consumers
+/// that work in percent space. Accepts:
+///
+///   - `RuntimeValue::Number(n)` where `0.0 <= n <= 100.0`
+///   - `RuntimeValue::FractionalPercent(fp)` (via `as_percent`)
+///
+/// Returns `None` for any other shape so RTDS consumers can fall back to
+/// their static config without aborting the slice install.
+pub fn runtime_value_as_percent(value: &RuntimeValue) -> Option<f64> {
+    match value {
+        RuntimeValue::Number(n) if n.is_finite() && (0.0..=100.0).contains(n) => Some(*n),
+        RuntimeValue::FractionalPercent(fp) => Some(fp.as_percent()),
+        _ => None,
+    }
+}

@@ -14,6 +14,7 @@ pub mod hbone;
 pub mod node_waypoint;
 pub mod policy;
 pub mod runtime;
+pub mod runtime_overlay_consumers;
 pub mod slice;
 
 use std::collections::HashMap;
@@ -5982,6 +5983,7 @@ mod tests {
             outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
+            runtime_overlay: crate::modes::mesh::config::MeshRuntimeOverlay::default(),
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
