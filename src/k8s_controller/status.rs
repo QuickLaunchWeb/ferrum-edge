@@ -357,6 +357,10 @@ fn route_status(
             "Programmed"
         } else if all_parent_matches_conflicted {
             "Conflicted"
+        } else if !resolved_refs {
+            resolved_refs_reason
+        } else if accepted_for_parent {
+            accepted_reason
         } else {
             "TranslationFailed"
         };
@@ -684,9 +688,7 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
-            message.contains("backendRef")
-                || message.contains("ReferenceGrant")
-                || message.contains("only core Service")
+            message.contains("ReferenceGrant") || message.contains("only core Service")
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -972,6 +974,73 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("BackendRefNotPermitted")
+        );
+    }
+
+    #[test]
+    fn route_status_rejects_invalid_backend_ref_weight() {
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "api",
+                        "port": 8080,
+                        "weight": 65536
+                    }]
+                }]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("Invalid")
+        );
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("Invalid")
+        );
+    }
+
+    #[test]
+    fn route_status_uses_no_rules_programmed_reason_for_empty_route() {
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NoRules")
+        );
+        assert_eq!(
+            find_condition(conditions, "Programmed")["reason"].as_str(),
+            Some("NoRules")
         );
     }
 
