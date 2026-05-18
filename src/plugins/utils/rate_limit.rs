@@ -953,19 +953,45 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        let window_idx = RedisRateLimitClient::window_index(1);
-        let redis_key = redis.make_key(&[key, &window_idx.to_string()]);
-        let count = redis.incr_with_expire(&redis_key, 2).await?;
-        let allowed = count <= self.burst_size as i64;
-        let remaining = (self.burst_size as i64 - count).max(0) as u64;
+        // Approximate the local TokenBucket via a sliding two-window
+        // check over the bucket's full-refill period. With window length
+        // `ceil(burst_size / frames_per_second)` and window cap
+        // `burst_size`, the average sustained rate matches
+        // `frames_per_second` and an initial burst of up to `burst_size`
+        // is still possible. The previous implementation hard-coded a
+        // 1-second window with `burst_size` as the limit, which silently
+        // ignored `frames_per_second` and admitted up to `burst_size`
+        // frames every second indefinitely — much higher than the
+        // configured sustained rate.
+        let limit = self.burst_size as u64;
+        let window_seconds = if self.frames_per_second > 0.0 {
+            ((self.burst_size / self.frames_per_second).ceil() as u64).max(1)
+        } else {
+            1
+        };
+
+        let curr_idx = RedisRateLimitClient::window_index(window_seconds);
+        let prev_idx = curr_idx.saturating_sub(1);
+        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window_seconds);
+        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+        let ttl = window_seconds * 2 + 1;
+
+        let (prev_count, curr_count) = redis
+            .sliding_window_increment(&prev_key, &curr_key, ttl)
+            .await?;
+        let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+        let allowed = weighted <= limit as f64;
+        let remaining = ((limit as f64) - weighted).max(0.0) as u64;
+
         let outcome = if allowed {
             RateLimitOutcome::allow()
         } else {
             RateLimitOutcome::deny()
         };
         Ok(outcome
-            .with_limit(self.burst_size as u64)
-            .with_window(1)
+            .with_limit(limit)
+            .with_window(window_seconds)
             .with_remaining(remaining))
     }
 
