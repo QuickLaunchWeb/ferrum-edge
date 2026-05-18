@@ -610,6 +610,19 @@ pub struct EnvConfig {
     /// and client CA verifier. Cert/key paths remain static operational
     /// inputs.
     pub mesh_peer_auth_live_reload_enabled: bool,
+    /// SPIFFE trust-bundle federation polling interval in seconds.
+    /// `0` disables the federation poller entirely; cross-cluster trust
+    /// bundles must then be provided via the slice's `TrustBundleSet.federated`
+    /// from the control plane.
+    pub mesh_federation_poll_interval_seconds: u64,
+    /// Per-request HTTP timeout for SPIFFE federation bundle fetches, in seconds.
+    pub mesh_federation_poll_timeout_seconds: u64,
+    /// When `true`, a poll failure that leaves a remote-cluster trust domain
+    /// with no cached bundle still allows the mesh to start / continue (the
+    /// remote trust domain is effectively unverifiable until the next
+    /// successful poll). When `false` (the default), missing bundles cause
+    /// cross-cluster mTLS verifications to fail closed.
+    pub mesh_federation_fail_open: bool,
     /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
     /// Identities enrolled with a cgroup v2 path are evicted when the
     /// cgroup is gone or its inode/fingerprint changes (pod restart,
@@ -1420,6 +1433,9 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
             mesh_peer_auth_live_reload_enabled: false,
+            mesh_federation_poll_interval_seconds: 300,
+            mesh_federation_poll_timeout_seconds: 30,
+            mesh_federation_fail_open: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_svid_rotation_drain_seconds: 0,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
@@ -1732,6 +1748,9 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
+            mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
+            mesh_federation_poll_timeout_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS" => 30u64;
+            mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
@@ -2114,6 +2133,9 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
             mesh_peer_auth_live_reload_enabled,
+            mesh_federation_poll_interval_seconds,
+            mesh_federation_poll_timeout_seconds,
+            mesh_federation_fail_open,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_svid_rotation_drain_seconds,
             node_agent_proxy_mode,

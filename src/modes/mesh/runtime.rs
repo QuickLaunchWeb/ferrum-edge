@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
+use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
 
@@ -169,6 +170,7 @@ pub struct MeshRuntimeState {
     has_first: Arc<AtomicBool>,
     revision_tx: Arc<watch::Sender<u64>>,
     egress_scope: Arc<MeshEgressScopeState>,
+    federation_store: FederationStore,
 }
 
 impl MeshRuntimeState {
@@ -180,6 +182,7 @@ impl MeshRuntimeState {
             has_first: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
             egress_scope: Arc::new(MeshEgressScopeState::new()),
+            federation_store: FederationStore::new(),
         }
     }
 
@@ -202,6 +205,14 @@ impl MeshRuntimeState {
     /// new slice is installed.
     pub fn egress_scope_state(&self) -> &MeshEgressScopeState {
         &self.egress_scope
+    }
+
+    /// Returns the live federation store. The store is always present, even
+    /// when no poller has been spawned — callers that need a "has the poller
+    /// actually populated anything" check should consult
+    /// [`FederationStore::has_first_success`].
+    pub fn federation_store(&self) -> &FederationStore {
+        &self.federation_store
     }
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.

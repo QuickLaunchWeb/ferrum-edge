@@ -9,6 +9,7 @@
 pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
+pub mod federation;
 pub mod hbone;
 pub mod node_waypoint;
 pub mod policy;
@@ -734,10 +735,20 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
 fn gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
+    federation: Option<&federation::FederationSnapshot>,
 ) -> Result<GatewayConfig, anyhow::Error> {
     let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
+    // Overlay live-polled federation bundles on top of the CP-provided
+    // [`TrustBundleSet.federated`] so cross-cluster mTLS verifies against the
+    // freshest bundle the gateway has fetched. Empty snapshots are a no-op.
+    let trust_bundles = match federation {
+        Some(snapshot) if !snapshot.bundles.is_empty() => {
+            federation::merge_federation_into_trust_bundles(slice.trust_bundles.clone(), snapshot)
+        }
+        _ => slice.trust_bundles.clone(),
+    };
     let config = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             workloads: slice.workloads.clone(),
@@ -753,7 +764,7 @@ fn gateway_config_from_mesh_slice(
             // DPs receive the already-narrowed set of services / service-entries /
             // destination-rules; `MeshSidecar` resources are not echoed back.
             sidecars: Vec::new(),
-            trust_bundles: slice.trust_bundles.clone(),
+            trust_bundles,
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
             ..MeshConfig::default()
@@ -773,7 +784,8 @@ async fn wait_for_initial_mesh_config(
     loop {
         let snapshot = mesh_state.snapshot();
         if let Some(slice) = snapshot.as_ref().as_ref() {
-            match gateway_config_from_mesh_slice(slice, runtime) {
+            let federation_snapshot = mesh_state.federation_store().snapshot();
+            match gateway_config_from_mesh_slice(slice, runtime, Some(&federation_snapshot)) {
                 Ok(config) => return Ok((config, Arc::new(slice.clone()))),
                 Err(e) => {
                     warn!(
@@ -2762,6 +2774,33 @@ async fn serve_mesh_runtime(
             .await;
     }
 
+    // Spawn the SPIFFE trust-bundle federation poller before the apply task so
+    // the first slice apply observes whatever the poller has already fetched.
+    // The poller updates `mesh_state.federation_store()` on each successful
+    // poll; the apply task subscribes to the same store. Disabled when
+    // `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or when the slice has
+    // no remote clusters configured.
+    let federation_poller_config = federation::FederationPollerConfig::from_env(
+        env_config.mesh_federation_poll_interval_seconds,
+        env_config.mesh_federation_poll_timeout_seconds,
+        env_config.mesh_federation_fail_open,
+    );
+    let initial_multi_cluster = initial_applied_mesh_slice
+        .as_ref()
+        .and_then(|slice| slice.multi_cluster.clone());
+    if let Some(handles) = federation::spawn_federation_poller(
+        initial_multi_cluster.as_ref(),
+        federation_poller_config,
+        proxy_state.plugin_cache.http_client().clone(),
+        mesh_state.federation_store().clone(),
+        shutdown_tx.subscribe(),
+    ) {
+        for handle in handles.tasks {
+            mesh_background_handles.push(handle);
+        }
+        info!("SPIFFE trust-bundle federation poller running");
+    }
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
@@ -3351,15 +3390,27 @@ fn start_mesh_slice_apply_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut updates = mesh_state.subscribe();
+        let mut federation_updates = mesh_state.federation_store().subscribe();
         let mut last_applied_slice = initial_applied_mesh_slice;
+        let mut last_applied_federation_revision = *federation_updates.borrow();
         loop {
             if *shutdown_rx.borrow() {
                 return;
             }
 
             let snapshot = mesh_state.snapshot();
+            let current_federation_revision = *federation_updates.borrow();
+            // The apply loop re-runs on slice OR federation changes. Without
+            // the second check, a no-op slice (CP did not push anything new)
+            // would skip applying a freshly polled federation bundle: the
+            // `content_eq` short-circuit only catches the slice, not the
+            // bundles we overlay on top.
+            let federation_changed =
+                current_federation_revision != last_applied_federation_revision;
             if let Some(slice) = snapshot.as_ref().as_ref() {
-                if mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice) {
+                let slice_unchanged =
+                    mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
+                if slice_unchanged && !federation_changed {
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
@@ -3387,7 +3438,12 @@ fn start_mesh_slice_apply_task(
                             "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
                         );
                     } else {
-                        match gateway_config_from_mesh_slice(slice, &runtime) {
+                        let federation_snapshot = mesh_state.federation_store().snapshot();
+                        match gateway_config_from_mesh_slice(
+                            slice,
+                            &runtime,
+                            Some(&federation_snapshot),
+                        ) {
                             Ok(config) => {
                                 let previous_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let candidate_loaded_at = config.loaded_at;
@@ -3477,10 +3533,20 @@ fn start_mesh_slice_apply_task(
                         }
                     }
                 }
+                // Federation revision is consumed after every apply attempt,
+                // whether successful or not. A rejected apply still advances
+                // the marker so a transient invalid slice doesn't pin the apply
+                // loop in a re-apply spin on every poll.
+                last_applied_federation_revision = current_federation_revision;
             }
 
             tokio::select! {
                 changed = updates.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = federation_updates.changed() => {
                     if changed.is_err() {
                         return;
                     }
@@ -5516,7 +5582,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let access_log = prepared
             .plugin_configs
             .iter()
@@ -5550,7 +5616,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let registry_plugin = prepared
             .plugin_configs
             .iter()
@@ -5589,7 +5655,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let registry_plugin = prepared
             .plugin_configs
             .iter()
@@ -5612,7 +5678,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
 
         assert!(
             prepared
@@ -5633,7 +5699,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let bpf_plugin = prepared
             .plugin_configs
             .iter()
@@ -5660,8 +5726,8 @@ mod tests {
                 ..MeshSlice::default()
             };
 
-            let prepared =
-                gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None)
+                .expect("mesh slice config");
             assert!(
                 prepared
                     .plugin_configs
@@ -5704,7 +5770,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
 
         // Access log plugin is explicitly absent (Telemetry disabled).
         assert!(
@@ -5737,7 +5803,7 @@ mod tests {
         };
 
         let mut prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         assert!(
             prepared
                 .plugin_configs
@@ -5779,7 +5845,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
 
         let plugin = prepared
             .plugin_configs
@@ -5816,7 +5882,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
 
         assert!(
             prepared
@@ -5840,7 +5906,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
 
         assert!(
             prepared
@@ -5976,7 +6042,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let workload_metrics = prepared
             .plugin_configs
             .iter()
@@ -6041,7 +6107,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let workload_metrics = prepared
             .plugin_configs
             .iter()
@@ -6948,8 +7014,8 @@ mod tests {
                     ..MeshSlice::default()
                 };
 
-                let prepared =
-                    gateway_config_from_mesh_slice(&slice, &runtime).expect("native slice config");
+                let prepared = gateway_config_from_mesh_slice(&slice, &runtime, None)
+                    .expect("native slice config");
                 let mesh_authz = prepared
                     .plugin_configs
                     .iter()
@@ -7431,7 +7497,7 @@ mod tests {
         };
 
         let prepared =
-            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime, None).expect("mesh slice config");
         let jwks = prepared
             .plugin_configs
             .iter()
