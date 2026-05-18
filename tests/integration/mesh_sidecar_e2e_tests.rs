@@ -167,12 +167,21 @@ fn sidecar_source_locality_projects_onto_upstreams_when_workload_matches() {
 fn sidecar_authz_plugin_config_carries_mesh_slice_with_workload_identity() {
     // The injected `mesh_authz` plugin must receive a fully-formed
     // `mesh_slice` block that includes the workload-identity fields the
-    // plugin uses for its construction-time scope filter
-    // (`namespace`, `labels`, `mesh_policies`). The plugin's internal
-    // filter then narrows policies — exercised in the authz-focused
-    // tests in PR2; here we just lock in the on-disk plugin config shape
-    // so a future refactor doesn't accidentally strip the scope context
-    // the plugin depends on.
+    // plugin uses for its construction-time scope filter (`namespace`,
+    // `labels`, `mesh_policies`).
+    //
+    // NOTE: Scope filtering is applied twice in production —
+    //   1. at slice projection time (`MeshSlice::from_gateway_config`
+    //      drops policies whose `PolicyScope` doesn't match this
+    //      workload's namespace/labels), and
+    //   2. defensively again in `MeshAuthz::new` (the plugin re-filters
+    //      its own `mesh_slice.mesh_policies`).
+    // So a policy scoped to a non-applicable workload is gone by the
+    // time the plugin config is serialised — the `mesh_slice.mesh_policies`
+    // array reaching the plugin contains only the policies that already
+    // passed slice-level filtering. This test locks in *both* the
+    // identity context being preserved AND the slice-level filter
+    // already running before plugin construction.
     let mut runtime = default_mesh_runtime();
     runtime
         .workload_labels
@@ -233,19 +242,20 @@ fn sidecar_authz_plugin_config_carries_mesh_slice_with_workload_identity() {
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
         .collect();
-    // Slice projection itself does NOT scope-filter policies — that's the
-    // plugin's job at construction. Both policies should be present in
-    // the on-disk config so the plugin can run its filter with full
-    // context.
+    // Slice projection DOES scope-filter mesh_policies (see
+    // `MeshSlice::from_gateway_config`), so the policy scoped to a
+    // non-applicable workload is dropped before the plugin config is
+    // serialised. The matching policy survives. This is the
+    // observable contract the request hot path depends on.
     assert!(
         policy_names.contains(&"reviews-allow"),
-        "reviews-scoped policy carried through to plugin config, got {policy_names:?}"
+        "reviews-scoped policy must survive slice projection for an \
+         app=reviews workload, got {policy_names:?}"
     );
     assert!(
-        policy_names.contains(&"ratings-allow"),
-        "ratings-scoped policy carried through to plugin config too — \
-         the per-workload filter runs inside MeshAuthz::new(), not at \
-         slice projection time, got {policy_names:?}"
+        !policy_names.contains(&"ratings-allow"),
+        "ratings-scoped policy must be filtered out by slice projection \
+         for an app=reviews workload, got {policy_names:?}"
     );
 }
 
