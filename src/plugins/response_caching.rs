@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,6 +69,19 @@ fn cache_key_vary_value(header: &str, value: &str) -> String {
         hashed
     } else {
         value.to_string()
+    }
+}
+
+/// Cache keys use `:` as a structural delimiter, but URL paths legitimately
+/// contain `:` (e.g. `/users:1/details`, matrix params, FHIR `$everything`).
+/// Percent-encode `:` in the path segment before joining so that path/query
+/// boundaries can be recovered unambiguously and invalidation matches the
+/// full path rather than truncating at the first `:`.
+fn encode_path_for_cache_key(path: &str) -> Cow<'_, str> {
+    if path.contains(':') {
+        Cow::Owned(path.replace(':', "%3A"))
+    } else {
+        Cow::Borrowed(path)
     }
 }
 
@@ -446,11 +460,12 @@ impl ResponseCaching {
             ""
         };
 
+        let encoded_path = encode_path_for_cache_key(&ctx.path);
         let mut key = String::with_capacity(
             proxy_id.len()
                 + host_part.len()
                 + ctx.method.len()
-                + ctx.path.len()
+                + encoded_path.len()
                 + query_part.len()
                 + consumer_part.len()
                 + 5,
@@ -461,7 +476,7 @@ impl ResponseCaching {
         key.push(':');
         key.push_str(&ctx.method);
         key.push(':');
-        key.push_str(&ctx.path);
+        key.push_str(&encoded_path);
         key.push(':');
         key.push_str(&query_part);
         key.push(':');
@@ -695,8 +710,10 @@ impl ResponseCaching {
 /// Check if a cache key's path segment matches the invalidation path.
 ///
 /// Cache key format: `proxy_id:host_hash:method:path:query:consumer[:vary...]`.
-/// Returns true if the cached path equals `target_path` or starts with it
-/// as a proper path prefix (followed by `/` or end of string).
+/// The `path` segment has any `:` percent-encoded (see
+/// [`encode_path_for_cache_key`]) so it cannot be confused with a structural
+/// delimiter. Returns true if the cached path equals the encoded `target_path`
+/// or starts with it as a proper path prefix (followed by `/`).
 fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
     let after_proxy_id = match cache_key.find(':') {
         Some(i) => &cache_key[i + 1..],
@@ -715,9 +732,11 @@ fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
         None => after_method,
     };
 
-    cached_path == target_path
-        || (cached_path.starts_with(target_path)
-            && cached_path.as_bytes().get(target_path.len()) == Some(&b'/'))
+    let encoded_target = encode_path_for_cache_key(target_path);
+    let encoded_target = encoded_target.as_ref();
+    cached_path == encoded_target
+        || (cached_path.starts_with(encoded_target)
+            && cached_path.as_bytes().get(encoded_target.len()) == Some(&b'/'))
 }
 
 fn normalize_etag(tag: &str) -> &str {
@@ -1115,6 +1134,117 @@ mod tests {
         assert!(!stored_key.contains(bearer));
         assert!(!stored_key.contains("reviewer-secret-token"));
         assert!(stored_key.contains("authorization=sha256-"));
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_passes_through_paths_without_colons() {
+        let plain = encode_path_for_cache_key("/users/42/details");
+        assert!(matches!(plain, Cow::Borrowed(_)));
+        assert_eq!(plain.as_ref(), "/users/42/details");
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_percent_encodes_colons() {
+        let encoded = encode_path_for_cache_key("/users:1/details");
+        assert_eq!(encoded.as_ref(), "/users%3A1/details");
+    }
+
+    #[test]
+    fn cache_key_path_matches_handles_paths_containing_colons() {
+        // Build cache_key the same way build_base_cache_key does, with the
+        // path segment percent-encoded. The matcher must accept the same
+        // unencoded path as the invalidation target.
+        let cache_key = format!(
+            "proxy:host:GET:{}:q=1:_anon",
+            encode_path_for_cache_key("/users:1/details")
+        );
+        assert!(cache_key_path_matches(&cache_key, "/users:1/details"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_unrelated_short_path_does_not_match_longer_colon_path() {
+        // `/users` must NOT match a cached entry for `/users:1/details` —
+        // the old colon-truncating matcher returned `/users` as the cached
+        // path and wrongly matched on equality.
+        let cache_key = format!(
+            "proxy:host:GET:{}:q=1:_anon",
+            encode_path_for_cache_key("/users:1/details")
+        );
+        assert!(!cache_key_path_matches(&cache_key, "/users"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_targeted_colon_path_does_not_match_unrelated_short_cache() {
+        // Conversely, `/users:1/details` must NOT invalidate a cached
+        // entry for `/users` (no false-positive prefix expansion through
+        // the colon).
+        let cache_key = "proxy:host:GET:/users:q=1:_anon".to_string();
+        assert!(!cache_key_path_matches(&cache_key, "/users:1/details"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_proper_path_prefix_with_trailing_slash_still_works() {
+        let cache_key = "proxy:host:GET:/api/items/42:q=1:_anon".to_string();
+        assert!(cache_key_path_matches(&cache_key, "/api/items"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_method_invalidates_cached_path_containing_colon() {
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut get_ctx = make_ctx("GET", "/users:1/details");
+        get_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut get_headers = get_ctx.headers.clone();
+        plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+        plugin
+            .on_final_response_body(&mut get_ctx, 200, &HashMap::new(), b"body")
+            .await;
+        assert_eq!(plugin.cache.len(), 1);
+
+        let mut post_ctx = make_ctx("POST", "/users:1/details");
+        post_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut post_headers = post_ctx.headers.clone();
+        plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+        assert!(
+            plugin.cache.is_empty(),
+            "unsafe method on same colon-containing path should invalidate the cached entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_method_does_not_invalidate_unrelated_path_with_colon_prefix_clash() {
+        // GET /users:1/details cached.
+        // POST /users (unrelated) must NOT invalidate it.
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut get_ctx = make_ctx("GET", "/users:1/details");
+        get_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut get_headers = get_ctx.headers.clone();
+        plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+        plugin
+            .on_final_response_body(&mut get_ctx, 200, &HashMap::new(), b"body")
+            .await;
+        assert_eq!(plugin.cache.len(), 1);
+
+        let mut post_ctx = make_ctx("POST", "/users");
+        post_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut post_headers = post_ctx.headers.clone();
+        plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+        assert_eq!(
+            plugin.cache.len(),
+            1,
+            "unsafe method on unrelated /users must NOT invalidate /users:1/details"
+        );
     }
 
     #[tokio::test]
