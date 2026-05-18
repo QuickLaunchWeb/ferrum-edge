@@ -303,10 +303,10 @@ fn per_resource_version(resource: &XdsResource) -> String {
 /// Translate one Envoy `envoy.service.runtime.v3.Runtime` resource (one RTDS
 /// "layer") into a `MeshRuntimeOverlay`.
 ///
-/// GAP-3E scope: ship subscription + parse + slice exposure ONLY. Downstream
-/// consumers (fault rates, log levels, header filters) are deferred — this
-/// function is the single decode site and the overlay is then carried
-/// verbatim on `MeshSlice.runtime_overlay`.
+/// This is the single decode site for RTDS resources. The overlay is then
+/// carried on `MeshSlice.runtime_overlay` and fanned out to consumers
+/// (fault injection, request/response transformer gates, tracing log level)
+/// at slice install via `runtime_overlay_consumers::apply_overlay`.
 ///
 /// Top-level fields in the Runtime's `layer` struct are flattened into
 /// `MeshRuntimeOverlay.fields` keyed by field name. Field values are mapped:
@@ -318,8 +318,8 @@ fn per_resource_version(resource: &XdsResource) -> String {
 ///     (`numerator: number, denominator: "HUNDRED"|"TEN_THOUSAND"|"MILLION"`)
 ///     → `RuntimeValue::FractionalPercent`
 ///   - other struct / list / null values are silently skipped (RTDS layers
-///     don't ship them in practice; GAP-3E intentionally avoids inventing
-///     placeholder semantics until a consumer needs them)
+///     don't ship them in practice; avoid inventing placeholder semantics
+///     until a consumer needs them)
 pub fn translate_rtds_layer(layer: &runtime_proto::Runtime) -> MeshRuntimeOverlay {
     let Some(layer_struct) = layer.layer.as_ref() else {
         return MeshRuntimeOverlay::default();

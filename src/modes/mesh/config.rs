@@ -2109,11 +2109,19 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
 /// Mesh runtime knobs sourced from xDS RTDS (`envoy.service.runtime.v3.Runtime`)
 /// layers.
 ///
-/// GAP-3E ships subscription + parse + slice exposure ONLY. Downstream
-/// consumers (fault rates, log levels, header filters) are deferred follow-up
-/// items — the overlay is carried verbatim on
-/// [`crate::modes::mesh::slice::MeshSlice`] so operators can inspect it via
-/// `GET /mesh/runtime-overlay` and so future plumbing has a stable target.
+/// The overlay is carried verbatim on
+/// [`crate::modes::mesh::slice::MeshSlice`]; operators inspect it via
+/// `GET /mesh/runtime-overlay`. Every slice install fans the overlay out to
+/// three live consumers via
+/// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
+/// fault-injection percentages
+/// ([`crate::plugins::fault_injection::runtime_overlay`]), request/response
+/// transformer gates
+/// ([`crate::plugins::request_transformer::runtime_overlay`],
+/// [`crate::plugins::response_transformer::runtime_overlay`]), and the
+/// gateway-wide tracing filter
+/// ([`crate::logging::runtime_overlay`]). Adding a new consumer is a single
+/// `apply_*` call from `runtime_overlay_consumers`.
 ///
 /// Wire compatibility: the type is an optional field on `MeshSlice` with
 /// `#[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]`,

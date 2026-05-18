@@ -35,10 +35,11 @@ const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
     // Kept after the baseline so DPs request the baseline first and treat
     // ECDS as a "richer-semantics" overlay rather than a hard dependency.
     ECDS_TYPE_URL,
-    // GAP-3E: RTDS is subscribed alongside the other xDS types, but it
-    // ships runtime knobs that downstream consumers haven't been wired to
-    // yet. Kept last so the baseline slice can apply even when the CP has
-    // no Runtime layers to send.
+    // RTDS is subscribed alongside the other xDS types; runtime knobs feed
+    // fault-injection percentages, transformer gates, and the tracing log
+    // level via `runtime_overlay_consumers::apply_overlay` at slice install.
+    // Kept last so the baseline slice can apply even when the CP has no
+    // Runtime layers to send.
     RTDS_TYPE_URL,
 ];
 const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =

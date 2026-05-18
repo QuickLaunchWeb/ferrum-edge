@@ -18,6 +18,14 @@ use ferrum_edge::plugins::fault_injection::runtime_overlay as fault_overlay;
 use ferrum_edge::plugins::request_transformer::runtime_overlay as request_gate;
 use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
 
+/// Process-global lock serialising every test in this module — the RTDS
+/// consumers all back onto module-level `ArcSwap` state, so two tests racing
+/// `apply_overlay` / `reset_for_test` would corrupt each other's
+/// assertions. Defined at module scope so every test acquires the SAME
+/// mutex; a `static` defined inside each test is a distinct mutex (local
+/// statics are per-function) and would not serialise at all.
+static CONSUMER_TEST_GUARD: Mutex<()> = Mutex::new(());
+
 #[derive(Default, Clone)]
 struct CapturingReloader {
     captured: Arc<Mutex<Vec<String>>>,
@@ -44,13 +52,14 @@ fn install_slice_with_overlay(state: &MeshRuntimeState, overlay: MeshRuntimeOver
 
 #[test]
 fn slice_install_fans_out_to_every_consumer() {
-    // The consumer registry is process-global, so we serialise the four
-    // assertions and reset every consumer before/after. Co-running with
-    // other consumer tests in the binary is safe because each test owns
-    // its own scope keys.
-    use std::sync::Mutex;
-    static GUARD: Mutex<()> = Mutex::new(());
-    let _guard = GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    // The consumer registry is process-global, so this test serialises
+    // against any sibling that touches the same `ArcSwap` state via the
+    // module-level `CONSUMER_TEST_GUARD` mutex. Reset every consumer at
+    // entry and exit so leftover state from an earlier sibling can't
+    // corrupt assertions.
+    let _guard = CONSUMER_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     fault_overlay::reset_for_test();
     request_gate::reset_for_test();
@@ -126,8 +135,9 @@ fn slice_install_fans_out_to_every_consumer() {
 
 #[test]
 fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
-    static GUARD: Mutex<()> = Mutex::new(());
-    let _guard = GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = CONSUMER_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     fault_overlay::reset_for_test();
     request_gate::reset_for_test();

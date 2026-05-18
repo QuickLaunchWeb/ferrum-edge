@@ -206,9 +206,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<MeshExtensionConfig>,
     /// xDS RTDS (`envoy.service.runtime.v3.Runtime`) overlay merged across
-    /// all subscribed layers. GAP-3E scope is subscription + parse + slice
-    /// exposure only — downstream consumers (fault rates, log levels,
-    /// header filters) are deferred follow-ups. Empty unless RTDS layers
+    /// all subscribed layers. Slice install fans the overlay out to live
+    /// consumers (fault-injection percentages, request/response transformer
+    /// gates, tracing log level) via
+    /// `runtime_overlay_consumers::apply_overlay`. Empty unless RTDS layers
     /// arrived on the stream.
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
     pub runtime_overlay: MeshRuntimeOverlay,

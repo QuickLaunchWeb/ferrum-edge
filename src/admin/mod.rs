@@ -1182,11 +1182,12 @@ async fn handle_mesh_runtime_overlay_get(
             &json!({"error": "No active mesh runtime overlay"}),
         ));
     };
-    // Read the lock-free ArcSwap snapshot once; downstream consumers
-    // (deferred per GAP-3E scope) will read the same path. Returning 404
-    // before the first slice arrives mirrors `/mesh/egress-scope` so
-    // operators can distinguish "no slice yet" from "slice carries an
-    // empty overlay".
+    // Read the lock-free ArcSwap snapshot once; consumers (fault injection,
+    // transformer gates, log level) read the same overlay via
+    // `runtime_overlay_consumers::apply_overlay` at slice install. Returning
+    // 404 before the first slice arrives mirrors `/mesh/egress-scope` so
+    // operators can distinguish "no slice yet" from "slice carries an empty
+    // overlay".
     let slice = mesh_runtime.snapshot();
     let Some(slice) = slice.as_ref().as_ref() else {
         return Ok(json_response(
