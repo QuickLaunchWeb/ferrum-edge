@@ -193,7 +193,16 @@ impl SoapWsSecurity {
                 )
             })?;
 
-            let public_key_der = cert.public_key().raw.to_vec();
+            // Ring's `RSA_PKCS1_*` verification algorithms expect a bare
+            // RFC 8017 §A.1.1 `RSAPublicKey` (modulus + exponent), NOT a
+            // full RFC 5280 `SubjectPublicKeyInfo` (which wraps the key
+            // with the algorithm identifier OID). For RSA SPKI the inner
+            // `subject_public_key` BitString contents ARE that bare
+            // `RSAPublicKey` encoding, so use that directly instead of
+            // `public_key().raw` (which is the entire SPKI DER) — passing
+            // SPKI bytes makes `UnparsedPublicKey::verify` fail to parse
+            // the key and reject every signature, regardless of validity.
+            let public_key_der = cert.public_key().subject_public_key.data.to_vec();
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
                 .to_vec();
