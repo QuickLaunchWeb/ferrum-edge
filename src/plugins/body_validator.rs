@@ -376,14 +376,9 @@ impl BodyValidator {
             let defined_props = schema.get("properties").and_then(|p| p.as_object());
             if let Some(additional) = schema.get("additionalProperties") {
                 if additional.as_bool() == Some(false) {
-                    if let Some(defined) = defined_props {
-                        for key in data_obj.keys() {
-                            if !defined.contains_key(key) {
-                                return Err(format!(
-                                    "Additional property '{}' is not allowed",
-                                    key
-                                ));
-                            }
+                    for key in data_obj.keys() {
+                        if !defined_props.map(|d| d.contains_key(key)).unwrap_or(false) {
+                            return Err(format!("Additional property '{}' is not allowed", key));
                         }
                     }
                 } else if additional.is_object() {
@@ -897,11 +892,22 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
 fn contains_xml_open_tag(body: &str, element: &str) -> bool {
     let body = body.as_bytes();
     let element = element.as_bytes();
-    if element.is_empty() || body.len() <= element.len() {
+    if element.is_empty() {
         return false;
     }
-    body.windows(element.len() + 1)
-        .any(|window| window[0] == b'<' && &window[1..] == element)
+    // Need: '<' + element + one delimiter byte ('>', '/', or whitespace per XML spec).
+    let window_size = element.len() + 2;
+    if body.len() < window_size {
+        return false;
+    }
+    body.windows(window_size).any(|window| {
+        window[0] == b'<'
+            && &window[1..1 + element.len()] == element
+            && matches!(
+                window[1 + element.len()],
+                b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
+            )
+    })
 }
 
 /// Load protobuf validation config from the plugin config JSON.

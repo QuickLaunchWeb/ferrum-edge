@@ -47,6 +47,7 @@ pub struct VaultPkiCa {
 
 impl VaultPkiCa {
     pub fn new(config: VaultPkiConfig) -> Self {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("vault_pki", false);
         Self { config }
     }
 
@@ -58,6 +59,11 @@ impl VaultPkiCa {
 #[async_trait]
 impl CertificateAuthority for VaultPkiCa {
     async fn issue_svid(&self, _req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("vault_pki", false);
+        crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+            "unknown",
+            "vault_pki",
+        );
         Err(CaError::Upstream(format!(
             "Vault PKI CA at '{}' (mount='{}', role='{}') is not yet implemented (Phase B+)",
             self.config.address, self.config.mount, self.config.role
@@ -65,6 +71,7 @@ impl CertificateAuthority for VaultPkiCa {
     }
 
     async fn trust_bundle(&self, _td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("vault_pki", false);
         Err(CaError::Upstream(
             "Vault PKI trust bundle fetch not yet implemented (Phase B+)".to_string(),
         ))
@@ -96,6 +103,7 @@ pub struct CertManagerCa {
 
 impl CertManagerCa {
     pub fn new(config: CertManagerConfig) -> Self {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("cert_manager", false);
         Self { config }
     }
 
@@ -107,6 +115,11 @@ impl CertManagerCa {
 #[async_trait]
 impl CertificateAuthority for CertManagerCa {
     async fn issue_svid(&self, _req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("cert_manager", false);
+        crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+            "unknown",
+            "cert_manager",
+        );
         Err(CaError::Upstream(format!(
             "cert-manager CA (issuer={}/{}) is not yet implemented (Phase B+)",
             self.config.issuer_kind, self.config.issuer_name
@@ -114,6 +127,7 @@ impl CertificateAuthority for CertManagerCa {
     }
 
     async fn trust_bundle(&self, _td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+        crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("cert_manager", false);
         Err(CaError::Upstream(
             "cert-manager trust bundle fetch not yet implemented (Phase B+)".to_string(),
         ))

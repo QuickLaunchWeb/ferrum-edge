@@ -1,20 +1,31 @@
 //! API Chargeback Plugin
 //!
-//! Tracks per-consumer API usage charges based on configurable pricing tiers
-//! keyed by HTTP status code. Charges accumulate in-memory via a global
-//! singleton registry and are exposed via the admin `/charges` endpoint in
-//! both Prometheus and JSON formats for external billing system integration.
+//! Tracks per-consumer API usage charges across three pricing dimensions:
 //!
-//! This plugin uses the `log()` hook to record charges from `TransactionSummary`.
-//! Only requests with an identified consumer (or authenticated identity) are
-//! charged — anonymous traffic is not tracked.
+//! 1. **Per-call pricing** keyed by HTTP status code (`pricing_tiers`) — used
+//!    for HTTP-family transactions (HTTP/1.1, H2, H3, gRPC, WebSocket upgrades).
+//! 2. **Bandwidth pricing** keyed by direction (`bandwidth_pricing`) — applied
+//!    to both HTTP-family transactions and stream transactions (TCP, TCP+TLS,
+//!    UDP, DTLS) using the gateway-perspective `bytes_sent` / `bytes_received`
+//!    counters that the unified [`TransactionSummary`] /
+//!    [`StreamTransactionSummary`] schema exposes.
+//! 3. **Per-connection pricing** for stream sessions (`stream_connection_pricing`).
+//!    Streams have no HTTP status code so they cannot use `pricing_tiers`; this
+//!    knob charges a flat fee per stream session at disconnect time.
 //!
-//! **Hot-path optimization**: The `record()` method uses a thread-local `String`
+//! Charges accumulate in-memory via a global singleton registry and are exposed
+//! via the admin `/charges` endpoint in both Prometheus and JSON formats for
+//! external billing system integration. Only requests with an identified
+//! consumer (or authenticated identity) are charged — anonymous traffic is not
+//! tracked.
+//!
+//! **Hot-path optimization**: The recording methods use a thread-local `String`
 //! buffer for the DashMap lookup key, achieving **zero heap allocation on cache
-//! hits** (99%+ of requests). Only the first request per unique
-//! (consumer, proxy, status_code) combination allocates — subsequent requests
+//! hits** (99%+ of requests). Only the first record per unique
+//! (consumer, proxy, status_code) combination allocates — subsequent records
 //! reuse the existing DashMap entry via a read-lock `get()` on a borrowed `&str`.
-//! This matches the connection pool key pattern in `connection_pool.rs`.
+//! Stream entries use a `status_code` sentinel of `0` to share the same key
+//! format and code path.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -26,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use super::{Plugin, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
@@ -50,23 +61,57 @@ fn escape_label_value(value: &str) -> String {
     escaped
 }
 
-/// Atomic chargeback entry with call count, accumulated charge, staleness
-/// tracking, and render metadata.
+/// Protocol family of a recorded entry. Stored on `ChargebackEntry` so the
+/// render path can label HTTP and stream activity distinctly without re-parsing
+/// the entry key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFamily {
+    Http,
+    Stream,
+}
+
+impl ProtocolFamily {
+    fn label(&self) -> &'static str {
+        match self {
+            ProtocolFamily::Http => "http",
+            ProtocolFamily::Stream => "stream",
+        }
+    }
+}
+
+/// Atomic chargeback entry. Tracks call counts, per-call charges, bandwidth
+/// counters (bytes + monetary), staleness, and render metadata.
 ///
-/// The `consumer`, `proxy_id`, `proxy_name`, and `status_code` fields are set
-/// once on creation and read during render. They are NOT in the DashMap key
-/// (which is a plain `String`) — this allows the hot-path `get()` to use a
-/// borrowed `&str` from a thread-local buffer with zero allocation.
+/// The `consumer`, `proxy_id`, `proxy_name`, `status_code`, and
+/// `protocol_family` fields are set once on creation and read during render.
+/// They are NOT in the DashMap key (which is a plain `String`) — this allows
+/// the hot-path `get()` to use a borrowed `&str` from a thread-local buffer
+/// with zero allocation.
+///
+/// For stream entries the `status_code` is `0` and there is exactly one entry
+/// per `(consumer, proxy_id)` (streams have no HTTP status).
 pub struct ChargebackEntry {
     pub call_count: AtomicU64,
-    /// Accumulated charge stored as u64 bits of f64.
+    /// Accumulated per-call (transaction or stream-session) charge, stored as
+    /// the u64 bits of an f64.
     pub charge_total_bits: AtomicU64,
+    /// Bytes the gateway sent onward toward the backend on the client's behalf
+    /// (request body for HTTP, client→backend half of a stream relay).
+    pub bytes_sent_total: AtomicU64,
+    /// Bytes the gateway received from the backend and forwarded to the client
+    /// (response body for HTTP, backend→client half of a stream relay).
+    pub bytes_received_total: AtomicU64,
+    /// Accumulated bandwidth charge for client→backend bytes, f64 bits.
+    pub bandwidth_charge_sent_bits: AtomicU64,
+    /// Accumulated bandwidth charge for backend→client bytes, f64 bits.
+    pub bandwidth_charge_received_bits: AtomicU64,
     pub last_updated: AtomicU64,
     // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Arc<str>,
     pub status_code: u16,
+    pub protocol_family: ProtocolFamily,
 }
 
 impl ChargebackEntry {
@@ -76,32 +121,51 @@ impl ChargebackEntry {
         proxy_id: Arc<str>,
         proxy_name: Arc<str>,
         status_code: u16,
+        protocol_family: ProtocolFamily,
     ) -> Self {
         Self {
             call_count: AtomicU64::new(0),
             charge_total_bits: AtomicU64::new(0f64.to_bits()),
+            bytes_sent_total: AtomicU64::new(0),
+            bytes_received_total: AtomicU64::new(0),
+            bandwidth_charge_sent_bits: AtomicU64::new(0f64.to_bits()),
+            bandwidth_charge_received_bits: AtomicU64::new(0f64.to_bits()),
             last_updated: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
             consumer,
             proxy_id,
             proxy_name,
             status_code,
+            protocol_family,
         }
     }
 
-    fn record(&self, price: f64, epoch: Instant) {
+    fn record(
+        &self,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+        epoch: Instant,
+    ) {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        // CAS loop to atomically add price to the f64 total
-        loop {
-            let old = self.charge_total_bits.load(Ordering::Relaxed);
-            let new_val = f64::from_bits(old) + price;
-            match self.charge_total_bits.compare_exchange_weak(
-                old,
-                new_val.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => continue,
+        if call_price > 0.0 {
+            add_f64_atomic(&self.charge_total_bits, call_price);
+        }
+        if bytes_sent > 0 {
+            self.bytes_sent_total
+                .fetch_add(bytes_sent, Ordering::Relaxed);
+            if bw_price_sent > 0.0 {
+                let charge = bytes_sent as f64 * bw_price_sent;
+                add_f64_atomic(&self.bandwidth_charge_sent_bits, charge);
+            }
+        }
+        if bytes_received > 0 {
+            self.bytes_received_total
+                .fetch_add(bytes_received, Ordering::Relaxed);
+            if bw_price_received > 0.0 {
+                let charge = bytes_received as f64 * bw_price_received;
+                add_f64_atomic(&self.bandwidth_charge_received_bits, charge);
             }
         }
         self.last_updated
@@ -115,6 +179,23 @@ impl ChargebackEntry {
     }
 }
 
+/// CAS loop to atomically add `delta` to an f64 stored as u64 bits.
+fn add_f64_atomic(slot: &AtomicU64, delta: f64) {
+    loop {
+        let old = slot.load(Ordering::Relaxed);
+        let new_val = f64::from_bits(old) + delta;
+        match slot.compare_exchange_weak(
+            old,
+            new_val.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+}
+
 /// Default stale entry TTL: 1 hour in nanoseconds.
 const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 
@@ -124,16 +205,20 @@ const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
+/// Sentinel `status_code` for stream entries (TCP/UDP/DTLS). HTTP status codes
+/// are always in the 100..=599 range so `0` cannot collide.
+const STREAM_STATUS_SENTINEL: u16 = 0;
+
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
 /// `"consumer|proxy_id|status_code"`. Render metadata (consumer, proxy_id,
-/// proxy_name, status_code) is stored in the `ChargebackEntry` value. This
-/// allows the hot-path `record()` to use `DashMap::get(&str)` with a
-/// thread-local buffer — zero allocation on cache hits. Only the cold path
-/// (first request per unique combination) allocates a `String` key and
-/// `Arc<str>` metadata. This matches the connection pool key pattern in
-/// `connection_pool.rs`.
+/// proxy_name, status_code, protocol_family) is stored in the `ChargebackEntry`
+/// value. This allows the hot-path recording methods to use
+/// `DashMap::get(&str)` with a thread-local buffer — zero allocation on cache
+/// hits. Only the cold path (first record per unique combination) allocates a
+/// `String` key and `Arc<str>` metadata. This matches the connection pool key
+/// pattern in `connection_pool.rs`.
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
@@ -227,22 +312,87 @@ impl ChargebackRegistry {
         });
     }
 
-    /// Record a chargeable API call.
-    ///
-    /// **Hot-path (cache hit)**: Uses `DashMap::get(&str)` with a thread-local
-    /// buffer — one `write!` into a pre-allocated `String`, one DashMap read-lock,
-    /// two atomic increments. Zero heap allocation.
-    ///
-    /// **Cold-path (first request per unique combination)**: Allocates the `String`
-    /// key, three `Arc<str>` for render metadata, and a new `ChargebackEntry`.
-    /// This runs once per unique (consumer, proxy, status_code) combination.
-    pub fn record(
+    /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
+    /// WebSocket upgrade). Status code is the response status.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_http(
         &self,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
         status_code: u16,
-        price: f64,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
+        self.record_inner(
+            consumer,
+            proxy_id,
+            proxy_name,
+            status_code,
+            ProtocolFamily::Http,
+            call_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    /// Record a chargeable stream session (TCP, TCP+TLS, UDP, DTLS). Streams
+    /// have no HTTP status code; entries are keyed by `(consumer, proxy_id)`
+    /// with the [`STREAM_STATUS_SENTINEL`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_stream(
+        &self,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        connection_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
+        self.record_inner(
+            consumer,
+            proxy_id,
+            proxy_name,
+            STREAM_STATUS_SENTINEL,
+            ProtocolFamily::Stream,
+            connection_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    /// Shared hot-path implementation behind `record_http` / `record_stream`.
+    ///
+    /// **Hot-path (cache hit)**: Uses `DashMap::get(&str)` with a thread-local
+    /// buffer — one `write!` into a pre-allocated `String`, one DashMap read-lock,
+    /// a handful of atomic operations. Zero heap allocation.
+    ///
+    /// **Cold-path (first record per unique combination)**: Allocates the `String`
+    /// key, three `Arc<str>` for render metadata, and a new `ChargebackEntry`.
+    /// This runs once per unique `(consumer, proxy, status_code)` combination
+    /// (per `(consumer, proxy)` for streams).
+    #[allow(clippy::too_many_arguments)]
+    fn record_inner(
+        &self,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol_family: ProtocolFamily,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
     ) {
         thread_local! {
             static KEY_BUF: std::cell::RefCell<String> =
@@ -257,7 +407,14 @@ impl ChargebackRegistry {
             let _ = write!(buf, "{}|{}|{}", consumer, proxy_id, status_code);
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
-                entry.record(price, self.epoch);
+                entry.record(
+                    call_price,
+                    bytes_sent,
+                    bytes_received,
+                    bw_price_sent,
+                    bw_price_received,
+                    self.epoch,
+                );
                 return true;
             }
             false
@@ -275,9 +432,17 @@ impl ChargebackRegistry {
                         Arc::from(proxy_id),
                         Arc::from(proxy_name),
                         status_code,
+                        protocol_family,
                     )
                 })
-                .record(price, self.epoch);
+                .record(
+                    call_price,
+                    bytes_sent,
+                    bytes_received,
+                    bw_price_sent,
+                    bw_price_received,
+                    self.epoch,
+                );
         }
 
         self.maybe_invalidate_caches();
@@ -341,17 +506,22 @@ impl ChargebackRegistry {
             .read()
             .map(|l| l.clone())
             .unwrap_or_default();
-        // Two counter families × ~150 bytes per entry
-        let estimated_cap = 512 + self.entries.len() * 300;
+
+        // Multiple counter families × ~200 bytes per entry
+        let estimated_cap = 1024 + self.entries.len() * 600;
         let mut output = String::with_capacity(estimated_cap);
 
-        // Chargeable calls counter
+        // --- Per-call metrics (HTTP entries only — streams have no status code) ---
+
         output.push_str(
-            "# HELP ferrum_api_chargeable_calls_total Total chargeable API calls per consumer.\n",
+            "# HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeable_calls_total counter\n");
         for entry in self.entries.iter() {
             let v = entry.value();
+            if v.protocol_family != ProtocolFamily::Http {
+                continue;
+            }
             let count = v.call_count.load(Ordering::Relaxed);
             output.push_str(&format!(
                 "ferrum_api_chargeable_calls_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\"{}}} {}\n",
@@ -364,12 +534,15 @@ impl ChargebackRegistry {
             ));
         }
 
-        // Charges counter (monetary)
-        output
-            .push_str("# HELP ferrum_api_charges_total Total charges accumulated per consumer.\n");
+        output.push_str(
+            "# HELP ferrum_api_charges_total Total per-call charges accumulated per consumer.\n",
+        );
         output.push_str("# TYPE ferrum_api_charges_total counter\n");
         for entry in self.entries.iter() {
             let v = entry.value();
+            if v.protocol_family != ProtocolFamily::Http {
+                continue;
+            }
             let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
             output.push_str(&format!(
                 "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
@@ -380,6 +553,142 @@ impl ChargebackRegistry {
                 escape_label_value(&currency),
                 ns_label,
                 charge
+            ));
+        }
+
+        // --- Stream connection metrics (stream entries only) ---
+
+        output.push_str(
+            "# HELP ferrum_api_stream_connections_total Total stream sessions (TCP/UDP/DTLS) per consumer.\n",
+        );
+        output.push_str("# TYPE ferrum_api_stream_connections_total counter\n");
+        for entry in self.entries.iter() {
+            let v = entry.value();
+            if v.protocol_family != ProtocolFamily::Stream {
+                continue;
+            }
+            let count = v.call_count.load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_api_stream_connections_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\"{}}} {}\n",
+                escape_label_value(&v.consumer),
+                escape_label_value(&v.proxy_id),
+                escape_label_value(&v.proxy_name),
+                ns_label,
+                count
+            ));
+        }
+
+        output.push_str(
+            "# HELP ferrum_api_stream_connection_charges_total Total per-connection charges for stream sessions.\n",
+        );
+        output.push_str("# TYPE ferrum_api_stream_connection_charges_total counter\n");
+        for entry in self.entries.iter() {
+            let v = entry.value();
+            if v.protocol_family != ProtocolFamily::Stream {
+                continue;
+            }
+            let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
+            output.push_str(&format!(
+                "ferrum_api_stream_connection_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\"{}}} {:.10}\n",
+                escape_label_value(&v.consumer),
+                escape_label_value(&v.proxy_id),
+                escape_label_value(&v.proxy_name),
+                escape_label_value(&currency),
+                ns_label,
+                charge
+            ));
+        }
+
+        // --- Bandwidth metrics (both HTTP and stream entries, aggregated per
+        //     (consumer, proxy_id) so HTTP entries spread across status codes
+        //     collapse to one row per direction) ---
+
+        #[derive(Default)]
+        struct BandwidthAggregate {
+            proxy_name: String,
+            protocol_family: Option<ProtocolFamily>,
+            bytes_sent: u64,
+            bytes_received: u64,
+            charge_sent: f64,
+            charge_received: f64,
+        }
+
+        let mut bw_aggregates: HashMap<(String, String), BandwidthAggregate> = HashMap::new();
+        for entry in self.entries.iter() {
+            let v = entry.value();
+            let agg = bw_aggregates
+                .entry((v.consumer.to_string(), v.proxy_id.to_string()))
+                .or_default();
+            if agg.proxy_name.is_empty() {
+                agg.proxy_name = v.proxy_name.to_string();
+            }
+            agg.protocol_family.get_or_insert(v.protocol_family);
+            agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
+            agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
+            agg.charge_sent += f64::from_bits(v.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
+            agg.charge_received +=
+                f64::from_bits(v.bandwidth_charge_received_bits.load(Ordering::Relaxed));
+        }
+
+        output.push_str(
+            "# HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.\n",
+        );
+        output.push_str("# TYPE ferrum_api_bytes_sent_total counter\n");
+        for ((consumer, proxy_id), agg) in &bw_aggregates {
+            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+            output.push_str(&format!(
+                "ferrum_api_bytes_sent_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
+                escape_label_value(consumer),
+                escape_label_value(proxy_id),
+                escape_label_value(&agg.proxy_name),
+                family.label(),
+                ns_label,
+                agg.bytes_sent
+            ));
+        }
+
+        output.push_str(
+            "# HELP ferrum_api_bytes_received_total Total bytes the gateway received backend->client and forwarded to this consumer.\n",
+        );
+        output.push_str("# TYPE ferrum_api_bytes_received_total counter\n");
+        for ((consumer, proxy_id), agg) in &bw_aggregates {
+            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+            output.push_str(&format!(
+                "ferrum_api_bytes_received_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
+                escape_label_value(consumer),
+                escape_label_value(proxy_id),
+                escape_label_value(&agg.proxy_name),
+                family.label(),
+                ns_label,
+                agg.bytes_received
+            ));
+        }
+
+        output.push_str(
+            "# HELP ferrum_api_bandwidth_charges_total Total bandwidth charges per consumer, split by direction.\n",
+        );
+        output.push_str("# TYPE ferrum_api_bandwidth_charges_total counter\n");
+        for ((consumer, proxy_id), agg) in &bw_aggregates {
+            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+            output.push_str(&format!(
+                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"sent\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
+                escape_label_value(consumer),
+                escape_label_value(proxy_id),
+                escape_label_value(&agg.proxy_name),
+                escape_label_value(&currency),
+                family.label(),
+                ns_label,
+                agg.charge_sent
+            ));
+            output.push_str(&format!(
+                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"received\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
+                escape_label_value(consumer),
+                escape_label_value(proxy_id),
+                escape_label_value(&agg.proxy_name),
+                escape_label_value(&currency),
+                family.label(),
+                ns_label,
+                agg.charge_received
             ));
         }
 
@@ -408,40 +717,67 @@ impl ChargebackRegistry {
     pub fn render_json_uncached(&self) -> String {
         let currency = self.currency.load();
 
-        // Build nested structure: consumer -> proxy -> status_code -> {calls, charges}
+        // Nested structure: consumer -> proxy -> {protocol, by_status, stream_summary, bandwidth}
         #[derive(Default)]
-        struct ProxyCharges {
+        struct ProxyAggregate {
             proxy_name: String,
-            by_status: HashMap<u16, (u64, f64)>, // (calls, charges)
+            protocol_family: Option<ProtocolFamily>,
+            by_status: HashMap<u16, (u64, f64)>,
+            stream_connections: u64,
+            stream_charges: f64,
+            bytes_sent: u64,
+            bytes_received: u64,
+            bandwidth_charge_sent: f64,
+            bandwidth_charge_received: f64,
         }
 
-        let mut consumers: HashMap<String, HashMap<String, ProxyCharges>> = HashMap::new();
+        let mut consumers: HashMap<String, HashMap<String, ProxyAggregate>> = HashMap::new();
 
         for entry in self.entries.iter() {
             let v = entry.value();
             let calls = v.call_count.load(Ordering::Relaxed);
             let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
+            let bytes_sent = v.bytes_sent_total.load(Ordering::Relaxed);
+            let bytes_received = v.bytes_received_total.load(Ordering::Relaxed);
+            let bw_sent = f64::from_bits(v.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
+            let bw_received =
+                f64::from_bits(v.bandwidth_charge_received_bits.load(Ordering::Relaxed));
 
             let proxy_map = consumers.entry(v.consumer.to_string()).or_default();
             let proxy_entry = proxy_map.entry(v.proxy_id.to_string()).or_default();
             proxy_entry.proxy_name = v.proxy_name.to_string();
-            proxy_entry.by_status.insert(v.status_code, (calls, charge));
+            proxy_entry.protocol_family.get_or_insert(v.protocol_family);
+            proxy_entry.bytes_sent += bytes_sent;
+            proxy_entry.bytes_received += bytes_received;
+            proxy_entry.bandwidth_charge_sent += bw_sent;
+            proxy_entry.bandwidth_charge_received += bw_received;
+
+            match v.protocol_family {
+                ProtocolFamily::Http => {
+                    proxy_entry.by_status.insert(v.status_code, (calls, charge));
+                }
+                ProtocolFamily::Stream => {
+                    proxy_entry.stream_connections = calls;
+                    proxy_entry.stream_charges = charge;
+                }
+            }
         }
 
-        // Build JSON
         let mut consumer_objects = serde_json::Map::new();
         for (consumer, proxies) in &consumers {
-            let mut total_charges = 0.0f64;
             let mut total_calls = 0u64;
+            let mut total_per_call_charges = 0.0f64;
+            let mut total_bandwidth_charges = 0.0f64;
+            let mut total_stream_charges = 0.0f64;
             let mut proxy_objects = serde_json::Map::new();
 
-            for (proxy_id, proxy_data) in proxies {
-                let mut proxy_charges = 0.0f64;
+            for (proxy_id, agg) in proxies {
+                let mut proxy_per_call_charges = 0.0f64;
                 let mut proxy_calls = 0u64;
                 let mut status_objects = serde_json::Map::new();
 
-                for (status_code, (calls, charge)) in &proxy_data.by_status {
-                    proxy_charges += charge;
+                for (status_code, (calls, charge)) in &agg.by_status {
+                    proxy_per_call_charges += charge;
                     proxy_calls += calls;
                     status_objects.insert(
                         status_code.to_string(),
@@ -452,25 +788,52 @@ impl ChargebackRegistry {
                     );
                 }
 
-                total_charges += proxy_charges;
-                total_calls += proxy_calls;
+                // Stream connections also count toward total_calls for headline numbers.
+                let proxy_total_calls = proxy_calls + agg.stream_connections;
+                let proxy_total_charges = proxy_per_call_charges
+                    + agg.stream_charges
+                    + agg.bandwidth_charge_sent
+                    + agg.bandwidth_charge_received;
 
-                proxy_objects.insert(
-                    proxy_id.clone(),
-                    serde_json::json!({
-                        "proxy_name": proxy_data.proxy_name,
-                        "total_charges": proxy_charges,
-                        "total_calls": proxy_calls,
-                        "by_status": serde_json::Value::Object(status_objects),
-                    }),
-                );
+                total_calls += proxy_total_calls;
+                total_per_call_charges += proxy_per_call_charges;
+                total_stream_charges += agg.stream_charges;
+                total_bandwidth_charges +=
+                    agg.bandwidth_charge_sent + agg.bandwidth_charge_received;
+
+                let mut proxy_obj = serde_json::json!({
+                    "proxy_name": agg.proxy_name,
+                    "protocol_family":
+                        agg.protocol_family.unwrap_or(ProtocolFamily::Http).label(),
+                    "total_calls": proxy_total_calls,
+                    "total_charges": proxy_total_charges,
+                    "by_status": serde_json::Value::Object(status_objects),
+                    "bandwidth": {
+                        "bytes_sent": agg.bytes_sent,
+                        "bytes_received": agg.bytes_received,
+                        "charge_sent": agg.bandwidth_charge_sent,
+                        "charge_received": agg.bandwidth_charge_received,
+                    },
+                });
+                if let Some(ProtocolFamily::Stream) = agg.protocol_family {
+                    proxy_obj["stream"] = serde_json::json!({
+                        "connections": agg.stream_connections,
+                        "connection_charges": agg.stream_charges,
+                    });
+                }
+
+                proxy_objects.insert(proxy_id.clone(), proxy_obj);
             }
 
             consumer_objects.insert(
                 consumer.clone(),
                 serde_json::json!({
-                    "total_charges": total_charges,
                     "total_calls": total_calls,
+                    "total_charges":
+                        total_per_call_charges + total_stream_charges + total_bandwidth_charges,
+                    "per_call_charges": total_per_call_charges,
+                    "stream_connection_charges": total_stream_charges,
+                    "bandwidth_charges": total_bandwidth_charges,
                     "proxies": serde_json::Value::Object(proxy_objects),
                 }),
             );
@@ -486,10 +849,32 @@ impl ChargebackRegistry {
     }
 }
 
+/// Resolved pricing configuration for one [`ApiChargeback`] instance.
+#[derive(Debug, Clone, Default)]
+struct PricingConfig {
+    /// Per-call pricing keyed by HTTP status code. Empty when `pricing_tiers`
+    /// is omitted.
+    price_by_status: HashMap<u16, f64>,
+    /// Per-byte bandwidth charge for client→backend bytes.
+    bandwidth_price_sent: f64,
+    /// Per-byte bandwidth charge for backend→client bytes.
+    bandwidth_price_received: f64,
+    /// Per-connection charge for stream sessions (TCP/UDP/DTLS).
+    stream_connection_price: f64,
+}
+
+impl PricingConfig {
+    fn has_any_pricing(&self) -> bool {
+        !self.price_by_status.is_empty()
+            || self.bandwidth_price_sent > 0.0
+            || self.bandwidth_price_received > 0.0
+            || self.stream_connection_price > 0.0
+    }
+}
+
 pub struct ApiChargeback {
     registry: Arc<ChargebackRegistry>,
-    /// Lookup from status code to price. Built at config time for O(1) hot-path lookups.
-    price_by_status: HashMap<u16, f64>,
+    pricing: PricingConfig,
 }
 
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
@@ -498,6 +883,136 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
             .as_u64()
             .ok_or_else(|| format!("api_chargeback: '{key}' must be an unsigned integer")),
         None => Ok(default),
+    }
+}
+
+fn optional_non_negative_f64(value: &Value, ctx: &str) -> Result<f64, String> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| format!("api_chargeback: '{ctx}' must be a number"))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!(
+            "api_chargeback: '{ctx}' must be a finite non-negative number"
+        ));
+    }
+    Ok(number)
+}
+
+fn parse_pricing_tiers(value: &Value) -> Result<HashMap<u16, f64>, String> {
+    let tiers = value
+        .as_array()
+        .ok_or_else(|| "api_chargeback: 'pricing_tiers' must be an array".to_string())?;
+
+    if tiers.is_empty() {
+        return Err(
+            "api_chargeback: 'pricing_tiers' must contain at least one pricing tier".to_string(),
+        );
+    }
+
+    let mut price_by_status: HashMap<u16, f64> = HashMap::new();
+    for (i, tier) in tiers.iter().enumerate() {
+        if !tier.is_object() {
+            return Err(format!(
+                "api_chargeback: pricing_tiers[{i}] must be an object"
+            ));
+        }
+
+        let status_codes = tier
+            .get("status_codes")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "api_chargeback: pricing_tiers[{i}].status_codes is required and must be an array"
+                )
+            })?;
+
+        if status_codes.is_empty() {
+            return Err(format!(
+                "api_chargeback: pricing_tiers[{i}].status_codes must not be empty"
+            ));
+        }
+
+        let price_value = tier.get("price_per_call").ok_or_else(|| {
+            format!(
+                "api_chargeback: pricing_tiers[{i}].price_per_call is required and must be a number"
+            )
+        })?;
+        let price =
+            optional_non_negative_f64(price_value, &format!("pricing_tiers[{i}].price_per_call"))?;
+
+        for code_val in status_codes {
+            let code_u64 = code_val.as_u64().ok_or_else(|| {
+                format!(
+                    "api_chargeback: pricing_tiers[{i}].status_codes contains non-integer value"
+                )
+            })?;
+
+            if !(100..=599).contains(&code_u64) {
+                return Err(format!(
+                    "api_chargeback: pricing_tiers[{i}].status_codes contains invalid HTTP status code {code_u64}"
+                ));
+            }
+            let code = code_u64 as u16;
+
+            if price_by_status.contains_key(&code) {
+                return Err(format!(
+                    "api_chargeback: status code {code} appears in multiple pricing tiers"
+                ));
+            }
+
+            price_by_status.insert(code, price);
+        }
+    }
+    Ok(price_by_status)
+}
+
+fn parse_bandwidth_pricing(value: &Value) -> Result<(f64, f64), String> {
+    if !value.is_object() {
+        return Err("api_chargeback: 'bandwidth_pricing' must be an object".to_string());
+    }
+    let allowed = ["price_per_byte_sent", "price_per_byte_received"];
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "api_chargeback: unknown key '{key}' in bandwidth_pricing (allowed: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    let price_sent = match value.get("price_per_byte_sent") {
+        Some(v) => optional_non_negative_f64(v, "bandwidth_pricing.price_per_byte_sent")?,
+        None => 0.0,
+    };
+    let price_received = match value.get("price_per_byte_received") {
+        Some(v) => optional_non_negative_f64(v, "bandwidth_pricing.price_per_byte_received")?,
+        None => 0.0,
+    };
+    Ok((price_sent, price_received))
+}
+
+fn parse_stream_connection_pricing(value: &Value) -> Result<f64, String> {
+    if !value.is_object() {
+        return Err("api_chargeback: 'stream_connection_pricing' must be an object".to_string());
+    }
+    let allowed = ["price_per_connection"];
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "api_chargeback: unknown key '{key}' in stream_connection_pricing (allowed: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    match value.get("price_per_connection") {
+        Some(v) => optional_non_negative_f64(v, "stream_connection_pricing.price_per_connection"),
+        None => Err(
+            "api_chargeback: 'stream_connection_pricing.price_per_connection' is required"
+                .to_string(),
+        ),
     }
 }
 
@@ -547,92 +1062,28 @@ impl ApiChargeback {
             DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
         )?;
 
-        // Validate pricing tiers BEFORE mutating the global registry.
-        // If validation fails, the singleton must remain unchanged so other
-        // plugin instances (or the /charges endpoint) are not affected.
-        let tiers = config
-            .get("pricing_tiers")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                "api_chargeback: 'pricing_tiers' is required and must be a non-empty array"
-                    .to_string()
-            })?;
-
-        if tiers.is_empty() {
-            return Err(
-                "api_chargeback: 'pricing_tiers' must contain at least one pricing tier"
-                    .to_string(),
-            );
+        // Validate ALL pricing dimensions before touching the global registry,
+        // so a config error never leaves shared state half-mutated.
+        let mut pricing = PricingConfig::default();
+        if let Some(tiers) = config.get("pricing_tiers") {
+            pricing.price_by_status = parse_pricing_tiers(tiers)?;
+        }
+        if let Some(bw) = config.get("bandwidth_pricing") {
+            let (sent, received) = parse_bandwidth_pricing(bw)?;
+            pricing.bandwidth_price_sent = sent;
+            pricing.bandwidth_price_received = received;
+        }
+        if let Some(stream) = config.get("stream_connection_pricing") {
+            pricing.stream_connection_price = parse_stream_connection_pricing(stream)?;
         }
 
-        let mut price_by_status: HashMap<u16, f64> = HashMap::new();
-
-        for (i, tier) in tiers.iter().enumerate() {
-            if !tier.is_object() {
-                return Err(format!(
-                    "api_chargeback: pricing_tiers[{i}] must be an object"
-                ));
-            }
-
-            let status_codes = tier
-                .get("status_codes")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    format!(
-                        "api_chargeback: pricing_tiers[{}].status_codes is required and must be an array",
-                        i
-                    )
-                })?;
-
-            if status_codes.is_empty() {
-                return Err(format!(
-                    "api_chargeback: pricing_tiers[{}].status_codes must not be empty",
-                    i
-                ));
-            }
-
-            let price = tier
-                .get("price_per_call")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| {
-                    format!(
-                        "api_chargeback: pricing_tiers[{}].price_per_call is required and must be a number",
-                        i
-                    )
-                })?;
-
-            if !price.is_finite() || price < 0.0 {
-                return Err(format!(
-                    "api_chargeback: pricing_tiers[{}].price_per_call must be finite and non-negative",
-                    i
-                ));
-            }
-
-            for code_val in status_codes {
-                let code_u64 = code_val.as_u64().ok_or_else(|| {
-                    format!(
-                        "api_chargeback: pricing_tiers[{}].status_codes contains non-integer value",
-                        i
-                    )
-                })?;
-
-                if !(100..=599).contains(&code_u64) {
-                    return Err(format!(
-                        "api_chargeback: pricing_tiers[{}].status_codes contains invalid HTTP status code {}",
-                        i, code_u64
-                    ));
-                }
-                let code = code_u64 as u16;
-
-                if price_by_status.contains_key(&code) {
-                    return Err(format!(
-                        "api_chargeback: status code {} appears in multiple pricing tiers",
-                        code
-                    ));
-                }
-
-                price_by_status.insert(code, price);
-            }
+        if !pricing.has_any_pricing() {
+            return Err(
+                "api_chargeback: at least one of 'pricing_tiers', 'bandwidth_pricing', or \
+                 'stream_connection_pricing' must be configured — the plugin would otherwise \
+                 record nothing"
+                    .to_string(),
+            );
         }
 
         // Validation passed — now safe to mutate the global registry.
@@ -647,10 +1098,7 @@ impl ApiChargeback {
         let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
         registry.start_cleanup_task(cleanup_interval_seconds);
 
-        Ok(Self {
-            registry,
-            price_by_status,
-        })
+        Ok(Self { registry, pricing })
     }
 }
 
@@ -665,31 +1113,79 @@ impl Plugin for ApiChargeback {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
+        // Stream protocols (TCP/UDP/DTLS) are now supported via on_stream_disconnect.
+        super::ALL_PROTOCOLS
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        // Only charge identified consumers
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
             _ => return,
         };
 
-        // Look up price for this status code — O(1) HashMap lookup, no allocation
-        let price = match self.price_by_status.get(&summary.response_status_code) {
-            Some(&p) => p,
-            None => return,
-        };
+        // Per-call price for this status code (O(1) HashMap lookup, no alloc).
+        // Zero when the status code is not in any tier — bandwidth charges may
+        // still apply, so we don't short-circuit here.
+        let call_price = self
+            .pricing
+            .price_by_status
+            .get(&summary.response_status_code)
+            .copied()
+            .unwrap_or(0.0);
+
+        let has_bandwidth_pricing =
+            self.pricing.bandwidth_price_sent > 0.0 || self.pricing.bandwidth_price_received > 0.0;
+
+        // If neither per-call nor bandwidth pricing applies, skip this record
+        // entirely to avoid creating a no-op entry for an uncharged status.
+        if call_price == 0.0 && !has_bandwidth_pricing {
+            return;
+        }
 
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
-        self.registry.record(
+        self.registry.record_http(
             consumer,
             proxy_id,
             proxy_name,
             summary.response_status_code,
-            price,
+            call_price,
+            summary.bytes_sent,
+            summary.bytes_received,
+            self.pricing.bandwidth_price_sent,
+            self.pricing.bandwidth_price_received,
+        );
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        let consumer = match summary.consumer_username.as_deref() {
+            Some(c) if !c.is_empty() => c,
+            _ => return,
+        };
+
+        let connection_price = self.pricing.stream_connection_price;
+        let has_bandwidth_pricing =
+            self.pricing.bandwidth_price_sent > 0.0 || self.pricing.bandwidth_price_received > 0.0;
+
+        // If neither stream-connection nor bandwidth pricing applies, skip —
+        // otherwise we would silently create a $0 entry for every stream
+        // disconnect on consumers using only HTTP per-call pricing.
+        if connection_price == 0.0 && !has_bandwidth_pricing {
+            return;
+        }
+
+        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
+
+        self.registry.record_stream(
+            consumer,
+            &summary.proxy_id,
+            proxy_name,
+            connection_price,
+            summary.bytes_sent,
+            summary.bytes_received,
+            self.pricing.bandwidth_price_sent,
+            self.pricing.bandwidth_price_received,
         );
     }
 }

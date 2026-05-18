@@ -2759,15 +2759,26 @@ async fn serve_mesh_runtime(
                 addr = %addr,
                 "Starting mesh listener"
             );
+            let records_mesh_mtls_metric = matches!(
+                kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            );
             let listener_result = if state.env_config.mesh_peer_auth_live_reload_enabled
-                && matches!(
-                    kind,
-                    MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-                ) {
+                && records_mesh_mtls_metric
+            {
                 proxy::start_proxy_listener_with_mesh_inbound_tls_and_signal(
                     addr,
                     state,
                     shutdown,
+                    Some(started_tx),
+                )
+                .await
+            } else if records_mesh_mtls_metric {
+                proxy::start_mesh_proxy_listener_with_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
                     Some(started_tx),
                 )
                 .await

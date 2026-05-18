@@ -1093,23 +1093,48 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 
 ### `api_chargeback`
 
-Tracks per-consumer API usage charges based on configurable pricing tiers keyed
-by HTTP status code. Charges accumulate in-memory and are exposed via the admin
-`/charges` endpoint in both Prometheus text and JSON formats for external billing
-system integration.
+Tracks per-consumer API usage charges across three independent pricing
+dimensions:
 
-Only requests with an identified consumer (gateway Consumer or external
-authenticated identity) are charged — anonymous traffic is not tracked. Status
-codes not listed in any pricing tier are free (not tracked).
+1. **Per-call pricing** (`pricing_tiers`) — HTTP-family only (HTTP/1.1, H2, H3,
+   gRPC, WebSocket upgrades). Charges a flat fee per call keyed by response
+   status code.
+2. **Bandwidth pricing** (`bandwidth_pricing`) — applies to both HTTP-family
+   and stream proxies (TCP, TCP+TLS, UDP, DTLS). Charges per byte using the
+   unified gateway-perspective `bytes_sent` (client→backend) and
+   `bytes_received` (backend→client) counters from the transaction-summary
+   schema.
+3. **Per-connection pricing** (`stream_connection_pricing`) — stream proxies
+   only. Charges a flat fee per session at disconnect time. Streams have no
+   HTTP status code so they cannot use `pricing_tiers`; this knob fills the
+   gap. Hooked into `on_stream_disconnect` — prior versions of this plugin
+   silently dropped L4 transactions entirely.
+
+At least one of the three blocks must be configured (otherwise the plugin
+would record nothing and is rejected at startup).
+
+Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
+in both Prometheus text and JSON formats for external billing system
+integration.
+
+Only transactions with an identified consumer (gateway Consumer or external
+authenticated identity) are charged — anonymous traffic is not tracked. For
+HTTP, status codes not listed in any pricing tier still record bandwidth (when
+configured) but no per-call charge.
 
 **Priority:** 9350
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion |
-| `pricing_tiers` | Array | _(required)_ | One or more pricing tiers. Each tier maps a set of status codes to a per-call price |
-| `pricing_tiers[].status_codes` | Array\<Integer\> | _(required)_ | HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier |
-| `pricing_tiers[].price_per_call` | Number | _(required)_ | Charge per API call (e.g. `0.00001`). Must be non-negative |
+| `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps a set of status codes to a per-call price |
+| `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier |
+| `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be non-negative |
+| `bandwidth_pricing` | Object | _(optional)_ | Bandwidth pricing block. Applies to HTTP-family and stream transactions |
+| `bandwidth_pricing.price_per_byte_sent` | Number | `0.0` | Per-byte charge for bytes flowed client→backend. Must be non-negative |
+| `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Must be non-negative |
+| `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
+| `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Must be non-negative |
 | `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
@@ -1121,8 +1146,8 @@ authenticated because chargeback output can contain customer and billing data.
 
 | Query Parameter | Description |
 |---|---|
-| _(none)_ | Prometheus text exposition format — two counter families: `ferrum_api_chargeable_calls_total` (call counts) and `ferrum_api_charges_total` (monetary charges) with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency`. When `FERRUM_NAMESPACE` is non-default, all metrics include an additional `namespace` label |
-| `?format=json` | JSON format with nested consumer → proxy → status breakdowns and pre-computed totals |
+| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP per-call counts and charges, status-code labelled); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include a `namespace` label |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries `protocol_family`, per-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and (for stream proxies) a `stream` block with session counts and per-connection charges. Consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges` |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and
@@ -1134,7 +1159,7 @@ are monotonically increasing counters, so Prometheus `increase()` or `rate()`
 functions work correctly across scrapes. Counters reset to zero on gateway
 restart — Prometheus handles resets natively via `increase()`.
 
-**Example configuration:**
+**Example configuration (HTTP per-call only — backwards compatible):**
 
 ```yaml
 plugins:
@@ -1146,6 +1171,23 @@ plugins:
           price_per_call: 0.00001
         - status_codes: [301, 302]
           price_per_call: 0.000005
+```
+
+**Example configuration (call + bandwidth + stream connections):**
+
+```yaml
+plugins:
+  - name: api_chargeback
+    config:
+      currency: "USD"
+      pricing_tiers:
+        - status_codes: [200, 201, 202, 204]
+          price_per_call: 0.00001
+      bandwidth_pricing:
+        price_per_byte_sent: 0.0000000001     # client -> backend
+        price_per_byte_received: 0.0000000002 # backend -> client
+      stream_connection_pricing:
+        price_per_connection: 0.0005
 ```
 
 **Example Prometheus scrape config** (multi-DP):
@@ -1424,7 +1466,7 @@ The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consume
 
 ### `soap_ws_security`
 
-Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, optional SAML assertion validation, timestamp freshness checks, and nonce replay protection.
+Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, timestamp freshness checks, and nonce replay protection. SAML assertion validation is **not currently supported** — see the SAML section below.
 
 The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
 
@@ -1444,14 +1486,14 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
-| `saml.enabled` | bool | `false` | Enable SAML assertion validation |
-| `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer values |
-| `saml.audience` | String | *(none)* | Expected SAML Audience value |
-| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML condition timestamps |
+| `saml.enabled` | bool | `false` | **Currently unsupported** — setting to `true` fails plugin construction (see [SAML Assertion Validation](#saml-assertion-validation) below) |
+| `saml.trusted_issuers` | String[] | `[]` | (Reserved for future XMLDSIG verification) Trusted SAML Issuer values |
+| `saml.audience` | String | *(none)* | (Reserved for future XMLDSIG verification) Expected SAML Audience value |
+| `saml.clock_skew_seconds` | u64 | `300` | (Reserved for future XMLDSIG verification) Clock skew tolerance for SAML condition timestamps |
 | `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection |
 | `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
 
-At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
+At least one security feature must be enabled (`timestamp.require`, `username_token`, or `x509_signature`). `saml.enabled: true` is currently rejected at plugin construction time.
 
 #### UsernameToken — PasswordDigest
 
@@ -1508,20 +1550,9 @@ config:
 
 #### SAML Assertion Validation
 
-Validates SAML 2.0 assertions embedded in the WS-Security header. Checks issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
+> **⚠ Not currently supported.** SAML assertion validation is gated off at plugin construction time. `saml.enabled: true` causes `soap_ws_security` to refuse to start with an explicit error message. The current implementation does not cryptographically verify the assertion's `<Signature>` (XMLDSIG), so accepting assertions would amount to trusting attacker-supplied XML — strictly worse than no SAML check. The config knobs are reserved for the upcoming XMLDSIG signature verification work; until that lands, leave `saml.enabled: false`.
 
-```yaml
-plugin_name: soap_ws_security
-config:
-  saml:
-    enabled: true
-    trusted_issuers:
-      - "https://idp.example.com"
-    audience: "https://api.example.com"
-    clock_skew_seconds: 300
-  timestamp:
-    require: true
-```
+When implemented, the validation will check the XMLDSIG signature against trusted IdP keys plus issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
 
 #### Combined Configuration
 

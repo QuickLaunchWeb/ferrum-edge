@@ -320,6 +320,8 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
+The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. In mesh mode it includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
+
 ### Runtime Metrics
 
 ```bash
@@ -342,9 +344,15 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 ```
 
-**Prometheus format** returns two counter families:
-- `ferrum_api_chargeable_calls_total` — call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`
-- `ferrum_api_charges_total` — monetary charges with an additional `currency` label
+**Prometheus format** returns counter families:
+- `ferrum_api_chargeable_calls_total` — HTTP call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code` (HTTP-family proxies only)
+- `ferrum_api_charges_total` — HTTP per-call monetary charges with an additional `currency` label
+- `ferrum_api_stream_connections_total` — stream session counts (TCP/TCP+TLS/UDP/DTLS proxies)
+- `ferrum_api_stream_connection_charges_total` — stream per-session monetary charges
+- `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` — bandwidth byte counters aggregated per `consumer`/`proxy_id`/`protocol_family`
+- `ferrum_api_bandwidth_charges_total` — bandwidth monetary charges, labelled with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`
+
+All families include a `namespace` label.
 
 **JSON format** returns a nested breakdown:
 ```json
@@ -353,16 +361,43 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
   "generated_at": "2025-01-15T10:30:00Z",
   "consumers": {
     "alice": {
-      "total_charges": 1.50,
-      "total_calls": 150000,
+      "total_charges": 1.55,
+      "total_calls": 150042,
+      "per_call_charges": 1.50,
+      "stream_connection_charges": 0.021,
+      "bandwidth_charges": 0.029,
       "proxies": {
         "proxy-abc": {
           "proxy_name": "Payments API",
-          "total_charges": 1.50,
+          "protocol_family": "http",
+          "total_charges": 1.5105,
           "total_calls": 150000,
           "by_status": {
             "200": { "calls": 145000, "charges": 1.45 },
             "201": { "calls": 5000, "charges": 0.05 }
+          },
+          "bandwidth": {
+            "bytes_sent": 1500000,
+            "bytes_received": 4500000,
+            "charge_sent": 0.0015,
+            "charge_received": 0.009
+          }
+        },
+        "tcp-edge": {
+          "proxy_name": "TCP Edge",
+          "protocol_family": "stream",
+          "total_charges": 0.0397,
+          "total_calls": 42,
+          "by_status": {},
+          "bandwidth": {
+            "bytes_sent": 95000,
+            "bytes_received": 184000,
+            "charge_sent": 0.0095,
+            "charge_received": 0.0092
+          },
+          "stream": {
+            "connections": 42,
+            "connection_charges": 0.021
           }
         }
       }
@@ -672,6 +707,48 @@ Field semantics:
 - `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
 
 `services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
+
+## Mesh Service Graph (mesh mode)
+
+`GET /mesh/service-graph` returns the live HTTP-family mesh service graph aggregated from the auto-injected `workload_metrics` plugin. It is JWT-authenticated and contains only identity, workload, protocol, and RED-counter metadata; request bodies, headers, and credentials are never stored.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/service-graph
+```
+
+Response:
+
+```json
+{
+  "generated_at": "2026-05-17T16:30:00Z",
+  "generated_at_unix_ms": 1779035400000,
+  "edge_count": 1,
+  "edges": [
+    {
+      "source_principal": "spiffe://cluster.local/ns/default/sa/frontend",
+      "source_workload": "frontend",
+      "source_namespace": "default",
+      "source_app": "frontend",
+      "source_service": "frontend",
+      "destination_principal": "spiffe://cluster.local/ns/default/sa/reviews",
+      "destination_workload": "reviews",
+      "destination_namespace": "default",
+      "destination_app": "reviews",
+      "destination_service": "reviews",
+      "request_protocol": "http",
+      "connection_security_policy": "mutual_tls",
+      "requests_total": 1250,
+      "errors_total": 3,
+      "duration_ms_total": 8420.5,
+      "duration_ms_avg": 6.7364,
+      "last_seen": "2026-05-17T16:29:58Z",
+      "last_seen_unix_ms": 1779035398000
+    }
+  ]
+}
+```
+
+The graph is node-local. In CP/DP or multi-replica mesh deployments, query each data plane and aggregate externally. The admin read path serves an `ArcSwap` snapshot, so frequent polling does not iterate live request counters.
 
 ## Mesh Egress Scope (mesh mode)
 

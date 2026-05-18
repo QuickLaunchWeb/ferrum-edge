@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +36,13 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 const CACHE_BASE_KEY: &str = "cache_base_key";
 const CACHE_STATUS: &str = "cache_status";
 const CACHE_PREDICT_KEY: &str = "cache_predict_key";
+/// JSON-serialized snapshot of the request header values `before_proxy` saw
+/// while building the cache key. `on_final_response_body` reads it back to
+/// build the storage cache key from the *same* header view, even when an
+/// earlier plugin's `transform_request_headers` mutated the outbound
+/// headers map — see [`ResponseCaching::stash_request_headers_snapshot`]
+/// and the bug it fixes.
+const CACHE_REQUEST_HEADERS_SNAPSHOT: &str = "cache_request_headers_snapshot";
 
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -68,6 +76,19 @@ fn cache_key_vary_value(header: &str, value: &str) -> String {
         hashed
     } else {
         value.to_string()
+    }
+}
+
+/// Cache keys use `:` as a structural delimiter, but URL paths legitimately
+/// contain `:` (e.g. `/users:1/details`, matrix params, FHIR `$everything`).
+/// Percent-encode `:` in the path segment before joining so that path/query
+/// boundaries can be recovered unambiguously and invalidation matches the
+/// full path rather than truncating at the first `:`.
+fn encode_path_for_cache_key(path: &str) -> Cow<'_, str> {
+    if path.contains(':') {
+        Cow::Owned(path.replace(':', "%3A"))
+    } else {
+        Cow::Borrowed(path)
     }
 }
 
@@ -446,11 +467,12 @@ impl ResponseCaching {
             ""
         };
 
+        let encoded_path = encode_path_for_cache_key(&ctx.path);
         let mut key = String::with_capacity(
             proxy_id.len()
                 + host_part.len()
                 + ctx.method.len()
-                + ctx.path.len()
+                + encoded_path.len()
                 + query_part.len()
                 + consumer_part.len()
                 + 5,
@@ -461,7 +483,7 @@ impl ResponseCaching {
         key.push(':');
         key.push_str(&ctx.method);
         key.push(':');
-        key.push_str(&ctx.path);
+        key.push_str(&encoded_path);
         key.push(':');
         key.push_str(&query_part);
         key.push(':');
@@ -681,22 +703,90 @@ impl ResponseCaching {
 
     fn shared_cache_allows_authorized_response(
         &self,
-        ctx: &RequestContext,
+        request_headers: &HashMap<String, String>,
         directives: CacheControlDirectives,
     ) -> bool {
-        if self.config.cache_key_include_consumer || !ctx.headers.contains_key("authorization") {
+        if self.config.cache_key_include_consumer || !request_headers.contains_key("authorization")
+        {
             return true;
         }
 
         directives.public || directives.must_revalidate || directives.s_maxage.is_some()
+    }
+
+    /// Stash the transformed-header values `before_proxy` saw for every
+    /// key that can land in the cache key — `host`, `authorization`, and
+    /// each configured `vary_by_headers` entry. `on_final_response_body`
+    /// reads it back via [`Self::restore_request_headers_view`] so the
+    /// storage cache key is derived from the same header view as the
+    /// lookup. Without this, a request-side transformer that touches a
+    /// vary header (e.g. injecting `X-Tenant` from a consumer property)
+    /// would make the storage key disagree with the lookup key and the
+    /// cache would never hit.
+    ///
+    /// Snapshot is intentionally narrow: only headers we know we will
+    /// consume go into it. Headers that show up later via the response
+    /// `Vary` directive — which can be any header at all — fall through
+    /// to `ctx.headers` at storage time. That's the same value we'd have
+    /// had to read at lookup time anyway, so the lookup/storage symmetry
+    /// is still preserved for them.
+    fn stash_request_headers_snapshot(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+    ) {
+        let mut snapshot: Vec<(String, String)> =
+            Vec::with_capacity(self.config.vary_by_headers.len() + 2);
+        let mut push_if_present = |key: &str| {
+            if let Some(value) = headers.get(key) {
+                snapshot.push((key.to_string(), value.clone()));
+            }
+        };
+        push_if_present("host");
+        push_if_present("authorization");
+        for header in &self.config.vary_by_headers {
+            // Skip duplicates that match the always-stashed pair above.
+            if header == "host" || header == "authorization" {
+                continue;
+            }
+            push_if_present(header);
+        }
+        if snapshot.is_empty() {
+            // Nothing to remember — the cache key only contains route
+            // metadata, which we can rebuild from `ctx` alone.
+            return;
+        }
+        if let Ok(serialized) = serde_json::to_string(&snapshot) {
+            ctx.metadata
+                .insert(CACHE_REQUEST_HEADERS_SNAPSHOT.to_string(), serialized);
+        }
+    }
+
+    /// Rebuild the request-headers view used to derive the storage cache
+    /// key. Layers `before_proxy`'s snapshot on top of `ctx.headers` so
+    /// snapshotted keys reflect the transformed values seen at lookup
+    /// time while any other key (typically a header added by the
+    /// response's own `Vary` directive) falls back to the original.
+    fn restore_request_headers_view(&self, ctx: &RequestContext) -> HashMap<String, String> {
+        let mut view = ctx.headers.clone();
+        if let Some(serialized) = ctx.metadata.get(CACHE_REQUEST_HEADERS_SNAPSHOT)
+            && let Ok(snapshot) = serde_json::from_str::<Vec<(String, String)>>(serialized)
+        {
+            for (key, value) in snapshot {
+                view.insert(key, value);
+            }
+        }
+        view
     }
 }
 
 /// Check if a cache key's path segment matches the invalidation path.
 ///
 /// Cache key format: `proxy_id:host_hash:method:path:query:consumer[:vary...]`.
-/// Returns true if the cached path equals `target_path` or starts with it
-/// as a proper path prefix (followed by `/` or end of string).
+/// The `path` segment has any `:` percent-encoded (see
+/// [`encode_path_for_cache_key`]) so it cannot be confused with a structural
+/// delimiter. Returns true if the cached path equals the encoded `target_path`
+/// or starts with it as a proper path prefix (followed by `/`).
 fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
     let after_proxy_id = match cache_key.find(':') {
         Some(i) => &cache_key[i + 1..],
@@ -715,9 +805,11 @@ fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
         None => after_method,
     };
 
-    cached_path == target_path
-        || (cached_path.starts_with(target_path)
-            && cached_path.as_bytes().get(target_path.len()) == Some(&b'/'))
+    let encoded_target = encode_path_for_cache_key(target_path);
+    let encoded_target = encoded_target.as_ref();
+    cached_path == encoded_target
+        || (cached_path.starts_with(encoded_target)
+            && cached_path.as_bytes().get(encoded_target.len()) == Some(&b'/'))
 }
 
 fn normalize_etag(tag: &str) -> &str {
@@ -800,6 +892,16 @@ impl Plugin for ResponseCaching {
         let base_key = self.build_base_cache_key(ctx, headers);
         ctx.metadata
             .insert(CACHE_BASE_KEY.to_string(), base_key.clone());
+        // Snapshot every header value that could end up in the cache key
+        // so `on_final_response_body` can rebuild the same key from
+        // metadata. The transformed `headers` view is only available
+        // during `before_proxy`; by storage time `on_final_response_body`
+        // has only `ctx.headers` (the original, untransformed map). Without
+        // this snapshot a request-side transformer that touches a
+        // configured `vary_by_headers` value, or rewrites `Host`, would
+        // make the lookup and storage keys disagree and cache every hit
+        // would miss.
+        self.stash_request_headers_snapshot(ctx, headers);
 
         if self.config.respect_no_cache
             && let Some(cc) = headers.get("cache-control")
@@ -937,7 +1039,13 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        if !self.shared_cache_allows_authorized_response(ctx, directives) {
+        // Restore the same header view `before_proxy` used so the
+        // shared-cache authorization check and the storage cache key
+        // both see the transformed values, not the untransformed
+        // `ctx.headers`. See `restore_request_headers_view` for why.
+        let lookup_headers = self.restore_request_headers_view(ctx);
+
+        if !self.shared_cache_allows_authorized_response(&lookup_headers, directives) {
             self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
@@ -981,14 +1089,21 @@ impl Plugin for ResponseCaching {
         // authorized responses across distinct credentials. The merged list
         // is sorted and re-stored in `vary_index` so the same dimension
         // applies to every subsequent lookup at this base key.
-        if ctx.headers.contains_key("authorization")
-            && !vary_headers.iter().any(|h| h == "authorization")
-        {
+        //
+        // `lookup_headers` was built above from
+        // `restore_request_headers_view`: it layers `before_proxy`'s header
+        // snapshot on top of `ctx.headers`, so configured `vary_by_headers`
+        // / `host` / `authorization` reflect the transformed values that
+        // were live during lookup. Response-added Vary headers fall back to
+        // `ctx.headers`, the same source any future lookup would use for
+        // them, so the lookup/storage symmetry holds for those too.
+        let storage_auth_present = lookup_headers.contains_key("authorization");
+        if storage_auth_present && !vary_headers.iter().any(|h| h == "authorization") {
             vary_headers.push("authorization".to_string());
             vary_headers.sort();
         }
 
-        let cache_key = self.build_cache_key(ctx, &vary_headers, &ctx.headers);
+        let cache_key = self.build_cache_key(ctx, &vary_headers, &lookup_headers);
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(
@@ -1115,6 +1230,215 @@ mod tests {
         assert!(!stored_key.contains(bearer));
         assert!(!stored_key.contains("reviewer-secret-token"));
         assert!(stored_key.contains("authorization=sha256-"));
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_passes_through_paths_without_colons() {
+        let plain = encode_path_for_cache_key("/users/42/details");
+        assert!(matches!(plain, Cow::Borrowed(_)));
+        assert_eq!(plain.as_ref(), "/users/42/details");
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_percent_encodes_colons() {
+        let encoded = encode_path_for_cache_key("/users:1/details");
+        assert_eq!(encoded.as_ref(), "/users%3A1/details");
+    }
+
+    #[test]
+    fn cache_key_path_matches_handles_paths_containing_colons() {
+        // Build cache_key the same way build_base_cache_key does, with the
+        // path segment percent-encoded. The matcher must accept the same
+        // unencoded path as the invalidation target.
+        let cache_key = format!(
+            "proxy:host:GET:{}:q=1:_anon",
+            encode_path_for_cache_key("/users:1/details")
+        );
+        assert!(cache_key_path_matches(&cache_key, "/users:1/details"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_unrelated_short_path_does_not_match_longer_colon_path() {
+        // `/users` must NOT match a cached entry for `/users:1/details` —
+        // the old colon-truncating matcher returned `/users` as the cached
+        // path and wrongly matched on equality.
+        let cache_key = format!(
+            "proxy:host:GET:{}:q=1:_anon",
+            encode_path_for_cache_key("/users:1/details")
+        );
+        assert!(!cache_key_path_matches(&cache_key, "/users"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_targeted_colon_path_does_not_match_unrelated_short_cache() {
+        // Conversely, `/users:1/details` must NOT invalidate a cached
+        // entry for `/users` (no false-positive prefix expansion through
+        // the colon).
+        let cache_key = "proxy:host:GET:/users:q=1:_anon".to_string();
+        assert!(!cache_key_path_matches(&cache_key, "/users:1/details"));
+    }
+
+    #[test]
+    fn cache_key_path_matches_proper_path_prefix_with_trailing_slash_still_works() {
+        let cache_key = "proxy:host:GET:/api/items/42:q=1:_anon".to_string();
+        assert!(cache_key_path_matches(&cache_key, "/api/items"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_method_invalidates_cached_path_containing_colon() {
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut get_ctx = make_ctx("GET", "/users:1/details");
+        get_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut get_headers = get_ctx.headers.clone();
+        plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+        plugin
+            .on_final_response_body(&mut get_ctx, 200, &HashMap::new(), b"body")
+            .await;
+        assert_eq!(plugin.cache.len(), 1);
+
+        let mut post_ctx = make_ctx("POST", "/users:1/details");
+        post_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut post_headers = post_ctx.headers.clone();
+        plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+        assert!(
+            plugin.cache.is_empty(),
+            "unsafe method on same colon-containing path should invalidate the cached entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_method_does_not_invalidate_unrelated_path_with_colon_prefix_clash() {
+        // GET /users:1/details cached.
+        // POST /users (unrelated) must NOT invalidate it.
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut get_ctx = make_ctx("GET", "/users:1/details");
+        get_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut get_headers = get_ctx.headers.clone();
+        plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+        plugin
+            .on_final_response_body(&mut get_ctx, 200, &HashMap::new(), b"body")
+            .await;
+        assert_eq!(plugin.cache.len(), 1);
+
+        let mut post_ctx = make_ctx("POST", "/users");
+        post_ctx
+            .headers
+            .insert("host".to_string(), "example.com".to_string());
+        let mut post_headers = post_ctx.headers.clone();
+        plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+        assert_eq!(
+            plugin.cache.len(),
+            1,
+            "unsafe method on unrelated /users must NOT invalidate /users:1/details"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_key_uses_transformed_headers_when_vary_header_modified_by_earlier_plugin() {
+        // Regression test: when an earlier `before_proxy` plugin
+        // (request_transformer-style) injects or rewrites a vary header,
+        // the storage and lookup cache keys must agree on the
+        // transformed value. Otherwise the cache stores under one key
+        // and the next identical request looks up under another — every
+        // request misses and entries pile up.
+        let plugin = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "vary_by_headers": ["x-tenant"]
+        }));
+
+        let mut ctx = make_ctx("GET", "/api/items");
+        ctx.headers
+            .insert("host".to_string(), "example.com".to_string());
+        // ctx.headers does NOT carry x-tenant — the originating request
+        // doesn't have it.
+        let mut transformed_headers = ctx.headers.clone();
+        // Simulate a request_transformer injecting the vary header.
+        transformed_headers.insert("x-tenant".to_string(), "acme".to_string());
+
+        let result = plugin
+            .before_proxy(&mut ctx, &mut transformed_headers)
+            .await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let predict_key = ctx
+            .metadata
+            .get(CACHE_PREDICT_KEY)
+            .expect("predict_key stored")
+            .clone();
+        assert!(
+            predict_key.contains("x-tenant=acme"),
+            "lookup key must carry the transformer-injected tenant: {predict_key}"
+        );
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"tenant-acme")
+            .await;
+
+        let cache_keys: Vec<String> = plugin.cache.iter().map(|e| e.key().clone()).collect();
+        assert_eq!(cache_keys.len(), 1);
+        assert!(
+            cache_keys[0].contains("x-tenant=acme"),
+            "storage key must carry the transformer-injected tenant — \
+             otherwise the next identical request will miss: {}",
+            cache_keys[0]
+        );
+        assert_eq!(
+            predict_key, cache_keys[0],
+            "lookup and storage keys must be identical when no Vary \
+             header is added by the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_key_uses_transformed_host_header_when_rewritten_by_earlier_plugin() {
+        // Equivalent regression for the `Host` rewrite case. The base
+        // cache key hashes the Host value; if the lookup uses the
+        // transformed Host and storage uses the original, the cache
+        // permanently misses across requests that share the same path.
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut ctx = make_ctx("GET", "/api/items");
+        ctx.headers
+            .insert("host".to_string(), "client.example.com".to_string());
+        let mut transformed_headers = ctx.headers.clone();
+        transformed_headers.insert("host".to_string(), "backend.internal".to_string());
+
+        let result = plugin
+            .before_proxy(&mut ctx, &mut transformed_headers)
+            .await;
+        assert!(matches!(result, PluginResult::Continue));
+        let predict_key = ctx
+            .metadata
+            .get(CACHE_PREDICT_KEY)
+            .expect("predict_key stored")
+            .clone();
+
+        plugin
+            .on_final_response_body(&mut ctx, 200, &HashMap::new(), b"host-acme")
+            .await;
+
+        let cache_keys: Vec<String> = plugin.cache.iter().map(|e| e.key().clone()).collect();
+        assert_eq!(cache_keys.len(), 1);
+        assert_eq!(
+            predict_key, cache_keys[0],
+            "lookup and storage cache keys must be identical when Host \
+             is rewritten by an earlier before_proxy plugin"
+        );
     }
 
     #[tokio::test]

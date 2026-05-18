@@ -597,13 +597,6 @@ pub struct EnvConfig {
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
 
-    /// Opt-in: emit `mesh_route_dispatch` plugin instances for Istio
-    /// VirtualService routes that carry method/header/queryParam predicates.
-    /// Default false (existing predicate-drop behavior). Operators turn this
-    /// on to surface the predicates as a per-proxy plugin config — the
-    /// override channel runs through `RequestContext.route_override_*` and
-    /// is applied to dispatch after admission plugins have run.
-    pub mesh_vs_header_routing_experimental: bool,
     /// Opt-in live reload for PeerAuthentication-derived inbound mTLS mode
     /// and client CA verifier. Cert/key paths remain static operational
     /// inputs.
@@ -1414,7 +1407,6 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
-            mesh_vs_header_routing_experimental: false,
             mesh_peer_auth_live_reload_enabled: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_svid_rotation_drain_seconds: 0,
@@ -1724,7 +1716,6 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
-            mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
@@ -2106,7 +2097,6 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
-            mesh_vs_header_routing_experimental,
             mesh_peer_auth_live_reload_enabled,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_svid_rotation_drain_seconds,

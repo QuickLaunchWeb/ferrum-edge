@@ -592,6 +592,8 @@ pub struct TcpListenerConfig {
     pub ktls_enabled: bool,
     /// Enable io_uring-based splice (from `FERRUM_IO_URING_SPLICE_ENABLED`).
     pub io_uring_splice_enabled: bool,
+    /// Whether frontend TCP TLS handshake failures should increment mesh mTLS metrics.
+    pub record_mesh_mtls_metric: bool,
 }
 
 #[derive(Clone)]
@@ -613,6 +615,7 @@ struct TcpAcceptLoopState {
     overload: Arc<crate::overload::OverloadState>,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
+    record_mesh_mtls_metric: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -652,6 +655,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         overload,
         ktls_enabled,
         io_uring_splice_enabled,
+        record_mesh_mtls_metric,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let backlog = tcp_listen_backlog as i32;
@@ -734,6 +738,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         overload,
         ktls_enabled,
         io_uring_splice_enabled,
+        record_mesh_mtls_metric,
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -837,6 +842,7 @@ async fn run_tcp_accept_loop(
                 let tcp_fastopen_enabled = state.tcp_fastopen_enabled;
                 let ktls_enabled = state.ktls_enabled;
                 let io_uring_splice_enabled = state.io_uring_splice_enabled;
+                let record_mesh_mtls_metric = state.record_mesh_mtls_metric;
 
                 tokio::spawn(async move {
                     // Track this connection for global overload accounting and graceful drain.
@@ -893,6 +899,7 @@ async fn run_tcp_accept_loop(
                         tcp_fastopen_enabled,
                         ktls_enabled,
                         io_uring_splice_enabled,
+                        record_mesh_mtls_metric,
                         &overload_for_conn,
                         metrics.as_ref(),
                     )
@@ -1253,6 +1260,7 @@ async fn handle_tcp_connection(
     tcp_fastopen: bool,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
+    record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
 ) -> TcpConnectionResult {
@@ -1287,6 +1295,7 @@ async fn handle_tcp_connection(
         tcp_fastopen,
         ktls_enabled,
         io_uring_splice_enabled,
+        record_mesh_mtls_metric,
         overload,
         metrics,
     )
@@ -1345,6 +1354,7 @@ async fn handle_tcp_connection_inner(
     tcp_fastopen: bool,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
+    record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
@@ -1658,6 +1668,7 @@ async fn handle_tcp_connection_inner(
             client_stream,
             frontend_tls_handshake_timeout_seconds,
             &remote_addr,
+            record_mesh_mtls_metric,
         )
         .await
         .map_err(|e| -> anyhow::Error {

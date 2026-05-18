@@ -9,11 +9,14 @@ pub fn dynamic_object_to_k8s_object(
 ) -> K8sObject {
     let metadata = K8sMetadata {
         name: obj.metadata.name.clone().unwrap_or_default(),
-        namespace: obj
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        namespace: if is_cluster_scoped(api_version, kind) {
+            String::new()
+        } else {
+            obj.metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string())
+        },
         labels: obj
             .metadata
             .labels
@@ -28,11 +31,16 @@ pub fn dynamic_object_to_k8s_object(
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        creation_timestamp: obj
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(k8s_time_to_rfc3339),
         deletion_timestamp: obj
             .metadata
             .deletion_timestamp
             .as_ref()
-            .map(|ts| ts.0.to_string()),
+            .map(k8s_time_to_rfc3339),
     };
 
     let spec = dynamic_object_spec(&obj.data);
@@ -49,6 +57,15 @@ pub fn dynamic_object_to_k8s_object(
         spec,
         status,
     }
+}
+
+fn is_cluster_scoped(api_version: &str, kind: &str) -> bool {
+    (api_version == "v1" && kind == "Node")
+        || (kind == "GatewayClass" && api_version.starts_with("gateway.networking.k8s.io/"))
+}
+
+fn k8s_time_to_rfc3339(ts: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> String {
+    ts.0.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn dynamic_object_spec(data: &serde_json::Value) -> serde_json::Value {
@@ -68,6 +85,7 @@ fn dynamic_object_spec(data: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
     use serde_json::json;
 
@@ -143,6 +161,63 @@ mod tests {
         assert_eq!(result.metadata.namespace, "default");
         assert!(result.metadata.labels.is_empty());
         assert!(result.spec.is_object());
+    }
+
+    #[test]
+    fn gateway_class_is_converted_as_cluster_scoped() {
+        for api_version in [
+            "gateway.networking.k8s.io/v1",
+            "gateway.networking.k8s.io/v1beta1",
+            "gateway.networking.k8s.io/v1alpha2",
+        ] {
+            let dyn_obj = DynamicObject {
+                metadata: ObjectMeta {
+                    name: Some("ferrum".to_string()),
+                    namespace: Some("should-not-survive".to_string()),
+                    ..Default::default()
+                },
+                types: None,
+                data: json!({
+                    "spec": {"controllerName": "ferrum.io/gateway-controller"}
+                }),
+            };
+
+            let result = dynamic_object_to_k8s_object(&dyn_obj, api_version, "GatewayClass");
+
+            assert_eq!(result.metadata.name, "ferrum");
+            assert_eq!(result.metadata.namespace, "");
+            assert_eq!(
+                result.spec["controllerName"].as_str(),
+                Some("ferrum.io/gateway-controller")
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_metadata_timestamps_as_rfc3339() {
+        let mut dyn_obj = make_dynamic_object("route", "default", json!({}));
+        dyn_obj.metadata.creation_timestamp = Some(Time(
+            "2026-05-18T03:08:25Z"
+                .parse()
+                .expect("valid creation timestamp"),
+        ));
+        dyn_obj.metadata.deletion_timestamp = Some(Time(
+            "2026-05-18T04:09:30Z"
+                .parse()
+                .expect("valid deletion timestamp"),
+        ));
+
+        let result =
+            dynamic_object_to_k8s_object(&dyn_obj, "gateway.networking.k8s.io/v1", "HTTPRoute");
+
+        assert_eq!(
+            result.metadata.creation_timestamp.as_deref(),
+            Some("2026-05-18T03:08:25Z")
+        );
+        assert_eq!(
+            result.metadata.deletion_timestamp.as_deref(),
+            Some("2026-05-18T04:09:30Z")
+        );
     }
 
     #[test]
