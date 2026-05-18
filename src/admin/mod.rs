@@ -66,6 +66,8 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+    /// Enables database-backed audit events for successful admin mutations.
+    pub admin_audit_enabled: bool,
     /// Startup readiness flag — flipped once by the mode after the initial config
     /// is loaded, all caches are built, DNS/pools are warmed, and every listener
     /// (proxy, admin, stream) is bound and accepting connections.
@@ -391,10 +393,10 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
     ))
 }
 
-pub(crate) fn log_audit_persist_failure(error: &anyhow::Error) {
-    error!(
+pub(crate) fn log_audit_enqueue_failure(error: &anyhow::Error) {
+    warn!(
         error = %error,
-        "Admin mutation persisted but audit write failed"
+        "Admin mutation persisted but audit event was not enqueued"
     );
 }
 
@@ -1490,8 +1492,8 @@ async fn handle_update_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1537,8 +1539,8 @@ async fn handle_delete_credentials(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1639,8 +1641,8 @@ async fn handle_append_credential(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -1731,8 +1733,8 @@ async fn handle_delete_credential_by_index(
                 crud::consumer_response_body(&consumer),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            log_audit_enqueue_failure(&error);
         }
     }
     Ok(response)
@@ -2377,8 +2379,8 @@ async fn handle_batch_create(
                 namespace,
                 audit::create_diff(response["created"].clone()),
             );
-            if let Err(error) = audit::record(db.clone(), event).await {
-                log_audit_persist_failure(&error);
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+                log_audit_enqueue_failure(&error);
             }
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
@@ -2392,8 +2394,8 @@ async fn handle_batch_create(
         namespace,
         audit::create_diff(response["created"].clone()),
     );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        log_audit_enqueue_failure(&error);
     }
 
     Ok(json_response(StatusCode::CREATED, &response))
@@ -2702,8 +2704,8 @@ async fn handle_restore(
                 response["restored"].clone(),
             ),
         );
-        if let Err(error) = audit::record(db.clone(), event).await {
-            log_audit_persist_failure(&error);
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            log_audit_enqueue_failure(&error);
         }
         return Ok(json_response(StatusCode::MULTI_STATUS, &response));
     }
@@ -2719,8 +2721,8 @@ async fn handle_restore(
             response["restored"].clone(),
         ),
     );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        log_audit_enqueue_failure(&error);
     }
 
     Ok(json_response(StatusCode::OK, &response))

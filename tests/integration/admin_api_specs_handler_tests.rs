@@ -105,6 +105,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,

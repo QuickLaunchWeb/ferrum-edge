@@ -23,7 +23,7 @@ use crate::admin::api_specs::{
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
-use crate::admin::{AdminState, log_audit_persist_failure};
+use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -2088,8 +2088,8 @@ pub async fn handle_post_api_spec(
         namespace,
         audit::create_diff(resp_body.clone()),
     );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        log_audit_enqueue_failure(&error);
     }
 
     // Build the body + standard headers via the shared `json_resp` helper, then
@@ -2255,8 +2255,8 @@ pub async fn handle_put_api_spec(
         namespace,
         audit::update_diff(before, resp_body.clone()),
     );
-    if let Err(error) = audit::record(db.clone(), event).await {
-        log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+        log_audit_enqueue_failure(&error);
     }
 
     Ok(json_resp(StatusCode::OK, &resp_body))
@@ -2424,8 +2424,8 @@ pub async fn handle_delete_api_spec(
                     "spec_version": existing.spec_version,
                 })),
             );
-            if let Err(error) = audit::record(db.clone(), event).await {
-                log_audit_persist_failure(&error);
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+                log_audit_enqueue_failure(&error);
             }
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)

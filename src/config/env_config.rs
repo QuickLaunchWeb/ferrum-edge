@@ -816,6 +816,8 @@ pub struct EnvConfig {
     pub tls_no_verify: bool,
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
+    /// Enable database-backed Admin API mutation audit events. Default: false.
+    pub admin_audit_enabled: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -1474,6 +1476,7 @@ impl Default for EnvConfig {
             admin_tls_client_ca_bundle_path: None,
             tls_no_verify: false,
             admin_read_only: false,
+            admin_audit_enabled: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             dtls_cert_path: None,
@@ -1636,6 +1639,7 @@ impl EnvConfig {
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
+            admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
         }
 
         env_config! {
@@ -2164,6 +2168,7 @@ impl EnvConfig {
             admin_tls_client_ca_bundle_path,
             tls_no_verify,
             admin_read_only,
+            admin_audit_enabled,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,

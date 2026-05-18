@@ -106,6 +106,7 @@ FERRUM_FILE_CONFIG_PATH = /path
 FERRUM_ENABLE_HTTP3 = true
 FERRUM_TLS_NO_VERIFY = 1
 FERRUM_ADMIN_READ_ONLY = false
+FERRUM_ADMIN_AUDIT_ENABLED = true
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
 
@@ -116,6 +117,7 @@ FERRUM_ADMIN_READ_ONLY = false
             assert!(config.enable_http3);
             assert!(config.tls_no_verify);
             assert!(!config.admin_read_only);
+            assert!(config.admin_audit_enabled);
         },
     );
 }

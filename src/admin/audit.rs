@@ -1,10 +1,11 @@
 //! Admin API audit logging.
 //!
-//! Audit events are written through a bounded worker queue per database backend.
-//! The HTTP mutation path never waits for queue capacity; if the bounded queue
-//! is full, enqueue fails fast and the committed mutation response can proceed
-//! after logging the audit failure. Audit persistence is best-effort and happens
-//! after the mutation response path has enqueued the event.
+//! When enabled, audit events are written through a bounded worker queue per
+//! database backend. The HTTP mutation path never waits for queue capacity; if
+//! the bounded queue is full, enqueue fails fast and the committed mutation
+//! response can proceed after logging the audit failure. Audit persistence is
+//! best-effort and happens after the mutation response path has enqueued the
+//! event.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -202,7 +203,15 @@ fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     sink
 }
 
-pub async fn record(db: Arc<dyn DatabaseBackend>, event: AuditEvent) -> Result<(), anyhow::Error> {
+pub async fn record(
+    enabled: bool,
+    db: Arc<dyn DatabaseBackend>,
+    event: AuditEvent,
+) -> Result<(), anyhow::Error> {
+    if !enabled {
+        return Ok(());
+    }
+
     let sink = sink_for_db(Arc::clone(&db));
     sink.record(event).await
 }

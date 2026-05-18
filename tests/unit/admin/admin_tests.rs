@@ -54,6 +54,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: false, // Default to read-write for existing tests
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,

@@ -107,6 +107,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
         proxy_state: Some(proxy_state),
         mode: "mesh".to_string(),
         read_only: false,
+        admin_audit_enabled: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,

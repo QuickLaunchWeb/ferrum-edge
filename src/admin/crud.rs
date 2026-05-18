@@ -325,8 +325,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 namespace,
                 audit::delete_diff(R::audit_body(&existing)),
             );
-            if let Err(error) = audit::record(db_arc, event).await {
-                super::log_audit_persist_failure(&error);
+            if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event).await {
+                super::log_audit_enqueue_failure(&error);
             }
             Ok(super::json_response(StatusCode::NO_CONTENT, &json!({})))
         }
@@ -1511,8 +1511,8 @@ async fn handle_write<R: AdminResource>(
         namespace,
         diff,
     );
-    if let Err(error) = audit::record(db_arc, event).await {
-        super::log_audit_persist_failure(&error);
+    if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event).await {
+        super::log_audit_enqueue_failure(&error);
     }
 
     let body = R::response_body(&resource);

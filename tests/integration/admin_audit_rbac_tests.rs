@@ -69,7 +69,7 @@ async fn make_store(dir: &TempDir) -> DatabaseStore {
         .expect("connect sqlite store")
 }
 
-fn admin_state(db: DatabaseStore) -> AdminState {
+fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> AdminState {
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: jwt_manager(),
@@ -77,6 +77,7 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        admin_audit_enabled,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
@@ -92,6 +93,10 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
     }
+}
+
+fn admin_state(db: DatabaseStore) -> AdminState {
+    admin_state_with_audit(db, true)
 }
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -251,6 +256,28 @@ async fn upstream_mutation_writes_queryable_audit_event() {
     assert_eq!(event["resource_id"], "audit-u1");
     assert_eq!(event["namespace"], "ferrum");
     assert_eq!(event["diff"]["after"]["id"], "audit-u1");
+}
+
+#[tokio::test]
+async fn disabled_admin_audit_skips_mutation_events() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state_with_audit(make_store(&tmp).await, false);
+    let (base, _shutdown) = start_admin(state).await;
+    let operator = token("mesh-operator", Some("operator"));
+    let admin = token("security-admin", Some("admin"));
+
+    let (status, body) = post_json(
+        &base,
+        "/upstreams",
+        &operator,
+        &upstream_payload("audit-disabled-u1"),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, audit_body) = get_json(&base, "/audit?resource_type=upstream", &admin).await;
+    assert_eq!(status, 200, "audit list failed: {audit_body:?}");
+    assert_eq!(audit_body["total"], 0);
 }
 
 #[tokio::test]

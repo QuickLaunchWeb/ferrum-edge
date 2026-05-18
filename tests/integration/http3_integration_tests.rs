@@ -191,6 +191,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         admin_tls_client_ca_bundle_path: None,
         tls_no_verify: false,
         admin_read_only: false,
+        admin_audit_enabled: false,
         admin_tls_no_verify: false,
         // HTTP/3 specific configuration (shares proxy_https_port for QUIC listener)
         enable_http3: true,

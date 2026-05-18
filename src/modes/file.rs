@@ -788,6 +788,7 @@ pub async fn serve(
         cached_config: Some(proxy_state.config.clone()),
         mode: "file".to_string(),
         read_only: true,
+        admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
