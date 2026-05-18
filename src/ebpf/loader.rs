@@ -301,15 +301,35 @@ impl EbpfBackend for AyaEbpfBackend {
         let link_id = prog
             .attach(cgroup_fd.as_fd())
             .map_err(|e| format!("Failed to attach SOCK_OPS to '{cgroup_root}': {e}"))?;
-        self.sock_ops_link_id = Some(link_id);
 
+        // Pin BEFORE storing link_id so a pinning failure can detach the
+        // program atomically. Without this, a pinning failure (bpffs not
+        // mounted, ENOSPC, permission denied on /sys/fs/bpf/ferrum/) leaves
+        // the SOCK_OPS program attached and burning kernel CPU on every TCP
+        // socket op cluster-wide, while writing into a ringbuf no userspace
+        // process can ever drain. Better to fail closed.
         if let Err(e) = pin_sock_ops_maps(bpf) {
             warn!(
                 error = %e,
-                "Failed to pin SOCK_OPS maps; mesh-proxy will not be able to consume events"
+                "Failed to pin SOCK_OPS maps; detaching program to avoid leaking an unreachable ringbuf"
             );
+            // Re-fetch prog_mut because the previous binding's borrow ended
+            // when pin_sock_ops_maps returned (it took &mut Ebpf).
+            if let Some(prog_ref) = bpf.program_mut(BPF_PROGRAM_SOCK_OPS) {
+                if let Ok(prog) = TryInto::<&mut SockOps>::try_into(prog_ref) {
+                    if let Err(detach_err) = prog.detach(link_id) {
+                        warn!(
+                            error = %detach_err,
+                            "Best-effort detach of SOCK_OPS after pin failure also failed"
+                        );
+                    }
+                }
+            }
             return Err(e);
         }
+        // Only record the link_id once pinning has succeeded — keeps the
+        // recorded lifecycle state consistent with what's actually live.
+        self.sock_ops_link_id = Some(link_id);
 
         info!(
             cgroup_root,
@@ -344,12 +364,27 @@ fn resolve_sock_ops_ringbuf_bytes() -> u32 {
     else {
         return SOCK_OPS_RINGBUF_DEFAULT_BYTES;
     };
+    // 256 MiB is a generous ceiling for a per-node TCP-event ringbuf.
+    // Stops operator typos (e.g., 2147483648 instead of 4194304) from
+    // claiming a gigabyte of locked kernel memory on every mesh-proxy
+    // node. Plenty of headroom for high-traffic node-waypoints.
+    const MAX_BYTES: u32 = 256 * 1024 * 1024;
     match raw.trim().parse::<u32>() {
-        Ok(n) if n >= 4096 && n.is_power_of_two() => n,
+        Ok(n) if n >= 4096 && n <= MAX_BYTES && n.is_power_of_two() => n,
+        Ok(n) if n > MAX_BYTES => {
+            warn!(
+                value = n,
+                max_bytes = MAX_BYTES,
+                "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES exceeds maximum supported size; using default {}",
+                SOCK_OPS_RINGBUF_DEFAULT_BYTES
+            );
+            SOCK_OPS_RINGBUF_DEFAULT_BYTES
+        }
         Ok(n) => {
             warn!(
                 value = n,
-                "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES must be a power of two >= 4096; using default {}",
+                "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES must be a power of two between 4096 and {}; using default {}",
+                MAX_BYTES,
                 SOCK_OPS_RINGBUF_DEFAULT_BYTES
             );
             SOCK_OPS_RINGBUF_DEFAULT_BYTES

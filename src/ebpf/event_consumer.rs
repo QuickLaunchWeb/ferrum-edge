@@ -212,8 +212,14 @@ impl SockOpsConsumer {
         recovery_threshold: u32,
     ) -> bool {
         match outcome {
-            PollOutcome::Drained { events: _ } => {
-                if self.metrics.is_in_overrun_regime() {
+            PollOutcome::Drained { events } => {
+                // Only advance the recovery counter on real drain progress.
+                // A spurious wakeup (epoll-edge artifact, drained=0) must
+                // NOT count toward recovery while the kernel is still
+                // dropping events on another CPU. Without this guard, three
+                // spurious wakeups in a row would clear the overrun regime
+                // and emit a false "recovered" info line.
+                if events > 0 && self.metrics.is_in_overrun_regime() {
                     *consecutive_drained = consecutive_drained.saturating_add(1);
                     if *consecutive_drained >= recovery_threshold {
                         self.record_recovery();
@@ -260,24 +266,56 @@ pub mod production {
         consumer: SockOpsConsumer,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let Some((mut ring_buf, stats)) = open_pinned_maps() else {
-            // Already logged in open_pinned_maps; treat absence as
-            // non-fatal so the gateway boots without node-agent.
-            return Ok(());
+        // Startup race: mesh-proxy may boot before node-agent has finished
+        // attaching and pinning. Retry with backoff (1s → 30s, capped) so
+        // the consumer recovers when node-agent eventually pins the maps.
+        // Without this, an early miss permanently disables the consumer
+        // and the plugin emits zeros forever until mesh-proxy itself
+        // restarts. Backoff races against `shutdown_rx` so SIGTERM during
+        // the wait still drains promptly.
+        let (mut ring_buf, mut stats) = match wait_for_pinned_maps(&mut shutdown_rx).await {
+            WaitOutcome::Found(pair) => pair,
+            WaitOutcome::Shutdown => {
+                info!("SOCK_OPS ringbuf consumer shutting down before maps were pinned");
+                return Ok(());
+            }
         };
 
         let raw_fd = ring_buf.as_raw_fd();
-        let async_fd = AsyncFd::with_interest(RingBufFd(raw_fd), Interest::READABLE)
+        let mut async_fd = AsyncFd::with_interest(RingBufFd(raw_fd), Interest::READABLE)
             .map_err(|e| anyhow::anyhow!("Failed to wrap SOCK_OPS ringbuf fd in AsyncFd: {e}"))?;
 
         let mut last_dropped_total: u64 = read_dropped_total(&stats);
         let mut consecutive_drained: u32 = 0;
+        // Seed the regime as engaged when we observe pre-existing drops, so
+        // the operator dashboard immediately reflects the kernel state
+        // instead of waiting for the next drop to flip the regime.
+        if last_dropped_total > 0 {
+            consumer.record_overrun();
+        }
+
+        // Track the inode of the events pin so we can detect node-agent
+        // restarts. When the node-agent re-attaches it pins a new ringbuf
+        // map at the same path — the inode changes, and our existing fd
+        // is now reading from an orphan kernel map that no producer writes
+        // to. Without periodic re-stat, counters silently freeze at their
+        // pre-restart values until mesh-proxy itself restarts.
+        let mut events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
 
         info!(
             pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
             initial_dropped_total = last_dropped_total,
+            inode = events_inode,
             "SOCK_OPS ringbuf consumer attached; draining events"
         );
+
+        // Periodic sanity check for pin-path inode change (node-agent
+        // restart). 30s is well within "operator can tolerate a brief
+        // counter gap after a node-agent restart" but rare enough that
+        // the stat syscall is negligible.
+        let mut inode_check = tokio::time::interval(std::time::Duration::from_secs(30));
+        inode_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        inode_check.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
@@ -287,18 +325,72 @@ pub mod production {
                         return Ok(());
                     }
                 }
+                _ = inode_check.tick() => {
+                    let current_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
+                    if current_inode != events_inode {
+                        warn!(
+                            previous_inode = events_inode,
+                            current_inode,
+                            pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                            "SOCK_OPS pin inode changed (likely node-agent restart); re-opening ringbuf"
+                        );
+                        // Drop the old async_fd / ring_buf / stats by
+                        // returning from the inner loop body and letting
+                        // the outer logic re-open. Easiest path: just
+                        // recurse via tail-call into a fresh consumer run.
+                        // We instead loop locally: drop old handles and
+                        // attempt re-open with the same retry/backoff
+                        // contract used at startup.
+                        drop(async_fd);
+                        drop(ring_buf);
+                        drop(stats);
+                        match wait_for_pinned_maps(&mut shutdown_rx).await {
+                            WaitOutcome::Found((new_rb, new_stats)) => {
+                                ring_buf = new_rb;
+                                stats = new_stats;
+                                let new_fd = ring_buf.as_raw_fd();
+                                async_fd = AsyncFd::with_interest(
+                                    RingBufFd(new_fd),
+                                    Interest::READABLE,
+                                )
+                                .map_err(|e| anyhow::anyhow!(
+                                    "Failed to re-wrap SOCK_OPS ringbuf fd in AsyncFd: {e}"
+                                ))?;
+                                last_dropped_total = read_dropped_total(&stats);
+                                consecutive_drained = 0;
+                                events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
+                                info!(
+                                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                                    inode = events_inode,
+                                    initial_dropped_total = last_dropped_total,
+                                    "SOCK_OPS ringbuf consumer re-attached after pin rotation"
+                                );
+                            }
+                            WaitOutcome::Shutdown => {
+                                info!("SOCK_OPS ringbuf consumer shutting down during pin re-open");
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                }
                 guard = async_fd.readable() => {
                     let mut guard = guard.map_err(|e| anyhow::anyhow!("SOCK_OPS AsyncFd readable failed: {e}"))?;
-                    drain_ringbuf(&mut ring_buf, &consumer);
+                    let events_handled = drain_ringbuf(&mut ring_buf, &consumer);
 
                     let now_dropped_total = read_dropped_total(&stats);
                     let outcome = if now_dropped_total > last_dropped_total {
                         last_dropped_total = now_dropped_total;
                         PollOutcome::Overrun
                     } else {
-                        // The exact event count isn't critical for the
-                        // state machine; downstream only checks `> 0`.
-                        PollOutcome::Drained { events: 1 }
+                        // Propagate the actual count so the recovery state
+                        // machine ignores spurious wakeups (events=0) and
+                        // requires real drain progress before flipping back
+                        // to "recovered". Without this, three epoll-edge
+                        // artifacts in a row would clear the overrun regime
+                        // even while the kernel is still dropping events on
+                        // another CPU.
+                        PollOutcome::Drained { events: events_handled }
                     };
                     consumer.observe_poll(
                         outcome,
@@ -312,6 +404,15 @@ pub mod production {
         }
     }
 
+    /// Returns the pin path's inode, or 0 if `stat` fails (treated as
+    /// "absent / never seen"). 0 vs. a real inode of 0 doesn't matter for
+    /// our comparison: we only care whether the value CHANGES, not its
+    /// absolute value.
+    fn pin_inode(path: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+    }
+
     /// Lightweight wrapper that owns a raw fd for `AsyncFd`. `RingBuf`
     /// itself implements `AsRawFd` but ownership is awkward to wire
     /// through `AsyncFd::with_interest`, which wants `T: AsRawFd + Send`.
@@ -321,6 +422,85 @@ pub mod production {
         fn as_raw_fd(&self) -> std::os::fd::RawFd {
             self.0
         }
+    }
+
+    /// Outcome of waiting for the SOCK_OPS pinned maps to appear.
+    enum WaitOutcome {
+        Found((RingBuf<MapData>, PerCpuArray<MapData, u64>)),
+        Shutdown,
+    }
+
+    /// Poll for the pinned SOCK_OPS maps with exponential backoff until they
+    /// appear or `shutdown_rx` signals. Backoff caps at 30s so the consumer
+    /// recovers within ~1 minute even after long node-agent outages without
+    /// burning a tight loop. The first miss is logged once at `info!`
+    /// (matching the stable Prometheus-surface contract); each backoff is
+    /// quiet.
+    async fn wait_for_pinned_maps(
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> WaitOutcome {
+        const BACKOFF_INITIAL_SECS: u64 = 1;
+        const BACKOFF_MAX_SECS: u64 = 30;
+        let mut backoff_secs = BACKOFF_INITIAL_SECS;
+        let mut logged_first_miss = false;
+        loop {
+            if let Some(pair) = open_pinned_maps_quiet() {
+                return WaitOutcome::Found(pair);
+            }
+            if !logged_first_miss {
+                info!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    "SOCK_OPS event ringbuf pin not yet present; retrying with backoff. \
+                     Expected when mesh-proxy boots before node-agent, or when no node-agent \
+                     runs on this host. TCP-layer counters stay at zero until the pin appears."
+                );
+                logged_first_miss = true;
+            }
+            let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs));
+            tokio::select! {
+                _ = sleep => {
+                    backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return WaitOutcome::Shutdown;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Variant of `open_pinned_maps` that returns silently on "pin not
+    /// present" (used by the retry loop), but still emits a warn for hard
+    /// errors (type mismatch on pinned map).
+    fn open_pinned_maps_quiet() -> Option<(RingBuf<MapData>, PerCpuArray<MapData, u64>)> {
+        let events_map = MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH).ok()?;
+        let ring_buf = match RingBuf::try_from(events_map) {
+            Ok(rb) => rb,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    error = %e,
+                    "Pinned SOCK_OPS map is not a RingBuf; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        let stats_map = MapData::from_pin(BPF_SOCK_OPS_STATS_PIN_PATH).ok()?;
+        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(stats_map) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
+                    error = %e,
+                    "Pinned SOCK_OPS stats map is not a PerCpuArray; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        Some((ring_buf, stats))
     }
 
     fn open_pinned_maps() -> Option<(RingBuf<MapData>, PerCpuArray<MapData, u64>)> {
@@ -378,7 +558,13 @@ pub mod production {
         Some((ring_buf, stats))
     }
 
-    fn drain_ringbuf(ring_buf: &mut RingBuf<MapData>, consumer: &SockOpsConsumer) {
+    /// Drain pending ringbuf items and return the count of valid events
+    /// dispatched. Counter is critical for the recovery state machine —
+    /// a spurious wakeup with zero events must NOT advance
+    /// `consecutive_drained` (which would falsely trigger recovery while
+    /// the kernel is still dropping events on another CPU).
+    fn drain_ringbuf(ring_buf: &mut RingBuf<MapData>, consumer: &SockOpsConsumer) -> u32 {
+        let mut events_handled: u32 = 0;
         while let Some(item) = ring_buf.next() {
             let bytes: &[u8] = &item;
             if bytes.len() < std::mem::size_of::<SockOpsRecord>() {
@@ -390,7 +576,10 @@ pub mod production {
                 continue;
             }
             match SockOpsEvent::from_record_bytes(bytes) {
-                Some(event) => consumer.handle_event(event),
+                Some(event) => {
+                    consumer.handle_event(event);
+                    events_handled = events_handled.saturating_add(1);
+                }
                 None => {
                     // Unknown discriminant. Log once at low volume; the
                     // ringbuf overrun warn covers the operator-visible
@@ -399,6 +588,7 @@ pub mod production {
                 }
             }
         }
+        events_handled
     }
 
     fn read_dropped_total(stats: &PerCpuArray<MapData, u64>) -> u64 {
@@ -601,5 +791,39 @@ mod tests {
         let in_regime = consumer.observe_poll(PollOutcome::Overrun, &mut consecutive, 3);
         assert!(in_regime);
         assert_eq!(snap(&consumer).ringbuf_overruns, 2);
+    }
+
+    /// Regression guard: spurious wakeups (drained with events=0) must not
+    /// advance the recovery counter. Three zero-event drains in a row used
+    /// to falsely clear the overrun regime even when the kernel was still
+    /// dropping events on another CPU.
+    #[test]
+    fn observe_poll_zero_event_drain_does_not_advance_recovery() {
+        let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+        let mut consecutive = 0u32;
+
+        // Enter the overrun regime.
+        let in_regime = consumer.observe_poll(PollOutcome::Overrun, &mut consecutive, 3);
+        assert!(in_regime);
+        assert_eq!(consecutive, 0);
+
+        // 3 spurious wakeups (events: 0) — must NOT advance recovery
+        // counter and must NOT clear the regime.
+        for _ in 0..3 {
+            let in_regime =
+                consumer.observe_poll(PollOutcome::Drained { events: 0 }, &mut consecutive, 3);
+            assert!(in_regime, "regime must persist across zero-event drains");
+            assert_eq!(consecutive, 0, "zero-event drain must not advance counter");
+        }
+
+        // Real drain progress still recovers normally.
+        consumer.observe_poll(PollOutcome::Drained { events: 1 }, &mut consecutive, 3);
+        consumer.observe_poll(PollOutcome::Drained { events: 1 }, &mut consecutive, 3);
+        let in_regime =
+            consumer.observe_poll(PollOutcome::Drained { events: 1 }, &mut consecutive, 3);
+        assert!(
+            !in_regime,
+            "three real drains in a row should clear the regime"
+        );
     }
 }
