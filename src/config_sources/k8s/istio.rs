@@ -1656,6 +1656,7 @@ fn virtual_service_routes(
                 },
                 MeshRouteDispatchPolicy {
                     timeout_ms,
+                    timeout_disabled: timeout_ms.is_none(),
                     retry: retry.as_ref(),
                     retry_disabled: retry.is_none(),
                 },
@@ -8030,7 +8031,7 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_same_path_guarded_route_without_timeout_leaves_rule_timeout_unset() {
+    fn virtual_service_same_path_guarded_route_without_timeout_sets_timeout_disabled() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8075,9 +8076,10 @@ extensionProviders:
             .expect("canary branch decorates stable proxy");
         let rules = plugin.config["rules"].as_array().expect("rules array");
         assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["timeout_disabled"].as_bool(), Some(true));
         assert!(
             rules[0].get("timeout_ms").is_none(),
-            "unconfigured VirtualService timeout should leave proxy default in force"
+            "unconfigured VirtualService timeout should clear inherited proxy timeout instead"
         );
     }
 
