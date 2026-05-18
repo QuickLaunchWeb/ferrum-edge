@@ -483,6 +483,27 @@ fn test_zero_burst_size_returns_error() {
 }
 
 #[test]
+fn test_burst_size_smaller_than_fps_returns_error() {
+    // The Redis sliding-window approximation assumes burst >= fps so the
+    // derived window stays >= 1s and sustained rate matches fps. Reject
+    // burst < fps at construction to keep local and Redis paths aligned.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 100, "burst_size": 50}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("burst_size"),
+        "expected burst_size error, got: {err}"
+    );
+    assert!(
+        err.contains("frames_per_second"),
+        "expected fps mention, got: {err}"
+    );
+}
+
+#[test]
 fn test_non_object_config_returns_error() {
     let result = WsRateLimiting::new(&json!("bad"), PluginHttpClient::default());
     assert!(result.is_err());
