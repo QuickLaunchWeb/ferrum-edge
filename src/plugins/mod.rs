@@ -2010,16 +2010,22 @@ pub fn create_plugin_with_http_client(
         "workload_metrics" => Ok(Some(Arc::new(
             mesh::workload_metrics::WorkloadMetrics::new_with_http_client(config, http_client)?,
         ))),
-        // GAP-SC3: `__mesh_bpf_metrics` is auto-injected on `NodeWaypoint`
-        // topology. Until a `ProxyState` plumbed Arc<BpfMetricsState> is
-        // threaded through create_plugin_with_http_client, the factory
-        // path builds a plugin with a fresh, unattached metrics state.
-        // This keeps the chain valid; the production wiring (passing the
-        // SockOpsConsumer's shared state) lands when the BPF program is
-        // wired in.
-        "__mesh_bpf_metrics" => Ok(Some(Arc::new(mesh::bpf_metrics::MeshBpfMetrics::new(
-            config,
-        )?))),
+        // GAP-SC3 / GAP-3D: `__mesh_bpf_metrics` is auto-injected on
+        // `NodeWaypoint` topology. When the gateway is mesh-mode +
+        // node-waypoint, `ProxyState::new` attaches the shared
+        // `Arc<BpfMetricsState>` to the `PluginHttpClient`, and the
+        // SOCK_OPS ringbuf consumer updates the same Arc. When the slot
+        // is empty (every other mode/topology, or a dev build that
+        // doesn't run the kernel program), fall back to a fresh
+        // unattached state — the plugin still emits a stable Prometheus
+        // surface populated by zeros.
+        "__mesh_bpf_metrics" => {
+            let plugin = match http_client.bpf_metrics_state() {
+                Some(state) => mesh::bpf_metrics::MeshBpfMetrics::with_state(config, state)?,
+                None => mesh::bpf_metrics::MeshBpfMetrics::new(config)?,
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
