@@ -665,6 +665,24 @@ fn test_dn_escape_trailing_space() {
 }
 
 #[test]
+fn test_dn_escape_trailing_space_after_multibyte() {
+    // `é` is 2 UTF-8 bytes — the old enumerate()-vs-input.len() comparison
+    // would never flag the trailing space as the last character for any
+    // input containing multi-byte UTF-8.
+    assert_eq!(escape_dn_value("héllo "), "héllo\\ ");
+}
+
+#[test]
+fn test_dn_escape_leading_space_with_multibyte() {
+    assert_eq!(escape_dn_value(" héllo"), "\\ héllo");
+}
+
+#[test]
+fn test_dn_escape_no_change_for_unicode_without_trailing_space() {
+    assert_eq!(escape_dn_value("héllo"), "héllo");
+}
+
+#[test]
 fn test_dn_escape_leading_hash() {
     assert_eq!(escape_dn_value("#alice"), "\\#alice");
 }
