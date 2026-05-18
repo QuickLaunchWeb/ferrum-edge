@@ -28,6 +28,7 @@ mod mesh_authz_negative_match_tests;
 mod mesh_destination_rule_locality_lb_tests;
 mod mesh_destination_rule_port_policy_tests;
 mod mesh_destination_rule_tls_tests;
+mod mesh_dr_service_entry_e2e_tests;
 mod mesh_hbone_tests;
 mod mesh_k8s_pod_discovery_tests;
 mod mesh_peer_auth_live_reload_tests;
