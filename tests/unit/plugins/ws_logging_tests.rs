@@ -1,12 +1,16 @@
 //! Tests for ws_logging plugin
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginHttpClient, PluginResult, WsDisconnectContext,
     ws_logging::WsLogging,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::plugin_utils::{
     create_test_context, create_test_stream_transaction_summary, create_test_transaction_summary,
@@ -354,4 +358,233 @@ async fn test_ws_logging_buffer_full_drops_gracefully() {
         plugin.log(&summary).await;
     }
     // Should not panic — overflow entries are dropped with a warning
+}
+
+// ============================================================================
+// Drain-task regression tests (PR 852 follow-up)
+//
+// The plugin spawns a background task that drains the WebSocket read half so
+// `tokio_tungstenite` can service Ping / Pong / server-initiated Close frames
+// internally. Two invariants are tested here:
+//
+// 1. While the connection is alive, server-issued Pings receive a Pong back —
+//    if they didn't, the server's keepalive would tear the connection down.
+// 2. When the plugin is dropped, the underlying TCP stream is released
+//    promptly. `futures_util::stream::split` keeps the underlying
+//    `WebSocketStream` alive via a `BiLock` while either half lives, so
+//    aborting the drain task on connection drop is what releases the read
+//    half. Without that abort, the server-side socket would linger until the
+//    OS keepalive timer fired (minutes-to-hours).
+// ============================================================================
+
+/// Wait for a tokio task with a small budget, panicking with the supplied
+/// label if the future doesn't complete in time.
+async fn await_within<F: std::future::Future>(label: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("timed out waiting for {label}"),
+    }
+}
+
+#[tokio::test]
+async fn test_ws_logging_drain_task_replies_to_server_ping() {
+    // Server: accept one connection, send a Ping, wait for the Pong reply.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+
+    let (pong_tx, pong_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake");
+        let (mut sink, mut read) = ws.split();
+
+        // First inbound message is the log batch from the plugin — drop it.
+        let _ = read.next().await;
+
+        // Ask the client to keep the connection alive.
+        sink.send(Message::Ping(b"ferrum-keepalive".to_vec().into()))
+            .await
+            .expect("send Ping");
+
+        // The drain task should respond with a Pong carrying the same
+        // payload. Anything else (or `None` / `Err`) means the read half
+        // wasn't being polled.
+        while let Some(msg) = read.next().await {
+            if let Ok(Message::Pong(data)) = msg {
+                let _ = pong_tx.send(data.to_vec());
+                return;
+            }
+        }
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    // Trigger the first flush so the connection is established.
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let pong = await_within("server Pong", pong_rx)
+        .await
+        .expect("Pong channel closed without a reply");
+    assert_eq!(pong, b"ferrum-keepalive");
+
+    drop(plugin);
+    let _ = await_within("server shutdown", server).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_drop_releases_underlying_stream() {
+    // Server: accept the connection, wait for the first log frame, then sit
+    // quietly with no further traffic. If the plugin's drain task is
+    // properly aborted on drop, the read side returns `None` (EOF) almost
+    // immediately. If the drain task lingers, the underlying TCP stream
+    // stays alive via `BiLock` and the server's `read.next()` blocks until
+    // the OS keepalive fires — well past the 5-second budget below.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake");
+        let (_sink, mut read) = ws.split();
+
+        // Drain everything the client sends. The plugin only writes one
+        // batch then is dropped — so `read.next()` should observe EOF /
+        // Close shortly after `drop(plugin)`.
+        while let Some(msg) = read.next().await {
+            if matches!(msg, Ok(Message::Close(_))) {
+                break;
+            }
+            if msg.is_err() {
+                break;
+            }
+        }
+        let _ = eof_tx.send(());
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    plugin.log(&create_test_transaction_summary()).await;
+
+    // Give the flush loop a moment to actually deliver the batch so we know
+    // the connection is established before we drop the plugin.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    drop(plugin);
+
+    // Without the abort-on-drop fix the drain task would keep polling and
+    // hold the read half alive via `BiLock`, so the server's stream would
+    // not see EOF and this would time out.
+    await_within("server EOF after plugin drop", eof_rx)
+        .await
+        .expect("server task ended without signalling EOF");
+    let _ = await_within("server shutdown", server).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_reconnects_after_server_close() {
+    // Server: accept two connections sequentially. The first connection's
+    // TCP stream is dropped immediately after the initial frame is read —
+    // simulating a broken-pipe scenario. The plugin's next `send` errors,
+    // which clears `Option<WsConnection>` (aborting the drain task in the
+    // process) and the reconnect path establishes connection #2.
+    //
+    // This exercises the send-failure → reconnect path with the new
+    // connection wrapper end-to-end: if the wrapper's Drop misbehaved or
+    // the abort-handle plumbing was wrong, either the first reconnect
+    // would hang on the lingering drain task or the second accept would
+    // never arrive.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        // First connection: read one frame, then yank the socket out from
+        // under the WebSocket layer. The client's next write will surface
+        // an I/O error (broken pipe / connection reset).
+        let (stream, _) = listener.accept().await.expect("accept #1");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake #1");
+        let (sink, mut read) = ws.split();
+        let _ = read.next().await;
+        drop(sink);
+        drop(read);
+
+        // Second connection: just notify and drain.
+        let (stream, _) = listener.accept().await.expect("accept #2");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake #2");
+        let _ = second_tx.send(());
+        let (_sink, mut read) = ws.split();
+        while let Some(msg) = read.next().await {
+            if matches!(msg, Ok(Message::Close(_))) || msg.is_err() {
+                break;
+            }
+        }
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 2,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    // First entry establishes connection #1.
+    plugin.log(&create_test_transaction_summary()).await;
+    // Wait long enough for the server to read the first frame and drop the
+    // socket so the next send observes broken pipe.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Pump entries until the reconnect path runs. The first send after the
+    // server drop fails (closing the stale connection), and the retry
+    // budget then connects to the second listener.
+    for _ in 0..5 {
+        plugin.log(&create_test_transaction_summary()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    await_within("second accept", second_rx)
+        .await
+        .expect("plugin did not reconnect to the second listener");
+
+    drop(plugin);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }
