@@ -97,6 +97,37 @@ fn spiffe_id_root_no_path_ok() {
 }
 
 #[test]
+fn service_account_returns_segment_after_first_sa() {
+    let id = SpiffeId::new("spiffe://cluster.local/ns/default/sa/ztunnel").unwrap();
+    assert_eq!(id.service_account(), Some("ztunnel"));
+}
+
+#[test]
+fn service_account_none_when_path_lacks_sa_segment() {
+    let id = SpiffeId::new("spiffe://cluster.local/ns/default").unwrap();
+    assert_eq!(id.service_account(), None);
+}
+
+#[test]
+fn service_account_none_when_sa_is_trailing() {
+    let id = SpiffeId::new("spiffe://cluster.local/ns/default/sa").unwrap();
+    assert_eq!(id.service_account(), None);
+}
+
+#[test]
+fn service_account_uses_first_sa_segment() {
+    // A second `sa` later in the path must not override the first match.
+    let id = SpiffeId::new("spiffe://cluster.local/sa/foo/sa/bar").unwrap();
+    assert_eq!(id.service_account(), Some("foo"));
+}
+
+#[test]
+fn service_account_none_for_root_spiffe_id() {
+    let id = SpiffeId::new("spiffe://cluster.local").unwrap();
+    assert_eq!(id.service_account(), None);
+}
+
+#[test]
 fn spiffe_id_rejects_wrong_scheme() {
     assert!(matches!(
         SpiffeId::new("https://prod.example.com/foo"),

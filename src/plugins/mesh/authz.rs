@@ -56,6 +56,13 @@ pub struct MeshAuthz {
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match.
     trust_domain_aliases: Vec<TrustDomain>,
+    /// Identity-asserting infrastructure SVIDs that are trusted to rewrite the
+    /// authz principal via HBONE baggage `source.principal`. Any
+    /// authenticated HBONE peer outside this set has its baggage identity
+    /// dropped and is authorised under its own peer SPIFFE ID. Default
+    /// `["ztunnel", "waypoint"]` (Istio ambient convention). See the
+    /// `TrustedAssertor` variants for matching semantics.
+    trusted_hbone_assertors: Vec<TrustedAssertor>,
     /// When `true`, the construction-time slice-level scope filter is
     /// skipped and policies are filtered per-request using
     /// [`RequestContext::node_waypoint_policy_scope`] instead. Used in
@@ -65,6 +72,36 @@ pub struct MeshAuthz {
     /// behaviour (slice-level filter at construction).
     per_pod_policy_scoping: bool,
 }
+
+/// Matching rule for the [`MeshAuthz::trusted_hbone_assertors`] allow-list.
+///
+/// Operators may supply either a bare service-account name (the Istio default
+/// for ztunnel and waypoints), or a full SPIFFE ID to pin a specific
+/// assertor identity, trust domain, and namespace.
+#[derive(Debug, Clone)]
+enum TrustedAssertor {
+    /// Match any peer whose SPIFFE-ID path encodes this Kubernetes service
+    /// account per the Istio convention `ns/<ns>/sa/<sa>`.
+    ServiceAccount(String),
+    /// Match a specific SPIFFE-ID exactly.
+    Spiffe(SpiffeId),
+}
+
+impl TrustedAssertor {
+    fn matches(&self, peer: &SpiffeId) -> bool {
+        match self {
+            Self::ServiceAccount(name) => peer.service_account() == Some(name.as_str()),
+            Self::Spiffe(id) => id == peer,
+        }
+    }
+}
+
+/// Default trusted-assertor allow-list used when the plugin config does not
+/// supply one. Matches Istio ambient's `ztunnel` and `waypoint` service
+/// accounts. Operators with custom waypoint SA names (Gateway-managed
+/// waypoints often use `<gateway-name>` or `<gateway-name>-istio`) must
+/// override this list to add their names.
+const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
@@ -82,6 +119,7 @@ impl MeshAuthz {
             MeshSlice::default()
         };
         let trust_domain_aliases = parse_trust_domain_aliases(config)?;
+        let trusted_hbone_assertors = parse_trusted_hbone_assertors(config)?;
 
         // Allow explicit identity overrides on top of the slice-embedded
         // namespace/labels — useful when `mesh_policies` is supplied directly
@@ -133,6 +171,7 @@ impl MeshAuthz {
             slice,
             has_header_rules,
             trust_domain_aliases,
+            trusted_hbone_assertors,
             per_pod_policy_scoping,
         })
     }
@@ -244,11 +283,20 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
-        let (source_principal, trust_domain_mismatch) = self.resolve_source_principal(ctx);
+        let (source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
+        let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
+        let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
         if trust_domain_mismatch {
             record_ignored_baggage_reason(&mut ctx.metadata, "trust_domain_mismatch");
             ctx.metadata.insert(
                 "mesh_authz.ignored_baggage.trust_domain_mismatch".to_string(),
+                "true".to_string(),
+            );
+        }
+        if untrusted_assertor {
+            record_ignored_baggage_reason(&mut ctx.metadata, "untrusted_assertor");
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage.untrusted_assertor".to_string(),
                 "true".to_string(),
             );
         }
@@ -335,6 +383,11 @@ impl Plugin for MeshAuthz {
                     "mesh_authz.deny_policy".to_string(),
                     "trust_domain_mismatch".to_string(),
                 );
+            } else if untrusted_assertor {
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "untrusted_assertor".to_string(),
+                );
             }
         }
         result
@@ -371,32 +424,59 @@ impl Plugin for MeshAuthz {
 
 impl MeshAuthz {
     /// Resolve the SPIFFE identity used for authz, applying the HBONE baggage
-    /// trust-domain check.
+    /// trust-assertor and trust-domain checks.
     ///
-    /// Returns `(principal, trust_domain_mismatch)`. When the second tuple
-    /// element is `true`, baggage carried a `source.principal` whose trust
-    /// domain neither matched the peer cert's trust domain nor appeared in
-    /// the configured `trust_domain_aliases` — the baggage identity is
-    /// dropped and the peer cert (the ztunnel's own SPIFFE id) is used as
-    /// fallback. Caller stamps diagnostic metadata.
-    fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, bool) {
+    /// Returns `(principal, BaggageOutcome)`. The outcome describes the
+    /// disposition of any incoming HBONE `baggage: source.principal` so that
+    /// the caller can stamp diagnostic metadata:
+    ///
+    /// - `Honored` — baggage parsed, the peer is a trusted assertor, and the
+    ///   baggage identity's trust domain matched the peer cert's (or an
+    ///   alias). The returned principal is the baggage identity.
+    /// - `UntrustedAssertor` — the peer is not on
+    ///   [`MeshAuthz::trusted_hbone_assertors`]. Baggage is dropped; the
+    ///   returned principal is the peer cert identity.
+    /// - `TrustDomainMismatch` — the peer is trusted but the baggage
+    ///   identity's trust domain neither matched the peer cert's nor appeared
+    ///   in [`MeshAuthz::trust_domain_aliases`]. Baggage is dropped; the
+    ///   returned principal is the peer cert identity (typically the
+    ///   ztunnel's own SPIFFE id).
+    /// - `NoBaggageOrNonHbone` — non-HBONE request, no baggage, or no
+    ///   authenticated peer to begin with. No diagnostic stamped.
+    fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, BaggageOutcome) {
         if !is_authenticated_hbone_request(ctx) {
-            return (ctx.peer_spiffe_id.clone(), false);
+            return (
+                ctx.peer_spiffe_id.clone(),
+                BaggageOutcome::NoBaggageOrNonHbone,
+            );
         }
         let Some(peer) = ctx.peer_spiffe_id.as_ref() else {
-            return (None, false);
+            return (None, BaggageOutcome::NoBaggageOrNonHbone);
         };
         let baggage_principal = HboneIdentity::from_baggage_values(
             ctx.raw_header_values(BAGGAGE_HEADER)
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         )
         .source_principal;
+        if !self.is_trusted_hbone_assertor(peer) {
+            // Stamp `UntrustedAssertor` only when the request actually carried
+            // a baggage source identity that we suppressed. Without that
+            // signal there's nothing observable for operators to triage and
+            // the metadata would just be noise on every non-assertor HBONE
+            // flow.
+            let outcome = if baggage_principal.is_some() {
+                BaggageOutcome::UntrustedAssertor
+            } else {
+                BaggageOutcome::NoBaggageOrNonHbone
+            };
+            return (Some(peer.clone()), outcome);
+        }
         match baggage_principal {
             Some(b) if self.trust_domain_allowed(peer.trust_domain(), b.trust_domain()) => {
-                (Some(b), false)
+                (Some(b), BaggageOutcome::Honored)
             }
-            Some(_) => (Some(peer.clone()), true),
-            None => (Some(peer.clone()), false),
+            Some(_) => (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch),
+            None => (Some(peer.clone()), BaggageOutcome::NoBaggageOrNonHbone),
         }
     }
 
@@ -407,6 +487,27 @@ impl MeshAuthz {
                 .iter()
                 .any(|alias| alias == baggage_td)
     }
+
+    fn is_trusted_hbone_assertor(&self, peer: &SpiffeId) -> bool {
+        self.trusted_hbone_assertors
+            .iter()
+            .any(|entry| entry.matches(peer))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaggageOutcome {
+    /// Baggage parsed and accepted; returned principal is the baggage identity.
+    Honored,
+    /// Peer is not a trusted assertor and baggage carried a source identity
+    /// that we dropped; returned principal is the peer cert identity.
+    UntrustedAssertor,
+    /// Baggage's trust domain did not match the peer's or an alias; returned
+    /// principal is the peer cert identity.
+    TrustDomainMismatch,
+    /// Nothing to surface — non-HBONE request, no baggage, or no authenticated
+    /// peer.
+    NoBaggageOrNonHbone,
 }
 
 pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDomain>, String> {
@@ -450,4 +551,59 @@ fn record_ignored_baggage_reason(metadata: &mut HashMap<String, String>, reason:
 
 fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
     ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
+}
+
+fn parse_trusted_hbone_assertors(config: &Value) -> Result<Vec<TrustedAssertor>, String> {
+    let items = match config.get("trusted_hbone_assertors") {
+        None | Some(Value::Null) => {
+            return Ok(default_trusted_hbone_assertors());
+        }
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            return Err("trusted_hbone_assertors must be an array of strings".to_string());
+        }
+    };
+
+    // Empty array intentionally means "no peer can assert baggage"; default
+    // assertors only apply when the key is absent or null. Operators can use
+    // `[]` to lock down baggage-rewrite entirely while still leaving the
+    // mesh_authz plugin active.
+    items
+        .iter()
+        .map(|item| {
+            let raw = item
+                .as_str()
+                .ok_or_else(|| "trusted_hbone_assertors entries must be strings".to_string())?;
+            parse_trusted_hbone_assertor(raw)
+        })
+        .collect()
+}
+
+fn parse_trusted_hbone_assertor(raw: &str) -> Result<TrustedAssertor, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("trusted_hbone_assertors entries must not be empty".to_string());
+    }
+    if trimmed.starts_with("spiffe://") {
+        SpiffeId::new(trimmed)
+            .map(TrustedAssertor::Spiffe)
+            .map_err(|e| format!("invalid trusted_hbone_assertors SPIFFE id '{trimmed}': {e}"))
+    } else {
+        // Reject anything that looks like an attempted URI but isn't a SPIFFE
+        // id (e.g. typo'd scheme) instead of silently treating it as a
+        // service-account name.
+        if trimmed.contains("://") {
+            return Err(format!(
+                "trusted_hbone_assertors entry '{trimmed}' looks like a URI but is not a 'spiffe://' SPIFFE id"
+            ));
+        }
+        Ok(TrustedAssertor::ServiceAccount(trimmed.to_string()))
+    }
+}
+
+fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
+    DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES
+        .iter()
+        .map(|name| TrustedAssertor::ServiceAccount((*name).to_string()))
+        .collect()
 }

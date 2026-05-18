@@ -565,6 +565,15 @@ pub struct EnvConfig {
     /// Default empty: strict same-trust-domain match. Each entry must parse
     /// as a valid `TrustDomain` (lowercase host-form, no path).
     pub mesh_trust_domain_aliases: Vec<String>,
+    /// Identity-asserting infrastructure SVIDs trusted to rewrite the authz
+    /// principal via HBONE baggage `source.principal`. Each entry is either a
+    /// bare Kubernetes service-account name (Istio convention,
+    /// `ns/<ns>/sa/<sa>`) or a full SPIFFE id pinning a specific assertor
+    /// identity. Default empty: mesh_authz uses its built-in defaults of
+    /// `["ztunnel", "waypoint"]`. Operators with custom waypoint SA names
+    /// (Gateway-managed waypoints often use `<gateway-name>` or
+    /// `<gateway-name>-istio`) must set this to include their names.
+    pub mesh_trusted_hbone_assertors: Vec<String>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -1401,6 +1410,7 @@ impl Default for EnvConfig {
             mesh_cert_ttl_seconds: 3600,
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
+            mesh_trusted_hbone_assertors: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -1710,6 +1720,7 @@ impl EnvConfig {
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
+            mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -2091,6 +2102,7 @@ impl EnvConfig {
             mesh_cert_ttl_seconds,
             mesh_config_protocol,
             mesh_trust_domain_aliases,
+            mesh_trusted_hbone_assertors,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
