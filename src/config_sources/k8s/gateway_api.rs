@@ -314,7 +314,7 @@ pub(crate) fn route_conflicts(
     conflicts
 }
 
-fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
+pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     let hostnames = route_hostnames(object);
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
@@ -1689,6 +1689,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1703,6 +1704,7 @@ mod tests {
         K8sObject {
             metadata: K8sMetadata {
                 namespace: namespace.to_string(),
+                generation: None,
                 ..object(kind, Value::Null).metadata
             },
             spec,
@@ -1770,6 +1772,29 @@ mod tests {
         assert!(result.warnings.iter().any(
             |warning| warning.contains("api-b") && warning.contains("winner is default/api-a")
         ));
+    }
+
+    #[test]
+    fn translation_surfaces_conflict_list_to_status_writer() {
+        // The status writer reuses `K8sTranslation.route_conflicts` so it
+        // doesn't recompute conflicts (and so invalid, translator-skipped
+        // routes don't leak into a valid sibling's `Conflicted` condition).
+        // Guard the wiring: the same conflict that drove the warning must
+        // also appear on the translation's exposed conflict list.
+        let newer = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+
+        let result =
+            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+
+        assert!(
+            result
+                .route_conflicts
+                .iter()
+                .any(|conflict| conflict.loser.name == "api-b" && conflict.winner.name == "api-a"),
+            "translator must surface conflict for the losing route on K8sTranslation: {:?}",
+            result.route_conflicts
+        );
     }
 
     #[test]

@@ -630,6 +630,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1015,6 +1016,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1053,6 +1055,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1091,6 +1094,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1129,6 +1133,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1165,6 +1170,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1201,6 +1207,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,
@@ -1241,6 +1248,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 creation_timestamp: None,
                 deletion_timestamp: None,

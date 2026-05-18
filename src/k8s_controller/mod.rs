@@ -8,6 +8,7 @@ pub mod convert;
 pub mod metrics;
 pub mod reconciler;
 pub mod resource_store;
+pub mod status;
 pub mod watcher;
 
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use crate::grpc::proto::ConfigUpdate;
 use metrics::ControllerMetrics;
 use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
+use status::GatewayApiStatusWriter;
 use watcher::{WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
 
 pub struct K8sControllerConfig {
@@ -123,6 +125,9 @@ pub async fn start_k8s_controller(
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         pod_discovery_enabled: controller_config.pod_discovery_enabled,
     };
+    let gateway_status_writer = controller_config
+        .watch_gateway_api
+        .then(|| GatewayApiStatusWriter::new(client.clone()));
 
     let reconciler_handle = spawn_reconcile_loop(
         store_set.clone(),
@@ -134,6 +139,7 @@ pub async fn start_k8s_controller(
             mesh_registry,
         },
         reconciler_config,
+        gateway_status_writer,
         metrics.clone(),
         shutdown.clone(),
     );

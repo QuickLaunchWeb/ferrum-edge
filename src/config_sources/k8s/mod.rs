@@ -31,6 +31,8 @@ pub struct K8sMetadata {
     pub name: String,
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     /// Object annotations. Required to read Istio waypoint bindings
@@ -177,6 +179,11 @@ impl std::error::Error for K8sTranslateError {}
 pub struct K8sTranslation {
     pub config: GatewayConfig,
     pub warnings: Vec<String>,
+    /// Gateway API route conflicts computed over the routes that survived
+    /// translator validation. Invalid routes are excluded so the status writer
+    /// does not mark a valid (and materialized) route as `Conflicted=True`
+    /// against an older sibling that the translator already dropped.
+    pub route_conflicts: Vec<GatewayApiRouteConflict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +264,11 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    /// Flat copy of the Gateway API route conflicts computed over the
+    /// translator's filtered object set. Reused by the status writer so
+    /// invalid routes (which the translator skips) cannot push a valid
+    /// sibling into `Conflicted=True`.
+    gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
 }
 
 impl K8sAccumulator {
@@ -279,6 +291,7 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_route_conflicts: Vec::new(),
         }
     }
 
@@ -421,6 +434,7 @@ impl K8sAccumulator {
         K8sTranslation {
             config: self.config,
             warnings: self.warnings,
+            route_conflicts: self.gateway_api_route_conflicts,
         }
     }
 }
@@ -447,6 +461,10 @@ pub fn gateway_api_route_conflicts(
     options: &K8sTranslationOptions,
 ) -> Vec<GatewayApiRouteConflict> {
     gateway_api::route_conflicts(objects, options)
+}
+
+pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
+    gateway_api::route_conflict_keys(object)
 }
 
 pub(crate) fn translate_k8s_objects_with_filter<F>(
@@ -495,7 +513,7 @@ where
     }
 
     let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
-    for conflict in gateway_api_route_conflicts {
+    for conflict in &gateway_api_route_conflicts {
         let skipped_reason = if conflict.loser.kind == "GRPCRoute"
             && conflict.key.match_signature == "{}"
         {
@@ -519,8 +537,9 @@ where
         acc.gateway_api_conflict_losers
             .entry(conflict.loser.clone())
             .or_default()
-            .push(conflict);
+            .push(conflict.clone());
     }
+    acc.gateway_api_route_conflicts = gateway_api_route_conflicts;
 
     for object in &included_objects {
         if !includes_object_namespace(&acc.options, object) {
@@ -551,6 +570,12 @@ where
         }
 
         if core::is_core_resource_kind(&object.kind) {
+            continue;
+        }
+
+        // GatewayClass is watched for ownership/status decisions by the
+        // controller, but it does not materialize proxy config directly.
+        if object.kind == "GatewayClass" {
             continue;
         }
 
@@ -1490,6 +1515,7 @@ mod tests {
             metadata: K8sMetadata {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
+                generation: None,
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 creation_timestamp: None,
@@ -1531,6 +1557,27 @@ mod tests {
             translate_k8s_objects(&[ignored], options("prod")).expect("translation should succeed");
 
         assert!(result.config.mesh.is_none());
+    }
+
+    #[test]
+    fn gateway_class_is_status_only_not_unsupported_translation_input() {
+        let mut gateway_class = object(
+            "GatewayClass",
+            serde_json::json!({"controllerName": "ferrum.io/gateway-controller"}),
+        );
+        gateway_class.api_version = "gateway.networking.k8s.io/v1".to_string();
+        gateway_class.metadata.namespace.clear();
+        let options = options("default").with_source_namespaces(Vec::new());
+
+        let result =
+            translate_k8s_objects(&[gateway_class], options).expect("translation should succeed");
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GatewayClass"))
+        );
     }
 
     #[test]

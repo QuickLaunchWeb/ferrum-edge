@@ -29,6 +29,7 @@ fn object(kind: &str, spec: Value) -> K8sObject {
         metadata: K8sMetadata {
             name: "sample".to_string(),
             namespace: "default".to_string(),
+            generation: None,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             creation_timestamp: None,
