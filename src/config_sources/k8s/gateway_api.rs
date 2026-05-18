@@ -314,7 +314,7 @@ pub(crate) fn route_conflicts(
     conflicts
 }
 
-fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
+pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     let hostnames = route_hostnames(object);
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();

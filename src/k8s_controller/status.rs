@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 
 use crate::config_sources::k8s::{
-    GatewayApiRouteConflict, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys,
     gateway_api_route_conflicts, resource_id, translate_k8s_objects_with_filter,
 };
 
@@ -82,16 +83,28 @@ pub fn plan_gateway_api_status_updates(
                 .iter()
                 .map(|parent_ref| route_parent_ref_key(object, parent_ref))
                 .collect();
-            let conflict = conflicts.iter().find(|conflict| {
-                conflict.loser == resource_key
-                    && (managed_parent_ref_keys.is_empty()
-                        || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
-            });
+            let route_conflicts: Vec<&GatewayApiRouteConflict> = conflicts
+                .iter()
+                .filter(|conflict| {
+                    conflict.loser == resource_key
+                        && (managed_parent_ref_keys.is_empty()
+                            || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
+                })
+                .collect();
+            let route_keys = if matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+                gateway_api_route_conflict_keys(object)
+                    .into_iter()
+                    .filter(|key| managed_parent_ref_keys.contains(&key.parent_ref))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let status = desired_status_for_object(
                 objects,
                 object,
                 options.clone(),
-                conflict,
+                &route_conflicts,
+                &route_keys,
                 &managed_parent_refs,
             );
             if status == object.status {
@@ -112,14 +125,12 @@ fn desired_status_for_object(
     objects: &[K8sObject],
     object: &K8sObject,
     options: K8sTranslationOptions,
-    conflict: Option<&GatewayApiRouteConflict>,
+    route_conflicts: &[&GatewayApiRouteConflict],
+    route_keys: &[GatewayApiRouteConflictKey],
     managed_parent_refs: &[Value],
 ) -> Value {
     if object.kind == "GatewayClass" {
         return gateway_class_status(object);
-    }
-    if let Some(conflict) = conflict {
-        return conflicted_route_status(object, conflict, managed_parent_refs);
     }
 
     let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
@@ -130,7 +141,13 @@ fn desired_status_for_object(
 
     match object.kind.as_str() {
         "Gateway" => gateway_status(object, result.as_ref()),
-        "HTTPRoute" | "GRPCRoute" => route_status(object, result.as_ref(), managed_parent_refs),
+        "HTTPRoute" | "GRPCRoute" => route_status(
+            object,
+            result.as_ref(),
+            managed_parent_refs,
+            route_conflicts,
+            route_keys,
+        ),
         _ => Value::Object(Default::default()),
     }
 }
@@ -227,37 +244,15 @@ fn gateway_status(
     status
 }
 
-fn conflicted_route_status(
-    object: &K8sObject,
-    conflict: &GatewayApiRouteConflict,
-    managed_parent_refs: &[Value],
-) -> Value {
-    let message = format!(
-        "Ferrum rejected this route because it conflicts on parent={} host={} path={}; winner is {}/{}",
+fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
+    format!(
+        "Ferrum rejected part of this route because it conflicts on parent={} host={} path={}; winner is {}/{}",
         conflict.key.parent_ref,
         conflict.key.hostname,
         conflict.key.listen_path,
         conflict.winner.namespace,
         conflict.winner.name
-    );
-    let mut parents = retained_existing_parent_statuses(&object.status, managed_parent_refs);
-    for parent_ref in managed_parent_refs {
-        let existing_parent_status = existing_parent_status(&object.status, parent_ref);
-        parents.push(json!({
-            "parentRef": parent_ref,
-            "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
-            "conditions": [
-                condition_at(object, existing_parent_status, "Accepted", false, "Conflicted", &message),
-                condition_at(object, existing_parent_status, "ResolvedRefs", true, "ResolvedRefs", "All backendRefs accepted by Ferrum"),
-                condition_at(object, existing_parent_status, "Programmed", false, "Conflicted", &message),
-                condition_at(object, existing_parent_status, "Conflicted", true, "Conflicted", &message),
-            ],
-        }));
-    }
-
-    let mut status = object.status.clone();
-    ensure_status_object(&mut status).insert("parents".to_string(), Value::Array(parents));
-    status
+    )
 }
 
 fn ensure_status_object(status: &mut Value) -> &mut serde_json::Map<String, Value> {
@@ -274,6 +269,8 @@ fn route_status(
     object: &K8sObject,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     managed_parent_refs: &[Value],
+    route_conflicts: &[&GatewayApiRouteConflict],
+    route_keys: &[GatewayApiRouteConflictKey],
 ) -> Value {
     let (accepted, resolved_refs, programmed, reason, message) = match result {
         Ok(translation) => {
@@ -304,14 +301,66 @@ fn route_status(
     let mut parents = retained_existing_parent_statuses(&object.status, managed_parent_refs);
     for parent_ref in managed_parent_refs {
         let existing_parent_status = existing_parent_status(&object.status, parent_ref);
+        let parent_ref_key = route_parent_ref_key(object, parent_ref);
+        let parent_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
+            .iter()
+            .copied()
+            .filter(|conflict| conflict.key.parent_ref == parent_ref_key)
+            .collect();
+        let parent_conflict_keys: HashSet<&GatewayApiRouteConflictKey> = parent_conflicts
+            .iter()
+            .map(|conflict| &conflict.key)
+            .collect();
+        let parent_route_keys: Vec<&GatewayApiRouteConflictKey> = route_keys
+            .iter()
+            .filter(|key| key.parent_ref == parent_ref_key)
+            .collect();
+        let has_conflict = !parent_conflicts.is_empty();
+        let all_parent_matches_conflicted = has_conflict
+            && !parent_route_keys.is_empty()
+            && parent_route_keys
+                .iter()
+                .all(|key| parent_conflict_keys.contains(key));
+        let conflict_message = parent_conflicts
+            .first()
+            .map(|conflict| route_conflict_message(conflict));
+        let accepted_for_parent = accepted && !all_parent_matches_conflicted;
+        let accepted_reason = if all_parent_matches_conflicted {
+            "Conflicted"
+        } else {
+            reason
+        };
+        let accepted_message = if all_parent_matches_conflicted {
+            conflict_message.as_deref().unwrap_or(&message)
+        } else {
+            &message
+        };
+        let programmed_for_parent = programmed && !all_parent_matches_conflicted;
+        let programmed_reason = if programmed_for_parent {
+            "Programmed"
+        } else if all_parent_matches_conflicted {
+            "Conflicted"
+        } else {
+            "TranslationFailed"
+        };
+        let programmed_message = if programmed_for_parent {
+            "Ferrum programmed this route"
+        } else if all_parent_matches_conflicted {
+            conflict_message.as_deref().unwrap_or(&message)
+        } else {
+            &message
+        };
+        let conflicted_message = conflict_message
+            .as_deref()
+            .unwrap_or("No Gateway API conflicts detected by Ferrum");
         let conditions = vec![
             condition_at(
                 object,
                 existing_parent_status,
                 "Accepted",
-                accepted,
-                reason,
-                &message,
+                accepted_for_parent,
+                accepted_reason,
+                accepted_message,
             ),
             condition_at(
                 object,
@@ -333,25 +382,21 @@ fn route_status(
                 object,
                 existing_parent_status,
                 "Programmed",
-                programmed,
-                if programmed {
-                    "Programmed"
-                } else {
-                    "TranslationFailed"
-                },
-                if programmed {
-                    "Ferrum programmed this route"
-                } else {
-                    &message
-                },
+                programmed_for_parent,
+                programmed_reason,
+                programmed_message,
             ),
             condition_at(
                 object,
                 existing_parent_status,
                 "Conflicted",
-                false,
-                "NoConflicts",
-                "No Gateway API conflicts detected by Ferrum",
+                has_conflict,
+                if has_conflict {
+                    "Conflicted"
+                } else {
+                    "NoConflicts"
+                },
+                conflicted_message,
             ),
         ];
         parents.push(json!({
@@ -912,6 +957,45 @@ mod tests {
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Conflicted")
         );
+    }
+
+    #[test]
+    fn partially_conflicting_route_reports_accepted_and_conflicted() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
+        let mut mixed = object(
+            "HTTPRoute",
+            "api-b",
+            json!({
+                "hostnames": ["api.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [
+                    {
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    },
+                    {
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                        "backendRefs": [{"name": "admin", "port": 9090}]
+                    }
+                ]
+            }),
+        );
+        mixed.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let updates =
+            plan_gateway_api_status_updates(&[gateway_class, gateway, mixed, older], options());
+        let mixed_update = updates
+            .iter()
+            .find(|update| update.name == "api-b")
+            .expect("partially conflicting route status");
+        let parents = mixed_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+        assert_condition(conditions, "Conflicted", "True");
     }
 
     #[test]

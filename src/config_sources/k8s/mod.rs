@@ -451,6 +451,10 @@ pub fn gateway_api_route_conflicts(
     gateway_api::route_conflicts(objects, options)
 }
 
+pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
+    gateway_api::route_conflict_keys(object)
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
