@@ -887,3 +887,314 @@ fn test_nonce_replay_detected_via_direct_api() {
     assert!(plugin.check_nonce_replay("unique-nonce").is_ok());
     assert!(plugin.check_nonce_replay("unique-nonce").is_err());
 }
+
+// ── X.509 signature verification — end-to-end roundtrip ─────────────────────
+//
+// PR #844 fixed `cert.public_key().raw` → `cert.public_key().subject_public_key.data`
+// so the bytes passed to `ring::signature::UnparsedPublicKey::new(&RSA_PKCS1_*, ...)`
+// are the bare RFC 8017 `RSAPublicKey` (modulus + exponent) instead of the full
+// RFC 5280 `SubjectPublicKeyInfo`. Without these tests, the only existing X.509
+// coverage was `test_x509_no_trusted_certs_is_error`, which only exercises the
+// empty-list error path — every signed-envelope flow was silently broken since
+// the feature was added because *no* test ever loaded an RSA cert and ran the
+// plugin against a real signature.
+//
+// These tests lock in the fix by minting a self-signed RSA cert with rcgen,
+// signing a deterministic `<SignedInfo>` block with ring's `RSA_PKCS1_SHA256`,
+// and feeding the resulting SOAP envelope through the public `before_proxy`
+// path. If a future refactor re-introduces the SPKI/RSAPublicKey mismatch the
+// happy-path test will start rejecting valid signatures; the
+// tampered-signature test makes sure we are not accidentally "verifying" by
+// returning Ok for anything.
+
+mod x509_roundtrip {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256,
+        PKCS_RSA_SHA256,
+    };
+    use ring::rand::SystemRandom;
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+
+    /// rcgen-minted self-signed RSA cert + the same PKCS#8 key material that
+    /// signed it, so we can both (a) hand the cert PEM to `SoapWsSecurity` for
+    /// trust-store loading and (b) hand the same private key to ring for
+    /// signing the `<SignedInfo>` block.
+    struct TestRsaCert {
+        cert_pem: String,
+        cert_der_b64: String,
+        signing_key: RsaKeyPair,
+    }
+
+    fn mint_rsa_cert() -> TestRsaCert {
+        let key_pair = KeyPair::generate_for(&PKCS_RSA_SHA256)
+            .expect("rcgen RSA keypair (requires aws_lc_rs feature on rcgen)");
+        let mut params = CertificateParams::new(vec!["soap-ws-security-test".to_string()])
+            .expect("rcgen CertificateParams");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "soap-ws-security-test");
+        params.distinguished_name = dn;
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("rcgen self-sign RSA cert");
+        let cert_pem = cert.pem();
+        let cert_der_b64 = B64.encode(cert.der().as_ref());
+
+        // rcgen `KeyPair::serialize_der` exposes the key as a PKCS#8 DER, which
+        // is the input format ring's `RsaKeyPair::from_pkcs8` expects.
+        let pkcs8_der = key_pair.serialize_der();
+        let signing_key =
+            RsaKeyPair::from_pkcs8(&pkcs8_der).expect("ring RsaKeyPair from rcgen PKCS#8 DER");
+
+        TestRsaCert {
+            cert_pem,
+            cert_der_b64,
+            signing_key,
+        }
+    }
+
+    /// rcgen-minted self-signed ECDSA P-256 cert PEM, used to drive the
+    /// non-RSA SPKI rejection path at constructor time.
+    fn mint_ecdsa_cert_pem() -> String {
+        let key_pair =
+            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("rcgen ECDSA P-256 keypair");
+        let mut params = CertificateParams::new(vec!["soap-ws-security-ecdsa-test".to_string()])
+            .expect("rcgen CertificateParams");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "soap-ws-security-ecdsa-test");
+        params.distinguished_name = dn;
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("rcgen self-sign ECDSA cert");
+        cert.pem()
+    }
+
+    fn write_pem_to_tempfile(pem: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::with_suffix(".pem").expect("tempfile");
+        file.write_all(pem.as_bytes()).expect("write pem");
+        file.flush().expect("flush pem");
+        file
+    }
+
+    /// Construct a SOAP envelope whose `<wsse:Security>` block contains a
+    /// `<Timestamp wsu:Id="TS-1">` and a `<Signature>` covering that Timestamp.
+    /// The `<SignedInfo>` byte sequence in the returned envelope is exactly
+    /// what `validate_x509_signature` extracts via `find_element_block`, so
+    /// the signature computed here will match what the verifier checks.
+    fn build_signed_soap_envelope(cert: &TestRsaCert) -> String {
+        let now = chrono::Utc::now();
+        let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let expires = (now + chrono::Duration::minutes(5))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        let timestamp_xml = format!(
+            r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created><wsu:Expires>{}</wsu:Expires></wsu:Timestamp>"#,
+            created, expires
+        );
+
+        // verify_reference_digests hashes the raw bytes of the referenced
+        // element as extracted from the envelope (no XML C14N in this impl),
+        // so we hash the exact `timestamp_xml` string we'll embed below.
+        let ts_digest = ring::digest::digest(&ring::digest::SHA256, timestamp_xml.as_bytes());
+        let ts_digest_b64 = B64.encode(ts_digest.as_ref());
+
+        // Build SignedInfo as the EXACT bytes that will appear in the envelope.
+        // This is what `find_element_block(security_block, "SignedInfo")`
+        // returns and what we pass into `ring::RsaKeyPair::sign`.
+        // Raw-string delimiter must be `##` because the URL fragments
+        // `xml-exc-c14n#`, `xmldsig-more#`, and `xmlenc#` contain `#`
+        // and a single-`#` raw literal would terminate at the first
+        // `"#` (e.g. inside `xml-exc-c14n#"/>`), which is what tripped
+        // the parser before the fix.
+        let signed_info = format!(
+            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
+            ts_digest_b64
+        );
+
+        // Sign the SignedInfo bytes with RSA-PKCS1-v1_5 over SHA-256.
+        let rng = SystemRandom::new();
+        let mut signature = vec![0u8; cert.signing_key.public().modulus_len()];
+        cert.signing_key
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &rng,
+                signed_info.as_bytes(),
+                &mut signature,
+            )
+            .expect("ring RSA sign");
+        let signature_b64 = B64.encode(&signature);
+
+        format!(
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+                   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+      {timestamp}
+      <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3">{cert_b64}</wsse:BinarySecurityToken>
+      <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+        {signed_info}
+        <SignatureValue>{sig_b64}</SignatureValue>
+      </Signature>
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body><GetPrice xmlns="http://example.com/prices"><Item>Widget</Item></GetPrice></soap:Body>
+</soap:Envelope>"#,
+            timestamp = timestamp_xml,
+            cert_b64 = cert.cert_der_b64,
+            signed_info = signed_info,
+            sig_b64 = signature_b64,
+        )
+    }
+
+    fn x509_plugin_config(cert_path: &std::path::Path) -> serde_json::Value {
+        json!({
+            "timestamp": { "require": true, "max_age_seconds": 300 },
+            "x509_signature": {
+                "enabled": true,
+                "trusted_certs": [cert_path.to_str().unwrap()],
+                "allowed_algorithms": ["rsa-sha256"],
+                "require_signed_timestamp": true,
+            },
+            "reject_missing_security_header": true
+        })
+    }
+
+    #[tokio::test]
+    async fn valid_rsa_signature_is_accepted() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with valid RSA cert");
+
+        let body = build_signed_soap_envelope(&cert);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "expected Continue with valid RSA signature, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_signature_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        // Flip the first character of the base64-encoded SignatureValue so
+        // ring's verify fails. Replacing with another valid base64 digit keeps
+        // the payload decodable — we want the *cryptographic* check to reject,
+        // not the base64 decoder.
+        let original = build_signed_soap_envelope(&cert);
+        let open = original
+            .find("<SignatureValue>")
+            .expect("envelope must have <SignatureValue>")
+            + "<SignatureValue>".len();
+        let first_char = original.as_bytes()[open];
+        let replacement = if first_char == b'A' { 'B' } else { 'A' };
+        let mut body = String::with_capacity(original.len());
+        body.push_str(&original[..open]);
+        body.push(replacement);
+        body.push_str(&original[open + 1..]);
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(
+                    body.contains("signature verification failed"),
+                    "expected signature failure message, got: {body}"
+                );
+            }
+            other => panic!("expected Reject on tampered signature, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_digest_value_breaks_reference_check() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        // Flip the first character of the Reference DigestValue in SignedInfo.
+        // The recomputed digest of the (untouched) Timestamp will no longer
+        // match the (tampered) base64 in SignedInfo, so `verify_reference_digests`
+        // must reject. We can't tamper with the Timestamp text itself here
+        // because `validate_timestamp` runs first in the pipeline and would
+        // fail on the parse before signature checks even run.
+        let original = build_signed_soap_envelope(&cert);
+        let dv_open = original
+            .find("<DigestValue>")
+            .expect("envelope must have <DigestValue>")
+            + "<DigestValue>".len();
+        let first_char = original.as_bytes()[dv_open];
+        let replacement = if first_char == b'A' { 'B' } else { 'A' };
+        let mut body = String::with_capacity(original.len());
+        body.push_str(&original[..dv_open]);
+        body.push(replacement);
+        body.push_str(&original[dv_open + 1..]);
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        match result {
+            PluginResult::Reject { body, .. } => assert!(
+                body.contains("digest mismatch"),
+                "expected digest mismatch, got: {body}"
+            ),
+            other => panic!("expected Reject on tampered DigestValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_rsa_cert_is_rejected_at_load_time() {
+        // Defense-in-depth: an ECDSA cert should fail with a precise error
+        // mentioning RSA, not silently load and only fail later at request
+        // time with a generic "signature verification failed" message.
+        let ecdsa_pem = mint_ecdsa_cert_pem();
+        let cert_file = write_pem_to_tempfile(&ecdsa_pem);
+
+        let result = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("ECDSA cert must be rejected at constructor time"),
+        };
+        assert!(
+            err.contains("not an RSA public key"),
+            "error should name the RSA constraint, got: {err}"
+        );
+        // The error must include the canonical RSA OID so operators can
+        // cross-reference with their cert tooling.
+        assert!(
+            err.contains("1.2.840.113549.1.1.1"),
+            "error should include canonical RSA OID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unreadable_cert_path_is_rejected_at_load_time() {
+        // A non-existent path must fail at constructor time with the
+        // existing "failed to read" surface, not panic.
+        let result = SoapWsSecurity::new(&x509_plugin_config(std::path::Path::new(
+            "/this/path/does/not/exist/cert.pem",
+        )));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing cert file must fail load"),
+        };
+        assert!(err.contains("failed to read trusted cert"), "got: {err}");
+    }
+}

@@ -252,7 +252,12 @@ wiremock = "0.6"
 # Functional testing dependencies
 rand = "0.10"
 futures = "0.3"
-rcgen = "0.14"
+# `aws_lc_rs` feature enables RSA key generation in rcgen (the default `ring`
+# backend cannot generate RSA keys). aws-lc-rs is already in the dep graph
+# transitively via `dimpl`, so this only flips a feature on an existing crate.
+# Required for `tests/unit/plugins/soap_ws_security_tests.rs` end-to-end
+# sign-then-verify roundtrip coverage of the X.509 signature path.
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 rstest = "0.26"
 time = "0.3"
 # Phase 6 cross-protocol matrix macro: concatenates idents at macro
