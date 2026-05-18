@@ -42,7 +42,9 @@ mod inner {
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
-    use mongodb::bson::{Binary, Bson, Document, doc, spec::BinarySubtype};
+    use mongodb::bson::{
+        Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
+    };
     use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -3620,14 +3622,7 @@ mod inner {
             if let Some(ref value) = filter.resource_id {
                 filter_doc.insert("resource_id", value.as_str());
             }
-            let mut ts_range = Document::new();
-            if let Some(ref value) = filter.start {
-                ts_range.insert("$gte", value.to_rfc3339());
-            }
-            if let Some(ref value) = filter.end {
-                ts_range.insert("$lte", value.to_rfc3339());
-            }
-            if !ts_range.is_empty() {
+            if let Some(ts_range) = audit_ts_range_filter(filter) {
                 filter_doc.insert("ts", ts_range);
             }
 
@@ -3657,6 +3652,25 @@ mod inner {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn audit_ts_range_filter(filter: &crate::admin::audit::AuditListFilter) -> Option<Document> {
+        let mut ts_range = Document::new();
+        if let Some(value) = filter.start.as_ref() {
+            ts_range.insert("$gte", audit_ts_bound(value));
+        }
+        if let Some(value) = filter.end.as_ref() {
+            ts_range.insert("$lte", audit_ts_bound(value));
+        }
+        if ts_range.is_empty() {
+            None
+        } else {
+            Some(ts_range)
+        }
+    }
+
+    fn audit_ts_bound(value: &DateTime<Utc>) -> Bson {
+        Bson::DateTime(BsonDateTime::from_millis(value.timestamp_millis()))
+    }
 
     impl MongoStore {
         /// Load all `_id` values from a collection (for deletion detection).
@@ -3858,6 +3872,36 @@ mod inner {
     mod tests {
         use super::*;
         use std::collections::HashSet;
+
+        #[test]
+        fn audit_ts_range_filter_uses_bson_datetimes() {
+            let start = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("start timestamp")
+                .with_timezone(&Utc);
+            let end = DateTime::parse_from_rfc3339("2026-05-18T02:00:00Z")
+                .expect("end timestamp")
+                .with_timezone(&Utc);
+            let filter = crate::admin::audit::AuditListFilter {
+                start: Some(start),
+                end: Some(end),
+                ..Default::default()
+            };
+
+            let range = audit_ts_range_filter(&filter).expect("timestamp range");
+
+            assert_eq!(
+                range.get("$gte"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    start.timestamp_millis()
+                )))
+            );
+            assert_eq!(
+                range.get("$lte"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    end.timestamp_millis()
+                )))
+            );
+        }
 
         // -------------------------------------------------------------------
         // diff_removed tests
