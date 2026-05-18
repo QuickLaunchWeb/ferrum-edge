@@ -254,6 +254,22 @@ impl AiRateLimiter {
             {
                 completion_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
             }
+
+            // Cohere v2 streaming: message-end event nests counts under
+            // `delta.usage.tokens.*` instead of root `usage`. Reuse
+            // `extract_response_usage` so we share Cohere v2's shape logic.
+            if json.get("type").and_then(|value| value.as_str()) == Some("message-end") {
+                let usage = extract_response_usage(&json, AiProvider::Cohere);
+                if usage.prompt_tokens.is_some() {
+                    prompt_tokens = usage.prompt_tokens;
+                }
+                if usage.completion_tokens.is_some() {
+                    completion_tokens = usage.completion_tokens;
+                }
+                if usage.total_tokens.is_some() {
+                    total_tokens = usage.total_tokens;
+                }
+            }
         }
 
         if total_tokens.is_none() {
