@@ -87,7 +87,6 @@ pub fn default_mesh_runtime() -> MeshRuntimeConfig {
         sidecar_enforced: false,
         sidecar_enforced_dry_run: false,
         sidecar_identity_narrowing: false,
-        trusted_hbone_assertors: Vec::new(),
     }
 }
 
