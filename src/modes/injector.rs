@@ -779,6 +779,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
     }
 
     value_is_true(annotations.and_then(|m| m.get("ferrum.io/inject")))
+        || value_is_true(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || labels
             .and_then(|m| m.get("ferrum.io/mesh"))
             .and_then(Value::as_str)
@@ -1222,6 +1223,33 @@ mod tests {
         )
         .expect("patch");
         assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn patch_opts_in_via_istio_inject_annotation_true() {
+        // Workloads migrating from Istio carry `sidecar.istio.io/inject: "true"`.
+        // The Ferrum injector honors this as opt-in alongside its native
+        // `ferrum.io/inject: "true"` and the `ferrum.io/mesh: "enabled"` label.
+        let pod = json!({
+            "metadata": {
+                "annotations": {"sidecar.istio.io/inject": "true"}
+            },
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect("patch");
+
+        assert!(
+            patch.iter().any(|op| op.path == "/spec/containers/-"),
+            "expected sidecar container to be appended"
+        );
     }
 
     #[test]
