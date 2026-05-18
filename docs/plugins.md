@@ -1466,9 +1466,11 @@ The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consume
 
 ### `soap_ws_security`
 
-Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, timestamp freshness checks, and nonce replay protection. SAML assertion validation is **not currently supported** — see the SAML section below.
+Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
 The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
+
+> **XMLDSIG canonicalization caveat.** Both the WS-Security X.509 signature path and the SAML assertion signature path verify `<SignatureValue>` against the **wire bytes** of `<SignedInfo>` (and digest each Reference against the wire bytes of the referenced element, with the SAML enveloped-signature transform applied for the assertion). They do not yet apply Exclusive XML Canonicalization (`xml-exc-c14n#`). Signers whose canonical output matches the wire bytes verify cleanly; signers whose intermediates re-serialize, reorder attributes, or re-emit namespace declarations may fail. Operators integrating with strict XMLDSIG IdPs / WS-Security signers should validate end-to-end before depending on these paths.
 
 **Priority:** 1500
 
@@ -1485,15 +1487,19 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 | `x509_signature.enabled` | bool | `false` | Enable X.509 signature verification |
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
+| `x509_signature.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_algorithms` |
 | `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
-| `saml.enabled` | bool | `false` | **Currently unsupported** — setting to `true` fails plugin construction (see [SAML Assertion Validation](#saml-assertion-validation) below) |
-| `saml.trusted_issuers` | String[] | `[]` | (Reserved for future XMLDSIG verification) Trusted SAML Issuer values |
-| `saml.audience` | String | *(none)* | (Reserved for future XMLDSIG verification) Expected SAML Audience value |
-| `saml.clock_skew_seconds` | u64 | `300` | (Reserved for future XMLDSIG verification) Clock skew tolerance for SAML condition timestamps |
+| `saml.enabled` | bool | `false` | Enable SAML 2.0 assertion validation (XMLDSIG signature-first) |
+| `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer URIs (required when enabled) |
+| `saml.trusted_signing_certs` | String[] | `[]` | PEM file paths of trusted IdP signing certs, matched by SHA-256 fingerprint (required when enabled) |
+| `saml.allowed_signature_algorithms` | String[] | `["rsa-sha256"]` | Allowed SAML signature algorithms (`rsa-sha256`, `rsa-sha1`) |
+| `saml.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed SAML Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_signature_algorithms` |
+| `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value |
+| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` |
 | `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection |
 | `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
 
-At least one security feature must be enabled (`timestamp.require`, `username_token`, or `x509_signature`). `saml.enabled: true` is currently rejected at plugin construction time.
+At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
 
 #### UsernameToken — PasswordDigest
 
@@ -1543,16 +1549,47 @@ config:
       - /etc/ferrum/certs/partner-signing.pem
     allowed_algorithms:
       - rsa-sha256
+    allowed_digest_algorithms:
+      - sha256
     require_signed_timestamp: true
   timestamp:
     require: true
 ```
 
+`allowed_algorithms` and `allowed_digest_algorithms` are gated independently. The defaults (`rsa-sha256` and `sha256` respectively) reject SHA-1 in either position; explicitly add `rsa-sha1` / `sha1` only to interoperate with legacy signers.
+
 #### SAML Assertion Validation
 
-> **⚠ Not currently supported.** SAML assertion validation is gated off at plugin construction time. `saml.enabled: true` causes `soap_ws_security` to refuse to start with an explicit error message. The current implementation does not cryptographically verify the assertion's `<Signature>` (XMLDSIG), so accepting assertions would amount to trusting attacker-supplied XML — strictly worse than no SAML check. The config knobs are reserved for the upcoming XMLDSIG signature verification work; until that lands, leave `saml.enabled: false`.
+The plugin cryptographically verifies the SAML assertion's `<Signature>` element before any other field is trusted. Verification order:
 
-When implemented, the validation will check the XMLDSIG signature against trusted IdP keys plus issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
+1. Locate `<Signature>` inside the assertion (`401` if absent). The plugin also rejects requests carrying more than one `<Assertion>` inside the WS-Security block.
+2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
+3. Verify each `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`. At least one Reference must target the enclosing Assertion ID.
+4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate` against `trusted_signing_certs` by SHA-256 fingerprint of the full DER. This is leaf-cert trust — operators supply the IdP's actual signing certificate(s) as published in IdP metadata, not a CA.
+5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched cert's RSA public key.
+6. Validate `Issuer` (must match one of `trusted_issuers`), `NotBefore` / `NotOnOrAfter` (with `clock_skew_seconds` tolerance), and `Audience` (when `audience` is configured).
+7. Extract the Subject `NameID` into `ctx.metadata["soap_ws_saml_subject"]` so downstream plugins (ACL, rate limiting, logging) can consume the SAML identity.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  saml:
+    enabled: true
+    trusted_issuers:
+      - https://idp.example.com/metadata
+    trusted_signing_certs:
+      - /etc/ferrum/saml/idp-signing.pem
+    allowed_signature_algorithms:
+      - rsa-sha256
+    allowed_digest_algorithms:
+      - sha256
+    audience: https://my-service.example.com
+    clock_skew_seconds: 300
+  timestamp:
+    require: true
+```
+
+Both `trusted_issuers` and `trusted_signing_certs` are required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
 
 #### Combined Configuration
 
@@ -1582,7 +1619,7 @@ config:
   reject_missing_security_header: true
 ```
 
-**Metadata:** On successful UsernameToken authentication, the plugin sets `ctx.metadata["soap_ws_username"]` to the authenticated username, available to downstream plugins and logging.
+**Metadata:** On successful UsernameToken authentication, the plugin sets `ctx.metadata["soap_ws_username"]` to the authenticated username. On successful SAML assertion validation, it sets `ctx.metadata["soap_ws_saml_subject"]` to the Subject `NameID`. Both are available to downstream plugins and logging.
 
 **Namespace prefix agnostic:** The plugin matches XML elements by local name, so it works regardless of namespace prefix conventions (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:`, etc.).
 
