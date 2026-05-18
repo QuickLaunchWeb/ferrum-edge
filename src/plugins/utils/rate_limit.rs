@@ -283,10 +283,6 @@ where
         self.fallback.tracked_keys_count()
     }
 
-    pub fn retain_local_active_at(&self, now: Instant) {
-        self.fallback.retain_active_at(now);
-    }
-
     pub fn enforce_local_capacity(&self, max_entries: usize, now: Instant) {
         self.fallback.enforce_capacity(max_entries, now);
     }
@@ -392,13 +388,6 @@ where
         match self {
             Self::Local(local) => local.tracked_keys_count(),
             Self::Failover(failover) => failover.tracked_keys_count(),
-        }
-    }
-
-    pub fn retain_active_at(&self, now: Instant) {
-        match self {
-            Self::Local(local) => local.retain_active_at(now),
-            Self::Failover(failover) => failover.retain_local_active_at(now),
         }
     }
 
