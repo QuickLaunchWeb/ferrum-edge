@@ -778,6 +778,16 @@ paths:
                     last_seen: "2026-05-17T16:29:58Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh service graph
+          content:
+            application/json:
+              schema:
+                type: object
+              examples:
+                no-active-mesh-service-graph:
+                  value:
+                    error: "No active mesh service graph"
 
   # ── Mesh egress scope (mesh mode) ────────────────────────────────────
   /mesh/egress-scope:

@@ -2376,7 +2376,7 @@ impl ProxyState {
                     }
                     v
                 },
-                env_config_arc.mode == crate::config::env_config::OperatingMode::Mesh,
+                false,
                 env_config_arc.so_busy_poll_us,
                 {
                     let v = env_config_arc
@@ -6351,7 +6351,10 @@ pub async fn start_proxy_listener_with_bound_listener(
     run_accept_loop(
         listener,
         state,
-        ListenerTlsSource::Static(tls_config),
+        ListenerTlsSource::Static {
+            tls_config,
+            record_mesh_mtls_metric: false,
+        },
         conn_semaphore,
         shutdown,
         0,
@@ -6436,7 +6439,31 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static(tls_config),
+        ListenerTlsSource::Static {
+            tls_config,
+            record_mesh_mtls_metric: false,
+        },
+        started_tx,
+    )
+    .await
+}
+
+/// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
+pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Static {
+            tls_config,
+            record_mesh_mtls_metric: true,
+        },
         started_tx,
     )
     .await
@@ -6473,7 +6500,10 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
 enum ListenerTlsSource {
     /// Static listener TLS captured at startup; loading clones only the inner
     /// `Option<Arc<_>>` and performs no atomic read.
-    Static(Option<Arc<rustls::ServerConfig>>),
+    Static {
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+        record_mesh_mtls_metric: bool,
+    },
     /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
     /// every accept so PeerAuthentication changes can hot-swap future
     /// handshakes without restarting the listener.
@@ -6488,10 +6518,26 @@ impl ListenerTlsSource {
     /// the narrow mesh live-reload carve-out and is not on the request path.
     fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
         match self {
-            Self::Static(tls_config) => tls_config.clone(),
+            Self::Static { tls_config, .. } => tls_config.clone(),
             Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
         }
     }
+
+    fn record_mesh_mtls_metric(&self) -> bool {
+        match self {
+            Self::Static {
+                record_mesh_mtls_metric,
+                ..
+            } => *record_mesh_mtls_metric,
+            Self::MeshInbound => true,
+        }
+    }
+}
+
+struct TlsConnectionMetadata {
+    frontend_listen_port: Option<u16>,
+    record_mesh_mtls_metric: bool,
+    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
 }
 
 async fn start_proxy_listener_with_tls_source_and_signal(
@@ -6671,6 +6717,7 @@ async fn run_accept_loop(
                                 None
                             };
                         let tls_config = tls_source.load(&state);
+                        let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -6688,14 +6735,18 @@ async fn run_accept_loop(
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
                             let result = if let Some(tls_config) = tls_config {
+                                let tls_connection_metadata = TlsConnectionMetadata {
+                                    frontend_listen_port,
+                                    record_mesh_mtls_metric,
+                                    node_waypoint_identity,
+                                };
                                 handle_tls_connection(
                                     stream,
                                     remote_addr,
                                     state,
                                     tls_config,
                                     conn_shutdown_rx,
-                                    frontend_listen_port,
-                                    node_waypoint_identity,
+                                    tls_connection_metadata,
                                 )
                                 .await
                             } else {
@@ -6739,8 +6790,7 @@ async fn handle_tls_connection(
     state: ProxyState,
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    frontend_listen_port: Option<u16>,
-    node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
+    tls_connection_metadata: TlsConnectionMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -6753,7 +6803,7 @@ async fn handle_tls_connection(
         stream,
         state.env_config.frontend_tls_handshake_timeout_seconds,
         &remote_addr,
-        state.env_config.mode == crate::config::env_config::OperatingMode::Mesh,
+        tls_connection_metadata.record_mesh_mtls_metric,
     )
     .await?;
     info!("TLS connection established from {}", remote_addr.ip());
@@ -6819,8 +6869,8 @@ async fn handle_tls_connection(
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
         let connection_metadata = RequestConnectionMetadata {
-            frontend_listen_port,
-            node_waypoint_identity: node_waypoint_identity.clone(),
+            frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
         };
         async move {
             handle_proxy_request_on_frontend_port(

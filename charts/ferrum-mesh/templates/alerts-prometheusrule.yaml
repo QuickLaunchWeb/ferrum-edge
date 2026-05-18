@@ -39,13 +39,13 @@ spec:
     - name: ferrum.mesh.control-plane
       rules:
         - alert: FerrumMeshControlPlaneConfigStale
-          expr: time() - ferrum_mesh_config_last_received_timestamp_seconds > {{ .Values.observability.alerts.cpStaleConfigSeconds }}
+          expr: (time() - ferrum_mesh_config_last_received_timestamp_seconds > {{ .Values.observability.alerts.cpStaleConfigSeconds }}) or absent(ferrum_mesh_config_last_received_timestamp_seconds)
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: Ferrum mesh data plane has stale control-plane config
-            description: "No fresh mesh config has been observed for data plane {{ "{{ $labels.instance }}" }} in namespace {{ "{{ $labels.namespace }}" }} within the configured freshness window."
+            description: "No fresh mesh config has been observed within the configured freshness window. Data plane {{ "{{ $labels.instance }}" }} namespace {{ "{{ $labels.namespace }}" }}."
     - name: ferrum.mesh.security
       rules:
         - alert: FerrumMeshMtlsHandshakeFailureSpike

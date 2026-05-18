@@ -160,10 +160,7 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                                 handle.install(bundle);
                             }
                             Err(e) => {
-                                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                                    "unknown",
-                                    "workload_api",
-                                );
+                                record_workload_api_rotation_failure(&handle);
                                 warn!(error = %e, "SVID fetch stream error — reconnecting");
                                 break;
                             }
@@ -171,18 +168,12 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                     }
                 }
                 Err(e) => {
-                    crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                        "unknown",
-                        "workload_api",
-                    );
+                    record_workload_api_rotation_failure(&handle);
                     error!(error = %e, "Workload API stream RPC failed");
                 }
             },
             Err(e) => {
-                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                    "unknown",
-                    "workload_api",
-                );
+                record_workload_api_rotation_failure(&handle);
                 error!(error = %e, "failed to connect to Workload API agent");
             }
         }
@@ -190,6 +181,19 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
         sleep(backoff).await;
         backoff = (backoff * 2).min(config.max_reconnect_backoff);
     }
+}
+
+fn record_workload_api_rotation_failure(handle: &SvidFetchHandle) {
+    let spiffe_id = handle
+        .snapshot()
+        .as_ref()
+        .as_ref()
+        .map(|bundle| bundle.spiffe_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+        &spiffe_id,
+        "workload_api",
+    );
 }
 
 fn record_fetch_bundle_metrics(bundle: &SvidBundle) {

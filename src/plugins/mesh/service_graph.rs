@@ -74,6 +74,7 @@ impl ServiceGraphCounters {
     fn snapshot(&self, key: &ServiceGraphKey) -> ServiceGraphEdge {
         let requests_total = self.requests_total.load(Ordering::Relaxed);
         let duration_ms_total = self.duration_micros_total.load(Ordering::Relaxed) as f64 / 1_000.0;
+        let last_seen_unix_ms = self.last_seen_unix_ms.load(Ordering::Relaxed);
         ServiceGraphEdge {
             source_principal: key.source_principal.to_string(),
             source_workload: key.source_workload.to_string(),
@@ -95,8 +96,8 @@ impl ServiceGraphCounters {
             } else {
                 duration_ms_total / requests_total as f64
             },
-            last_seen_unix_ms: self.last_seen_unix_ms.load(Ordering::Relaxed),
-            last_seen: unix_ms_rfc3339(self.last_seen_unix_ms.load(Ordering::Relaxed)),
+            last_seen_unix_ms,
+            last_seen: unix_ms_rfc3339(last_seen_unix_ms),
         }
     }
 }
@@ -170,12 +171,15 @@ impl ServiceGraphRegistry {
     }
 
     fn ensure_snapshot_worker(self: &Arc<Self>) {
+        if self.snapshot_worker_started.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         if self
             .snapshot_worker_started
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             return;

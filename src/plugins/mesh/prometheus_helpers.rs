@@ -14,9 +14,11 @@ use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 
 const MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS: u64 = 6 * 60 * 60;
+const MESH_CERT_EXPIRY_EVICTION_INTERVAL_SECONDS: u64 = 60;
 
 static MESH_CERT_EXPIRY_UNIX_SECONDS: LazyLock<DashMap<MeshCertExpiryKey, MeshCertExpiryGauge>> =
     LazyLock::new(DashMap::new);
+static MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS: AtomicU64 = AtomicU64::new(0);
 static MESH_CERT_ROTATION_FAILURES: LazyLock<DashMap<MeshCertRotationFailureKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static MESH_CA_HEALTH: LazyLock<DashMap<MeshCaHealthKey, AtomicU64>> = LazyLock::new(DashMap::new);
@@ -215,8 +217,10 @@ pub fn record_mesh_trust_bundle_roots(
 }
 
 pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
+    let namespace = namespace.as_ref();
+    MESH_CONFIG_LAST_RECEIVED.retain(|key, _| key.as_ref() == namespace);
     MESH_CONFIG_LAST_RECEIVED
-        .entry(Arc::from(namespace.as_ref()))
+        .entry(Arc::from(namespace))
         .or_insert_with(|| AtomicU64::new(0))
         .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
 }
@@ -233,7 +237,7 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
 
 pub fn render_mesh_cert_metrics(output: &mut String) {
     let now = unix_now_seconds();
-    evict_stale_mesh_cert_expiry_series(now);
+    maybe_evict_stale_mesh_cert_expiry_series(now);
 
     if !MESH_CERT_EXPIRY_UNIX_SECONDS.is_empty() {
         output.push_str(
@@ -328,6 +332,27 @@ pub fn render_mesh_cert_metrics(output: &mut String) {
 
 fn unix_now_seconds() -> u64 {
     Utc::now().timestamp().max(0) as u64
+}
+
+fn maybe_evict_stale_mesh_cert_expiry_series(now: u64) {
+    let mut last = MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS.load(Ordering::Relaxed);
+    loop {
+        if last != 0 && now.saturating_sub(last) < MESH_CERT_EXPIRY_EVICTION_INTERVAL_SECONDS {
+            return;
+        }
+        match MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS.compare_exchange_weak(
+            last,
+            now,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                evict_stale_mesh_cert_expiry_series(now);
+                return;
+            }
+            Err(actual) => last = actual,
+        }
+    }
 }
 
 fn evict_stale_mesh_cert_expiry_series(now: u64) {
@@ -543,6 +568,7 @@ mod tests {
             now.saturating_sub(1),
             now,
         );
+        MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS.store(0, Ordering::Relaxed);
 
         let mut output = String::new();
         render_mesh_cert_metrics(&mut output);

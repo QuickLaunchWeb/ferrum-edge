@@ -541,6 +541,7 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
+        // Service graph aggregates all mesh RED data; trace export below honors sampling.
         crate::plugins::mesh::service_graph::record_transaction(summary);
         if !self.should_export_metadata(&summary.metadata) {
             return;

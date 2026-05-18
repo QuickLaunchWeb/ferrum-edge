@@ -320,7 +320,7 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
-The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. In mesh mode it includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics.
+The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. In mesh mode it includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
 
 ### Runtime Metrics
 
