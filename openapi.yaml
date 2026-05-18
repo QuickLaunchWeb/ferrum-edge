@@ -6794,6 +6794,48 @@ components:
                   backend_tls:
                     description: Optional per-rule backend TLS override (direct backends only).
                     type: [object, "null"]
+              request_transform:
+                type: array
+                description: |
+                  Per-rule request header transforms (Istio VirtualService
+                  `http[].headers.request.{set,add,remove}`). Published onto
+                  `RequestContext.route_override_request_transform` when this
+                  rule matches; consumed by the `request_transformer` plugin
+                  on the proxy when its `apply_route_overrides` flag is true.
+                  Route-level transforms layer AFTER the static plugin rules,
+                  so route-level header writes win on conflict. Validated at
+                  config load — CRLF in values and unknown operations are
+                  rejected.
+                items:
+                  type: object
+                  required: [op, key]
+                  properties:
+                    op:
+                      type: string
+                      enum: [add, update, remove]
+                    key:
+                      type: string
+                    value:
+                      type: string
+                      description: Required for add/update; omitted for remove.
+              response_transform:
+                type: array
+                description: |
+                  Per-rule response header transforms (Istio VirtualService
+                  `http[].headers.response.{set,add,remove}`). Same shape as
+                  `request_transform` but applied on the response path via
+                  the `response_transformer` plugin.
+                items:
+                  type: object
+                  required: [op, key]
+                  properties:
+                    op:
+                      type: string
+                      enum: [add, update, remove]
+                    key:
+                      type: string
+                    value:
+                      type: string
         reject_unmatched:
           type: boolean
           default: false
@@ -7319,6 +7361,20 @@ components:
         and JSON body. Rules are validated at plugin load time; unknown
         operations or targets, missing `value` on add/update, missing
         `new_key` on rename, and CR/LF in header values are rejected.
+
+        When `apply_route_overrides: true`, the plugin also consumes per-rule
+        header transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_request_transform`. Static `rules`
+        run first, then per-rule overrides — route-level header writes win
+        on conflict. The Istio VirtualService translator auto-emits a
+        proxy-scoped instance with `rules: []` + `apply_route_overrides: true`
+        on routes that carry `headers.request.{set,add,remove}` and have no
+        operator-configured `request_transformer`. Operators with a global
+        `request_transformer` should be aware: a proxy-scoped instance
+        REPLACES the global on that proxy, so the global's static body /
+        query rules will not apply to VS-translated routes that auto-emit
+        this plugin. The plugin_cache logs a `warn!` when this shadowing
+        happens.
       properties:
         rules:
           type: array
@@ -7330,7 +7386,9 @@ components:
                 type: string
                 enum: [add, remove, update, rename]
                 description: |
-                  add: insert if absent (does not overwrite).
+                  add: insert if absent (does not overwrite). Note: this is
+                  the historical Ferrum semantics, not Istio's "append to
+                  multi-value" semantics — use `update` to overwrite.
                   update: write, creating intermediate objects as needed.
                   remove: delete the field.
                   rename: move old → new, with rollback if the destination is unreachable.
@@ -7355,6 +7413,18 @@ components:
               new_key:
                 type: string
                 description: Required for rename operations.
+        apply_route_overrides:
+          type: boolean
+          default: false
+          description: |
+            When `true`, this instance accepts an empty `rules` array and
+            consumes per-rule header transforms published by
+            `mesh_route_dispatch` on the matching route. The plugin declares
+            `modifies_request_headers() == true` so the dispatcher allocates
+            a separate cloned header map for route-level writes (preserving
+            the gateway invariant that `ctx.headers` carries the original
+            inbound headers during `before_proxy`). Auto-emitted by the
+            Istio VirtualService translator.
 
     ResponseTransformerConfig:
       type: object
@@ -7363,6 +7433,12 @@ components:
         body. Same validation rules as request_transformer (unknown
         operations / targets, missing value / new_key, and CR/LF in header
         values are rejected at plugin load time).
+
+        When `apply_route_overrides: true`, the plugin consumes per-rule
+        header transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_response_transform`. See the
+        `request_transformer` notes on shadowing of operator-configured
+        globals — the same applies on the response side.
       properties:
         rules:
           type: array
@@ -7391,6 +7467,14 @@ components:
               new_key:
                 type: string
                 description: Required for rename operations.
+        apply_route_overrides:
+          type: boolean
+          default: false
+          description: |
+            Counterpart to `request_transformer.apply_route_overrides` for
+            response headers. Auto-emitted by the Istio VirtualService
+            translator on routes carrying `headers.response.{set,add,remove}`
+            that have no operator-configured `response_transformer`.
 
     CompressionConfig:
       type: object

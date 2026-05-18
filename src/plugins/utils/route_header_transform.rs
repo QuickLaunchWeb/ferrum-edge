@@ -14,12 +14,26 @@
 //!
 //! Operations supported are the strict subset of header ops that the
 //! transformer plugins also expose:
-//! - `add`     — insert if absent (`headers.request.add` semantics)
-//! - `update`  — insert or replace (`headers.request.set` semantics)
-//! - `remove`  — delete the header
+//! - `add`     — insert if absent (NOT Istio's append-to-multi-value
+//!               semantics — the existing Ferrum `request_transformer`
+//!               historically uses insert-if-absent and we preserve that
+//!               for consistency; use `update` to overwrite).
+//! - `update`  — insert or replace (`headers.request.set` semantics).
+//! - `remove`  — delete the header (all values for the key).
 //!
 //! Rename is intentionally not part of the route-level transform contract
 //! because Istio has no rename verb.
+//!
+//! ## Divergence note for VS authors
+//!
+//! Istio `headers.request.add` appends to multi-value headers (e.g.,
+//! `Forwarded`, `Via`, `X-Forwarded-For`). Ferrum's underlying
+//! `HashMap<String, String>` header storage does not natively model
+//! multi-value headers (set-cookie is the only multi-value carve-out, via a
+//! `\n` separator). A VirtualService relying on Istio's append semantics on
+//! a previously-set header will see the `add` become a no-op here. Operators
+//! who need to overwrite should use `headers.request.set` (translates to
+//! `update`), which has identical effect on single-value headers.
 
 use std::collections::HashMap;
 
@@ -328,8 +342,15 @@ mod tests {
         assert_eq!(headers.get("x-trace").map(String::as_str), Some("final"));
     }
 
+    /// Documents the insert-if-absent semantics of `add` — this is NOT
+    /// Istio's append-to-multi-value behavior. See module-level docs:
+    /// Ferrum's underlying `HashMap<String, String>` storage doesn't model
+    /// multi-value headers, and the existing `request_transformer` plugin
+    /// already uses insert-if-absent so we preserve consistency. Operators
+    /// who want overwrite semantics should use `headers.request.set` (which
+    /// translates to `update`).
     #[test]
-    fn apply_add_respects_existing_value() {
+    fn apply_add_is_insert_if_absent_not_istio_append() {
         let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(serde_json::json!([
             {"operation": "add", "target": "header", "key": "X-Trace", "value": "from-add"},
         ]))
@@ -338,6 +359,9 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-trace".to_string(), "client".to_string());
         apply_route_header_transforms(&parsed, &mut headers);
+        // Pre-existing value is preserved; the `add` is effectively a no-op
+        // because the key is already present. Istio's `add` would append
+        // "from-add" as an additional value — we do not.
         assert_eq!(headers.get("x-trace").map(String::as_str), Some("client"));
     }
 

@@ -883,13 +883,20 @@ pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[Plugin
 /// `request_transformer` plugin so the per-context override channel
 /// reaches a consumer. `apply_route_overrides: true` lets the plugin
 /// accept the empty-rules config.
+///
+/// The id uses the reserved `__istio_vs_` prefix so (a) operators can
+/// recognize auto-emitted instances at a glance, (b) the prefix cannot
+/// collide with operator-chosen ids (validated names disallow leading
+/// underscores), and (c) `plugin_cache.rs` keys off the prefix to warn
+/// operators when this auto-emit shadows an operator-configured global
+/// `request_transformer`.
 pub(crate) fn route_request_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("istio-vs-req-xform-{proxy_id}"),
+        id: format!("__istio_vs_req_xform_{proxy_id}"),
         plugin_name: "request_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -907,14 +914,14 @@ pub(crate) fn route_request_transformer_plugin_for_proxy(
 }
 
 /// Counterpart to [`route_request_transformer_plugin_for_proxy`] for response
-/// header transforms.
+/// header transforms. Same `__istio_vs_` prefix convention.
 pub(crate) fn route_response_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("istio-vs-resp-xform-{proxy_id}"),
+        id: format!("__istio_vs_resp_xform_{proxy_id}"),
         plugin_name: "response_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -1347,10 +1354,56 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
     };
     let set = headers.get("set").and_then(Value::as_object);
     let add = headers.get("add").and_then(Value::as_object);
+
+    // Warn (don't silently drop) when set/add contain non-string values.
+    // Istio's CRD typing requires string values, but a hand-rolled
+    // VirtualService JSON like `{"X-Count": 42}` will deserialize into a
+    // serde_json::Number that the route-header parser cannot use. Surface
+    // the loss instead of silently applying less than what the operator
+    // wrote (CLAUDE.md "no silent behavior changes").
+    if let Some(set_map) = set {
+        for (key, value) in set_map {
+            if !value.is_string() {
+                tracing::warn!(
+                    direction = direction,
+                    header = %key,
+                    value_kind = ?value,
+                    "VirtualService headers.{}.set entry has non-string value; entry will be dropped",
+                    direction,
+                );
+            }
+        }
+    }
+    if let Some(add_map) = add {
+        for (key, value) in add_map {
+            if !value.is_string() {
+                tracing::warn!(
+                    direction = direction,
+                    header = %key,
+                    value_kind = ?value,
+                    "VirtualService headers.{}.add entry has non-string value; entry will be dropped",
+                    direction,
+                );
+            }
+        }
+    }
+
     let remove = headers.get("remove").and_then(Value::as_array).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect::<Vec<_>>()
+        let mut names = Vec::with_capacity(arr.len());
+        for entry in arr {
+            match entry.as_str() {
+                Some(name) => names.push(name.to_string()),
+                None => {
+                    tracing::warn!(
+                        direction = direction,
+                        value_kind = ?entry,
+                        "VirtualService headers.{}.remove entry is not a string; entry will be dropped",
+                        direction,
+                    );
+                }
+            }
+        }
+        names
     });
     crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json(
         set,
