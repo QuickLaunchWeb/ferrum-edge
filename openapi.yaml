@@ -266,12 +266,21 @@ paths:
               schema:
                 type: [string, "null"]
               example: |
-                # HELP ferrum_api_chargeable_calls_total Total chargeable API calls per consumer.
+                # HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.
                 # TYPE ferrum_api_chargeable_calls_total counter
-                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200"} 150000
-                # HELP ferrum_api_charges_total Total charges accumulated per consumer.
+                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",namespace="ferrum"} 150000
+                # HELP ferrum_api_charges_total Total per-call charges accumulated per consumer.
                 # TYPE ferrum_api_charges_total counter
-                ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD"} 1.5000000000
+                ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD",namespace="ferrum"} 1.5000000000
+                # HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.
+                # TYPE ferrum_api_bytes_sent_total counter
+                ferrum_api_bytes_sent_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",protocol_family="http",namespace="ferrum"} 4500000
+                # HELP ferrum_api_bandwidth_charges_total Total bandwidth charges per consumer, split by direction.
+                # TYPE ferrum_api_bandwidth_charges_total counter
+                ferrum_api_bandwidth_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",direction="received",currency="USD",protocol_family="http",namespace="ferrum"} 0.0900000000
+                # HELP ferrum_api_stream_connections_total Total stream sessions (TCP/UDP/DTLS) per consumer.
+                # TYPE ferrum_api_stream_connections_total counter
+                ferrum_api_stream_connections_total{consumer="alice",proxy_id="tcp-edge",proxy_name="TCP Edge",namespace="ferrum"} 42
             application/json:
               schema:
                 $ref: "#/components/schemas/ChargebackResponse"
@@ -8478,8 +8487,14 @@ components:
 
     ApiChargebackConfig:
       type: object
-      description: "Plugin: api_chargeback — Per-consumer API usage charge tracking with configurable pricing tiers by HTTP status code."
-      required: [pricing_tiers]
+      description: |
+        Plugin: api_chargeback — Per-consumer API usage charge tracking across
+        three independent pricing dimensions: per-call pricing by HTTP status
+        code, per-byte bandwidth pricing (both client->backend and
+        backend->client, applied to HTTP-family AND stream proxies), and
+        per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS).
+        At least one of `pricing_tiers`, `bandwidth_pricing`, or
+        `stream_connection_pricing` must be configured.
       properties:
         currency:
           type: string
@@ -8501,8 +8516,44 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                description: Charge per API call (e.g. 0.00001). Must be non-negative.
-          description: One or more pricing tiers mapping status codes to per-call prices.
+                description: Charge per HTTP API call (e.g. 0.00001). Must be non-negative.
+          description: |
+            HTTP-family per-call pricing. Each tier maps a set of status codes
+            to a per-call price. Applies to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and
+            WebSocket upgrades. Stream proxies (TCP/UDP/DTLS) have no HTTP
+            status code and use `stream_connection_pricing` instead.
+        bandwidth_pricing:
+          type: object
+          additionalProperties: false
+          description: |
+            Optional bandwidth pricing applied to both HTTP-family and stream
+            transactions, using the gateway-perspective `bytes_sent` /
+            `bytes_received` counters from the transaction-summary schema.
+          properties:
+            price_per_byte_sent:
+              type: number
+              minimum: 0
+              default: 0.0
+              description: Per-byte charge for bytes flowed client->backend.
+            price_per_byte_received:
+              type: number
+              minimum: 0
+              default: 0.0
+              description: Per-byte charge for bytes flowed backend->client.
+        stream_connection_pricing:
+          type: object
+          additionalProperties: false
+          required: [price_per_connection]
+          description: |
+            Optional per-connection pricing for stream proxies (TCP, TCP+TLS,
+            UDP, DTLS). Charges the configured flat fee once per session at
+            disconnect time. Streams have no HTTP status code so they cannot
+            use `pricing_tiers`.
+          properties:
+            price_per_connection:
+              type: number
+              minimum: 0
+              description: Per-session charge applied at stream disconnect.
         render_cache_ttl_seconds:
           type: integer
           default: 5
@@ -8537,8 +8588,19 @@ components:
             properties:
               total_charges:
                 type: number
+                description: Sum of per-call, stream-connection, and bandwidth charges across all proxies for this consumer.
               total_calls:
                 type: integer
+                description: Sum of HTTP calls + stream sessions across all proxies for this consumer.
+              per_call_charges:
+                type: number
+                description: HTTP per-call charges only.
+              stream_connection_charges:
+                type: number
+                description: Stream per-connection charges only.
+              bandwidth_charges:
+                type: number
+                description: Bandwidth charges only (sent + received).
               proxies:
                 type: object
                 additionalProperties:
@@ -8546,12 +8608,19 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                    protocol_family:
+                      type: string
+                      enum: [http, stream]
+                      description: Protocol family this proxy serves. Bandwidth metrics and the JSON breakdown are scoped per family.
                     total_charges:
                       type: number
+                      description: Per-proxy sum of per-call, stream-connection, and bandwidth charges.
                     total_calls:
                       type: integer
+                      description: Per-proxy sum of HTTP calls + stream sessions.
                     by_status:
                       type: object
+                      description: HTTP per-status breakdown (empty for stream proxies).
                       additionalProperties:
                         type: object
                         properties:
@@ -8559,6 +8628,31 @@ components:
                             type: integer
                           charges:
                             type: number
+                    bandwidth:
+                      type: object
+                      properties:
+                        bytes_sent:
+                          type: integer
+                          description: Total bytes flowed client->backend for this consumer/proxy pair.
+                        bytes_received:
+                          type: integer
+                          description: Total bytes flowed backend->client for this consumer/proxy pair.
+                        charge_sent:
+                          type: number
+                          description: Accumulated bandwidth charge for client->backend bytes.
+                        charge_received:
+                          type: number
+                          description: Accumulated bandwidth charge for backend->client bytes.
+                    stream:
+                      type: object
+                      description: Present only for stream proxies (TCP/UDP/DTLS).
+                      properties:
+                        connections:
+                          type: integer
+                          description: Number of stream sessions recorded.
+                        connection_charges:
+                          type: number
+                          description: Accumulated per-connection charge.
 
     RequestDeduplicationConfig:
       type: object
