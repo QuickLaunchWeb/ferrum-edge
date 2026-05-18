@@ -1157,6 +1157,10 @@ mod inner {
     ) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(event)?;
         doc.insert("_id", event.id.as_str());
+        doc.insert(
+            "ts",
+            Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
+        );
         Ok(doc)
     }
 
@@ -1164,6 +1168,17 @@ mod inner {
         mut doc: Document,
     ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
         doc.remove("_id");
+        match doc.remove("ts") {
+            Some(Bson::DateTime(ts)) => {
+                let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
+                    .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+                doc.insert("ts", ts.to_rfc3339());
+            }
+            Some(other) => {
+                doc.insert("ts", other);
+            }
+            None => {}
+        }
         Ok(mongodb::bson::from_document(doc)?)
     }
 
@@ -3901,6 +3916,35 @@ mod inner {
                     end.timestamp_millis()
                 )))
             );
+        }
+
+        #[test]
+        fn audit_event_to_doc_stores_ts_as_bson_datetime() {
+            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let event = crate::admin::audit::AuditEvent {
+                id: "audit-1".to_string(),
+                ts,
+                actor: "operator".to_string(),
+                action: "update".to_string(),
+                resource_type: "proxy".to_string(),
+                resource_id: "proxy-1".to_string(),
+                namespace: "ferrum".to_string(),
+                diff: serde_json::json!({"changed": true}),
+            };
+
+            let doc = audit_event_to_doc(&event).expect("audit event document");
+
+            assert_eq!(
+                doc.get("ts"),
+                Some(&Bson::DateTime(BsonDateTime::from_millis(
+                    ts.timestamp_millis()
+                )))
+            );
+
+            let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
+            assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
         }
 
         // -------------------------------------------------------------------
