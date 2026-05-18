@@ -150,7 +150,7 @@ impl AuditSink {
         Self { tx }
     }
 
-    async fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
+    fn record(&self, event: AuditEvent) -> Result<(), anyhow::Error> {
         self.tx
             .try_send(AuditEnvelope { event })
             .map_err(|error| match error {
@@ -203,7 +203,7 @@ fn sink_for_db(db: Arc<dyn DatabaseBackend>) -> AuditSink {
     sink
 }
 
-pub async fn record(
+pub fn record(
     enabled: bool,
     db: Arc<dyn DatabaseBackend>,
     event: AuditEvent,
@@ -213,7 +213,7 @@ pub async fn record(
     }
 
     let sink = sink_for_db(Arc::clone(&db));
-    sink.record(event).await
+    sink.record(event)
 }
 
 pub fn create_diff(after: Value) -> Value {

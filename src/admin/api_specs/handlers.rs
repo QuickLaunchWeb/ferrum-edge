@@ -2088,7 +2088,7 @@ pub async fn handle_post_api_spec(
         namespace,
         audit::create_diff(resp_body.clone()),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -2255,7 +2255,7 @@ pub async fn handle_put_api_spec(
         namespace,
         audit::update_diff(before, resp_body.clone()),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -2424,7 +2424,7 @@ pub async fn handle_delete_api_spec(
                     "spec_version": existing.spec_version,
                 })),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
                 log_audit_enqueue_failure(&error);
             }
             Ok(Response::builder()
