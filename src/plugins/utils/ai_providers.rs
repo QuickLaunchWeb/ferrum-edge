@@ -80,6 +80,20 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::Anthropic);
     }
 
+    // Cohere v2 (`/v2/chat`, the format `ai_federation` uses by default)
+    // reports `{"usage": {"tokens": {"input_tokens": ..., "output_tokens": ...}}}`.
+    // Cohere v1 (`/v1/generate`) reported it under `meta.tokens.*`. Accept
+    // both — v2 must come first because its shape is a strict subset of
+    // the OpenAI / Bedrock branches below.
+    if json
+        .get("usage")
+        .and_then(|usage| usage.get("tokens"))
+        .and_then(|tokens| tokens.get("input_tokens"))
+        .is_some()
+    {
+        return Some(AiProvider::Cohere);
+    }
+
     if json
         .get("meta")
         .and_then(|meta| meta.get("tokens"))
@@ -378,7 +392,13 @@ fn extract_google_usage(json: &Value) -> AiTokenUsage {
 }
 
 fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
-    let tokens = json.get("meta").and_then(|value| value.get("tokens"));
+    // Cohere v2 (`/v2/chat`) returns counts at `usage.tokens.*`. Cohere v1
+    // (`/v1/generate`) returned them at `meta.tokens.*`. Try v2 first, then
+    // fall back to v1 so legacy deployments continue to report usage.
+    let tokens = json
+        .get("usage")
+        .and_then(|value| value.get("tokens"))
+        .or_else(|| json.get("meta").and_then(|value| value.get("tokens")));
     let prompt = tokens
         .and_then(|value| value.get("input_tokens"))
         .and_then(|value| value.as_u64());
@@ -442,8 +462,16 @@ mod tests {
             detect_response_provider(&json!({"usage": {"input_tokens": 1}})),
             Some(AiProvider::Anthropic)
         );
+        // Cohere v1 (`/v1/generate`)
         assert_eq!(
             detect_response_provider(&json!({"meta": {"tokens": {"input_tokens": 1}}})),
+            Some(AiProvider::Cohere)
+        );
+        // Cohere v2 (`/v2/chat` — what `ai_federation` uses by default)
+        assert_eq!(
+            detect_response_provider(
+                &json!({"usage": {"tokens": {"input_tokens": 1, "output_tokens": 2}}})
+            ),
             Some(AiProvider::Cohere)
         );
         assert_eq!(
@@ -454,6 +482,49 @@ mod tests {
             detect_response_provider(&json!({"usage": {"prompt_tokens": 1}})),
             Some(AiProvider::OpenAi)
         );
+    }
+
+    #[test]
+    fn extracts_cohere_v2_usage_from_usage_tokens_path() {
+        let usage = extract_response_usage(
+            &json!({
+                "usage": {
+                    "tokens": {
+                        "input_tokens": 17,
+                        "output_tokens": 9
+                    }
+                },
+                "model": "command-r-plus"
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.prompt_tokens, Some(17));
+        assert_eq!(usage.completion_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(26));
+        assert_eq!(usage.model.as_deref(), Some("command-r-plus"));
+    }
+
+    #[test]
+    fn extracts_cohere_v1_usage_from_meta_tokens_path() {
+        // Backwards compatibility: legacy `/v1/generate` callers.
+        let usage = extract_response_usage(
+            &json!({
+                "meta": {
+                    "tokens": {
+                        "input_tokens": 3,
+                        "output_tokens": 4
+                    }
+                },
+                "model": "command-light"
+            }),
+            AiProvider::Cohere,
+        );
+
+        assert_eq!(usage.prompt_tokens, Some(3));
+        assert_eq!(usage.completion_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(7));
+        assert_eq!(usage.model.as_deref(), Some("command-light"));
     }
 
     #[test]
