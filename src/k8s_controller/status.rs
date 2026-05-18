@@ -488,7 +488,7 @@ fn existing_parent_status<'a>(status: &'a Value, parent_ref: &Value) -> Option<&
         .map(Vec::as_slice)
 }
 
-fn retained_existing_parent_statuses(status: &Value, managed_parent_refs: &[Value]) -> Vec<Value> {
+fn retained_existing_parent_statuses(status: &Value, _managed_parent_refs: &[Value]) -> Vec<Value> {
     status
         .get("parents")
         .and_then(Value::as_array)
@@ -497,15 +497,22 @@ fn retained_existing_parent_statuses(status: &Value, managed_parent_refs: &[Valu
         .filter(|parent| {
             let is_ferrum_parent = parent.get("controllerName").and_then(Value::as_str)
                 == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
-            let is_replaced_parent = parent.get("parentRef").is_some_and(|parent_ref| {
-                managed_parent_refs
-                    .iter()
-                    .any(|new_ref| parent_ref == new_ref)
-            });
-            !is_ferrum_parent || !is_replaced_parent
+            !is_ferrum_parent
         })
         .cloned()
         .collect()
+}
+
+fn has_ferrum_parent_status(status: &Value) -> bool {
+    status
+        .get("parents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|parent| {
+            parent.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
 }
 
 fn route_parent_refs(object: &K8sObject) -> Vec<Value> {
@@ -526,7 +533,9 @@ fn status_target_is_managed_by_ferrum(
     match object.kind.as_str() {
         "GatewayClass" => gateway_class_is_managed_by_ferrum(object),
         "Gateway" => gateway_is_managed_by_ferrum(objects, object),
-        "HTTPRoute" | "GRPCRoute" => !managed_parent_refs.is_empty(),
+        "HTTPRoute" | "GRPCRoute" => {
+            !managed_parent_refs.is_empty() || has_ferrum_parent_status(&object.status)
+        }
         _ => false,
     }
 }
@@ -1130,6 +1139,79 @@ mod tests {
             parent.get("controllerName").and_then(Value::as_str)
                 == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
         }));
+    }
+
+    #[test]
+    fn route_status_drops_stale_ferrum_parent_entries() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        route.status = json!({
+            "parents": [
+                {
+                    "parentRef": {"name": "old-edge"},
+                    "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                    "conditions": []
+                },
+                {
+                    "parentRef": {"name": "edge"},
+                    "controllerName": "example.com/other-controller",
+                    "conditions": []
+                }
+            ]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        assert!(!parents.iter().any(|parent| {
+            parent.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                && parent.get("parentRef") == Some(&json!({"name": "old-edge"}))
+        }));
+        assert!(parents.iter().any(|parent| {
+            parent.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                && parent.get("parentRef") == Some(&json!({"name": "edge"}))
+        }));
+        assert!(parents.iter().any(|parent| {
+            parent.get("controllerName").and_then(Value::as_str)
+                == Some("example.com/other-controller")
+        }));
+    }
+
+    #[test]
+    fn detached_route_status_clears_ferrum_parent_entries() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        route.status = json!({
+            "parents": [{
+                "parentRef": {"name": "edge"},
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": []
+            }]
+        });
+
+        let updates = plan_gateway_api_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        assert!(parents.is_empty());
     }
 
     #[test]
