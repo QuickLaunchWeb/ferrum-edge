@@ -242,6 +242,70 @@ async fn test_redact_mode_ssn() {
 }
 
 #[tokio::test]
+async fn test_redact_mode_updates_request_body_metadata_for_downstream_before_proxy() {
+    // Regression test: ai_federation (and any other before_proxy plugin
+    // that consumes the buffered body) reads `ctx.metadata["request_body"]`
+    // directly and short-circuits the backend dispatch path via
+    // RejectBinary. transform_request_body never runs on that path, so
+    // unless before_proxy itself redacts the buffered body the original
+    // un-redacted PII flows through to the AI provider.
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn", "email"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&ai_request("SSN 123-45-6789 email a@b.com"));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let stored = ctx
+        .metadata
+        .get("request_body")
+        .expect("before_proxy must leave a request_body entry in metadata");
+    assert!(
+        !stored.contains("123-45-6789"),
+        "original SSN must not survive in metadata: {stored}"
+    );
+    assert!(
+        !stored.contains("a@b.com"),
+        "original email must not survive in metadata: {stored}"
+    );
+    assert!(
+        stored.contains("[REDACTED:ssn]"),
+        "metadata must contain the SSN placeholder: {stored}"
+    );
+    assert!(
+        stored.contains("[REDACTED:email]"),
+        "metadata must contain the email placeholder: {stored}"
+    );
+}
+
+#[tokio::test]
+async fn test_redact_mode_no_pii_leaves_metadata_unchanged() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"]
+    }))
+    .unwrap();
+
+    let request = ai_request("nothing sensitive here");
+    let original = serde_json::to_string(&request).unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_str),
+        Some(original.as_str()),
+        "without PII, metadata body must not be rewritten"
+    );
+    assert!(!ctx.metadata.contains_key("ai_shield_redacted"));
+}
+
+#[tokio::test]
 async fn test_redact_multiple_types() {
     let plugin = AiPromptShield::new(&json!({
         "action": "redact",
