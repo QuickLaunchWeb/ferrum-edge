@@ -742,11 +742,13 @@ Consistent hash load balancing (`consistentHash`) is translated to Ferrum's `con
 
 ### Subsets
 
-DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream. Each subset can carry its own traffic policy overrides (connection pool, outlier detection, load balancer) that take precedence over the top-level traffic policy.
+DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream. Each subset can carry a `loadBalancer` override that takes precedence over the top-level traffic policy. Subset-level `outlierDetection`, `tls`, and `connectionPool` are parsed by the K8s translator and warned but not applied per subset — only the subset's load-balancer algorithm currently overrides the top-level traffic policy.
 
 ### Deferred Fields
 
-Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields at slice-apply time. Backend handshake SNI consumption and SAN allow-list verification are enforced on the backend TLS paths; both settings are included in backend pool keys so distinct TLS identities never share connections. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset. Port-level `connectionPool.tcp.connectTimeout` is enforced; port-level load balancer and outlier detection overrides are parsed and warned but not enforced per port.
+Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields at slice-apply time. Backend handshake SNI consumption and SAN allow-list verification are enforced on the backend TLS paths; both settings are included in backend pool keys so distinct TLS identities never share connections. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset.
+
+Port-level `connectionPool.tcp.connectTimeout`, `loadBalancer`, and `outlierDetection` are **all enforced** for HTTP/H2/H3/gRPC/WebSocket/HBONE dispatch via `Upstream.port_overrides[port]` + `Proxy.dispatch_port_overrides[port]`. TCP, UDP, and DTLS stream proxies enforce only the per-port `connectTimeout`; load-balancing and outlier-detection for stream-family upstreams use upstream-level settings only.
 
 ## Observability
 
