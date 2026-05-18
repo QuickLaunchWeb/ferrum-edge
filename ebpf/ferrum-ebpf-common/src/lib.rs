@@ -90,6 +90,62 @@ pub const INBOUND_HBONE_PORT: u16 = 15008;
 /// Singleton key for `FERRUM_CAPTURE_CONFIG`.
 pub const FERRUM_CAPTURE_CONFIG_KEY: u32 = 0;
 
+/// Single SOCK_OPS event record published by the kernel-side
+/// `BPF_PROG_TYPE_SOCK_OPS` program over the ringbuf and consumed by the
+/// userspace `SockOpsConsumer`. Fixed-width fields for stable BPF wire
+/// shape; the userspace decoder maps this into the `SockOpsEvent` enum.
+///
+/// `event_type` selects which variant the record carries; meaning of the
+/// remaining fields depends on the variant — see the `SOCK_OPS_EVENT_*`
+/// constants. `_pad` keeps the struct 8-byte aligned for the BPF verifier.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SockOpsRecord {
+    /// One of the `SOCK_OPS_EVENT_*` constants.
+    pub event_type: u32,
+    /// Direction when meaningful (`SOCK_OPS_DIRECTION_*`); zero otherwise.
+    pub direction: u32,
+    /// Drop reason when `event_type == SOCK_OPS_EVENT_DROP_REASON`
+    /// (`SOCK_OPS_DROP_*`); zero otherwise.
+    pub drop_reason: u32,
+    pub _pad: u32,
+    /// Payload value for latency / RTT variants in microseconds. Zero for
+    /// pure event types (connect, accept_established, rst, fin).
+    pub value: u64,
+}
+
+// `SockOpsRecord::event_type` discriminants. Matches the
+// `SockOpsEvent` enum on the userspace side.
+pub const SOCK_OPS_EVENT_CONNECT: u32 = 1;
+pub const SOCK_OPS_EVENT_ACCEPT_ESTABLISHED: u32 = 2;
+pub const SOCK_OPS_EVENT_RST: u32 = 3;
+pub const SOCK_OPS_EVENT_FIN: u32 = 4;
+pub const SOCK_OPS_EVENT_RTT_SAMPLE: u32 = 5;
+pub const SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY: u32 = 6;
+pub const SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY: u32 = 7;
+pub const SOCK_OPS_EVENT_DROP_REASON: u32 = 8;
+
+// `SockOpsRecord::direction` values. Zero is "unused".
+pub const SOCK_OPS_DIRECTION_SENT: u32 = 1;
+pub const SOCK_OPS_DIRECTION_RECEIVED: u32 = 2;
+
+// `SockOpsRecord::drop_reason` values. Zero is "unused".
+pub const SOCK_OPS_DROP_BYPASS_UID_HIT: u32 = 1;
+pub const SOCK_OPS_DROP_EXCLUDE_CIDR_HIT: u32 = 2;
+pub const SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR: u32 = 3;
+pub const SOCK_OPS_DROP_EXCLUDE_PORT_HIT: u32 = 4;
+
+/// Default ringbuf byte size (4 MiB) used when
+/// `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` is unset. Must be a power of two.
+pub const SOCK_OPS_RINGBUF_DEFAULT_BYTES: u32 = 4 * 1024 * 1024;
+
+/// `FERRUM_SOCK_OPS_STATS` index for "events dropped because the ringbuf
+/// could not be reserved". Userspace polls this counter periodically; when
+/// it advances between polls, [`SockOpsConsumer::record_overrun`] fires.
+pub const SOCK_OPS_STATS_EVENTS_DROPPED: u32 = 0;
+/// Length of `FERRUM_SOCK_OPS_STATS` array map.
+pub const SOCK_OPS_STATS_LEN: u32 = 1;
+
 /// IPv4 loopback (127.0.0.1) stored as the `u32` the kernel's `user_ip4`
 /// field expects (network byte order in memory).
 pub const IPV4_LOOPBACK_NBO: u32 = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -147,6 +203,9 @@ mod tests {
         assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
+        // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
+        assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
+        assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
     }
 
     #[test]
@@ -159,6 +218,12 @@ mod tests {
         assert_copy::<BpfCaptureConfig>();
         assert_copy::<CidrKey4>();
         assert_copy::<CidrKey6>();
+        assert_copy::<SockOpsRecord>();
+    }
+
+    #[test]
+    fn sock_ops_default_ringbuf_size_is_power_of_two() {
+        assert!(SOCK_OPS_RINGBUF_DEFAULT_BYTES.is_power_of_two());
     }
 
     #[test]

@@ -4,9 +4,10 @@
 //! across program reloads and can be read by the proxy.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
     BpfCaptureConfig, CidrKey4, CidrKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo,
+    SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -53,3 +54,28 @@ pub static FERRUM_PORT_EXCLUDE: HashMap<u16, u8> = HashMap::with_max_entries(256
 /// Singleton node-agent capture settings.
 #[map]
 pub static FERRUM_CAPTURE_CONFIG: HashMap<u32, BpfCaptureConfig> = HashMap::with_max_entries(1, 0);
+
+/// SOCK_OPS event ringbuf. Sized at load time by the userspace loader from
+/// `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES`; the kernel default here
+/// (`SOCK_OPS_RINGBUF_DEFAULT_BYTES`, 4 MiB) is the fallback when the
+/// loader leaves the size unchanged.
+#[map]
+pub static FERRUM_SOCK_OPS_EVENTS: RingBuf =
+    RingBuf::with_byte_size(SOCK_OPS_RINGBUF_DEFAULT_BYTES, 0);
+
+/// SOCK_OPS per-program counters. Index `SOCK_OPS_STATS_EVENTS_DROPPED`
+/// tracks events that could not be reserved on the ringbuf (kernel-side
+/// "overrun" signal that userspace polls for warn/recover state machine).
+/// Per-CPU so the kernel-side increment is contention-free; userspace sums
+/// across CPUs when reading.
+#[map]
+pub static FERRUM_SOCK_OPS_STATS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(SOCK_OPS_STATS_LEN, 0);
+
+/// Per-socket cookie timestamps captured at outbound `TCP_CONNECT_CB` and
+/// consumed at `ACTIVE_ESTABLISHED_CB` so we can emit a SynToAck latency
+/// sample. Bounded LRU so listening sockets that never connect cannot
+/// grow the map unboundedly.
+#[map]
+pub static FERRUM_SOCK_OPS_CONNECT_TS: LruHashMap<u64, u64> =
+    LruHashMap::with_max_entries(65536, 0);
