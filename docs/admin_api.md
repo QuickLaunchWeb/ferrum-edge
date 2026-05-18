@@ -368,7 +368,7 @@ All families include a `namespace` label.
         "proxy-abc": {
           "proxy_name": "Payments API",
           "protocol_family": "http",
-          "total_charges": 1.50,
+          "total_charges": 1.5105,
           "total_calls": 150000,
           "by_status": {
             "200": { "calls": 145000, "charges": 1.45 },
@@ -384,7 +384,7 @@ All families include a `namespace` label.
         "tcp-edge": {
           "proxy_name": "TCP Edge",
           "protocol_family": "stream",
-          "total_charges": 0.04,
+          "total_charges": 0.0397,
           "total_calls": 42,
           "by_status": {},
           "bandwidth": {

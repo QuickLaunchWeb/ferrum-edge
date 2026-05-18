@@ -1,6 +1,6 @@
 //! API Chargeback Plugin
 //!
-//! Tracks per-consumer API usage charges across two pricing dimensions:
+//! Tracks per-consumer API usage charges across three pricing dimensions:
 //!
 //! 1. **Per-call pricing** keyed by HTTP status code (`pricing_tiers`) — used
 //!    for HTTP-family transactions (HTTP/1.1, H2, H3, gRPC, WebSocket upgrades).
