@@ -41,7 +41,7 @@ fn test_jwt_verification() {
 }
 
 #[test]
-fn test_admin_role_claim_parses_and_defaults_to_admin() {
+fn test_admin_role_claim_parses_and_requires_explicit_role() {
     let now = Utc::now();
     let mut claims = AdminClaims {
         iss: "test-issuer".to_string(),
@@ -55,7 +55,10 @@ fn test_admin_role_claim_parses_and_defaults_to_admin() {
     assert_eq!(claims.admin_role().unwrap(), AdminRole::Operator);
 
     claims.additional = json!({});
-    assert_eq!(claims.admin_role().unwrap(), AdminRole::Admin);
+    assert!(
+        claims.admin_role().is_err(),
+        "missing role claims must not fail open as admin"
+    );
 
     claims.additional = json!({"role": null});
     assert!(

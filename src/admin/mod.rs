@@ -808,7 +808,10 @@ pub async fn handle_admin_request(
     match (method, segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
-            crud::handle_list::<Proxy>(&state, &pagination, &namespace).await
+            crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
+        }
+        (Method::GET, ["proxies", id]) => {
+            crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
         }
         (Method::POST, ["proxies"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -816,7 +819,6 @@ pub async fn handle_admin_request(
             }
             crud::handle_create::<Proxy>(&state, &auth, &body_bytes, &namespace).await
         }
-        (Method::GET, ["proxies", id]) => crud::handle_get::<Proxy>(&state, id, &namespace).await,
         (Method::PUT, ["proxies", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
@@ -832,7 +834,7 @@ pub async fn handle_admin_request(
 
         // Consumers CRUD
         (Method::GET, ["consumers"]) => {
-            crud::handle_list::<Consumer>(&state, &pagination, &namespace).await
+            crud::handle_list::<Consumer>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["consumers"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -841,7 +843,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<Consumer>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["consumers", id]) => {
-            crud::handle_get::<Consumer>(&state, id, &namespace).await
+            crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["consumers", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -909,7 +911,7 @@ pub async fn handle_admin_request(
         // Plugins
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
-            crud::handle_list::<PluginConfig>(&state, &pagination, &namespace).await
+            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -918,7 +920,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<PluginConfig>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["plugins", "config", id]) => {
-            crud::handle_get::<PluginConfig>(&state, id, &namespace).await
+            crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -935,7 +937,7 @@ pub async fn handle_admin_request(
 
         // Upstreams CRUD
         (Method::GET, ["upstreams"]) => {
-            crud::handle_list::<Upstream>(&state, &pagination, &namespace).await
+            crud::handle_list::<Upstream>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["upstreams"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -944,7 +946,7 @@ pub async fn handle_admin_request(
             crud::handle_create::<Upstream>(&state, &auth, &body_bytes, &namespace).await
         }
         (Method::GET, ["upstreams", id]) => {
-            crud::handle_get::<Upstream>(&state, id, &namespace).await
+            crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

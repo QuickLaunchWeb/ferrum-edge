@@ -54,6 +54,7 @@ fn generate_test_token(config: &TestConfig) -> String {
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
@@ -69,6 +70,7 @@ fn generate_expired_test_token(config: &TestConfig) -> String {
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
+        "role": "admin",
         "iat": (now - chrono::Duration::seconds(900)).timestamp(),
         "nbf": (now - chrono::Duration::seconds(900)).timestamp(),
         "exp": (now - chrono::Duration::seconds(300)).timestamp(),

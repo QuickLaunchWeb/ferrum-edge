@@ -8,11 +8,11 @@ info:
     require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
-    Admin JWTs may include a string `role` claim. `viewer` can call read-only
+    Admin JWTs must include a string `role` claim. `viewer` can call read-only
     endpoints, `operator` can also mutate proxies, upstreams, plugin configs,
     and operational refresh/test endpoints, and `admin` has full access
     including consumers, credentials, API specs, batch/restore, and audit logs.
-    Tokens without `role` currently default to `admin` during build-out.
+    Tokens without a valid `role` claim are rejected.
 
     ## Namespaces
 
@@ -2630,8 +2630,8 @@ components:
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
 
-        Optional `role` claim values are `viewer`, `operator`, and `admin`.
-        Missing `role` defaults to `admin` during build-out.
+        Required `role` claim values are `viewer`, `operator`, and `admin`.
+        Tokens without a valid `role` claim are rejected.
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:

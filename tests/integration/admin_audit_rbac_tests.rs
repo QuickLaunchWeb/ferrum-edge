@@ -203,6 +203,25 @@ async fn viewer_role_is_rejected_on_admin_mutation() {
 }
 
 #[tokio::test]
+async fn token_without_role_claim_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let no_role = token("legacy-token", None);
+    let (status, body) = get_json(&base, "/upstreams", &no_role).await;
+
+    assert_eq!(status, 401, "missing-role token body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Missing admin role claim"),
+        "unexpected missing-role error body: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn non_admin_cannot_read_backup_unredacted_credentials() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
@@ -370,6 +389,64 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
 }
 
 #[tokio::test]
+async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let secret_key = "read-secret-load-test-key";
+    let nested_api_key = "read-nested-api-key-value";
+    let plugin = json!({
+        "id": "read-plugin-secret",
+        "plugin_name": "load_testing",
+        "scope": "global",
+        "config": {
+            "key": secret_key,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "nested": {
+                "api_key": nested_api_key,
+                "label": "safe-label"
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let (status, viewer_body) =
+        get_json(&base, "/plugins/config/read-plugin-secret", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
+    assert_eq!(viewer_body["config"]["nested"]["api_key"], "[REDACTED]");
+    assert!(
+        !viewer_body.to_string().contains(secret_key),
+        "viewer response leaked plugin secret: {viewer_body:?}"
+    );
+    assert!(
+        !viewer_body.to_string().contains(nested_api_key),
+        "viewer response leaked nested plugin secret: {viewer_body:?}"
+    );
+
+    let (status, operator_body) =
+        get_json(&base, "/plugins/config/read-plugin-secret", &operator).await;
+    assert_eq!(status, 200, "operator plugin get failed: {operator_body:?}");
+    assert_eq!(operator_body["config"]["key"], "[REDACTED]");
+
+    let (status, admin_body) = get_json(&base, "/plugins/config/read-plugin-secret", &admin).await;
+    assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
+    assert_eq!(admin_body["config"]["key"], secret_key);
+    assert_eq!(admin_body["config"]["nested"]["api_key"], nested_api_key);
+
+    let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
+    assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+}
+
+#[tokio::test]
 async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
@@ -462,6 +539,66 @@ async fn upstream_consul_token_redacted_in_audit_diff() {
     assert!(
         !serialized.contains(consul_token),
         "plaintext consul token leaked into audit diff: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_admin_upstream_reads_redact_consul_token() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let consul_token = "read-secret-consul-acl-token";
+    let upstream = json!({
+        "id": "read-consul-upstream",
+        "name": "read-upstream-consul",
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin",
+        "service_discovery": {
+            "provider": "consul",
+            "consul": {
+                "address": "http://consul.local:8500",
+                "service_name": "my-service",
+                "token": consul_token
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/upstreams", &admin, &upstream).await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, viewer_body) = get_json(&base, "/upstreams/read-consul-upstream", &viewer).await;
+    assert_eq!(status, 200, "viewer upstream get failed: {viewer_body:?}");
+    assert_eq!(
+        viewer_body["service_discovery"]["consul"]["token"],
+        "[REDACTED]"
+    );
+    assert!(
+        !viewer_body.to_string().contains(consul_token),
+        "viewer response leaked consul token: {viewer_body:?}"
+    );
+
+    let (status, operator_body) =
+        get_json(&base, "/upstreams/read-consul-upstream", &operator).await;
+    assert_eq!(
+        status, 200,
+        "operator upstream get failed: {operator_body:?}"
+    );
+    assert_eq!(
+        operator_body["service_discovery"]["consul"]["token"],
+        "[REDACTED]"
+    );
+
+    let (status, admin_body) = get_json(&base, "/upstreams/read-consul-upstream", &admin).await;
+    assert_eq!(status, 200, "admin upstream get failed: {admin_body:?}");
+    assert_eq!(
+        admin_body["service_discovery"]["consul"]["token"],
+        consul_token
     );
 }
 

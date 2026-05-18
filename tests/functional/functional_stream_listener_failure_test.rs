@@ -65,6 +65,7 @@ fn admin_jwt() -> String {
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "stream-listener-test-admin",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

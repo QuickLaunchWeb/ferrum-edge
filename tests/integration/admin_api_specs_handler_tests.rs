@@ -60,6 +60,7 @@ fn make_token() -> String {
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "test-user",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600i64)).timestamp(),

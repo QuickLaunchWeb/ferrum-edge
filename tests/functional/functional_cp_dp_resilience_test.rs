@@ -258,6 +258,7 @@ fn generate_admin_token() -> String {
     let claims = json!({
         "iss": "ferrum-edge",
         "sub": "resilience-test",
+        "role": "admin",
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),

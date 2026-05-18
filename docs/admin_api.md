@@ -13,7 +13,7 @@ See also:
 
 All endpoints (except `/health`, `/status`, `/overload`, and exact `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/metrics/runtime` requires JWT authentication because it exposes process and host diagnostics. `/charges` also requires JWT authentication because it exposes customer and billing data.
 
-Admin JWTs may include a string `role` claim:
+Admin JWTs must include a string `role` claim:
 
 | Role | Access |
 | --- | --- |
@@ -21,13 +21,13 @@ Admin JWTs may include a string `role` claim:
 | `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, and mesh egress-scope test operations |
 | `admin` | Full access, including consumers, credentials, API specs, batch/restore, and audit logs |
 
-Tokens without a `role` claim are treated as `admin` during the build-out phase so existing externally minted admin tokens continue to work.
+Tokens without a valid `role` claim are rejected.
 
 Generate a token:
 ```bash
-# Using any JWT library; payload can be minimal
+# Using any JWT library; include an explicit role
 # Example using Node.js jsonwebtoken:
-node -e "console.log(require('jsonwebtoken').sign({sub:'admin'}, 'my-super-secret-jwt-key'))"
+node -e "console.log(require('jsonwebtoken').sign({sub:'admin', role:'admin'}, 'my-super-secret-jwt-key'))"
 ```
 
 ## Health Check (Unauthenticated)
