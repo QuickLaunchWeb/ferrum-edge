@@ -272,31 +272,48 @@ fn route_status(
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
 ) -> Value {
-    let (accepted, resolved_refs, programmed, reason, message) = match result {
-        Ok(translation) => {
-            let programmed = route_programmed(object, &translation.config);
-            (
-                true,
-                true,
-                programmed,
-                if programmed { "Accepted" } else { "NoRules" },
-                if programmed {
-                    "Ferrum accepted and programmed this route".to_string()
+    let (accepted, resolved_refs, programmed, accepted_reason, resolved_refs_reason, message) =
+        match result {
+            Ok(translation) => {
+                let programmed = route_programmed(object, &translation.config);
+                (
+                    true,
+                    true,
+                    programmed,
+                    if programmed { "Accepted" } else { "NoRules" },
+                    "ResolvedRefs",
+                    if programmed {
+                        "Ferrum accepted and programmed this route".to_string()
+                    } else {
+                        "Ferrum accepted this route but no materialized rule was produced"
+                            .to_string()
+                    },
+                )
+            }
+            Err(error) => {
+                if error_is_reference_resolution(error) {
+                    (
+                        true,
+                        false,
+                        false,
+                        "Accepted",
+                        "BackendRefNotPermitted",
+                        format!(
+                            "Ferrum accepted this route but could not resolve all backendRefs: {error}"
+                        ),
+                    )
                 } else {
-                    "Ferrum accepted this route but no materialized rule was produced".to_string()
-                },
-            )
-        }
-        Err(error) => {
-            let message = format!("Ferrum rejected this route: {error}");
-            let reason = if error_is_reference_resolution(error) {
-                "BackendRefNotPermitted"
-            } else {
-                "Invalid"
-            };
-            (false, false, false, reason, message)
-        }
-    };
+                    (
+                        false,
+                        false,
+                        false,
+                        "Invalid",
+                        "Invalid",
+                        format!("Ferrum rejected this route: {error}"),
+                    )
+                }
+            }
+        };
 
     let mut parents = retained_existing_parent_statuses(&object.status, managed_parent_refs);
     for parent_ref in managed_parent_refs {
@@ -328,7 +345,7 @@ fn route_status(
         let accepted_reason = if all_parent_matches_conflicted {
             "Conflicted"
         } else {
-            reason
+            accepted_reason
         };
         let accepted_message = if all_parent_matches_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
@@ -370,7 +387,7 @@ fn route_status(
                 if resolved_refs {
                     "ResolvedRefs"
                 } else {
-                    reason
+                    resolved_refs_reason
                 },
                 if resolved_refs {
                     "All backendRefs accepted by Ferrum"
@@ -945,9 +962,13 @@ mod tests {
         let route_update = update_for(&updates, "HTTPRoute", "api");
         let parents = route_update.status["parents"].as_array().unwrap();
         let conditions = parents[0]["conditions"].as_array().unwrap();
-        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "Accepted", "True");
         assert_condition(conditions, "ResolvedRefs", "False");
         assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("Accepted")
+        );
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("BackendRefNotPermitted")
