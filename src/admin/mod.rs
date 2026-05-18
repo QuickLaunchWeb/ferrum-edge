@@ -1007,6 +1007,9 @@ pub async fn handle_admin_request(
             handle_mesh_egress_scope_test(&state, &body_bytes).await
         }
 
+        // Mesh trust-bundle federation status (GAP-3C).
+        (Method::GET, ["mesh", "federation"]) => handle_mesh_federation_get(&state).await,
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -1092,6 +1095,56 @@ async fn handle_mesh_egress_scope_get(
             "namespace": proxy_state.env_config.namespace,
             "scope": scope,
             "health": egress.health(),
+        }),
+    ))
+}
+
+async fn handle_mesh_federation_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh federation"}),
+        ));
+    };
+    let store = mesh_runtime.federation_store();
+    if !store.has_first_success() {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No mesh federation bundles cached yet"}),
+        ));
+    }
+    let snapshot = store.snapshot();
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let mut bundles: Vec<serde_json::Value> = snapshot
+        .bundles
+        .values()
+        .map(|fed| {
+            json!({
+                "cluster": fed.cluster_name,
+                "trust_domain": fed.bundle.trust_domain.as_str(),
+                "endpoint": fed.endpoint,
+                "fetched_at_unix_seconds": fed.fetched_at_unix_seconds,
+                "bundle_age_seconds": now.saturating_sub(fed.fetched_at_unix_seconds),
+                "x509_authorities": fed.bundle.x509_authorities.len(),
+                "jwt_authorities": fed.bundle.jwt_authorities.len(),
+                "refresh_hint_seconds": fed.bundle.refresh_hint_seconds,
+            })
+        })
+        .collect();
+    // Deterministic ordering for tooling / human reads — `HashMap` iteration
+    // order isn't stable across restarts. Cheap on cold paths.
+    bundles.sort_by(|a, b| {
+        a.get("trust_domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .cmp(b.get("trust_domain").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "bundles": bundles,
         }),
     ))
 }

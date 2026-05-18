@@ -956,6 +956,88 @@ paths:
                   error:
                     type: string
 
+  /mesh/federation:
+    get:
+      operationId: getMeshFederation
+      summary: Inspect the live SPIFFE trust-bundle federation snapshot
+      description: |
+        Returns the currently cached cross-cluster SPIFFE trust bundles
+        fetched by the federation poller. The poller hits each
+        `MultiClusterConfig.remote_clusters[].federation_endpoint` at
+        `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the
+        validated bundle on `TrustBundleSet.federated`. Each entry includes
+        the originating cluster name, trust domain, endpoint URL, fetch
+        timestamp, derived bundle age, and authority counts.
+
+        Returns `404 Not Found` outside mesh mode (when the mesh runtime
+        state is not wired into the admin API) or before the first
+        successful poll. Polled bundles win on conflict against any
+        CP-supplied federated entries — operators inspect this endpoint to
+        confirm the freshest rotation is in effect.
+      tags: [Mesh Federation]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cached federation snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bundles]
+                properties:
+                  bundles:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - cluster
+                        - trust_domain
+                        - endpoint
+                        - fetched_at_unix_seconds
+                        - bundle_age_seconds
+                        - x509_authorities
+                        - jwt_authorities
+                      properties:
+                        cluster:
+                          type: string
+                          description: Operator-facing name of the RemoteCluster entry.
+                        trust_domain:
+                          type: string
+                          description: SPIFFE trust domain.
+                        endpoint:
+                          type: string
+                          description: HTTPS endpoint the bundle was fetched from.
+                        fetched_at_unix_seconds:
+                          type: integer
+                          format: int64
+                        bundle_age_seconds:
+                          type: integer
+                          format: int64
+                          description: Seconds since `fetched_at_unix_seconds`. Saturates at 0.
+                        x509_authorities:
+                          type: integer
+                          description: Number of cached X.509 authority entries.
+                        jwt_authorities:
+                          type: integer
+                          description: Number of cached JWT authority entries.
+                        refresh_hint_seconds:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: SPIFFE `spiffe_refresh_hint` from the bundle, if present.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No mesh federation bundles cached yet (poller disabled, not in mesh mode, or no successful poll)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Audit ────────────────────────────────────────────────────────────
   /audit:
     parameters:

@@ -29,6 +29,10 @@ static MESH_CONFIG_LAST_RECEIVED: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static MESH_MTLS_HANDSHAKE_FAILURES: LazyLock<DashMap<MeshMtlsHandshakeFailureKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_FEDERATION_POLL_FAILURES: LazyLock<DashMap<MeshFederationPollFailureKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_FEDERATION_LAST_SUCCESS: LazyLock<DashMap<Arc<str>, AtomicU64>> =
+    LazyLock::new(DashMap::new);
 
 /// Istio/GAMMA-style RED metric key for mesh HTTP-family requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -75,6 +79,12 @@ struct MeshTrustBundleVersionKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshMtlsHandshakeFailureKey {
     reason: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshFederationPollFailureKey {
+    trust_domain: Arc<str>,
+    endpoint: Arc<str>,
 }
 
 struct MeshCertExpiryGauge {
@@ -235,6 +245,30 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
         .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
 }
 
+pub fn increment_mesh_federation_poll_failure(
+    trust_domain: impl AsRef<str>,
+    endpoint: impl AsRef<str>,
+) {
+    let key = MeshFederationPollFailureKey {
+        trust_domain: Arc::from(trust_domain.as_ref()),
+        endpoint: Arc::from(endpoint.as_ref()),
+    };
+    MESH_FEDERATION_POLL_FAILURES
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_mesh_federation_poll_success(
+    trust_domain: impl AsRef<str>,
+    fetched_at_unix_seconds: u64,
+) {
+    MESH_FEDERATION_LAST_SUCCESS
+        .entry(Arc::from(trust_domain.as_ref()))
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(fetched_at_unix_seconds, Ordering::Relaxed);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -335,6 +369,48 @@ pub fn render_mesh_cert_metrics(output: &mut String) {
                 "ferrum_mesh_mtls_handshake_failures_total{{reason=\"{}\"}} {}\n",
                 escape_label_value(&entry.key().reason),
                 entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_FEDERATION_POLL_FAILURES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_federation_poll_failures_total SPIFFE federation trust-bundle poll failures.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_federation_poll_failures_total counter\n");
+        for entry in MESH_FEDERATION_POLL_FAILURES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().trust_domain),
+                escape_label_value(&entry.key().endpoint),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_FEDERATION_LAST_SUCCESS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_federation_last_success_timestamp_seconds Unix timestamp of last successful SPIFFE federation poll.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_federation_last_success_timestamp_seconds gauge\n");
+        output.push_str(
+            "# HELP ferrum_mesh_federation_bundle_age_seconds Age of the cached federated trust bundle, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_federation_bundle_age_seconds gauge\n");
+        for entry in MESH_FEDERATION_LAST_SUCCESS.iter() {
+            let last = entry.value().load(Ordering::Relaxed);
+            let trust_domain = escape_label_value(entry.key());
+            output.push_str(&format!(
+                "ferrum_mesh_federation_last_success_timestamp_seconds{{trust_domain=\"{}\"}} {}\n",
+                trust_domain, last
+            ));
+            // Age clamps to 0 when the cached "last" timestamp is somehow in the
+            // future (clock skew on a restart). Saturating subtraction keeps the
+            // gauge non-negative for a Prometheus `gauge` type.
+            let age = now.saturating_sub(last);
+            output.push_str(&format!(
+                "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"}} {}\n",
+                trust_domain, age
             ));
         }
     }

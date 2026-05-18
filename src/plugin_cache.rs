@@ -708,6 +708,13 @@ impl PluginCache {
         })
     }
 
+    /// Borrow the shared HTTP client configured at construction. Used by
+    /// out-of-band runtime tasks (mesh federation poller, etc.) that need
+    /// the same DNS cache, pool settings, and TLS configuration as plugins.
+    pub fn http_client(&self) -> &PluginHttpClient {
+        &self.http_client
+    }
+
     pub(crate) fn build_inner(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,

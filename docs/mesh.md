@@ -607,6 +607,43 @@ In addition to remote-cluster gateways, the east-west topology materializes a TC
 
 X.509 authorities are stored as base64-encoded DER for serialization-friendly persistence. JWT authorities carry `key_id` and `public_key_pem`.
 
+A background poller hits each `RemoteCluster.federation_endpoint` over HTTPS at
+`FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` (default 300; `0` disables) and
+overlays the fetched bundle onto `TrustBundleSet.federated` for cross-cluster
+mTLS verification. The polled bundle is validated through the same invariants
+the slice validator applies before swapping the `ArcSwap`-held snapshot, so a
+malformed remote response is rejected and the last-good bundle stays in
+service. Per-target failures use jittered exponential backoff (1s → 30s cap,
+±25%, matching `src/grpc/dp_client.rs`); successes reset the backoff to the
+configured poll interval. The polled bundles win on conflict against any
+control-plane-supplied federated entries because the poller signals the
+freshest rotation; CP-supplied bundles remain as a fallback for trust domains
+the poller has not yet fetched. `FERRUM_MESH_FEDERATION_FAIL_OPEN` is reserved
+for future verifier integration — today it is recorded in poll-failure log
+lines for operator visibility but does NOT change verifier behavior. Verifier
+behavior is fail-closed regardless of the flag (verification only succeeds
+against the last-good cached bundle). Endpoints are validated at slice apply
+for SSRF (link-local / loopback / cloud metadata IPs are rejected) and must
+use `https://`; response bodies are capped at 2 MiB and parsed bundles are
+capped at 256 X.509 + 256 JWT authorities.
+
+Two on-the-wire formats are accepted:
+
+1. The native Ferrum `TrustBundle` JSON shape (round-trips through
+   `serde_json` from the persistence model).
+2. The SPIFFE Trust Domain and Bundle JWKS profile
+   (`{"keys": [{"use": "x509-svid", "x5c": ["..."]}], "spiffe_refresh_hint":
+   60}`). The trust domain is supplied by the surrounding `RemoteCluster`
+   entry because SPIFFE bundles do not carry it inline.
+
+The federation snapshot is exposed at `GET /mesh/federation` (JWT-auth), with
+per-trust-domain `bundle_age_seconds` and authority counts, and emits these
+Prometheus series alongside the existing mesh metrics:
+
+- `ferrum_mesh_federation_poll_failures_total{trust_domain,endpoint}`
+- `ferrum_mesh_federation_last_success_timestamp_seconds{trust_domain}`
+- `ferrum_mesh_federation_bundle_age_seconds{trust_domain}`
+
 ### Remote Clusters
 
 `RemoteCluster` entries identify peer clusters:
