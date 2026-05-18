@@ -555,6 +555,17 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        # Cache restore/save is a build-time optimization, not a correctness
+        # input. The Windows runner occasionally fails the post-step cache
+        # upload to GitHub's cache service with no log output (observed on PR
+        # #884: tar.exe completes, then the step is marked failed before any
+        # error is printed). The release binary itself is already built and
+        # uploaded as an artifact before this step's post phase runs, so a
+        # cache miss / save failure should not gate the binary build. Treat
+        # this step as best-effort across all targets to avoid an entire
+        # build matrix entry going red on a transient GitHub Actions cache
+        # issue.
+        continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}"
 
