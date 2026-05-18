@@ -3923,6 +3923,7 @@ mod tests {
             labels: HashMap::from([("version".to_string(), "v2".to_string())]),
             traffic_policy: Some(crate::config::types::SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
+                tls: None,
             }),
         }];
         let lb = LoadBalancer::with_subsets(

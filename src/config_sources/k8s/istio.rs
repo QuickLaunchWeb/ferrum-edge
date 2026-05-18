@@ -1272,12 +1272,10 @@ fn translate_subset(
                 object.metadata.namespace, object.metadata.name, name
             ));
         }
-        if policy.tls.is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} subset '{}' trafficPolicy.tls is parsed but not yet applied per-subset; only the top-level trafficPolicy.tls projects onto the resolved Upstream's backend_tls_* fields",
-                object.metadata.namespace, object.metadata.name, name
-            ));
-        }
+        // `policy.tls` is now applied per-subset by the cold-path apply in
+        // `src/modes/mesh/mod.rs::resolve_subset_traffic_policy_tls` and
+        // projected onto `Proxy.resolved_tls` for proxies that select this
+        // subset via `upstream_subset`. No warn needed.
     }
 
     Ok(MeshSubset {
@@ -9640,9 +9638,12 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_tls_is_parsed_and_warns() {
-        // Per-subset trafficPolicy.tls is parsed onto the MeshSubset but not
-        // yet projected onto a per-subset Upstream-TLS view — surface a warning.
+    fn destination_rule_subset_tls_is_parsed_without_warning() {
+        // Per-subset trafficPolicy.tls is now applied per-subset by the
+        // cold-path apply in `src/modes/mesh/mod.rs::resolve_subset_traffic_policy_tls`
+        // and projected onto `Proxy.resolved_tls` for proxies that select the
+        // subset via `upstream_subset`. The translator parses it onto
+        // `MeshSubset.traffic_policy.tls` with no warning.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -9676,14 +9677,14 @@ extensionProviders:
         assert_eq!(tls.mode, MtlsMode::Simple);
         assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
 
-        // And a translator-level warning surfaced so operators know it isn't
-        // applied per-subset on the cold path yet.
+        // No translator-level warning is emitted because the per-subset TLS
+        // overlay is applied on the cold path.
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
                 .any(|w| w.contains("trafficPolicy.tls is parsed but not yet applied per-subset")),
-            "expected per-subset tls warning, got: {:?}",
+            "expected no per-subset tls warning, got: {:?}",
             result.warnings
         );
     }

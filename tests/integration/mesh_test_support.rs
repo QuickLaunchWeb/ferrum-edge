@@ -356,6 +356,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         backend_tls_server_ca_cert_path: None,
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
         api_spec_id: None,
         created_at: now,
         updated_at: now,

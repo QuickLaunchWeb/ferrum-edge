@@ -204,6 +204,13 @@ fn write_grpc_pool_key(
     let _ = write!(buf, "{}|{}|{}|", host, port, tls);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
+    // Subset name partitions gRPC pools so two proxies that share
+    // `(host, port, scheme, dns_override)` but select different
+    // DestinationRule subsets cannot share an H2 gRPC sender even when their
+    // TLS material is byte-identical. Empty when the proxy has no
+    // `upstream_subset`.
+    buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+    buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,
@@ -370,9 +377,12 @@ impl GrpcConnectionPool {
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
-    /// Currently unused post-refactor; see `pool_key_owned`.
+    /// `pub` for parity with `Http2ConnectionPool::pool_key_for_warmup` so
+    /// external integration/unit tests can verify pool-key partitioning
+    /// behavior (e.g., GAP-3B subset partitioning regression guard in
+    /// `tests/unit/gateway_core/pool_key_tests.rs`).
     #[allow(dead_code)]
-    pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
+    pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
     }
 

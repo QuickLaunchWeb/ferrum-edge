@@ -898,7 +898,7 @@ impl Http3ConnectionPool {
         use std::fmt::Write;
         buf.clear();
         // Key shape:
-        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+        //   host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
         //
         // This must cover every dimension that affects QUIC connection
         // identity *and* matches the backend-capability registry key for
@@ -907,13 +907,20 @@ impl Http3ConnectionPool {
         // probed QUIC connection be reused for another proxy whose
         // resolver / cert material differs — the exact wrong-backend /
         // wrong-identity bug the reviewer flagged.
+        //
+        // `subset` partitions H3 pools so two proxies that share
+        // `(host, port, dns_override)` but select different DestinationRule
+        // subsets cannot share a QUIC connection even when their TLS
+        // material is byte-identical. Empty when the proxy has no
+        // `upstream_subset`.
         let _ = write!(
             buf,
-            "{}|{}|{}|{}|",
+            "{}|{}|{}|{}|{}|",
             host,
             port,
             index,
             proxy.dns_override.as_deref().unwrap_or_default(),
+            proxy.upstream_subset.as_deref().unwrap_or_default(),
         );
         append_backend_tls_pool_key_fields(
             buf,

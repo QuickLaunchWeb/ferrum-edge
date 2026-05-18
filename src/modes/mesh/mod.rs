@@ -30,8 +30,9 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
-    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget,
+    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -1017,6 +1018,7 @@ fn build_east_west_service_proxies_and_upstreams(
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -1280,11 +1282,17 @@ fn apply_destination_rules(
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                                tls: sp.tls.clone(),
                             }
                         }),
                     })
                     .collect();
                 upstream.subsets = Some(subset_defs);
+                // Drop any stale per-subset TLS overlays from a previous DR
+                // application of this upstream. The next pass below
+                // recomputes overlays for the new subset set against the
+                // final upstream-level TLS.
+                upstream.resolved_subset_tls.clear();
             }
 
             if let Some(timeout_ms) = connect_timeout_ms {
@@ -1308,6 +1316,68 @@ fn apply_destination_rules(
         }
     }
 
+    // Final pass: project per-subset `trafficPolicy.tls` overlays onto each
+    // upstream's `resolved_subset_tls` map. Runs once after all DRs are
+    // applied so subset TLS layers over the FINAL upstream-level TLS rather
+    // than whatever value a mid-loop pass would have observed.
+    resolve_subset_traffic_policy_tls(config, runtime)?;
+
+    Ok(())
+}
+
+/// Compute each upstream's per-subset resolved TLS overlay against the
+/// upstream's settled `backend_tls_*` posture. Skips upstreams with no
+/// subsets and subsets with no `trafficPolicy.tls`. The result lands on
+/// `Upstream.resolved_subset_tls` keyed by subset name; consulted by
+/// [`GatewayConfig::resolve_upstream_tls`] for proxies whose
+/// `upstream_subset` selects that subset.
+///
+/// Fail-closed: any subset whose `trafficPolicy.tls` cannot be resolved
+/// (e.g., `ISTIO_MUTUAL` requested without SVID material) rejects the entire
+/// slice via `Err`, matching [`apply_traffic_policy_tls_to_upstream`]'s
+/// upstream-level semantics. Silently degrading to upstream-level TLS would
+/// turn an operator-requested mTLS posture into whatever the upstream defaults
+/// to (potentially `SIMPLE` with a public CA).
+fn resolve_subset_traffic_policy_tls(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Result<(), anyhow::Error> {
+    for upstream in &mut config.upstreams {
+        let Some(subsets) = upstream.subsets.as_ref() else {
+            // No subsets — make sure any stale map from a previous apply
+            // doesn't survive a slice that removed all subsets.
+            upstream.resolved_subset_tls.clear();
+            continue;
+        };
+        let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
+        let mut resolved_map: HashMap<String, ResolvedSubsetTrafficPolicy> = HashMap::new();
+        for subset in subsets {
+            let Some(subset_tls) = subset
+                .traffic_policy
+                .as_ref()
+                .and_then(|tp| tp.tls.as_ref())
+            else {
+                continue;
+            };
+            let identity = format!("{}/{}", upstream.id, subset.name);
+            let mut slot = upstream_base_tls.clone();
+            apply_traffic_policy_tls_to_backend_config(
+                &mut slot, subset_tls, runtime, &identity,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
+                    upstream.id,
+                    subset.name,
+                    e
+                )
+            })?;
+            if let Some(resolved) = ResolvedSubsetTrafficPolicy::from_tls(Some(slot)) {
+                resolved_map.insert(subset.name.clone(), resolved);
+            }
+        }
+        upstream.resolved_subset_tls = resolved_map;
+    }
     Ok(())
 }
 
@@ -1448,55 +1518,85 @@ fn apply_traffic_policy_to_upstream(
 }
 
 /// Project `MeshTrafficPolicyTls` onto an `Upstream`'s `backend_tls_*`
-/// fields. The DR wins over the PeerAuthentication-derived default for
-/// every field it sets.
+/// fields. Thin shim over [`apply_traffic_policy_tls_to_backend_config`] that
+/// builds a `BackendTlsConfig` view of the upstream's TLS fields, runs the
+/// shared overlay, and writes the result back. The DR wins over the
+/// PeerAuthentication-derived default for every field it sets.
+///
+/// See [`apply_traffic_policy_tls_to_backend_config`] for the per-mode mapping
+/// (`Disable` / `Simple` / `Mutual` / `IstioMutual`), the
+/// `insecure_skip_verify` precedence rules, and SAN/SNI bounding behaviour.
+fn apply_traffic_policy_tls_to_upstream(
+    upstream: &mut Upstream,
+    tls: &MeshTrafficPolicyTls,
+    runtime: &MeshRuntimeConfig,
+) -> Result<(), anyhow::Error> {
+    let mut slot = BackendTlsConfig::from_upstream(upstream);
+    apply_traffic_policy_tls_to_backend_config(&mut slot, tls, runtime, &upstream.id)?;
+    upstream.backend_tls_client_cert_path = slot.client_cert_path;
+    upstream.backend_tls_client_key_path = slot.client_key_path;
+    upstream.backend_tls_server_ca_cert_path = slot.server_ca_cert_path;
+    upstream.backend_tls_verify_server_cert = slot.verify_server_cert;
+    upstream.backend_tls_sni = slot.sni;
+    upstream.backend_tls_san_allow_list = slot.san_allow_list;
+    Ok(())
+}
+
+/// Project `MeshTrafficPolicyTls` onto a `BackendTlsConfig` slot.
+///
+/// Shared overlay used by both the upstream-level apply
+/// ([`apply_traffic_policy_tls_to_upstream`]) and the per-subset apply
+/// ([`apply_subset_traffic_policy_tls`]), so subset TLS overrides cannot drift
+/// from the upstream-level translation. `identity` is used only for log /
+/// error context (the upstream id, or `<upstream>/<subset>`).
 ///
 /// Mapping:
-/// - `Disable`: clear all client TLS material; mark server-cert verify off
-///   (no TLS handshake actually originates — `backend_scheme` controls that
-///   on the proxy side and is not changed here; this only neutralizes the
-///   upstream's TLS config so a backend that does happen to negotiate TLS
-///   downstream does not pin client material).
+/// - `Disable`: clear all client TLS material and stale SNI / SAN allow-list;
+///   leave `verify_server_cert` at its current value (TLS may still originate
+///   when the proxy's `backend_scheme` is `https`) unless the operator also
+///   asked for `insecure_skip_verify`.
 /// - `Simple`: enable server-cert verification; populate CA from
 ///   `ca_certificates`; clear any stale client cert/key.
 /// - `Mutual`: enable server-cert verification; populate CA, client cert,
 ///   and private key from the DR.
 /// - `IstioMutual`: enable server-cert verification; project the workload's
 ///   X.509-SVID cert/key paths and trust bundle from the mesh runtime onto the
-///   upstream.
+///   slot.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
-/// `backend_tls_verify_server_cert=false` regardless of mode.
+/// `verify_server_cert=false` regardless of mode.
 ///
-/// SNI (`tls.sni`) and `subject_alt_names` project onto upstream fields here.
-/// SAN lists are bounded here too because mesh-projected upstreams skip admin
-/// admission. Later backend dispatch/verifier work consumes the resolved cache.
-fn apply_traffic_policy_tls_to_upstream(
-    upstream: &mut Upstream,
+/// SNI (`tls.sni`) and `subject_alt_names` project onto slot fields here. SAN
+/// lists are bounded because mesh-projected slots skip admin admission. The
+/// SAN-allow-list digest is recomputed at the end so pool keys partition on
+/// the current SAN set.
+fn apply_traffic_policy_tls_to_backend_config(
+    slot: &mut BackendTlsConfig,
     tls: &MeshTrafficPolicyTls,
     runtime: &MeshRuntimeConfig,
+    identity: &str,
 ) -> Result<(), anyhow::Error> {
     match tls.mode {
         MtlsMode::Disable => {
-            upstream.backend_tls_client_cert_path = None;
-            upstream.backend_tls_client_key_path = None;
-            upstream.backend_tls_server_ca_cert_path = None;
-            upstream.backend_tls_sni = None;
-            upstream.backend_tls_san_allow_list.clear();
+            slot.client_cert_path = None;
+            slot.client_key_path = None;
+            slot.server_ca_cert_path = None;
+            slot.sni = None;
+            slot.san_allow_list.clear();
             // When mTLS is explicitly disabled, leave `verify_server_cert`
             // at its current value (TLS may still originate when the
             // proxy's `backend_scheme` is `https`) unless the operator
             // also asked for skip_verify.
         }
         MtlsMode::Simple => {
-            upstream.backend_tls_client_cert_path = None;
-            upstream.backend_tls_client_key_path = None;
-            upstream.backend_tls_server_ca_cert_path = tls.ca_certificates.clone();
+            slot.client_cert_path = None;
+            slot.client_key_path = None;
+            slot.server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::Mutual => {
-            upstream.backend_tls_client_cert_path = tls.client_certificate.clone();
-            upstream.backend_tls_client_key_path = tls.private_key.clone();
-            upstream.backend_tls_server_ca_cert_path = tls.ca_certificates.clone();
+            slot.client_cert_path = tls.client_certificate.clone();
+            slot.client_key_path = tls.private_key.clone();
+            slot.server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
             let (Some(cert_path), Some(key_path)) = (
@@ -1504,27 +1604,26 @@ fn apply_traffic_policy_tls_to_upstream(
                 runtime.workload_svid_key_path.clone(),
             ) else {
                 return Err(anyhow::anyhow!(
-                    "DestinationRule ISTIO_MUTUAL for upstream '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH and FERRUM_GATEWAY_SVID_KEY_PATH",
-                    upstream.id
+                    "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH and FERRUM_GATEWAY_SVID_KEY_PATH",
+                    identity
                 ));
             };
-            upstream.backend_tls_server_ca_cert_path =
-                runtime.workload_svid_trust_bundle_path.clone();
+            slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
             if runtime.workload_svid_trust_bundle_path.is_none() {
                 warn!(
-                    upstream = %upstream.id,
-                    "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale upstream CA and falling back to global/default trust"
+                    identity = %identity,
+                    "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
                 );
             }
-            upstream.backend_tls_client_cert_path = Some(cert_path);
-            upstream.backend_tls_client_key_path = Some(key_path);
+            slot.client_cert_path = Some(cert_path);
+            slot.client_key_path = Some(key_path);
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
         // error. Treat as a no-op rather than panic on the cold path.
         MtlsMode::Strict | MtlsMode::Permissive => {
             warn!(
-                upstream = %upstream.id,
+                identity = %identity,
                 mode = ?tls.mode,
                 "DestinationRule trafficPolicy.tls.mode is a server-side mode and cannot apply to client-side backend TLS; ignoring"
             );
@@ -1536,30 +1635,30 @@ fn apply_traffic_policy_tls_to_upstream(
     // forces false; otherwise SIMPLE/MUTUAL/ISTIO_MUTUAL require verify=true
     // and DISABLE leaves the existing value alone.
     if tls.insecure_skip_verify {
-        upstream.backend_tls_verify_server_cert = false;
+        slot.verify_server_cert = false;
     } else if matches!(
         tls.mode,
         MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual
     ) {
-        upstream.backend_tls_verify_server_cert = true;
+        slot.verify_server_cert = true;
     }
 
     if tls.mode != MtlsMode::Disable {
-        upstream.backend_tls_sni = bounded_backend_tls_sni(&upstream.id, tls.sni.as_deref());
-        upstream.backend_tls_san_allow_list =
-            bounded_backend_tls_san_allow_list(&upstream.id, &tls.subject_alt_names);
+        slot.sni = bounded_backend_tls_sni(identity, tls.sni.as_deref());
+        slot.san_allow_list = bounded_backend_tls_san_allow_list(identity, &tls.subject_alt_names);
     }
 
+    slot.recompute_san_digest();
     Ok(())
 }
 
-fn bounded_backend_tls_sni(upstream_id: &str, sni: Option<&str>) -> Option<String> {
+fn bounded_backend_tls_sni(identity: &str, sni: Option<&str>) -> Option<String> {
     let sni = sni?;
     match crate::config::types::validate_backend_tls_sni(sni) {
         Ok(()) => Some(sni.to_ascii_lowercase()),
         Err(error) => {
             warn!(
-                upstream = %upstream_id,
+                identity = %identity,
                 error = %error,
                 "DestinationRule trafficPolicy.tls.sni is invalid for backend TLS; dropping SNI override"
             );
@@ -1568,11 +1667,11 @@ fn bounded_backend_tls_sni(upstream_id: &str, sni: Option<&str>) -> Option<Strin
     }
 }
 
-fn bounded_backend_tls_san_allow_list(upstream_id: &str, sans: &[String]) -> Vec<String> {
+fn bounded_backend_tls_san_allow_list(identity: &str, sans: &[String]) -> Vec<String> {
     let mut bounded = Vec::with_capacity(sans.len().min(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES));
     if sans.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
         warn!(
-            upstream = %upstream_id,
+            identity = %identity,
             count = sans.len(),
             max = MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
             "DestinationRule subjectAltNames exceeds backend TLS SAN allow-list limit; dropping extra entries"
@@ -1582,7 +1681,7 @@ fn bounded_backend_tls_san_allow_list(upstream_id: &str, sans: &[String]) -> Vec
     for san in sans.iter().take(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES) {
         if san.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH {
             warn!(
-                upstream = %upstream_id,
+                identity = %identity,
                 len = san.len(),
                 max = MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
                 "DestinationRule subjectAltNames entry exceeds backend TLS SAN allow-list entry limit; dropping entry"
@@ -1591,7 +1690,7 @@ fn bounded_backend_tls_san_allow_list(upstream_id: &str, sans: &[String]) -> Vec
         }
         if let Err(error) = crate::config::types::validate_backend_tls_san_allow_list_entry(san) {
             warn!(
-                upstream = %upstream_id,
+                identity = %identity,
                 error = %error,
                 "DestinationRule subjectAltNames entry is invalid for backend TLS SAN allow-list; dropping entry"
             );
@@ -1810,6 +1909,7 @@ fn build_egress_proxies_and_upstreams(
                     backend_tls_server_ca_cert_path: None,
                     backend_tls_sni: None,
                     backend_tls_san_allow_list: Vec::new(),
+                    resolved_subset_tls: HashMap::new(),
                     api_spec_id: None,
                     created_at: now,
                     updated_at: now,
@@ -3714,9 +3814,9 @@ mod tests {
     use crate::modes::mesh::config::{
         AccessLogFilter, AppProtocol, EastWestGateway, JwtHeader, MeshAccessLoggingConfig,
         MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
-        MeshService, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction,
-        PolicyScope, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-        TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+        MeshService, MeshSubset, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig,
+        PolicyAction, PolicyScope, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+        ServicePort, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -4463,6 +4563,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -5091,6 +5192,356 @@ mod tests {
             Some("/etc/certs/ca.pem")
         );
         assert!(upstream.backend_tls_verify_server_cert);
+    }
+
+    #[test]
+    fn dr_subset_tls_overrides_upstream_level_tls_at_apply() {
+        // A DestinationRule that sets BOTH upstream-level `trafficPolicy.tls`
+        // AND per-subset `trafficPolicy.tls` must produce:
+        //   - Upstream-level fields (`upstream.backend_tls_*`) reflect the
+        //     top-level TLS — so proxies that DON'T select the subset still
+        //     pick up upstream-level TLS.
+        //   - `upstream.resolved_subset_tls["v1"]` carries the subset's
+        //     overlaid `BackendTlsConfig` (subset CA / SNI / mTLS material)
+        //     so `resolve_upstream_tls` can swap it into `Proxy.resolved_tls`
+        //     for proxies whose `upstream_subset == "v1"`.
+        //
+        // Proves that subset TLS overrides upstream-level TLS rather than
+        // merging into it: the v1 subset's CA replaces the upstream-level CA
+        // for v1 dispatch, not "in addition to."
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tls: Some(MeshTrafficPolicyTls {
+                        mode: MtlsMode::Simple,
+                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        sni: Some("reviews.default.svc.cluster.local".to_string()),
+                        ..MeshTrafficPolicyTls::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        tls: Some(MeshTrafficPolicyTls {
+                            mode: MtlsMode::Mutual,
+                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
+                            client_certificate: Some("/etc/certs/v1-client.pem".to_string()),
+                            private_key: Some("/etc/certs/v1-client.key".to_string()),
+                            sni: Some("v1.reviews.mesh.internal".to_string()),
+                            ..MeshTrafficPolicyTls::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        // Upstream-level TLS reflects the top-level DR.tls.
+        assert_eq!(
+            upstream.backend_tls_server_ca_cert_path.as_deref(),
+            Some("/etc/certs/upstream-ca.pem"),
+            "upstream CA still reflects upstream-level DR.tls"
+        );
+        assert_eq!(
+            upstream.backend_tls_sni.as_deref(),
+            Some("reviews.default.svc.cluster.local")
+        );
+        assert!(upstream.backend_tls_client_cert_path.is_none());
+
+        // Per-subset overlay landed on `resolved_subset_tls`.
+        let subset_tls = upstream
+            .resolved_subset_tls
+            .get("v1")
+            .expect("v1 subset has resolved TLS")
+            .tls
+            .as_ref()
+            .expect("v1 resolved tls is Some");
+        assert_eq!(
+            subset_tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/v1-ca.pem"),
+            "subset overlay swaps the CA for v1 dispatch"
+        );
+        assert_eq!(
+            subset_tls.client_cert_path.as_deref(),
+            Some("/etc/certs/v1-client.pem")
+        );
+        assert_eq!(
+            subset_tls.client_key_path.as_deref(),
+            Some("/etc/certs/v1-client.key")
+        );
+        assert_eq!(
+            subset_tls.sni.as_deref(),
+            Some("v1.reviews.mesh.internal"),
+            "subset overlay also wins on SNI"
+        );
+        assert!(subset_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn dr_subset_tls_projects_onto_proxy_resolved_tls_via_resolve_upstream_tls() {
+        // End-to-end: subset overlay reaches `Proxy.resolved_tls` so the pool
+        // key construction (which consumes `proxy.resolved_tls`) naturally
+        // fragments per subset.
+        let mut config = GatewayConfig {
+            proxies: vec![
+                // p1 has no upstream_subset — picks up upstream-level TLS.
+                destination_rule_test_proxy("p1", "u1"),
+            ],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // p2 selects subset v1 — should pick up the subset overlay.
+        let mut p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "hosts": ["p2.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("test proxy with subset");
+        p2.normalize_fields();
+        config.proxies.push(p2);
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tls: Some(MeshTrafficPolicyTls {
+                        mode: MtlsMode::Simple,
+                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ..MeshTrafficPolicyTls::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        tls: Some(MeshTrafficPolicyTls {
+                            mode: MtlsMode::Simple,
+                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
+                            ..MeshTrafficPolicyTls::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+        config.resolve_upstream_tls();
+
+        let p1 = config.proxies.iter().find(|p| p.id == "p1").expect("p1");
+        let p2 = config.proxies.iter().find(|p| p.id == "p2").expect("p2");
+
+        assert_eq!(
+            p1.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/upstream-ca.pem"),
+            "proxy without upstream_subset gets upstream-level CA"
+        );
+        assert_eq!(
+            p2.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/v1-ca.pem"),
+            "proxy with upstream_subset='v1' gets subset overlay CA"
+        );
+    }
+
+    #[test]
+    fn dr_subset_without_tls_falls_back_to_upstream_level_tls() {
+        // A subset without `trafficPolicy.tls` must NOT populate
+        // `resolved_subset_tls`, so `resolve_upstream_tls` falls back to the
+        // upstream-level posture for proxies that select that subset.
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tls: Some(MeshTrafficPolicyTls {
+                        mode: MtlsMode::Simple,
+                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ..MeshTrafficPolicyTls::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    // Subset carries a load_balancer override but no TLS.
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.resolved_subset_tls.is_empty(),
+            "subset without trafficPolicy.tls must not populate resolved_subset_tls"
+        );
+        // The non-TLS subset traffic-policy fields still translate.
+        let subsets = upstream.subsets.as_ref().expect("subsets present");
+        let v1 = &subsets[0];
+        assert_eq!(
+            v1.traffic_policy
+                .as_ref()
+                .expect("v1 traffic policy")
+                .load_balancer_algorithm,
+            Some(LoadBalancerAlgorithm::Random)
+        );
+    }
+
+    #[test]
+    fn dr_subset_tls_apply_clears_stale_resolved_subset_tls() {
+        // A DR application that overwrites `upstream.subsets` (e.g., the next
+        // slice removed the v1 subset) must also clear any stale
+        // `resolved_subset_tls` entries — otherwise a proxy that still
+        // references the removed subset name would silently get its old TLS
+        // overlay through `resolve_upstream_tls`.
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.resolved_subset_tls.insert(
+            "ghost".to_string(),
+            ResolvedSubsetTrafficPolicy {
+                tls: Some(BackendTlsConfig {
+                    server_ca_cert_path: Some("/etc/certs/stale-ca.pem".to_string()),
+                    ..BackendTlsConfig::default_verify()
+                }),
+            },
+        );
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                // New slice carries a different subset that has NO TLS.
+                subsets: vec![MeshSubset {
+                    name: "v2".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+                    traffic_policy: None,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            !upstream.resolved_subset_tls.contains_key("ghost"),
+            "stale resolved_subset_tls entry must be cleared on DR re-apply"
+        );
+        assert!(
+            upstream.resolved_subset_tls.is_empty(),
+            "no subsets carry TLS in the new slice, resolved map must be empty"
+        );
+    }
+
+    #[test]
+    fn dr_subset_tls_pool_key_differs_across_subsets() {
+        // Two proxies that share `upstream_id` but select different subsets
+        // must produce different backend pool keys, even when their TLS
+        // material is byte-identical — `upstream_subset` enters the pool
+        // key as a defense-in-depth backstop on top of TLS partitioning.
+        let mut p_v1: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p_v1",
+            "hosts": ["p.example.com"],
+            "backend_host": "reviews.default.svc.cluster.local",
+            "backend_port": 8080,
+            "backend_scheme": "https",
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("proxy v1");
+        let mut p_v2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p_v2",
+            "hosts": ["p.example.com"],
+            "backend_host": "reviews.default.svc.cluster.local",
+            "backend_port": 8080,
+            "backend_scheme": "https",
+            "upstream_id": "u1",
+            "upstream_subset": "v2",
+        }))
+        .expect("proxy v2");
+        p_v1.normalize_fields();
+        p_v2.normalize_fields();
+        // Identical resolved TLS — the subset name is the only differentiator.
+        p_v1.resolved_tls = BackendTlsConfig::default_verify();
+        p_v2.resolved_tls = BackendTlsConfig::default_verify();
+
+        let pool_v1 = crate::http3::client::Http3ConnectionPool::pool_key_for_target(
+            &p_v1,
+            "reviews.default.svc.cluster.local",
+            8080,
+            0,
+        );
+        let pool_v2 = crate::http3::client::Http3ConnectionPool::pool_key_for_target(
+            &p_v2,
+            "reviews.default.svc.cluster.local",
+            8080,
+            0,
+        );
+
+        assert_ne!(
+            pool_v1, pool_v2,
+            "H3 pool keys must differ when upstream_subset differs, even with identical TLS"
+        );
+        assert!(pool_v1.contains("|v1|"), "v1 marker present in pool key");
+        assert!(pool_v2.contains("|v2|"), "v2 marker present in pool key");
     }
 
     #[test]
@@ -6658,6 +7109,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
             created_at: now,
             updated_at: now,

@@ -20,6 +20,7 @@ fn subset_definition_round_trip_json() {
         labels: HashMap::from([("version".into(), "v2".into())]),
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+            tls: None,
         }),
     };
 
@@ -69,10 +70,59 @@ fn subset_definition_multi_label_selector() {
 fn subset_traffic_policy_omits_none_fields() {
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
+        tls: None,
     };
     let json = serde_json::to_string(&policy).unwrap();
-    // skip_serializing_if = "Option::is_none" should omit the field
+    // skip_serializing_if = "Option::is_none" should omit both optional fields,
+    // producing a wire-compatible empty object.
     assert!(!json.contains("load_balancer_algorithm"));
+    assert!(!json.contains("\"tls\""));
+    assert_eq!(json, "{}");
+}
+
+#[test]
+fn subset_traffic_policy_tls_round_trip_json() {
+    use ferrum_edge::modes::mesh::config::{MeshTrafficPolicyTls, MtlsMode};
+
+    let policy = SubsetTrafficPolicy {
+        load_balancer_algorithm: None,
+        tls: Some(MeshTrafficPolicyTls {
+            mode: MtlsMode::Mutual,
+            ca_certificates: Some("/etc/certs/subset-ca.pem".into()),
+            client_certificate: Some("/etc/certs/subset-client.pem".into()),
+            private_key: Some("/etc/certs/subset-client.key".into()),
+            sni: Some("subset.mesh.internal".into()),
+            subject_alt_names: vec!["spiffe://mesh.local/ns/default/sa/canary".into()],
+            insecure_skip_verify: false,
+        }),
+    };
+
+    let json = serde_json::to_string(&policy).unwrap();
+    assert!(json.contains("\"tls\""));
+    assert!(json.contains("\"ca_certificates\""));
+    assert!(json.contains("\"subject_alt_names\""));
+
+    let back: SubsetTrafficPolicy = serde_json::from_str(&json).unwrap();
+    let tls = back.tls.expect("subset tls round-trips");
+    assert_eq!(tls.mode, MtlsMode::Mutual);
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("/etc/certs/subset-ca.pem")
+    );
+    assert_eq!(
+        tls.client_certificate.as_deref(),
+        Some("/etc/certs/subset-client.pem")
+    );
+    assert_eq!(
+        tls.private_key.as_deref(),
+        Some("/etc/certs/subset-client.key")
+    );
+    assert_eq!(tls.sni.as_deref(), Some("subset.mesh.internal"));
+    assert_eq!(
+        tls.subject_alt_names,
+        vec!["spiffe://mesh.local/ns/default/sa/canary".to_string()]
+    );
+    assert!(!tls.insecure_skip_verify);
 }
 
 // ── PassiveHealthCheck new fields serde ───────────────────────────────────────
@@ -141,6 +191,7 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         backend_tls_server_ca_cert_path: None,
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -249,6 +300,7 @@ fn upstream_valid_subsets_pass_validation() {
             labels: HashMap::from([("version".into(), "v2".into())]),
             traffic_policy: Some(SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+                tls: None,
             }),
         },
     ]));
