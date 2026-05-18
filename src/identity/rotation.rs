@@ -99,6 +99,10 @@ pub fn spawn_rotation(config: RotationConfig) -> tokio::task::JoinHandle<()> {
 async fn rotation_main(config: RotationConfig) {
     // Mint an initial SVID so callers can bind listeners.
     if let Err(e) = mint_and_install(&config).await {
+        crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+            &config.spiffe_id,
+            "rotation",
+        );
         error!(error = %e, "initial SVID issuance failed — rotation task continues");
     }
 
@@ -127,7 +131,13 @@ async fn rotation_main(config: RotationConfig) {
                     "SVID rotated"
                 );
             }
-            Err(e) => warn!(error = %e, spiffe_id = %config.spiffe_id, "SVID rotation failed"),
+            Err(e) => {
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    &config.spiffe_id,
+                    "rotation",
+                );
+                warn!(error = %e, spiffe_id = %config.spiffe_id, "SVID rotation failed");
+            }
         }
     }
 }
@@ -151,6 +161,12 @@ async fn mint_and_install(config: &RotationConfig) -> Result<(), String> {
         .trust_bundle(config.spiffe_id.trust_domain())
         .await
         .map_err(|e| e.to_string())?;
+    crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+        &svid.spiffe_id,
+        "rotation",
+        &svid.not_after,
+    );
+    crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle(&bundle, "rotation");
 
     let svid_bundle = SvidBundle {
         spiffe_id: svid.spiffe_id.clone(),

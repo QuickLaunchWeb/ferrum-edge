@@ -386,6 +386,7 @@ async fn try_spawn_tcp_tls_gateway(
             overload: Arc::new(OverloadState::new()),
             ktls_enabled: false,
             io_uring_splice_enabled: false,
+            record_mesh_mtls_metric: false,
         };
         let _ = start_tcp_listener(cfg).await;
     });
