@@ -913,12 +913,42 @@ pub struct WsFrameRateAlgorithm {
     burst_size: f64,
 }
 
+/// Upper bound on the Redis sliding-window length, in seconds. With
+/// pathological-but-legal configs (`burst_size=10_000_000, frames_per_second=1`)
+/// the derived window would otherwise span ~115 days, leaving per-connection
+/// Redis keys alive for ~230 days. Capping turns those configs into a lower-
+/// resolution counter (still safe — admission stays bounded by `burst_size`)
+/// instead of a multi-month TTL.
+const REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
+
 impl WsFrameRateAlgorithm {
     pub fn new(frames_per_second: f64, burst_size: f64) -> Self {
         Self {
             frames_per_second,
             burst_size,
         }
+    }
+
+    /// Returns `(window_seconds, limit)` for the Redis sliding-window
+    /// approximation. The window length is the bucket's full-refill period
+    /// (`ceil(burst_size / frames_per_second)`); the cap at
+    /// [`REDIS_MAX_WINDOW_SECONDS`] bounds Redis TTLs.
+    ///
+    /// `ws_rate_limiting::new` rejects `frames_per_second == 0` and
+    /// `burst_size < frames_per_second` at construction, so the derived
+    /// window is always at least 1 second and the average sustained rate
+    /// matches `frames_per_second` for all configs that reach this code.
+    fn redis_window_derivation(&self) -> (u64, u64) {
+        debug_assert!(
+            self.frames_per_second > 0.0,
+            "WsFrameRateAlgorithm: frames_per_second must be > 0; \
+             enforced by optional_positive_u64 at plugin construction"
+        );
+        let limit = self.burst_size as u64;
+        let window_seconds = ((self.burst_size / self.frames_per_second).ceil() as u64)
+            .max(1)
+            .min(REDIS_MAX_WINDOW_SECONDS);
+        (window_seconds, limit)
     }
 }
 
@@ -953,22 +983,14 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        // Approximate the local TokenBucket via a sliding two-window
-        // check over the bucket's full-refill period. With window length
-        // `ceil(burst_size / frames_per_second)` and window cap
-        // `burst_size`, the average sustained rate matches
-        // `frames_per_second` and an initial burst of up to `burst_size`
-        // is still possible. The previous implementation hard-coded a
-        // 1-second window with `burst_size` as the limit, which silently
-        // ignored `frames_per_second` and admitted up to `burst_size`
-        // frames every second indefinitely — much higher than the
-        // configured sustained rate.
-        let limit = self.burst_size as u64;
-        let window_seconds = if self.frames_per_second > 0.0 {
-            ((self.burst_size / self.frames_per_second).ceil() as u64).max(1)
-        } else {
-            1
-        };
+        // Approximate the local TokenBucket via a sliding two-window check
+        // over the bucket's full-refill period. See `redis_window_derivation`
+        // for the (window_seconds, limit) contract. The previous
+        // implementation hard-coded a 1-second window with `burst_size` as
+        // the limit, which silently ignored `frames_per_second` and admitted
+        // up to `burst_size` frames every second indefinitely — much higher
+        // than the configured sustained rate.
+        let (window_seconds, limit) = self.redis_window_derivation();
 
         let curr_idx = RedisRateLimitClient::window_index(window_seconds);
         let prev_idx = curr_idx.saturating_sub(1);
@@ -1286,6 +1308,34 @@ mod tests {
             Ok(None) => panic!("redis limiter should be enabled by sync_mode=redis"),
             Err(error) => panic!("redis limiter config should be valid: {error}"),
         }
+    }
+
+    #[test]
+    fn ws_frame_rate_redis_window_derivation_normal_cases() {
+        // The reviewed regression: `frames_per_second` must drive
+        // `window_seconds`, not be silently dropped. Each pair is
+        // `(fps, burst) -> (window_seconds, limit)`.
+        //
+        // burst == fps → 1-second window
+        let alg = WsFrameRateAlgorithm::new(100.0, 100.0);
+        assert_eq!(alg.redis_window_derivation(), (1, 100));
+        // burst = 4 * fps → 4-second window
+        let alg = WsFrameRateAlgorithm::new(5.0, 20.0);
+        assert_eq!(alg.redis_window_derivation(), (4, 20));
+        // Non-integer ratio → ceil
+        let alg = WsFrameRateAlgorithm::new(3.0, 10.0);
+        assert_eq!(alg.redis_window_derivation(), (4, 10));
+    }
+
+    #[test]
+    fn ws_frame_rate_redis_window_derivation_caps_pathological_configs() {
+        // Without the cap, `burst=10_000_000, fps=1` would produce a
+        // ~115-day window and ~230-day Redis TTL on per-connection keys.
+        let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
+        assert_eq!(
+            alg.redis_window_derivation(),
+            (REDIS_MAX_WINDOW_SECONDS, 10_000_000)
+        );
     }
 
     #[test]

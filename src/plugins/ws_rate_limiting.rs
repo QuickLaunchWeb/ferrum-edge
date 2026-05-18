@@ -38,6 +38,18 @@ impl WsRateLimiting {
         let burst_size = optional_positive_u64(config, "burst_size")?
             .map_or(frames_per_second, |value| value as f64);
 
+        // The Redis sliding-window approximation assumes burst >= fps so the
+        // derived window length stays >= 1 second and the average sustained
+        // rate matches frames_per_second. Without this, burst<fps configs
+        // would diverge between local (token bucket refills independently of
+        // capacity) and Redis (window floors to 1s, sustained = burst fps).
+        if burst_size < frames_per_second {
+            return Err(format!(
+                "ws_rate_limiting: 'burst_size' ({}) must be >= 'frames_per_second' ({})",
+                burst_size as u64, frames_per_second as u64
+            ));
+        }
+
         let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Frame rate exceeded")
             .to_string();
