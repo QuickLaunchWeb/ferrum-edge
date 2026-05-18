@@ -14,6 +14,7 @@ pub mod hbone;
 pub mod node_waypoint;
 pub mod policy;
 pub mod runtime;
+pub mod runtime_overlay_consumers;
 pub mod slice;
 
 use std::collections::HashMap;

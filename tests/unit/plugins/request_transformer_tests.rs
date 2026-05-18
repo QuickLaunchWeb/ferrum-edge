@@ -1181,3 +1181,160 @@ async fn test_request_transformer_apply_route_overrides_invalid_type_rejected() 
     .expect("non-boolean apply_route_overrides must error");
     assert!(err.contains("must be a boolean"), "got: {err}");
 }
+
+// === GAP-3E: RTDS overlay gate ===
+
+#[tokio::test]
+async fn test_request_transformer_runtime_overlay_scope_accepted() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Always", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "internal",
+        "default_enabled": true
+    }))
+    .unwrap();
+    assert_eq!(plugin.name(), "request_transformer");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_empty_runtime_overlay_scope() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Always", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "   "
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("runtime_overlay_scope"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_bool_default_enabled() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Always", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "internal",
+        "default_enabled": "true"
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("default_enabled"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_overlay_gate_observable_end_to_end() {
+    // Single test that walks every overlay-gate behaviour serially to
+    // avoid racing the process-global `request_transformer::runtime_overlay`
+    // ArcSwap from parallel test cases.
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::request_transformer::runtime_overlay;
+    use tokio::sync::Mutex;
+    static GUARD: Mutex<()> = Mutex::const_new(());
+    let _guard = GUARD.lock().await;
+
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true
+    }))
+    .unwrap();
+
+    // ── Case 1: overlay missing → fallback default_enabled=true applies the rule.
+    runtime_overlay::reset_for_test();
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
+
+    // ── Case 2: overlay says enabled=false → rule short-circuited.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+    assert!(
+        !headers.contains_key("x-gated"),
+        "overlay=false must suppress the rule"
+    );
+
+    // ── Case 3: overlay says enabled=true → rule applies.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+    assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
+
+    // ── Case 4: plugin without a scope ignores the overlay entirely.
+    runtime_overlay::reset_for_test();
+    let no_scope_plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Plain", "value": "v"}
+        ]
+    }))
+    .unwrap();
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    no_scope_plugin
+        .before_proxy(&mut make_ctx(), &mut headers)
+        .await;
+    assert_eq!(
+        headers.get("x-plain").map(String::as_str),
+        Some("v"),
+        "plugins without runtime_overlay_scope must always apply rules"
+    );
+
+    // ── Case 5: default_enabled=false combined with missing overlay
+    //           suppresses rules until the overlay flips them on.
+    runtime_overlay::reset_for_test();
+    let pessimistic_plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Pess", "value": "v"}
+        ],
+        "runtime_overlay_scope": "pessimistic",
+        "default_enabled": false
+    }))
+    .unwrap();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    pessimistic_plugin
+        .before_proxy(&mut make_ctx(), &mut headers)
+        .await;
+    assert!(
+        !headers.contains_key("x-pess"),
+        "default_enabled=false must suppress when overlay missing"
+    );
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.pessimistic.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    pessimistic_plugin
+        .before_proxy(&mut make_ctx(), &mut headers)
+        .await;
+    assert_eq!(headers.get("x-pess").map(String::as_str), Some("v"));
+
+    runtime_overlay::reset_for_test();
+}

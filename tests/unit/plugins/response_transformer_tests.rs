@@ -887,3 +887,92 @@ async fn test_response_transformer_apply_route_overrides_invalid_type_rejected()
     .expect("non-boolean apply_route_overrides must error");
     assert!(err.contains("must be a boolean"), "got: {err}");
 }
+
+// === GAP-3E: RTDS overlay gate ===
+
+#[tokio::test]
+async fn test_response_transformer_runtime_overlay_scope_accepted() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Always", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "internal",
+        "default_enabled": true
+    }))
+    .unwrap();
+    assert_eq!(plugin.name(), "response_transformer");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_empty_runtime_overlay_scope() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Always", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "   "
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("runtime_overlay_scope"));
+}
+
+#[tokio::test]
+async fn test_response_transformer_overlay_gate_observable_end_to_end() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    use tokio::sync::Mutex;
+    static GUARD: Mutex<()> = Mutex::const_new(());
+    let _guard = GUARD.lock().await;
+
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}
+        ],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true
+    }))
+    .unwrap();
+
+    // ── Case 1: overlay missing → fallback default_enabled=true applies.
+    runtime_overlay::reset_for_test();
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
+
+    // ── Case 2: overlay says enabled=false → rule short-circuited.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+    assert!(
+        !headers.contains_key("x-gated"),
+        "overlay=false must suppress the rule"
+    );
+
+    // ── Case 3: request_transformer overlay must NOT cross into
+    //           response_transformer state.
+    runtime_overlay::reset_for_test();
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    ferrum_edge::plugins::request_transformer::runtime_overlay::apply_overlay(
+        &MeshRuntimeOverlay { fields },
+    );
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+    assert_eq!(
+        headers.get("x-gated").map(String::as_str),
+        Some("yes"),
+        "request_transformer overlay must not gate response_transformer"
+    );
+
+    runtime_overlay::reset_for_test();
+    ferrum_edge::plugins::request_transformer::runtime_overlay::reset_for_test();
+}

@@ -31,6 +31,7 @@ pub mod identity;
 pub mod k8s_controller;
 pub mod lazy_timeout;
 pub mod load_balancer;
+pub mod logging;
 pub mod metrics;
 pub mod modes;
 pub mod notifications;

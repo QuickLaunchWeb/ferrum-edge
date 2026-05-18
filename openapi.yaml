@@ -1057,10 +1057,16 @@ paths:
           Envoy `FractionalPercent` (`denominator` is one of `hundred`,
           `ten_thousand`, `million`)
 
-        GAP-3E scope is subscription + parse + slice exposure only.
-        Downstream consumers (fault rates, log levels, header filters) are
-        deferred follow-up items so each can be reviewed against the
-        parsed overlay independently.
+        Every slice install fans the overlay out to three live consumers:
+        - `ferrum.fault_injection.<scope>.abort_percent` /
+          `.delay_percent` rewires fault injection percentages on
+          `fault_injection` plugins that declared the matching
+          `runtime_overlay_scope`.
+        - `ferrum.request_transformer.<scope>.enabled` /
+          `ferrum.response_transformer.<scope>.enabled` short-circuit the
+          opted-in header / query / body transformers.
+        - `ferrum.log.level` rebuilds the gateway-wide tracing
+          `EnvFilter` (any `RUST_LOG`-style directive).
 
         Returns `404 Not Found` outside mesh mode or before the first slice
         is installed. A slice with no RTDS layers returns `200` with an

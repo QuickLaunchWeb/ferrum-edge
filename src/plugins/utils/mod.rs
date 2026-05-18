@@ -23,6 +23,7 @@ pub mod route_header_transform;
 pub mod size_limit;
 pub mod sse;
 pub mod tcp_endpoint;
+pub mod transformer_gate;
 pub mod udp_endpoint;
 
 pub use batching_logger::{

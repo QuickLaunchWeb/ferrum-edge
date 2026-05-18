@@ -2162,6 +2162,20 @@ pub struct RuntimeFractionalPercent {
     pub denominator: FractionalPercentDenominator,
 }
 
+impl RuntimeFractionalPercent {
+    /// Convert to a 0.0–100.0 percentage. Saturates at 100.0 if the operator
+    /// supplied a numerator larger than the denominator. Used by RTDS
+    /// consumers that work in `f64` percent space (e.g. fault injection).
+    pub fn as_percent(&self) -> f64 {
+        let denom = self.denominator.units_per_full();
+        if denom == 0 {
+            return 0.0;
+        }
+        let pct = (self.numerator as f64 / denom as f64) * 100.0;
+        pct.clamp(0.0, 100.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FractionalPercentDenominator {
@@ -2169,4 +2183,32 @@ pub enum FractionalPercentDenominator {
     Hundred,
     TenThousand,
     Million,
+}
+
+impl FractionalPercentDenominator {
+    /// The number of units the `numerator` is expressed against. `Hundred`
+    /// → 100, `TenThousand` → 10_000, `Million` → 1_000_000.
+    pub fn units_per_full(&self) -> u64 {
+        match self {
+            FractionalPercentDenominator::Hundred => 100,
+            FractionalPercentDenominator::TenThousand => 10_000,
+            FractionalPercentDenominator::Million => 1_000_000,
+        }
+    }
+}
+
+/// Extract a `0.0..=100.0` percentage from a [`RuntimeValue`] for consumers
+/// that work in percent space. Accepts:
+///
+///   - `RuntimeValue::Number(n)` where `0.0 <= n <= 100.0`
+///   - `RuntimeValue::FractionalPercent(fp)` (via `as_percent`)
+///
+/// Returns `None` for any other shape so RTDS consumers can fall back to
+/// their static config without aborting the slice install.
+pub fn runtime_value_as_percent(value: &RuntimeValue) -> Option<f64> {
+    match value {
+        RuntimeValue::Number(n) if n.is_finite() && (0.0..=100.0).contains(n) => Some(*n),
+        RuntimeValue::FractionalPercent(fp) => Some(fp.as_percent()),
+        _ => None,
+    }
 }
