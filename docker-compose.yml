@@ -43,7 +43,7 @@ services:
     environment:
       POSTGRES_DB: ferrum
       POSTGRES_USER: ferrum
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-password-change-in-production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -75,7 +75,7 @@ services:
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: postgres
-      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
       FERRUM_DB_POLL_INTERVAL: 30
@@ -170,7 +170,7 @@ services:
     environment:
       FERRUM_MODE: cp
       FERRUM_DB_TYPE: postgres
-      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
