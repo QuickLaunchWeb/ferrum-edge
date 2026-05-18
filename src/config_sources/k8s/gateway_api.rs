@@ -851,7 +851,10 @@ fn http_route_dispatch_rules_for_proxy(
                 let Some(value) = string_field(header, "value") else {
                     continue;
                 };
-                headers.insert(name.to_ascii_lowercase(), Value::String(value.to_string()));
+                let name = name.to_ascii_lowercase();
+                if !headers.contains_key(&name) {
+                    headers.insert(name, Value::String(value.to_string()));
+                }
             }
             if !headers.is_empty() {
                 match_criteria.insert("headers".to_string(), Value::Object(headers));
@@ -870,7 +873,10 @@ fn http_route_dispatch_rules_for_proxy(
                 let Some(value) = string_field(param, "value") else {
                     continue;
                 };
-                params.insert(name.to_string(), Value::String(value.to_string()));
+                let name = name.to_string();
+                if !params.contains_key(&name) {
+                    params.insert(name, Value::String(value.to_string()));
+                }
             }
             if !params.is_empty() {
                 match_criteria.insert("query_params".to_string(), Value::Object(params));
@@ -1628,6 +1634,46 @@ mod tests {
             rules[0]["destination"]["upstream_id"].as_str(),
             result.config.proxies[0].upstream_id.as_deref()
         );
+    }
+
+    #[test]
+    fn http_route_dispatch_matchers_keep_first_duplicate_header_and_query_name() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [{
+                            "headers": [
+                                {"name": "X-Tenant", "value": "first"},
+                                {"name": "x-tenant", "value": "second"}
+                            ],
+                            "queryParams": [
+                                {"name": "version", "value": "v1"},
+                                {"name": "version", "value": "v2"}
+                            ]
+                        }],
+                        "backendRefs": [
+                            {"name": "api-a", "port": 8080},
+                            {"name": "api-b", "port": 8081}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("predicate-only HTTPRoute emits mesh_route_dispatch");
+        let rule_match = &plugin.config["rules"][0]["match"];
+        assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("first"));
+        assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v1"));
     }
 
     #[test]
