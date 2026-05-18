@@ -250,87 +250,93 @@ impl InternalCa {
 #[async_trait]
 impl CertificateAuthority for InternalCa {
     async fn issue_svid(&self, req: IssuanceRequest) -> Result<SignedSvid, CaError> {
-        match req {
-            IssuanceRequest::Csr {
-                csr_der,
-                spiffe_id,
-                ttl_secs,
-            } => {
-                self.enforce_trust_domain(&spiffe_id)?;
-                let ttl = self.clamp_ttl(ttl_secs);
-
-                // Re-derive the requester's public key from the CSR. We
-                // deliberately ignore any SAN already present in the CSR —
-                // the caller-attested `spiffe_id` is authoritative.
-                //
-                // SECURITY (TODO before non-UDS callers in Phase B+):
-                // `rcgen::CertificateSigningRequestParams::from_der` does NOT
-                // verify the CSR self-signature (proof-of-possession). For
-                // the local UDS Workload API server this is acceptable — the
-                // transport itself authenticates the calling workload via
-                // SO_PEERCRED-class attestation, and the SVID's URI SAN is
-                // determined by attestation, not by anything in the CSR.
-                //
-                // For ANY future caller that flows CSRs over a remote
-                // transport (Vault PKI bridge, cert-manager Issuer, federated
-                // SPIFFE bundle endpoint, mesh-expansion VM bootstrap), the
-                // PoP signature MUST be verified before we sign the public
-                // key — otherwise an attacker who intercepts a CSR can swap
-                // in their own public key and obtain a valid SVID for the
-                // victim's identity. Add a webpki / x509-parser-based PoP
-                // verification step at the start of this arm before wiring
-                // any non-UDS transport into `IssuanceRequest::Csr`.
-                let csr = rcgen::CertificateSigningRequestParams::from_der(&csr_der.into())
-                    .map_err(|e| CaError::BadCsr(format!("CSR parse failed: {e}")))?;
-                let public_key = csr.public_key;
-                let params = self.build_svid_params(&spiffe_id, ttl)?;
-                let cert = params
-                    .signed_by(&public_key, &self.issuer)
-                    .map_err(|e| CaError::Internal(format!("rcgen sign(csr) failed: {e}")))?;
-
-                debug!(spiffe_id = %spiffe_id, ttl_secs = ttl, "internal CA: issued SVID from CSR");
-
-                let leaf_der = cert.der().to_vec();
-                let not_after = issued_cert_not_after(&leaf_der)?;
-                crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
-                    &spiffe_id, "internal", &not_after,
-                );
-                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
-                Ok(SignedSvid {
+        let result = (|| -> Result<SignedSvid, CaError> {
+            match req {
+                IssuanceRequest::Csr {
+                    csr_der,
                     spiffe_id,
-                    cert_chain_der: vec![leaf_der, self.root_cert_der.clone()],
-                    private_key_pkcs8_der: Vec::new(),
-                    not_after,
-                })
+                    ttl_secs,
+                } => {
+                    self.enforce_trust_domain(&spiffe_id)?;
+                    let ttl = self.clamp_ttl(ttl_secs);
+
+                    // Re-derive the requester's public key from the CSR. We
+                    // deliberately ignore any SAN already present in the CSR —
+                    // the caller-attested `spiffe_id` is authoritative.
+                    //
+                    // SECURITY (TODO before non-UDS callers in Phase B+):
+                    // `rcgen::CertificateSigningRequestParams::from_der` does NOT
+                    // verify the CSR self-signature (proof-of-possession). For
+                    // the local UDS Workload API server this is acceptable — the
+                    // transport itself authenticates the calling workload via
+                    // SO_PEERCRED-class attestation, and the SVID's URI SAN is
+                    // determined by attestation, not by anything in the CSR.
+                    //
+                    // For ANY future caller that flows CSRs over a remote
+                    // transport (Vault PKI bridge, cert-manager Issuer, federated
+                    // SPIFFE bundle endpoint, mesh-expansion VM bootstrap), the
+                    // PoP signature MUST be verified before we sign the public
+                    // key — otherwise an attacker who intercepts a CSR can swap
+                    // in their own public key and obtain a valid SVID for the
+                    // victim's identity. Add a webpki / x509-parser-based PoP
+                    // verification step at the start of this arm before wiring
+                    // any non-UDS transport into `IssuanceRequest::Csr`.
+                    let csr = rcgen::CertificateSigningRequestParams::from_der(&csr_der.into())
+                        .map_err(|e| CaError::BadCsr(format!("CSR parse failed: {e}")))?;
+                    let public_key = csr.public_key;
+                    let params = self.build_svid_params(&spiffe_id, ttl)?;
+                    let cert = params
+                        .signed_by(&public_key, &self.issuer)
+                        .map_err(|e| CaError::Internal(format!("rcgen sign(csr) failed: {e}")))?;
+
+                    debug!(spiffe_id = %spiffe_id, ttl_secs = ttl, "internal CA: issued SVID from CSR");
+
+                    let leaf_der = cert.der().to_vec();
+                    let not_after = issued_cert_not_after(&leaf_der)?;
+                    crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+                        &spiffe_id, "internal", &not_after,
+                    );
+                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
+                    Ok(SignedSvid {
+                        spiffe_id,
+                        cert_chain_der: vec![leaf_der, self.root_cert_der.clone()],
+                        private_key_pkcs8_der: Vec::new(),
+                        not_after,
+                    })
+                }
+                IssuanceRequest::Generate {
+                    spiffe_id,
+                    ttl_secs,
+                } => {
+                    self.enforce_trust_domain(&spiffe_id)?;
+                    let ttl = self.clamp_ttl(ttl_secs);
+
+                    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+                        .map_err(|e| CaError::Internal(format!("keypair gen failed: {e}")))?;
+                    let serialized_key = key_pair.serialize_der();
+
+                    let mut svid = self.sign_with_keypair(&spiffe_id, ttl, &key_pair)?;
+                    svid.private_key_pkcs8_der = serialized_key;
+                    crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
+                        &svid.spiffe_id,
+                        "internal",
+                        &svid.not_after,
+                    );
+                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
+
+                    debug!(
+                        spiffe_id = %spiffe_id,
+                        ttl_secs = ttl,
+                        "internal CA: issued SVID with generated key"
+                    );
+                    Ok(svid)
+                }
             }
-            IssuanceRequest::Generate {
-                spiffe_id,
-                ttl_secs,
-            } => {
-                self.enforce_trust_domain(&spiffe_id)?;
-                let ttl = self.clamp_ttl(ttl_secs);
-
-                let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-                    .map_err(|e| CaError::Internal(format!("keypair gen failed: {e}")))?;
-                let serialized_key = key_pair.serialize_der();
-
-                let mut svid = self.sign_with_keypair(&spiffe_id, ttl, &key_pair)?;
-                svid.private_key_pkcs8_der = serialized_key;
-                crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
-                    &svid.spiffe_id,
-                    "internal",
-                    &svid.not_after,
-                );
-                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", true);
-
-                debug!(
-                    spiffe_id = %spiffe_id,
-                    ttl_secs = ttl,
-                    "internal CA: issued SVID with generated key"
-                );
-                Ok(svid)
-            }
+        })();
+        if result.is_err() {
+            crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("internal", false);
         }
+        result
     }
 
     async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
