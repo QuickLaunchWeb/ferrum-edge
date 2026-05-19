@@ -1073,24 +1073,9 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<IncludeOutboundPorts, S
 
 fn exclude_outbound_ports_for_pod(
     config: &InjectorConfig,
-    pod: &Value,
+    _pod: &Value,
 ) -> Result<Vec<u16>, String> {
-    let annotations = pod
-        .pointer("/metadata/annotations")
-        .and_then(Value::as_object);
     let mut ports = config.exclude_outbound_ports.clone();
-    for key in [
-        ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
-        FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
-    ] {
-        let annotation_ports = parse_port_list(
-            annotations
-                .and_then(|annotations| annotations.get(key))
-                .and_then(Value::as_str),
-        )
-        .map_err(|e| format!("invalid {key}: {e}"))?;
-        ports.extend(annotation_ports);
-    }
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
@@ -1337,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_excludes_configured_and_annotated_outbound_ports() {
+    fn patch_excludes_only_configured_outbound_ports() {
         let pod = json!({
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
@@ -1362,8 +1347,14 @@ mod tests {
             .and_then(Value::as_str)
             .expect("iptables plan");
 
-        for port in [3306, 5432, 9092, 15020] {
+        for port in [3306, 5432] {
             assert!(commands.contains(&format!("--dport {port} -j RETURN")));
+        }
+        for port in [9092, 15020] {
+            assert!(
+                !commands.contains(&format!("--dport {port} -j RETURN")),
+                "pod annotations must not affect outbound exclude ports"
+            );
         }
     }
 
@@ -1610,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_rejects_invalid_exclude_outbound_ports_annotation() {
+    fn patch_ignores_invalid_exclude_outbound_ports_annotation() {
         let pod = json!({
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
@@ -1622,15 +1613,12 @@ mod tests {
         });
         let config = test_config(true, CaptureMode::Iptables);
 
-        let err = build_sidecar_patch_for_namespace(&pod, &config, None)
-            .expect_err("invalid annotation rejected");
-
-        assert!(err.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
-        assert!(!err.contains(": invalid port exclusion"));
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
     }
 
     #[test]
-    fn admission_response_denies_invalid_exclude_outbound_ports_annotation() {
+    fn admission_response_allows_invalid_exclude_outbound_ports_annotation() {
         let review = json!({
             "apiVersion": "admission.k8s.io/v1",
             "kind": "AdmissionReview",
@@ -1652,19 +1640,13 @@ mod tests {
             review.to_string().as_bytes(),
             &test_config(true, CaptureMode::Iptables),
         )
-        .expect("admission denial");
+        .expect("admission response");
 
         assert_eq!(
             response.pointer("/response/allowed"),
-            Some(&Value::Bool(false))
+            Some(&Value::Bool(true))
         );
-        assert_eq!(response.pointer("/response/patch"), None);
-        let message = response
-            .pointer("/response/status/message")
-            .and_then(Value::as_str)
-            .expect("denial message");
-        assert!(message.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
-        assert!(!message.contains(": invalid port exclusion"));
+        assert!(response.pointer("/response/patch").is_some());
     }
 
     #[test]
