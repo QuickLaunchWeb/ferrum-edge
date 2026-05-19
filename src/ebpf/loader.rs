@@ -27,7 +27,8 @@ use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
     BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_PROGRAM_SOCK_OPS,
-    BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, PodInfo,
+    BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, IncludePortsPolicy,
+    PodInfo,
 };
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
@@ -273,6 +274,20 @@ impl EbpfBackend for AyaEbpfBackend {
     fn update_port_exclude(&mut self, port: u16) -> Result<(), String> {
         let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
         maps.insert_port_exclude(port)
+    }
+
+    fn update_pod_include_ports(
+        &mut self,
+        cgroup_id: u64,
+        policy: &IncludePortsPolicy,
+    ) -> Result<(), String> {
+        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        maps.insert_include_ports(cgroup_id, policy)
+    }
+
+    fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
+        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        maps.remove_include_ports(cgroup_id)
     }
 
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
