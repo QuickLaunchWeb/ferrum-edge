@@ -5447,7 +5447,16 @@ fn build_websocket_tls_connector(
     // Build client config with TLS policy (cipher suites, protocol versions)
     let builder = match crate::tls::backend_client_config_builder(tls_policy) {
         Ok(b) => {
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+            let inner = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                if proxy.resolved_tls.san_allow_list.is_empty() {
+                    inner
+                } else {
+                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
+                        inner,
+                        proxy.resolved_tls.san_allow_list.clone(),
+                    )?)
+                };
             b.with_webpki_verifier(verifier)
         }
         Err(e) => {
@@ -5457,7 +5466,16 @@ fn build_websocket_tls_connector(
             );
             let fallback_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let verifier = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
+            let inner = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
+            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                if proxy.resolved_tls.san_allow_list.is_empty() {
+                    inner
+                } else {
+                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
+                        inner,
+                        proxy.resolved_tls.san_allow_list.clone(),
+                    )?)
+                };
             rustls::ClientConfig::builder().with_webpki_verifier(verifier)
         }
     };
