@@ -53,6 +53,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -212,6 +213,7 @@ impl MeshRouteDispatchConfig {
                 compile_transform_field(idx, "request_transform", &rule.request_transform)?;
             rule.response_transform_compiled =
                 compile_transform_field(idx, "response_transform", &rule.response_transform)?;
+            rule.methods_compiled = compile_method_matchers(idx, &rule.match_.methods)?;
         }
         Ok(())
     }
@@ -323,13 +325,36 @@ pub struct RouteRule {
     /// `request_transform_compiled`.
     #[serde(skip)]
     response_transform_compiled: Option<Arc<Vec<RouteHeaderTransformRule>>>,
+    /// Pre-compiled per-method matchers built during normalize. `Regex`
+    /// values are compiled here, not per request — the hot path only does
+    /// `matchers.iter().any(|m| m.matches(ctx.method.as_str()))`. Empty when
+    /// `match.methods` is empty (no method restriction).
+    #[serde(skip)]
+    methods_compiled: Vec<MethodMatcher>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MatchCriteria {
-    /// HTTP methods (any-of). Empty = no method restriction.
+    /// HTTP methods (any-of). Empty = no method restriction. Each entry is
+    /// one of:
+    ///
+    /// - a plain string — interpreted as an `Exact` match (back-compat with
+    ///   the original `Vec<String>` shape);
+    /// - an object with exactly one of `exact` / `prefix` / `regex` — the
+    ///   Istio `StringMatch` shape, projected from VirtualService translation.
+    ///
+    /// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). The
+    /// translator preserves operator casing on the wire, but the plugin
+    /// uppercases `prefix` / `regex` patterns at compile time so the hot
+    /// path can do a single case-sensitive compare against the request
+    /// method without per-request casing work. `Exact` keeps the operator's
+    /// literal casing to preserve the existing `method_match_is_case_sensitive`
+    /// contract.
+    ///
+    /// Regexes compile at config-load time (cold path); the hot path reads
+    /// the pre-compiled `Regex` from the rule's `methods_compiled` slot.
     #[serde(default)]
-    pub methods: Vec<String>,
+    pub methods: Vec<MethodMatchOp>,
     /// Header equality matches (all-of). Header names are case-insensitive;
     /// values match exactly.
     #[serde(default)]
@@ -344,6 +369,64 @@ pub struct MatchCriteria {
 impl MatchCriteria {
     fn is_empty(&self) -> bool {
         self.methods.is_empty() && self.headers.is_empty() && self.query_params.is_empty()
+    }
+}
+
+/// Per-method match operator. Mirrors the Istio `StringMatch` shape (one of
+/// `exact` / `prefix` / `regex`), with an extra wire-compat arm for the
+/// legacy plain-string form (`["GET", "POST"]` → two `Exact` entries).
+///
+/// Serde-untagged so JSON round-trips byte-identical for both shapes:
+/// a plain-string method entry deserializes (and re-serializes) as the legacy
+/// form; the tagged form deserializes (and re-serializes) as the
+/// `StringMatch` object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MethodMatchOp {
+    /// Back-compat form: bare string, interpreted as `Exact`.
+    Legacy(String),
+    /// Tagged form: `{ "exact" | "prefix" | "regex": "..." }`.
+    Tagged(MethodStringMatch),
+}
+
+/// Tagged `StringMatch` for HTTP method matchers — exactly one of `exact`,
+/// `prefix`, or `regex` may be present. `deny_unknown_fields` rejects e.g.
+/// typos like `{"prefiks": "..."}` at config-load time rather than silently
+/// ignoring them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MethodStringMatch {
+    Exact(String),
+    Prefix(String),
+    Regex(String),
+}
+
+/// Compiled hot-path representation of a `MethodMatchOp`. Regexes are stored
+/// as `Regex` (compiled once at config load); exact/prefix keep an owned
+/// `String` value. `Clone` is cheap because the `regex` crate's `Regex` is
+/// `Arc`-backed internally and clones are refcount bumps, not pattern
+/// recompiles.
+///
+/// `Prefix` and `Regex` are uppercased at compile time (methods are
+/// conventionally uppercase ASCII per RFC 9110 §9.1) so the hot path is a
+/// single case-sensitive compare against the request method. `Exact` retains
+/// the operator's casing exactly so `method_match_is_case_sensitive` stays
+/// truthful — operators who write `"get"` continue to match only literal
+/// `"get"` requests, never `"GET"`.
+#[derive(Debug, Clone)]
+pub(crate) enum MethodMatcher {
+    Exact(String),
+    Prefix(String),
+    Regex(Regex),
+}
+
+impl MethodMatcher {
+    fn matches(&self, method: &str) -> bool {
+        match self {
+            MethodMatcher::Exact(expected) => method == expected.as_str(),
+            MethodMatcher::Prefix(prefix) => method.starts_with(prefix.as_str()),
+            MethodMatcher::Regex(re) => re.is_match(method),
+        }
     }
 }
 
@@ -414,6 +497,60 @@ fn normalize_header_match_keys(
     }
     *headers = normalized;
     Ok(())
+}
+
+/// Compile each per-method matcher once, at config load. Regex compilation is
+/// the cold-path work; the request hot path only calls `Regex::is_match`.
+/// Invalid regex (or an empty pattern after the operator-provided string) is a
+/// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
+/// plugin-config-validation rule.
+///
+/// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). `Prefix`
+/// and `Regex` patterns are uppercased here at compile time so the hot path
+/// can do a single case-sensitive compare against the request method.
+/// `Exact` deliberately preserves the operator's casing so the existing
+/// `method_match_is_case_sensitive` test continues to pass (operators who
+/// write `"get"` continue to match only literal `"get"` requests).
+fn compile_method_matchers(
+    rule_idx: usize,
+    methods: &[MethodMatchOp],
+) -> Result<Vec<MethodMatcher>, String> {
+    let mut compiled = Vec::with_capacity(methods.len());
+    for (op_idx, op) in methods.iter().enumerate() {
+        let matcher = match op {
+            MethodMatchOp::Legacy(value) => MethodMatcher::Exact(value.clone()),
+            MethodMatchOp::Tagged(MethodStringMatch::Exact(value)) => {
+                MethodMatcher::Exact(value.clone())
+            }
+            MethodMatchOp::Tagged(MethodStringMatch::Prefix(prefix)) => {
+                if prefix.is_empty() {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].prefix \
+                         must not be empty (every method would match — likely a misconfiguration)"
+                    ));
+                }
+                MethodMatcher::Prefix(prefix.to_ascii_uppercase())
+            }
+            MethodMatchOp::Tagged(MethodStringMatch::Regex(pattern)) => {
+                if pattern.is_empty() {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
+                         must not be empty"
+                    ));
+                }
+                let uppercased = pattern.to_ascii_uppercase();
+                let re = Regex::new(&uppercased).map_err(|e| {
+                    format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
+                         is invalid: {e}"
+                    )
+                })?;
+                MethodMatcher::Regex(re)
+            }
+        };
+        compiled.push(matcher);
+    }
+    Ok(compiled)
 }
 
 #[async_trait]
@@ -521,11 +658,14 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
         return rule.request_transform_compiled.is_some()
             || rule.response_transform_compiled.is_some();
     }
-    if !m.methods.is_empty()
-        && !m
-            .methods
+    // Method match: any-of across the compiled matchers. Matchers are
+    // pre-compiled (regex included) at config load — the hot path is one
+    // pass over the matcher slice with a case-sensitive compare per entry.
+    if !rule.methods_compiled.is_empty()
+        && !rule
+            .methods_compiled
             .iter()
-            .any(|method| ctx.method.as_str() == method.as_str())
+            .any(|matcher| matcher.matches(ctx.method.as_str()))
     {
         return false;
     }
@@ -1304,5 +1444,309 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("request_transform"), "got: {err}");
         assert!(err.contains("add/update/remove"), "got: {err}");
+    }
+
+    // ── MethodMatchOp (exact / prefix / regex) ────────────────────────────
+    //
+    // T1-B.2: VirtualService translation can emit prefix/regex method
+    // matchers; the plugin compiles regex at config-load time and the hot
+    // path stays one pass over the compiled matcher slice per request.
+    // Methods are conventionally uppercase ASCII (RFC 9110 §9.1) — prefix
+    // and regex inputs are uppercased at compile time so the matcher does a
+    // single case-sensitive compare against the request method without
+    // per-request casing work.
+
+    #[test]
+    fn accepts_legacy_bare_string_method_entry_as_exact() {
+        // Back-compat: a bare string is the existing wire shape — must keep
+        // round-tripping byte-identical and evaluate as `Exact`.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        let compiled = &plugin.rules()[0].methods_compiled;
+        assert_eq!(compiled.len(), 1);
+        match &compiled[0] {
+            MethodMatcher::Exact(v) => assert_eq!(v, "GET"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_tagged_exact_method_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"exact": "GET"}]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].methods_compiled[0] {
+            MethodMatcher::Exact(v) => assert_eq!(v, "GET"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_prefix_method_match_at_load_and_uppercases_pattern() {
+        // The translator preserves operator casing on the wire, but the
+        // hot-path compare is case-sensitive: uppercase the prefix at
+        // compile time so `"po"` matches `"POST"` / `"PUT"` like the
+        // operator intended without per-request casing.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"prefix": "po"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].methods_compiled[0] {
+            MethodMatcher::Prefix(p) => assert_eq!(p, "PO"),
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_regex_method_match_at_load_and_uppercases_pattern() {
+        // Same uppercase-at-load contract as Prefix: operator casing is not
+        // load-bearing because the request method is uppercase ASCII.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "^(post|put|patch)$"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].methods_compiled[0] {
+            MethodMatcher::Regex(re) => {
+                assert!(re.is_match("POST"));
+                assert!(re.is_match("PUT"));
+                assert!(re.is_match("PATCH"));
+                assert!(!re.is_match("GET"));
+                assert!(
+                    !re.is_match("post"),
+                    "regex was uppercased at compile time — \
+                     hot path stays case-sensitive against uppercase methods"
+                );
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_regex_method_match_at_load() {
+        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
+        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "["}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
+        assert!(err.contains("methods[0]"), "got: {err}");
+        assert!(err.contains("regex"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_regex_method_match_at_load() {
+        // An empty regex (`""`) matches every method, which is almost always
+        // a misconfiguration. Fail loud instead of silently widening traffic.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": ""}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("regex"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_prefix_method_match_at_load() {
+        // An empty prefix matches every method, see regex rationale above.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"prefix": ""}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("prefix"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_method_match_operator_at_load() {
+        // `deny_unknown_fields` on `MethodStringMatch` catches typos like
+        // `{"prefiks": "..."}` at load time so we never compile and ship a
+        // rule that silently never fires.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"prefiks": "PO"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("mesh_route_dispatch") || err.contains("unknown"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regex_method_match_routes_when_method_matches() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "^(POST|PUT|PATCH)$"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        for method in ["POST", "PUT", "PATCH"] {
+            let mut ctx = ctx_with(method, "/api");
+            let mut headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(
+                ctx.route_override_upstream_id.as_deref(),
+                Some("writes"),
+                "regex must match {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regex_method_match_falls_through_when_method_does_not_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "^(POST|PUT|PATCH)$"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn prefix_method_match_routes_when_method_starts_with_prefix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"prefix": "PO"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        for method in ["POST", "POLL"] {
+            let mut ctx = ctx_with(method, "/api");
+            let mut headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(
+                ctx.route_override_upstream_id.as_deref(),
+                Some("writes"),
+                "prefix must match {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_method_match_falls_through_when_method_does_not_start_with_prefix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"prefix": "PO"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_prefix_regex_methods_are_anyed() {
+        // Any-of semantics across mixed matcher kinds — a single method match
+        // is enough for the rule to fire. Mirrors Istio's `method` predicate
+        // (Istio expresses any-of via sibling `match[]` entries; mesh_route
+        // _dispatch collapses sibling entries onto one rule when they share
+        // the URI scope, so we accept any-of in one rule too).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "methods": [
+                        "GET",
+                        {"prefix": "PO"},
+                        {"regex": "^DELE.*$"}
+                    ]
+                },
+                "destination": {"upstream_id": "any-match"}
+            }]
+        }))
+        .unwrap();
+
+        for method in ["GET", "POST", "POLL", "DELETE"] {
+            let mut ctx = ctx_with(method, "/api");
+            let mut headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(
+                ctx.route_override_upstream_id.as_deref(),
+                Some("any-match"),
+                "{method} should match one of the matchers"
+            );
+        }
+
+        // None match → no override.
+        let mut ctx = ctx_with("OPTIONS", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[test]
+    fn legacy_and_tagged_method_form_round_trip_through_serde() {
+        // The schema must keep the two wire shapes byte-stable so existing
+        // configs deserialize unchanged.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "methods": [
+                        "GET",
+                        {"regex": "^(POST|PUT)$"}
+                    ]
+                },
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+
+        // The compiled hot-path representation reflects each form correctly.
+        let compiled = &plugin.rules()[0].methods_compiled;
+        assert_eq!(compiled.len(), 2);
+        match &compiled[0] {
+            MethodMatcher::Exact(v) => assert_eq!(v, "GET"),
+            other => panic!("expected Exact for legacy form, got {other:?}"),
+        }
+        match &compiled[1] {
+            MethodMatcher::Regex(_) => {}
+            other => panic!("expected Regex for tagged form, got {other:?}"),
+        }
+
+        // The serialized JSON for the raw `MatchCriteria.methods` list keeps
+        // the bare string vs object distinction the operator wrote.
+        let raw = serde_json::to_value(&plugin.rules()[0].match_.methods).unwrap();
+        let arr = raw.as_array().expect("methods array");
+        assert_eq!(arr.len(), 2);
+        assert!(arr[0].is_string());
+        assert_eq!(arr[0].as_str(), Some("GET"));
+        assert!(arr[1].is_object());
+        assert_eq!(arr[1]["regex"].as_str(), Some("^(POST|PUT)$"));
     }
 }

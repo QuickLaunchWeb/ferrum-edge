@@ -1181,10 +1181,27 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         // must not create an unguarded catch-all proxy in `match_paths`.
         let had_unsupported_predicate = mesh_route_dispatch_has_unsupported_predicate(entry);
 
-        if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
-            && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
-        {
-            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+        // Istio `StringMatch` shape: exactly one of `exact` / `prefix` /
+        // `regex` should be present on the `method` entry. `exact` emits as
+        // the bare-string back-compat form so older binaries (and existing
+        // wire snapshots) keep deserializing it as an `Exact` matcher;
+        // `prefix` and `regex` emit as the tagged form so the plugin
+        // compiles them as the matching predicate type at config-load time.
+        // Entries without any of the three supported keys are skipped here
+        // — the entry-level `had_unsupported_predicate` flag (computed
+        // up-front) ensures such an entry is dropped wholesale below, never
+        // partially.
+        if let Some(method_obj) = entry.get("method").and_then(Value::as_object) {
+            if let Some(exact) = method_obj.get("exact").and_then(Value::as_str) {
+                match_criteria.insert("methods".to_string(), serde_json::json!([exact]));
+            } else if let Some(prefix) = method_obj.get("prefix").and_then(Value::as_str) {
+                match_criteria.insert(
+                    "methods".to_string(),
+                    serde_json::json!([{"prefix": prefix}]),
+                );
+            } else if let Some(regex) = method_obj.get("regex").and_then(Value::as_str) {
+                match_criteria.insert("methods".to_string(), serde_json::json!([{"regex": regex}]));
+            }
         }
 
         if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
@@ -1451,13 +1468,18 @@ pub(crate) fn mesh_route_dispatch_plugin_from_rules(
     })
 }
 
+/// Returns `true` if the `method` value object carries one of the predicate
+/// operators that `mesh_route_dispatch` supports today. Method `StringMatch`
+/// support tracks Istio: `exact`, `prefix`, `regex`.
+fn method_value_has_supported_predicate(value: &Value) -> bool {
+    value.get("exact").and_then(Value::as_str).is_some()
+        || value.get("prefix").and_then(Value::as_str).is_some()
+        || value.get("regex").and_then(Value::as_str).is_some()
+}
+
 pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
-    if entry
-        .get("method")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("exact"))
-        .and_then(Value::as_str)
-        .is_some()
+    if let Some(method) = entry.get("method")
+        && method_value_has_supported_predicate(method)
     {
         return true;
     }
@@ -1487,13 +1509,13 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         }
     }
 
-    if entry.get("method").is_some()
-        && entry
-            .get("method")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("exact"))
-            .and_then(Value::as_str)
-            .is_none()
+    // Method `StringMatch` supports `exact` / `prefix` / `regex`. Any other
+    // shape (missing op, unknown op, non-string value, non-object method
+    // entry) is treated as an unsupported predicate so the route falls
+    // closed via `request_termination` rather than silently widening
+    // traffic.
+    if let Some(method) = entry.get("method")
+        && !method_value_has_supported_predicate(method)
     {
         return true;
     }
