@@ -66,7 +66,11 @@ async fn test_plugin_name_and_priority() {
     )));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
     assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
-    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+    // Spec change (PR #956 / commit 55a59396): the POST-only buffering
+    // shortcut was a security bypass — non-POST AI responses (e.g. GET
+    // chat history endpoints) would skip token-budget accounting. The
+    // plugin now buffers every method when it's active.
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
 // ─── Basic flow ─────────────────────────────────────────────────────────
