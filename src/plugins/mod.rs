@@ -712,6 +712,12 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
+                    // Reserved gateway-asserted identity headers are never
+                    // trusted from clients. They are injected after
+                    // authentication from `identified_consumer`.
+                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
+                        continue;
+                    }
                     if is_comma_folded_list_header(key) {
                         // These are list headers, so multiple field lines are
                         // equivalent to one comma-separated value. Preserve that
