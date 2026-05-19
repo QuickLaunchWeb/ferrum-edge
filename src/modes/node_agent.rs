@@ -653,12 +653,13 @@ pub struct PodEvent<'a> {
     pub pod_ip_str: Option<&'a str>,
     pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
-    /// the production `discover_veth_for_pod(pod_pid)` resolver. Production
-    /// always sets this to `None` and relies on the procfs/sysfs probe;
-    /// tests set it to a synthetic interface name (e.g., `"veth-mock"`) to
-    /// satisfy the post-`65606d87` enrollment invariant that requires an
-    /// inbound tc attach before the pod is considered enrolled, without
-    /// needing a real pod PID or a Linux kernel under test.
+    /// the production resolver. Production always sets this to `None` and
+    /// relies on the procfs/sysfs probe from either the explicit pod PID or
+    /// the resolved pod cgroup; tests set it to a synthetic interface name
+    /// (e.g., `"veth-mock"`) to satisfy the post-`65606d87` enrollment
+    /// invariant that requires an inbound tc attach before the pod is
+    /// considered enrolled, without needing a real pod PID or a Linux kernel
+    /// under test.
     pub veth_iface_override: Option<&'a str>,
 }
 
@@ -703,14 +704,15 @@ pub fn handle_pod_added(
 
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    // Production: the kube-rs caller sets `veth_iface_override = None` and
-    // we fall back to the procfs/sysfs probe in `discover_veth_for_pod`.
-    // Tests supply a synthetic name so the post-65606d87 inbound-tc
-    // invariant is satisfied without a real pod PID / Linux kernel.
+    // Production: the kube-rs caller sets `veth_iface_override = None`; the
+    // resolver first uses an explicit pod PID when available, then falls back
+    // to the resolved pod cgroup to find a live process in that pod.
+    // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
+    // is satisfied without a real pod PID / Linux kernel.
     let veth_iface = event
         .veth_iface_override
         .map(|s| s.to_string())
-        .or_else(|| veth::discover_veth_for_pod(event.pod_pid));
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
