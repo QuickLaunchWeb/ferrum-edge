@@ -7296,6 +7296,103 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_header_regex_match_emits_plugin_with_tagged_regex() {
+        // T1-B.1: VirtualService `headers.X.regex` is now a first-class
+        // mesh_route_dispatch predicate. The translator must emit the
+        // tagged `{regex: "..."}` shape, NOT the legacy bare-string form
+        // (which would compile as Exact), and the plugin construction must
+        // succeed (regex compiled at config load time, not per request).
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-user": {"regex": "^admin-.*"}}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for regex header");
+        let header_value = &plugin.config["rules"][0]["match"]["headers"]["x-user"];
+        assert!(
+            header_value.is_object(),
+            "regex header must emit as tagged StringMatch object, got: {header_value}"
+        );
+        assert_eq!(
+            header_value["regex"].as_str(),
+            Some("^admin-.*"),
+            "regex predicate must round-trip the pattern literally"
+        );
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "header regex must NOT cause fail-closed request_termination anymore"
+        );
+
+        // The plugin must load successfully from the translator's JSON shape
+        // (regex compiled at config-load time). A bad shape would error here.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_header_prefix_match_emits_plugin_with_tagged_prefix() {
+        // T1-B.1 sibling of the regex case: `prefix` header matchers are
+        // also now first-class. Tagged shape required for the plugin to
+        // pick the Prefix matcher arm instead of Exact.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-tenant": {"prefix": "admin-"}}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for prefix header");
+        let header_value = &plugin.config["rules"][0]["match"]["headers"]["x-tenant"];
+        assert!(
+            header_value.is_object(),
+            "prefix header must emit as tagged StringMatch object, got: {header_value}"
+        );
+        assert_eq!(header_value["prefix"].as_str(), Some("admin-"));
+
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
     fn virtual_service_mixed_uri_only_and_header_match_disables_reject_unmatched() {
         // Codex P1 (#3237393205): a VirtualService whose `match[]` mixes a
         // URI-only branch with a URI+header branch on the same URI must let
@@ -7694,7 +7791,11 @@ extensionProviders:
         // Unsupported URI-less predicates cannot be represented by
         // mesh_route_dispatch. If they were skipped, the later default route
         // would serve requests that Istio gated. Collapse a terminating plugin
-        // onto the selected default proxy instead.
+        // onto the selected default proxy instead. `authority` remains an
+        // unsupported predicate type (sibling PRs cover method.regex /
+        // authority / sourceNamespace separately), so we use it here to keep
+        // exercising the fail-closed path now that header regex/prefix are
+        // first-class predicates.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7703,7 +7804,7 @@ extensionProviders:
                     "http": [
                         {
                             "match": [
-                                {"headers": {"x-tier": {"regex": "gold|platinum"}}}
+                                {"authority": {"exact": "tier.example.com"}}
                             ],
                             "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                         },
@@ -8365,11 +8466,13 @@ extensionProviders:
 
     #[test]
     fn virtual_service_header_only_match_with_unsupported_predicates_fails_closed() {
-        // A header-only entry whose only header predicate is `regex`
-        // cannot be enforced by mesh_route_dispatch. Materializing a
-        // catch-all to the route's backend would silently widen past the
-        // operator's intent. Emit a terminating catch-all instead, so a
-        // later broader route cannot accidentally serve the guarded traffic.
+        // A URI-less entry whose only predicate type is unsupported cannot
+        // be enforced by mesh_route_dispatch. Materializing a catch-all to
+        // the route's backend would silently widen past the operator's
+        // intent. Emit a terminating catch-all instead, so a later broader
+        // route cannot accidentally serve the guarded traffic. `authority`
+        // is still unsupported (sibling PRs cover method.regex / authority /
+        // sourceNamespace separately).
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8377,7 +8480,7 @@ extensionProviders:
                     "hosts": ["api.example.com"],
                     "http": [{
                         "match": [
-                            {"headers": {"x-tier": {"regex": "gold|platinum"}}}
+                            {"authority": {"exact": "tier.example.com"}}
                         ],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                     }]
@@ -8417,7 +8520,10 @@ extensionProviders:
         // A URI-less entry with one exact predicate and one unsupported
         // predicate is unsafe to materialize: mesh_route_dispatch would skip
         // the partial rule, leaving an unguarded catch-all proxy behind. The
-        // translator emits a terminating catch-all instead.
+        // translator emits a terminating catch-all instead. Header regex /
+        // prefix are now first-class supported predicates, so we use a
+        // still-unsupported sibling key (`authority`) to keep exercising
+        // partial-extraction fail-closed.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8427,9 +8533,9 @@ extensionProviders:
                         "match": [
                             {
                                 "headers": {
-                                    "x-canary": {"exact": "v2"},
-                                    "x-tier": {"regex": "gold|platinum"}
-                                }
+                                    "x-canary": {"exact": "v2"}
+                                },
+                                "authority": {"exact": "tier.example.com"}
                             }
                         ],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
@@ -8597,12 +8703,14 @@ extensionProviders:
     fn virtual_service_partial_predicate_extraction_skips_rule() {
         // Codex P1 (#3237631705) follow-on: an entry with one supported
         // and one unsupported predicate is also unsafe to emit as a
-        // partial rule. `method=GET + headers.X.regex` cannot be honored
-        // (the regex header predicate is dropped), so emitting a rule
-        // with only `methods=[GET]` would silently widen the route to
-        // match GET regardless of the gated header value. Skip the entry
-        // entirely; `reject_unmatched: true` 404s the request, which is
-        // the fail-closed VirtualService semantic.
+        // partial rule. `method=GET + authority` cannot be honored
+        // (the authority predicate is dropped), so emitting a rule with
+        // only `methods=[GET]` would silently widen the route to match GET
+        // regardless of the gated authority. Skip the entry entirely;
+        // `reject_unmatched: true` 404s the request, which is the
+        // fail-closed VirtualService semantic. Header regex / prefix are
+        // now first-class supported predicates, so we use a still-unsupported
+        // sibling key (`authority`) to exercise this partial-extraction path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8614,7 +8722,7 @@ extensionProviders:
                             {
                                 "uri": {"prefix": "/api"},
                                 "method": {"exact": "GET"},
-                                "headers": {"x-tier": {"regex": "gold|platinum"}}
+                                "authority": {"exact": "tier.example.com"}
                             }
                         ],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
