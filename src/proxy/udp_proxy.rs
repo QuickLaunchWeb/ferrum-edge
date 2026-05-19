@@ -104,6 +104,8 @@ struct UdpSession {
     backend_scheme: BackendScheme,
     listen_port: u16,
     idle_timeout_ms: u64,
+    stop_reply_task: std::sync::atomic::AtomicBool,
+    stop_notify: Arc<tokio::sync::Notify>,
     /// RAII guard that increments [`crate::overload::OverloadState::active_connections`]
     /// on construction and decrements on drop. Each UDP session counts as one
     /// connection toward the global pressure-shedding threshold so pure-UDP
@@ -1328,6 +1330,12 @@ fn spawn_session_cleanup(
                             if let Some(ref dtls) = session.dtls_conn {
                                 let _ = dtls.close().await;
                             }
+                            // Signal plain-UDP backend reply tasks to stop even
+                            // when no backend datagram arrives to wake recv().
+                            session
+                                .stop_reply_task
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            session.stop_notify.notify_waiters();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
                             metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -2508,6 +2516,8 @@ async fn create_session(
         backend_scheme,
         listen_port,
         idle_timeout_ms: proxy.udp_idle_timeout_seconds.saturating_mul(1000),
+        stop_reply_task: std::sync::atomic::AtomicBool::new(false),
+        stop_notify: Arc::new(tokio::sync::Notify::new()),
         // Increment OverloadState.active_connections for each accepted UDP
         // session so per-session pressure shedding works the same as TCP/H3.
         // Decrements automatically on session drop (idle expiry, backend
@@ -2545,6 +2555,7 @@ async fn create_session(
     let reply_dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let reply_listen_port = listen_port;
+    let reply_stop_notify = Arc::clone(&session.stop_notify);
     let mut reply_listener_shutdown = listener_shutdown.clone();
     let mut reply_global_shutdown = global_shutdown.cloned();
     let is_dtls = reply_dtls.is_some();
@@ -2577,6 +2588,12 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
+            if reply_session
+                .stop_reply_task
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
             if *reply_listener_shutdown.borrow()
                 || reply_global_shutdown
                     .as_ref()
@@ -2591,6 +2608,7 @@ async fn create_session(
             if let Some(ref dtls) = reply_dtls {
                 let recv_result = tokio::select! {
                     result = dtls.recv() => Some(result),
+                    _ = reply_stop_notify.notified() => None,
                     _ = reply_listener_shutdown.changed() => None,
                     _ = async {
                         match reply_global_shutdown.as_mut() {
@@ -2629,6 +2647,7 @@ async fn create_session(
             } else if let Some(ref sock) = backend_socket {
                 let recv_result = tokio::select! {
                     result = sock.recv(&mut buf) => Some(result),
+                    _ = reply_stop_notify.notified() => None,
                     _ = reply_listener_shutdown.changed() => None,
                     _ = async {
                         match reply_global_shutdown.as_mut() {
