@@ -128,6 +128,49 @@ fn service_account_none_for_root_spiffe_id() {
 }
 
 #[test]
+fn namespace_returns_segment_after_first_ns() {
+    let id = SpiffeId::new("spiffe://cluster.local/ns/default/sa/ztunnel").unwrap();
+    assert_eq!(id.namespace(), Some("default"));
+}
+
+#[test]
+fn namespace_returns_segment_after_first_ns_for_non_canonical_path() {
+    // Only `ns/<namespace>` is required; a SPIFFE ID without `sa/...` still
+    // resolves the namespace. Mirrors the Istio convention `spiffe://td/ns/<ns>`
+    // for workload group identities.
+    let id = SpiffeId::new("spiffe://cluster.local/ns/prod").unwrap();
+    assert_eq!(id.namespace(), Some("prod"));
+}
+
+#[test]
+fn namespace_none_when_path_lacks_ns_segment() {
+    let id = SpiffeId::new("spiffe://cluster.local/sa/client").unwrap();
+    assert_eq!(id.namespace(), None);
+}
+
+#[test]
+fn namespace_none_when_ns_is_trailing() {
+    let id = SpiffeId::new("spiffe://cluster.local/ns").unwrap();
+    assert_eq!(id.namespace(), None);
+}
+
+#[test]
+fn namespace_uses_first_ns_segment() {
+    // A second `ns/...` later in the path must not override the first match.
+    // Istio places `ns/<namespace>` at a single canonical position; honoring
+    // any later `ns/` segment would weaken authorization built on top of this
+    // helper (e.g., `sourceNamespace` predicates).
+    let id = SpiffeId::new("spiffe://cluster.local/ns/prod/ns/staging/sa/foo").unwrap();
+    assert_eq!(id.namespace(), Some("prod"));
+}
+
+#[test]
+fn namespace_none_for_root_spiffe_id() {
+    let id = SpiffeId::new("spiffe://cluster.local").unwrap();
+    assert_eq!(id.namespace(), None);
+}
+
+#[test]
 fn spiffe_id_rejects_wrong_scheme() {
     assert!(matches!(
         SpiffeId::new("https://prod.example.com/foo"),

@@ -124,10 +124,11 @@ impl MeshRouteDispatchConfig {
             if rule.match_.is_empty() && !has_transforms {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
-                     methods / headers / query_params (an empty match would silently \
-                     never fire, contradicting first-match-wins semantics)"
+                     methods / headers / query_params / source_namespace (an empty match \
+                     would silently never fire, contradicting first-match-wins semantics)"
                 ));
             }
+            normalize_source_namespace(idx, &mut rule.match_.source_namespace)?;
             if rule.destination.is_empty() {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
@@ -379,11 +380,33 @@ pub struct MatchCriteria {
     /// `ctx.query_params` from the raw query string).
     #[serde(default)]
     pub query_params: HashMap<String, String>,
+    /// Source workload Kubernetes namespace (exact match). Resolved from the
+    /// peer's SPIFFE ID per the Istio convention
+    /// `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>` via
+    /// [`SpiffeId::namespace`](crate::identity::SpiffeId::namespace).
+    ///
+    /// The Istio CRD models `HTTPMatchRequest.sourceNamespace` as an
+    /// exact-only string (no `prefix`/`regex` arms), so this field is a plain
+    /// `Option<String>` rather than a `StringMatch` enum — adding more arms
+    /// later would silently shadow operator intent. Matches are
+    /// case-sensitive: Kubernetes namespace names are lowercase per RFC 1123,
+    /// so any operator-provided casing is preserved verbatim and a
+    /// `"Prod"` predicate will not match a SPIFFE ID encoding `ns/prod`.
+    ///
+    /// `None` = no source-namespace restriction. The predicate also fails to
+    /// match (returns `false`) when the request carries no resolved peer
+    /// SPIFFE identity (non-mesh request, or the source workload is outside
+    /// the mesh trust domain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_namespace: Option<String>,
 }
 
 impl MatchCriteria {
     fn is_empty(&self) -> bool {
-        self.methods.is_empty() && self.headers.is_empty() && self.query_params.is_empty()
+        self.methods.is_empty()
+            && self.headers.is_empty()
+            && self.query_params.is_empty()
+            && self.source_namespace.is_none()
     }
 }
 
@@ -542,6 +565,37 @@ impl MeshRouteDispatch {
     pub fn rules(&self) -> &[RouteRule] {
         &self.config.rules
     }
+}
+
+/// Validate the optional `match.source_namespace` predicate. The Istio CRD
+/// shape is `HTTPMatchRequest.sourceNamespace: string` (exact-only); the
+/// translator projects exactly that. An empty string would silently match
+/// every workload that has any encoded namespace (a `""` predicate against
+/// `extract_namespace(...).is_some_and(|ns| ns == "")` would only match a
+/// degenerate SPIFFE ID, but the operator clearly meant to gate by a real
+/// namespace), so we reject the empty case at config-load time rather than
+/// shipping a never-firing rule. Patterns are preserved verbatim — Kubernetes
+/// namespace names are lowercase per RFC 1123, so any operator casing that
+/// would not match the SPIFFE encoding is the operator's bug, not a silent
+/// fold the gateway should hide.
+fn normalize_source_namespace(
+    rule_idx: usize,
+    source_namespace: &mut Option<String>,
+) -> Result<(), String> {
+    let Some(ns) = source_namespace.as_mut() else {
+        return Ok(());
+    };
+    if ns.is_empty() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].match.source_namespace must not be empty"
+        ));
+    }
+    if ns.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].match.source_namespace must not contain whitespace"
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_header_match_keys(
@@ -797,6 +851,33 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
         match ctx.query_params.get(name.as_str()) {
             Some(actual) if actual == expected => {}
             _ => return false,
+        }
+    }
+    if let Some(expected_ns) = m.source_namespace.as_deref() {
+        // Source workload namespace is encoded in the peer's SPIFFE ID via
+        // the Istio convention `spiffe://<td>/ns/<ns>/sa/<sa>`. The
+        // identity is populated by the `spiffe_identity` plugin during
+        // `on_request_received` (priority 940), well before this plugin
+        // runs in `before_proxy` (priority 2995), so a populated
+        // `ctx.peer_spiffe_id` is the steady state for mesh requests.
+        //
+        // Outside mesh mode — or when the source workload presents no
+        // SPIFFE-bearing certificate — there is no identity to match
+        // against. Treat that as "no match" so the predicate fails
+        // closed under `reject_unmatched: true` rather than silently
+        // matching every request that happens to lack a peer identity.
+        // `SpiffeId::namespace` reuses the same path-segment walk that
+        // `mesh_authz` uses for `namespace_pattern` matching, so the
+        // two surfaces never disagree on what `ns/<value>` means.
+        let Some(peer_ns) = ctx
+            .peer_spiffe_id
+            .as_ref()
+            .and_then(crate::identity::SpiffeId::namespace)
+        else {
+            return false;
+        };
+        if peer_ns != expected_ns {
+            return false;
         }
     }
     true
@@ -2163,5 +2244,280 @@ mod tests {
         assert!(raw["x-canary"].is_string());
         assert!(raw["x-tier"].is_object());
         assert_eq!(raw["x-tier"]["regex"].as_str(), Some("^(gold|platinum)$"));
+    }
+
+    // -- source_namespace matcher (T1-B.4) ----------------------------------
+    //
+    // VirtualService `match[].sourceNamespace` is now a first-class
+    // mesh_route_dispatch predicate. The hot path reads `ctx.peer_spiffe_id`
+    // (populated by the `spiffe_identity` plugin at priority 940, before
+    // mesh_route_dispatch runs at 2995) and extracts the namespace via
+    // `SpiffeId::namespace` — the same path-segment walk that `mesh_authz`
+    // uses for `namespace_pattern`, so the two surfaces cannot disagree.
+    // Istio models `sourceNamespace` as exact-only (no prefix/regex arms in
+    // the CRD), so the schema is `Option<String>` rather than a tagged enum.
+    use crate::identity::SpiffeId;
+
+    fn ctx_with_peer(method: &str, path: &str, spiffe_id: Option<&str>) -> RequestContext {
+        let mut ctx = ctx_with(method, path);
+        ctx.peer_spiffe_id = spiffe_id.map(|id| SpiffeId::new(id).expect("valid spiffe id"));
+        ctx
+    }
+
+    #[test]
+    fn accepts_source_namespace_only_match_at_load() {
+        // A rule whose only predicate is `source_namespace` must load —
+        // `MatchCriteria::is_empty()` returns false because the field is set.
+        // Without that update, the rule would hit the "empty match requires
+        // transforms" error and silently never compile.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            plugin.rules()[0].match_.source_namespace.as_deref(),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_source_namespace_at_load() {
+        // An empty string would only match a degenerate SPIFFE ID with an
+        // `ns/` segment that has no value (which the SPIFFE parser already
+        // rejects). Operators clearly meant a real namespace; treat empty as
+        // a config error rather than shipping a never-firing rule.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": ""},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("source_namespace"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_source_namespace_containing_whitespace_at_load() {
+        // K8s namespace names are RFC 1123 lowercase identifiers — no
+        // whitespace is ever legitimate, and a stray space would silently
+        // never match. Reject at load so the operator sees the typo.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod env"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("source_namespace"), "got: {err}");
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn source_namespace_match_routes_request() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer(
+            "GET",
+            "/api",
+            Some("spiffe://cluster.local/ns/prod/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("internal"));
+    }
+
+    #[tokio::test]
+    async fn source_namespace_mismatch_falls_through() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer(
+            "GET",
+            "/api",
+            Some("spiffe://cluster.local/ns/staging/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_namespace_match_is_case_sensitive() {
+        // Kubernetes namespace names are RFC 1123 lowercase, and SPIFFE IDs
+        // encode them literally. An uppercase predicate against a lowercase
+        // SPIFFE namespace must NOT match — folding case would silently
+        // accept operator typos.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "PROD"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer(
+            "GET",
+            "/api",
+            Some("spiffe://cluster.local/ns/prod/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_peer_identity_does_not_match_source_namespace() {
+        // No peer SPIFFE ID → no source namespace → match returns false.
+        // The predicate fails closed under `reject_unmatched: true` rather
+        // than silently matching every request that happens to lack a peer
+        // identity. Non-mesh requests and clients that present non-SPIFFE
+        // certs both land here.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer("GET", "/api", None);
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_identity_without_ns_segment_does_not_match_source_namespace() {
+        // A SPIFFE ID with no `ns/<value>` segment (operator using a
+        // non-Istio identity layout) cannot resolve a workload namespace.
+        // `SpiffeId::namespace()` returns `None`; the predicate must treat
+        // that as "no match" rather than panicking or matching accidentally.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer("GET", "/api", Some("spiffe://cluster.local/sa/billing"));
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_namespace_and_method_must_both_match() {
+        // All-of semantics across distinct predicate kinds — source_namespace
+        // is ANDed with method/headers/queryParams. Mirrors Istio's
+        // `HTTPMatchRequest` semantics where every field is conjunctive.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "methods": ["POST"],
+                    "source_namespace": "prod"
+                },
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        // Right method, wrong namespace.
+        let mut ctx = ctx_with_peer(
+            "POST",
+            "/api",
+            Some("spiffe://cluster.local/ns/staging/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+        // Right namespace, wrong method.
+        let mut ctx = ctx_with_peer(
+            "GET",
+            "/api",
+            Some("spiffe://cluster.local/ns/prod/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+        // Both match.
+        let mut ctx = ctx_with_peer(
+            "POST",
+            "/api",
+            Some("spiffe://cluster.local/ns/prod/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("internal"));
+    }
+
+    #[tokio::test]
+    async fn reject_unmatched_returns_404_when_source_namespace_does_not_match() {
+        // End-to-end: under `reject_unmatched: true` (the VS translator
+        // default), a source_namespace-only rule that does not match the
+        // peer identity must 404 instead of falling through to the default
+        // backend. This is the fail-closed VirtualService semantic.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"source_namespace": "prod"},
+                "destination": {"upstream_id": "internal"}
+            }],
+            "reject_unmatched": true
+        }))
+        .unwrap();
+        let mut ctx = ctx_with_peer(
+            "GET",
+            "/api",
+            Some("spiffe://cluster.local/ns/staging/sa/billing"),
+        );
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 404),
+            other => panic!("expected 404 reject, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_namespace_round_trips_through_serde() {
+        // The field uses `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+        // so configs without `source_namespace` round-trip without the key
+        // appearing in their serialized form. Configs with it round-trip
+        // byte-stable as a plain string.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [
+                {
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "no-ns"}
+                },
+                {
+                    "match": {"source_namespace": "prod"},
+                    "destination": {"upstream_id": "with-ns"}
+                }
+            ]
+        }))
+        .unwrap();
+        let rendered_no_ns =
+            serde_json::to_value(&plugin.rules()[0].match_).expect("serialize match");
+        assert!(
+            rendered_no_ns.get("source_namespace").is_none(),
+            "missing source_namespace must round-trip absent, got: {rendered_no_ns}"
+        );
+        let rendered_with_ns =
+            serde_json::to_value(&plugin.rules()[1].match_).expect("serialize match");
+        assert_eq!(
+            rendered_with_ns["source_namespace"].as_str(),
+            Some("prod"),
+            "string source_namespace must round-trip verbatim, got: {rendered_with_ns}"
+        );
     }
 }

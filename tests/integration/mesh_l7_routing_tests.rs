@@ -5,7 +5,7 @@ use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, PluginCon
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
-use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -910,4 +910,120 @@ async fn mesh_l7_routing_virtual_service_header_prefix_match_routes_and_falls_th
         PluginResult::Continue
     ));
     assert!(miss_ctx.route_override_backend_host.is_none());
+}
+
+// -- VirtualService sourceNamespace matcher (T1-B.4) ----------------------
+//
+// VirtualService `match[].sourceNamespace` is now a first-class
+// mesh_route_dispatch predicate. The test below exercises the full
+// translator → plugin construction → request hot path: the translator emits
+// the bare-string `source_namespace` field, and the plugin's hot path
+// resolves the source workload namespace from `ctx.peer_spiffe_id` via the
+// `SpiffeId::namespace` helper (the same path-segment walk that `mesh_authz`
+// uses for `namespace_pattern`, so the two surfaces cannot drift).
+//
+// The predicate is Istio exact-only (no `prefix`/`regex` arms in the CRD)
+// and case-sensitive: Kubernetes namespaces are RFC 1123 lowercase and the
+// matcher does not silently fold operator-provided casing. Outside mesh mode
+// (no peer SPIFFE identity) the predicate fails closed.
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_source_namespace_match_routes_and_misses_fall_closed() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/api"},
+                        "sourceNamespace": "prod"
+                    }],
+                    "route": [{"destination": {"host": "prod.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["source_namespace"].as_str(),
+        Some("prod")
+    );
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true),
+        "guarded-route VS still enforces match semantics via reject_unmatched"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match: source peer identity is from `prod` namespace → route override applies.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    ctx.peer_spiffe_id =
+        Some(SpiffeId::new("spiffe://cluster.local/ns/prod/sa/billing").expect("valid spiffe id"));
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("prod.default.svc.cluster.local")
+    );
+    assert_eq!(ctx.route_override_backend_port, Some(8080));
+
+    // Miss: source peer identity is from a different namespace → 404 (not
+    // silent fall-through to the default backend). This is the fail-closed
+    // VirtualService semantic that the request_termination shim used to
+    // provide; now it comes from the plugin's `reject_unmatched: true`.
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    miss_ctx.peer_spiffe_id = Some(
+        SpiffeId::new("spiffe://cluster.local/ns/staging/sa/billing").expect("valid spiffe id"),
+    );
+    let mut miss_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+
+    // Miss: request carries no peer SPIFFE identity (non-mesh path) → 404.
+    // The predicate cannot match an absent identity; failing closed avoids
+    // silently routing every unauthenticated request to the gated backend.
+    let mut nomesh_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut nomesh_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut nomesh_ctx, &mut nomesh_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
 }
