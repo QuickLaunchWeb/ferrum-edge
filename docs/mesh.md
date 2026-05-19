@@ -84,7 +84,7 @@ All east-west traffic flows through a shared TCP passthrough listener on port 15
 
 ### Egress Gateway
 
-Controlled egress proxy for mesh-to-external traffic. Materializes HTTP-family proxies from `ServiceEntry` resources with `location: mesh_external`.
+Controlled egress proxy for mesh-to-external traffic. Materializes HTTP-family proxies (sharing the egress listener at 15090 with mTLS termination) and stream-family TCP proxies (each on its own listener bound to the ServiceEntry's destination port) from `ServiceEntry` resources with `location: mesh_external`. See the "Egress Gateway" section below for materialization rules.
 
 | Listener | Address | Direction | Kind |
 |---|---|---|---|
@@ -772,15 +772,17 @@ multi_cluster:
 
 ## Egress Gateway
 
-When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-family proxies from `ServiceEntry` resources with `location: mesh_external`.
+When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-family **and** stream-family (TCP) proxies from `ServiceEntry` resources with `location: mesh_external`.
 
 ### Materialization Rules
 
 - Only `MeshExternal` entries are materialized (internal entries are skipped).
-- Each entry port produces one `Upstream` (targets from endpoints or DNS hosts) and one `Proxy` per host.
-- HTTP-family protocols are materialized (`http`, `http2`, `grpc`, `tls`). Non-HTTP protocols (`tcp`, `mongo`, `redis`, `mysql`, `postgres`) are skipped.
-- DNS-resolution entries use ServiceEntry hosts as backend targets; static-resolution entries use endpoint addresses.
-- Materialized proxies use host-only routing (no `listen_path`), `preserve_host_header: true`, and passive health checks.
+- HTTP-family protocols (`http`, `http2`, `grpc`, `tls`) materialize **HTTP-family** proxies: host-routed off the shared egress listener (mTLS termination at `egress_listen_addr`, default 15090). One proxy per host across all ports — host-only routing cannot disambiguate multiple ports under the same host.
+- Stream-family protocols (`tcp`, `mongo`, `redis`, `mysql`, `postgres`) materialize **stream-family** TCP proxies (T5-A): each binds its own listener on the ServiceEntry's own destination port (e.g., `mongo.external.io:27017/TCP` produces a TCP listener on port 27017). One proxy per port; same-port collisions across ServiceEntries skip the second entry with a warning. Multi-port stream ServiceEntries bind each port separately. ServiceEntry ports that collide with the egress gateway's own listener port (`egress_listen_addr.port()`, default `15090`) or port `0` are skipped with a warning rather than emitted — letting them through would fail to bind at runtime (`EADDRINUSE`) and reject the entire slice apply.
+- Mongo / Redis / MySQL / Postgres are TCP-based at the wire level; the protocol tag is preserved on `Proxy.name` for observability but **no protocol-aware mediation** (e.g., MongoDB wire-format inspection) is performed. Protocol-level mediation is tracked separately.
+- DNS-resolution entries use ServiceEntry hosts as backend targets; static-resolution entries use endpoint addresses. Stream-family proxies pin to the first host (DNS) or all endpoints (Static) — a raw L4 listener cannot distinguish hosts (no SNI for plain TCP), so multi-host external services should be split into one SE per host.
+- HTTP-family materialized proxies use host-only routing (no `listen_path`), `preserve_host_header: true`, and passive health checks. Stream-family proxies use port routing (no `hosts`), `passthrough: false` (the per-port stream listener is plaintext L4 — the inbound sidecar mTLS boundary is the sibling 15090 mTLS-termination listener for HTTP-family flows, *not* the per-port stream listener itself; this is NOT raw SNI passthrough, that flow lives in the east-west gateway), and passive health checks.
+- The egress gateway materialization pairs with the `mesh_outbound_registry` plugin (HTTP-family, request-path 4xx/5xx). T5-A and the sibling T5-B (stream-family outbound enforcement at sidecar capture: connection-level drop / silent UDP datagram drop) close the `outboundTrafficPolicy: REGISTRY_ONLY` gap across both transport families.
 
 ### ServiceEntry Visibility
 
