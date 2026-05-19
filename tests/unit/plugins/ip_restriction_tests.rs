@@ -617,3 +617,16 @@ fn ipv4_too_many_octets_is_rejected() {
     }));
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn ipv4_rule_matches_ipv4_mapped_ipv6_client() {
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["192.168.1.0/24"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("::ffff:192.168.1.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}

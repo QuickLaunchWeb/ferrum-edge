@@ -246,6 +246,10 @@ pub(super) fn parse_client_ip(ip: &str) -> ParsedClientIp {
         return ParsedClientIp::V4(u32::from_be_bytes(octets));
     }
     if let Some(parts) = parse_ipv6(ip) {
+        let v6 = Ipv6Addr::from(parts);
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return ParsedClientIp::V4(u32::from(v4));
+        }
         return ParsedClientIp::V6(ipv6_to_u128(&parts));
     }
     ParsedClientIp::Unknown
