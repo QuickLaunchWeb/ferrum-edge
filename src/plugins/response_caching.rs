@@ -434,8 +434,14 @@ impl ResponseCaching {
                 if index > 0 {
                     query_part.push('&');
                 }
+                // Encode as length-prefixed fields to avoid delimiter
+                // ambiguity after query percent-decoding.
+                query_part.push_str(&key.len().to_string());
+                query_part.push(':');
                 query_part.push_str(key);
                 query_part.push('=');
+                query_part.push_str(&value.len().to_string());
+                query_part.push(':');
                 query_part.push_str(value);
             }
         }

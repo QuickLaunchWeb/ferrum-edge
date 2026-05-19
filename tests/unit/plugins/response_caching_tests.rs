@@ -188,6 +188,37 @@ async fn test_cache_miss_first_request() {
     assert!(ctx.metadata.contains_key("cache_base_key"));
 }
 
+#[tokio::test]
+async fn test_query_cache_key_avoids_decoded_delimiter_collision() {
+    let plugin = default_plugin();
+
+    // Decoded map for `?a=1%26b=2`
+    let mut attacker_ctx = make_ctx_with_query("GET", "/api/data", &[("a", "1&b=2")]);
+    let mut attacker_headers = HashMap::new();
+    let attacker_result = plugin
+        .before_proxy(&mut attacker_ctx, &mut attacker_headers)
+        .await;
+    assert!(matches!(attacker_result, PluginResult::Continue));
+    let attacker_key = attacker_ctx
+        .metadata
+        .get("cache_base_key")
+        .expect("cache key should be stored")
+        .clone();
+
+    // Decoded map for `?a=1&b=2`
+    let mut victim_ctx = make_ctx_with_query("GET", "/api/data", &[("a", "1"), ("b", "2")]);
+    let mut victim_headers = HashMap::new();
+    let victim_result = plugin.before_proxy(&mut victim_ctx, &mut victim_headers).await;
+    assert!(matches!(victim_result, PluginResult::Continue));
+    let victim_key = victim_ctx
+        .metadata
+        .get("cache_base_key")
+        .expect("cache key should be stored")
+        .clone();
+
+    assert_ne!(attacker_key, victim_key);
+}
+
 // === Cache hit on second request ===
 
 #[tokio::test]
