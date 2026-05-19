@@ -248,6 +248,53 @@ pub struct UpstreamPortOverride {
     /// the upstream-level `Upstream.locality_lb_setting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
+    /// Per-port cap on inflight backend TCP connections, mapped from
+    /// DestinationRule `connectionPool.tcp.maxConnections`. Currently enforced
+    /// only by stream-family (TCP / TCP+TLS) backend dispatch; HTTP-family
+    /// dispatch ignores the field (tracked as a follow-on PR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    /// Per-port TCP keepalive overrides, mapped from DestinationRule
+    /// `connectionPool.tcp.tcpKeepalive`. Currently applied only by
+    /// stream-family backend dispatch on the newly connected backend socket
+    /// (HTTP-family dispatch is a follow-on PR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_keepalive: Option<TcpKeepaliveCfg>,
+}
+
+/// Per-target TCP keepalive override. Mirrors Istio's
+/// `ConnectionPoolSettings.TCPSettings.TcpKeepalive` (time/interval/probes)
+/// but stores integer seconds so the schema round-trips through serde without
+/// pulling in Istio duration parsing on the apply side. Translation from
+/// `google.protobuf.Duration` happens at the K8s translator boundary.
+///
+/// Fields are independently optional so operators can configure only the knobs
+/// they care about (e.g. just `time_seconds` to extend the idle probe delay).
+/// Sub-second durations are rejected at translate time — the underlying
+/// `TCP_KEEPIDLE` / `TCP_KEEPINTVL` socket options are specified in seconds on
+/// every supported platform.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpKeepaliveCfg {
+    /// Idle time before the first keepalive probe (`TCP_KEEPIDLE` on Linux,
+    /// `TCP_KEEPALIVE` on macOS/iOS). Always positive when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_seconds: Option<u32>,
+    /// Interval between successive keepalive probes (`TCP_KEEPINTVL`).
+    /// Always positive when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u32>,
+    /// Maximum number of unacknowledged probes before declaring the
+    /// connection dead (`TCP_KEEPCNT`). Always positive when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<u32>,
+}
+
+impl TcpKeepaliveCfg {
+    /// `true` when no field is set — used by translators to avoid emitting an
+    /// empty override on the upstream slot.
+    pub fn is_empty(&self) -> bool {
+        self.time_seconds.is_none() && self.interval_seconds.is_none() && self.probes.is_none()
+    }
 }
 
 /// Cold-path projection of an [`UpstreamPortOverride`] onto a `Proxy`.
@@ -262,6 +309,8 @@ pub struct ResolvedPortOverride {
     pub hash_on: Option<String>,
     pub passive_health_check: Option<PassiveHealthCheck>,
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
+    pub max_connections: Option<u32>,
+    pub tcp_keepalive: Option<TcpKeepaliveCfg>,
 }
 
 impl ResolvedPortOverride {
@@ -272,6 +321,8 @@ impl ResolvedPortOverride {
             hash_on: value.hash_on.clone(),
             passive_health_check: value.passive_health_check.clone(),
             locality_lb_setting: value.locality_lb_setting.clone(),
+            max_connections: value.max_connections,
+            tcp_keepalive: value.tcp_keepalive.clone(),
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -282,6 +333,8 @@ impl ResolvedPortOverride {
             && self.hash_on.is_none()
             && self.passive_health_check.is_none()
             && self.locality_lb_setting.is_none()
+            && self.max_connections.is_none()
+            && self.tcp_keepalive.is_none()
     }
 }
 

@@ -128,6 +128,7 @@ pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS ha
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
+pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -512,7 +513,169 @@ pub struct TcpProxyMetrics {
     /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
     /// When non-zero, indicates splice was used instead of userspace copy.
     pub splice_bytes_transferred: AtomicU64,
+    /// Per-backend-target inflight TCP connection counters used to enforce
+    /// DestinationRule `connectionPool.tcp.maxConnections`. Lazily created on
+    /// first hit per `(host, port)` target. The counters are
+    /// [`crossbeam_utils::CachePadded`] so the read-mostly inflight count
+    /// doesn't share a cache line with the hotter listener-level
+    /// `active_backend_connections` field — at high stream-proxy QPS, false
+    /// sharing turned every cmpxchg into a coherence stall.
+    ///
+    /// Key components cannot contain `|` because hostnames are admission-
+    /// validated and ports are `u16` — see `crate::config::types`
+    /// normalisation rules.
+    pub backend_inflight: BackendInflightCounters,
 }
+
+/// Lazy per-target inflight counter map. Wrapped in its own struct so we can
+/// implement `Default` (DashMap doesn't derive it for us with custom shard
+/// sizing) and so future callers (HTTP-family follow-on) can extend the API
+/// without touching every `TcpProxyMetrics` initialiser.
+#[derive(Clone)]
+pub struct BackendInflightCounters {
+    inner: Arc<dashmap::DashMap<BackendInflightKey, Arc<crossbeam_utils::CachePadded<AtomicU64>>>>,
+}
+
+/// `(host, port)` key for per-backend-target inflight counters. Owned host
+/// `String` so the key survives across DNS-cache-refreshed connect attempts
+/// and the host doesn't have to be reborrowed from the proxy struct on every
+/// connect.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BackendInflightKey {
+    host: String,
+    port: u16,
+}
+
+impl Default for BackendInflightCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackendInflightCounters {
+    pub fn new() -> Self {
+        // Conservative cardinality: a single TCP proxy maps to one upstream
+        // group, typically 1–10 backend targets. We still go through
+        // `pool_shard_amount` for consistency with the rest of the hot-path
+        // map sizing — a 0 override means "auto" (`max(64, num_cpus * 16)`).
+        let shards = crate::util::sharding::pool_shard_amount(0);
+        Self {
+            inner: Arc::new(dashmap::DashMap::with_shard_amount(shards)),
+        }
+    }
+
+    /// Look up or insert the counter for the given target, returning a cheap
+    /// `Arc` handle so the guard can hold the same counter even if the
+    /// DashMap entry is concurrently evicted later (cleanup is currently a
+    /// non-feature — counters stick around for the listener's lifetime — so
+    /// this is forward-compatible).
+    fn counter_for(&self, host: &str, port: u16) -> Arc<crossbeam_utils::CachePadded<AtomicU64>> {
+        // Two-phase: cheap read first, fall back to entry-API only when the
+        // key is missing. Hot path is always cache-hit because steady-state
+        // traffic reuses the same target set.
+        if let Some(existing) = self.inner.get(&BackendInflightKey {
+            host: host.to_string(),
+            port,
+        }) {
+            return existing.clone();
+        }
+        let key = BackendInflightKey {
+            host: host.to_string(),
+            port,
+        };
+        self.inner
+            .entry(key)
+            .or_insert_with(|| Arc::new(crossbeam_utils::CachePadded::new(AtomicU64::new(0))))
+            .clone()
+    }
+
+    /// Read the current inflight count for a target. Test- and metrics-only
+    /// access — the production hot path uses `counter_for` directly.
+    #[allow(dead_code)]
+    pub fn inflight(&self, host: &str, port: u16) -> u64 {
+        self.inner
+            .get(&BackendInflightKey {
+                host: host.to_string(),
+                port,
+            })
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+/// RAII guard that increments a per-target inflight counter on construction
+/// and decrements on drop. Held alongside the per-listener
+/// `TcpBackendSessionGuard` so both the global and per-target totals stay in
+/// sync across all relay exits (graceful close, idle timeout, error).
+#[derive(Debug)]
+struct BackendInflightGuard {
+    counter: Arc<crossbeam_utils::CachePadded<AtomicU64>>,
+}
+
+impl BackendInflightGuard {
+    /// Acquire a slot, returning `Ok(guard)` if under the cap or `Err` when
+    /// the cap is already reached. The `cap` is `Option<u32>` so callers
+    /// pass `None` for "no cap configured" (the hot path then skips the
+    /// counter entirely and avoids the inflight DashMap lookup).
+    fn try_acquire(
+        counters: &BackendInflightCounters,
+        host: &str,
+        port: u16,
+        cap: u32,
+    ) -> Result<Self, BackendInflightAcquireError> {
+        let counter = counters.counter_for(host, port);
+        let cap_u64 = u64::from(cap);
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= cap_u64 {
+                return Err(BackendInflightAcquireError {
+                    current,
+                    cap: cap_u64,
+                });
+            }
+            // Use compare-exchange-weak in a CAS loop so two concurrent
+            // accepting threads can never both squeak past `cap - 1`. A
+            // `fetch_add + check + rollback` race-free shape is harder to
+            // read and gives the same throughput on uncontended paths.
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Self { counter }),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+impl Drop for BackendInflightGuard {
+    fn drop(&mut self) {
+        // `saturating_sub` would mask a counter underflow bug — use the
+        // straight `fetch_sub` and rely on the test suite to catch any
+        // missing-guard regression.
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackendInflightAcquireError {
+    current: u64,
+    cap: u64,
+}
+
+impl std::fmt::Display for BackendInflightAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend max_connections reached: {} inflight (cap {})",
+            self.current, self.cap
+        )
+    }
+}
+
+impl std::error::Error for BackendInflightAcquireError {}
 
 struct TcpBackendSessionGuard<'a> {
     metrics: &'a TcpProxyMetrics,
@@ -1143,6 +1306,18 @@ struct TcpConnParams {
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
     tcp_fastopen_enabled: bool,
+    /// DestinationRule `connectionPool.tcp.maxConnections` for the resolved
+    /// destination port. When `Some(cap)`, the per-target inflight counter is
+    /// CAS-bumped before connect and `Err`s with a typed
+    /// [`BackendInflightAcquireError`] when the cap is already reached.
+    /// When `None`, the inflight counter is not consulted at all and the
+    /// hot path saves a DashMap lookup.
+    max_backend_connections: Option<u32>,
+    /// DestinationRule `connectionPool.tcp.tcpKeepalive` for the resolved
+    /// destination port. Applied via `socket_opts::apply_tcp_keepalive` after
+    /// the backend socket is connected (best-effort: a `setsockopt` failure
+    /// logs and continues rather than dropping the connection).
+    tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -1464,12 +1639,16 @@ async fn handle_tcp_connection_inner(
         // field read, no DashMap/ArcSwap traversal. Pre-port DR
         // connectTimeouts for TCP services (e.g. MySQL on 3306 with a
         // tighter budget than the proxy default) now flow into the relay.
-        let effective_backend_connect_timeout_ms = proxy
+        let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&backend_port))
+            .and_then(|m| m.get(&backend_port));
+        let effective_backend_connect_timeout_ms = port_override
             .and_then(|override_config| override_config.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
+        let max_backend_connections =
+            port_override.and_then(|override_config| override_config.max_connections);
+        let tcp_keepalive = port_override.and_then(|c| c.tcp_keepalive.clone());
 
         let params = TcpConnParams {
             backend_host,
@@ -1489,6 +1668,8 @@ async fn handle_tcp_connection_inner(
             upstream_subset: proxy.upstream_subset.clone(),
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
+            max_backend_connections,
+            tcp_keepalive,
         };
 
         (params, cb_info)
@@ -1617,6 +1798,36 @@ async fn handle_tcp_connection_inner(
         let addr = SocketAddr::new(resolved_ip, params.backend_port);
         backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
+        // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
+        // the passthrough path. The cap is checked before connect so we don't
+        // count failed handshakes against the cap. The guard's RAII drop
+        // covers every relay exit (graceful EOF, idle timeout, error).
+        let _backend_inflight_guard = match acquire_backend_inflight_slot(
+            &params,
+            metrics,
+            &params.backend_host,
+            params.backend_port,
+        ) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    backend = %format_backend_target(&params.backend_host, params.backend_port),
+                    reason = %reason,
+                    "TCP passthrough rejected: backend maxConnections reached"
+                );
+                return Err(StreamSetupError::with_source(
+                    StreamSetupKind::BackendMaxConnectionsExceeded,
+                    format!(
+                        "for {}",
+                        format_backend_target(&params.backend_host, params.backend_port)
+                    ),
+                    reason,
+                )
+                .into());
+            }
+        };
+
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
         let backend_stream =
@@ -1632,6 +1843,11 @@ async fn handle_tcp_connection_inner(
                         cb.record_failure(502, true, cb_info.is_half_open_probe);
                     }
                 })?;
+
+        // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
+        // backend socket. Best-effort: a `setsockopt` failure logs and
+        // continues rather than dropping the connection.
+        apply_backend_tcp_keepalive(proxy_id, &backend_stream, params.tcp_keepalive.as_ref());
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
 
@@ -1945,6 +2161,74 @@ async fn handle_tcp_connection_inner(
         // DNS succeeded — record the resolved IP for logging.
         backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
+        // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
+        // the non-passthrough connect path. Checked once per retry attempt
+        // so failed dials don't consume slots; the guard's `Drop` impl
+        // releases the slot when the relay future ends.
+        //
+        // The slot is rebuilt on each retry against `current_host` /
+        // `current_port` so that a load-balancer rotation to a sibling
+        // target counts against the new target's counter, not the failed
+        // one. `_backend_inflight_guard_attempt` is shadowed at every loop
+        // entry — only the latest successful guard survives past the `break`.
+        let backend_inflight_guard_attempt =
+            match acquire_backend_inflight_slot(&params, metrics, &current_host, current_port) {
+                Ok(guard) => guard,
+                Err(reason) => {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        backend = %format_backend_target(&current_host, current_port),
+                        reason = %reason,
+                        "TCP backend rejected: maxConnections reached"
+                    );
+                    if can_retry
+                        && attempt < max_retries
+                        && let Some(next) = try_next_target(
+                            &params,
+                            &current_host,
+                            current_port,
+                            &epoch.load_balancer,
+                        )
+                    {
+                        current_host = next.0;
+                        current_port = next.1;
+                        current_cb_info = TcpConnCbInfo {
+                            cb_config: current_cb_info.cb_config.clone(),
+                            cb_target_key: params.upstream_id.as_ref().map(|_| {
+                                crate::circuit_breaker::target_key(&current_host, current_port)
+                            }),
+                            is_half_open_probe: false,
+                        };
+                        backend_info.backend_target =
+                            format_backend_target(&current_host, current_port);
+                        backend_info.backend_resolved_ip = None;
+                        last_connect_err = Some(
+                            StreamSetupError::with_source(
+                                StreamSetupKind::BackendMaxConnectionsExceeded,
+                                format!(
+                                    "for {}",
+                                    format_backend_target(&current_host, current_port)
+                                ),
+                                reason,
+                            )
+                            .into(),
+                        );
+                        attempt += 1;
+                        if let Some(ref retry_config) = params.retry {
+                            tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt))
+                                .await;
+                        }
+                        continue;
+                    }
+                    return Err(StreamSetupError::with_source(
+                        StreamSetupKind::BackendMaxConnectionsExceeded,
+                        format!("for {}", format_backend_target(&current_host, current_port)),
+                        reason,
+                    )
+                    .into());
+                }
+            };
+
         // Attempt backend TCP connection (with optional TLS origination)
         let connect_result = if is_backend_tls {
             connect_backend_tls_cached(
@@ -1954,20 +2238,26 @@ async fn handle_tcp_connection_inner(
                 cached_backend_tls,
                 params.tcp_fastopen_enabled,
                 overload,
+                params.tcp_keepalive.as_ref(),
+                proxy_id,
             )
             .await
             .map(|s| BackendStream::Tls(Box::new(s)))
         } else {
             connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
                 .await
+                .inspect(|stream| {
+                    apply_backend_tcp_keepalive(proxy_id, stream, params.tcp_keepalive.as_ref());
+                })
                 .map(BackendStream::Plain)
         };
 
         match connect_result {
             Ok(_stream) => {
-                // Connection succeeded — break out of retry loop with the address.
-                // We pass the stream via BackendStream enum below.
-                break (addr, _stream);
+                // Connection succeeded — break out of retry loop with the
+                // address, carrying the inflight guard so the per-target
+                // counter is decremented at relay exit.
+                break (addr, _stream, backend_inflight_guard_attempt);
             }
             Err(e) => {
                 record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
@@ -2007,7 +2297,7 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
-    let (_backend_socket_addr, backend_stream) = backend_addr;
+    let (_backend_socket_addr, backend_stream, _backend_inflight_guard) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
 
@@ -2371,6 +2661,73 @@ fn try_next_target(
     Some((next.host.clone(), next.port))
 }
 
+/// Try to acquire a per-target inflight slot for DR
+/// `connectionPool.tcp.maxConnections`. Returns:
+///   * `Ok(None)` when no cap is configured (hot path: zero overhead).
+///   * `Ok(Some(guard))` when a slot was acquired. The guard's `Drop` impl
+///     decrements the counter.
+///   * `Err(BackendInflightAcquireError)` when the cap is already reached.
+fn acquire_backend_inflight_slot(
+    params: &TcpConnParams,
+    metrics: &TcpProxyMetrics,
+    host: &str,
+    port: u16,
+) -> Result<Option<BackendInflightGuard>, BackendInflightAcquireError> {
+    let Some(cap) = params.max_backend_connections else {
+        return Ok(None);
+    };
+    let guard = BackendInflightGuard::try_acquire(&metrics.backend_inflight, host, port, cap)?;
+    Ok(Some(guard))
+}
+
+/// Apply DestinationRule `connectionPool.tcp.tcpKeepalive` on a freshly
+/// connected backend `TcpStream`. Best-effort: a `setsockopt` failure logs
+/// at `warn!` and continues rather than dropping the backend connection —
+/// keepalive is an operational hint, not a correctness requirement.
+fn apply_backend_tcp_keepalive(
+    proxy_id: &str,
+    stream: &TcpStream,
+    cfg: Option<&crate::config::types::TcpKeepaliveCfg>,
+) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) = crate::socket_opts::apply_tcp_keepalive(stream.as_raw_fd(), cfg) {
+            warn!(
+                proxy_id = %proxy_id,
+                error = %e,
+                "Failed to apply DestinationRule TCP keepalive on backend socket; continuing"
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        if let Err(e) = crate::socket_opts::apply_tcp_keepalive(stream.as_raw_socket(), cfg) {
+            warn!(
+                proxy_id = %proxy_id,
+                error = %e,
+                "Failed to apply DestinationRule TCP keepalive on backend socket; continuing"
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Other platforms: keepalive is unreachable via socket2 here, but the
+        // K8s translator still accepts the configuration. Surface that the
+        // operator intent landed in slice apply but cannot take effect on
+        // this build target.
+        debug!(
+            proxy_id = %proxy_id,
+            "DestinationRule TCP keepalive configured but unsupported on this platform; skipping"
+        );
+        let _ = (stream, cfg);
+    }
+}
+
 /// Connect to a plain TCP backend with the given connect timeout.
 ///
 /// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` and `TCP_FASTOPEN_CONNECT`
@@ -2428,6 +2785,14 @@ async fn connect_backend_plain(
 
 /// Connect to a TLS-enabled backend using the cached TLS config when available.
 /// Falls back to building the config from disk if no cache is provided.
+///
+/// `keepalive` carries DestinationRule `connectionPool.tcp.tcpKeepalive`. We
+/// apply it to the underlying `TcpStream` BEFORE the TLS handshake starts so
+/// the kernel begins counting idle time from connection establishment, not
+/// from handshake completion. Best-effort: `setsockopt` failures log and
+/// continue rather than aborting the connection (keepalive is an operational
+/// hint).
+#[allow(clippy::too_many_arguments)]
 async fn connect_backend_tls_cached(
     addr: SocketAddr,
     hostname: &str,
@@ -2435,9 +2800,12 @@ async fn connect_backend_tls_cached(
     cached_tls: Option<&CachedBackendTlsConfig>,
     tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
+    keepalive: Option<&crate::config::types::TcpKeepaliveCfg>,
+    proxy_id: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
     let connect_started = Instant::now();
     let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
+    apply_backend_tcp_keepalive(proxy_id, &tcp_stream, keepalive);
 
     let tls_config = cached_tls
         .map(|c| c.config.clone())
@@ -4960,5 +5328,125 @@ mod cause_direction_tests {
             pre_copy_disconnect_direction(&e, &ErrorClass::DnsLookupError),
             Direction::BackendToClient
         );
+    }
+
+    #[test]
+    fn typed_backend_max_connections_maps_to_backend_error_and_backend_direction() {
+        // DR `connectionPool.tcp.maxConnections` enforcement is a backend-side
+        // policy decision (the gateway is applying the operator's intent to
+        // shed traffic away from this target). Symmetric to
+        // `CircuitBreakerOpen` — both must NOT misclassify as client-side.
+        let e = err(StreamSetupKind::BackendMaxConnectionsExceeded);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+}
+
+#[cfg(test)]
+mod backend_inflight_tests {
+    //! Unit tests for the per-backend-target inflight counter used by
+    //! DestinationRule `connectionPool.tcp.maxConnections` enforcement.
+
+    use super::{BackendInflightCounters, BackendInflightGuard};
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn guard_increments_and_decrements_counter() {
+        let counters = BackendInflightCounters::new();
+        assert_eq!(counters.inflight("backend", 8080), 0);
+        {
+            let _guard =
+                BackendInflightGuard::try_acquire(&counters, "backend", 8080, 5).expect("acquire");
+            assert_eq!(counters.inflight("backend", 8080), 1);
+        }
+        assert_eq!(counters.inflight("backend", 8080), 0, "drop must decrement");
+    }
+
+    #[test]
+    fn guards_for_different_targets_do_not_share_a_counter() {
+        let counters = BackendInflightCounters::new();
+        let _g1 =
+            BackendInflightGuard::try_acquire(&counters, "backend-a", 80, 2).expect("acquire a");
+        let _g2 =
+            BackendInflightGuard::try_acquire(&counters, "backend-b", 80, 2).expect("acquire b");
+        assert_eq!(counters.inflight("backend-a", 80), 1);
+        assert_eq!(counters.inflight("backend-b", 80), 1);
+    }
+
+    #[test]
+    fn cap_is_enforced_and_release_lets_next_acquire_succeed() {
+        let counters = BackendInflightCounters::new();
+        let g1 = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1).expect("first slot");
+        let err = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1).expect_err("cap hit");
+        // The displayed error includes the current count and cap so logs
+        // surface the right context. Don't byte-match the wording — just
+        // sanity-check the cap value is in there.
+        let msg = err.to_string();
+        assert!(msg.contains("cap 1"), "unexpected error wording: {msg}");
+        drop(g1);
+        // Re-acquire works once the slot is released.
+        let _g2 = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1)
+            .expect("re-acquire after release");
+        assert_eq!(counters.inflight("h", 7777), 1);
+    }
+
+    #[test]
+    fn concurrent_acquire_release_never_goes_negative_or_exceeds_cap() {
+        let counters = Arc::new(BackendInflightCounters::new());
+        let cap: u32 = 32;
+        let threads = 8usize;
+        let ops_per_thread = 5_000usize;
+
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let counters = Arc::clone(&counters);
+            handles.push(thread::spawn(move || {
+                let mut acquired_at_least_once = false;
+                for _ in 0..ops_per_thread {
+                    if let Ok(guard) = BackendInflightGuard::try_acquire(&counters, "h", 9090, cap)
+                    {
+                        acquired_at_least_once = true;
+                        // Hold the slot briefly so the inflight count
+                        // exercises the cap boundary across threads.
+                        std::hint::spin_loop();
+                        drop(guard);
+                    }
+                }
+                acquired_at_least_once
+            }));
+        }
+        let mut at_least_one_success = false;
+        for h in handles {
+            at_least_one_success |= h.join().expect("thread join");
+        }
+        assert!(
+            at_least_one_success,
+            "at least one thread should have acquired the slot during the stress run"
+        );
+        let final_inflight = counters.inflight("h", 9090);
+        assert_eq!(
+            final_inflight, 0,
+            "after every guard is dropped the counter must be exactly zero \
+             (was {final_inflight}); negative values would have wrapped to u64::MAX"
+        );
+    }
+
+    #[test]
+    fn cap_zero_rejects_everything() {
+        // `max_connections == 0` is rejected at translate time, but the
+        // guard helper must still behave sanely if a caller ever passes
+        // `0` through (defence-in-depth).
+        let counters = BackendInflightCounters::new();
+        let err =
+            BackendInflightGuard::try_acquire(&counters, "h", 1, 0).expect_err("cap 0 rejects");
+        assert!(err.to_string().contains("cap 0"));
+        assert_eq!(counters.inflight("h", 1), 0);
     }
 }

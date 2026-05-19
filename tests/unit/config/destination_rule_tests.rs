@@ -546,3 +546,87 @@ fn gateway_config_accepts_valid_proxy_subset_reference() {
 
     assert!(config.validate_upstream_references().is_ok());
 }
+
+// ── UpstreamPortOverride max_connections / tcp_keepalive serde ────────────────
+
+#[test]
+fn upstream_port_override_max_connections_round_trips() {
+    use ferrum_edge::config::types::{TcpKeepaliveCfg, UpstreamPortOverride};
+
+    let override_slot = UpstreamPortOverride {
+        max_connections: Some(50),
+        tcp_keepalive: Some(TcpKeepaliveCfg {
+            time_seconds: Some(300),
+            interval_seconds: Some(30),
+            probes: Some(3),
+        }),
+        ..UpstreamPortOverride::default()
+    };
+    let json = serde_json::to_string(&override_slot).unwrap();
+    assert!(json.contains("\"max_connections\":50"));
+    assert!(json.contains("\"tcp_keepalive\""));
+
+    let back: UpstreamPortOverride = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.max_connections, Some(50));
+    let keepalive = back.tcp_keepalive.expect("keepalive round-trips");
+    assert_eq!(keepalive.time_seconds, Some(300));
+    assert_eq!(keepalive.interval_seconds, Some(30));
+    assert_eq!(keepalive.probes, Some(3));
+}
+
+#[test]
+fn upstream_port_override_default_omits_new_fields_from_json() {
+    use ferrum_edge::config::types::UpstreamPortOverride;
+
+    // Wire compatibility: an `UpstreamPortOverride::default()` MUST omit
+    // both new fields from the JSON shape so old DPs reading new slices see
+    // the same byte-for-byte serialization as before.
+    let empty = UpstreamPortOverride::default();
+    let json = serde_json::to_string(&empty).unwrap();
+    assert!(
+        !json.contains("max_connections"),
+        "max_connections=None must NOT appear in JSON: {json}"
+    );
+    assert!(
+        !json.contains("tcp_keepalive"),
+        "tcp_keepalive=None must NOT appear in JSON: {json}"
+    );
+    assert_eq!(
+        json, "{}",
+        "default override must serialize to empty object"
+    );
+}
+
+#[test]
+fn tcp_keepalive_cfg_partial_fields_round_trip() {
+    use ferrum_edge::config::types::TcpKeepaliveCfg;
+
+    // Each field is independently optional. A keepalive cfg with only
+    // `time_seconds` must round-trip without resurrecting None fields.
+    let cfg = TcpKeepaliveCfg {
+        time_seconds: Some(600),
+        ..TcpKeepaliveCfg::default()
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    assert!(json.contains("\"time_seconds\":600"));
+    assert!(!json.contains("interval_seconds"));
+    assert!(!json.contains("probes"));
+
+    let back: TcpKeepaliveCfg = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.time_seconds, Some(600));
+    assert!(back.interval_seconds.is_none());
+    assert!(back.probes.is_none());
+}
+
+#[test]
+fn tcp_keepalive_cfg_is_empty_recognises_all_none() {
+    use ferrum_edge::config::types::TcpKeepaliveCfg;
+    assert!(TcpKeepaliveCfg::default().is_empty());
+    assert!(
+        !TcpKeepaliveCfg {
+            probes: Some(1),
+            ..TcpKeepaliveCfg::default()
+        }
+        .is_empty()
+    );
+}

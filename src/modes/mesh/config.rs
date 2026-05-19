@@ -1077,6 +1077,21 @@ pub struct MeshTrafficPolicy {
     /// reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
+    /// Cap on inflight backend TCP connections per target, mapped from
+    /// Istio `connectionPool.tcp.maxConnections`. Currently enforced only
+    /// by stream-family backend dispatch (TCP / TCP+TLS proxies); HTTP-family
+    /// dispatch ignores the field — that is tracked as a follow-on PR.
+    /// Old DPs reading new slices see this as a no-op via the serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    /// TCP keepalive overrides mapped from Istio
+    /// `connectionPool.tcp.tcpKeepalive`. Each subfield is independently
+    /// optional. Currently applied only by stream-family backend dispatch on
+    /// the newly connected backend socket (HTTP-family dispatch is a
+    /// follow-on PR). Old DPs reading new slices see this as a no-op via
+    /// the serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's

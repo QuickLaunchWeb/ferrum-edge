@@ -196,6 +196,127 @@ pub fn set_tcp_fastopen_client(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── TCP_KEEPALIVE (DestinationRule connectionPool.tcp.tcpKeepalive) ─────────
+
+/// Apply per-target TCP keepalive overrides on an already-connected backend
+/// socket.
+///
+/// Wraps `socket2::Socket::set_tcp_keepalive`, which fans out to the right
+/// per-platform socket options:
+///   * Linux: `TCP_KEEPIDLE` (time), `TCP_KEEPINTVL` (interval), `TCP_KEEPCNT` (probes)
+///   * macOS / iOS: `TCP_KEEPALIVE` (time), `TCP_KEEPINTVL` (interval), `TCP_KEEPCNT` (probes)
+///   * BSDs: `TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`
+///   * Windows: a single `WSAIoctl(SIO_KEEPALIVE_VALS)` carrying time + interval (probes ignored)
+///
+/// Returns `Ok(())` on every supported platform when at least one field is set;
+/// the helper is a no-op when `cfg.is_empty()`. We also enable `SO_KEEPALIVE`
+/// itself first so the per-knob values actually take effect — otherwise the
+/// kernel keeps the connection in default keepalive-disabled mode regardless
+/// of `TCP_KEEPIDLE` / friends.
+///
+/// `time_seconds` and `interval_seconds` are always set as whole seconds
+/// (sub-second precision is rejected at the K8s translator boundary because
+/// the underlying socket options are second-granular on every supported
+/// platform).
+///
+/// Failures from `setsockopt` are bubbled up; callers (`tcp_proxy.rs`) treat
+/// keepalive setup as best-effort and log + continue rather than dropping the
+/// backend connection.
+#[cfg(unix)]
+pub fn apply_tcp_keepalive(
+    fd: std::os::fd::RawFd,
+    cfg: &crate::config::types::TcpKeepaliveCfg,
+) -> std::io::Result<()> {
+    if cfg.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: `from_raw_fd` takes ownership of the fd. We immediately call
+    // `into_raw_fd()` after the setsockopts complete to release ownership
+    // back to the caller so dropping `socket` does NOT close the still-live
+    // backend connection.
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+    let result = apply_tcp_keepalive_inner(&socket, cfg);
+    // Release the fd back so socket Drop does not close the connection.
+    let _ = socket.into_raw_fd();
+    result
+}
+
+#[cfg(windows)]
+pub fn apply_tcp_keepalive(
+    sock: std::os::windows::io::RawSocket,
+    cfg: &crate::config::types::TcpKeepaliveCfg,
+) -> std::io::Result<()> {
+    if cfg.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: same lifecycle contract as the unix branch — re-release the
+    // underlying raw socket via `into_raw_socket()` so the caller keeps
+    // ownership of the live connection.
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    let socket = unsafe { socket2::Socket::from_raw_socket(sock) };
+    let result = apply_tcp_keepalive_inner(&socket, cfg);
+    let _ = socket.into_raw_socket();
+    result
+}
+
+/// Shared helper that owns the `socket2::TcpKeepalive` construction so the
+/// per-platform `apply_tcp_keepalive` wrappers only differ in how they wrap
+/// the raw handle. Kept private so callers always go through the
+/// fd / socket-typed entry points above.
+fn apply_tcp_keepalive_inner(
+    socket: &socket2::Socket,
+    cfg: &crate::config::types::TcpKeepaliveCfg,
+) -> std::io::Result<()> {
+    socket.set_keepalive(true)?;
+    let mut params = socket2::TcpKeepalive::new();
+    if let Some(secs) = cfg.time_seconds {
+        params = params.with_time(std::time::Duration::from_secs(u64::from(secs)));
+    }
+    // `with_interval` and `with_retries` are gated behind platform cfgs in
+    // socket2. They are present on every platform Ferrum currently builds
+    // for (Linux, macOS, Windows, BSDs) per Cargo target list, so we feed
+    // them unconditionally inside the cross-platform setter.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "windows",
+    ))]
+    {
+        if let Some(secs) = cfg.interval_seconds {
+            params = params.with_interval(std::time::Duration::from_secs(u64::from(secs)));
+        }
+        if let Some(probes) = cfg.probes {
+            params = params.with_retries(probes);
+        }
+    }
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "windows",
+    )))]
+    {
+        // Unused on platforms that don't expose interval/retries.
+        let _ = cfg.interval_seconds;
+        let _ = cfg.probes;
+    }
+    socket.set_tcp_keepalive(&params)
+}
+
 // ── TCP_INFO (BDP-optimal buffer sizing) ───────────────────────────────
 
 /// Kernel-level TCP connection metrics from `getsockopt(TCP_INFO)`.
@@ -2125,5 +2246,147 @@ mod ktls_availability_tests {
             is_ktls_chacha20_poly1305_available(),
         );
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod keepalive_tests {
+    //! Roundtrip tests for `apply_tcp_keepalive`. Run on Linux + macOS because
+    //! both expose `getsockopt`-readable equivalents of `SO_KEEPALIVE`,
+    //! `TCP_KEEPIDLE`/`TCP_KEEPALIVE`, `TCP_KEEPINTVL`, and `TCP_KEEPCNT`.
+    //! The test binds an accepted loopback socket pair so the call path
+    //! matches the production `connect_backend_plain → apply_tcp_keepalive`
+    //! flow byte-for-byte.
+
+    use super::apply_tcp_keepalive;
+    use crate::config::types::TcpKeepaliveCfg;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::io::AsRawFd;
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn getsockopt_int(fd: i32, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len as *mut libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "getsockopt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        val
+    }
+
+    #[test]
+    fn empty_cfg_is_noop_and_does_not_enable_keepalive() {
+        let (client, _server) = loopback_pair();
+        let fd = client.as_raw_fd();
+        let cfg = TcpKeepaliveCfg::default();
+        apply_tcp_keepalive(fd, &cfg).expect("noop should succeed");
+        // SO_KEEPALIVE must remain at its kernel default (off). The exact
+        // "on" value differs across platforms (Linux returns `1`; some
+        // BSDs / macOS variants return the `SO_KEEPALIVE` constant value
+        // `8`), so we only assert "zero == off" here.
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_eq!(so_keepalive, 0, "empty cfg must not enable SO_KEEPALIVE");
+    }
+
+    #[test]
+    fn applies_time_interval_probes_and_enables_keepalive() {
+        let (client, _server) = loopback_pair();
+        let fd = client.as_raw_fd();
+        let cfg = TcpKeepaliveCfg {
+            time_seconds: Some(120),
+            interval_seconds: Some(30),
+            probes: Some(5),
+        };
+        apply_tcp_keepalive(fd, &cfg).expect("keepalive setup should succeed");
+
+        // SO_KEEPALIVE must be enabled — without it, the per-knob options
+        // have no effect on the actual probe scheduling. The exact "on"
+        // value differs across platforms (Linux returns `1`, BSD/macOS
+        // returns a bitmask such as `8`), so we assert non-zero rather
+        // than `== 1`.
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_ne!(so_keepalive, 0, "SO_KEEPALIVE must be enabled");
+
+        // TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on macOS — both fields name
+        // the same kernel concept (idle time before first probe).
+        #[cfg(target_os = "linux")]
+        let time_name = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let time_name = libc::TCP_KEEPALIVE;
+        let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
+        assert_eq!(time, 120, "TCP_KEEP[IDLE|ALIVE] mismatch");
+
+        let interval = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL);
+        assert_eq!(interval, 30, "TCP_KEEPINTVL mismatch");
+
+        let probes = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT);
+        assert_eq!(probes, 5, "TCP_KEEPCNT mismatch");
+    }
+
+    #[test]
+    fn applies_only_time_when_other_fields_unset() {
+        let (client, _server) = loopback_pair();
+        let fd = client.as_raw_fd();
+        let cfg = TcpKeepaliveCfg {
+            time_seconds: Some(300),
+            interval_seconds: None,
+            probes: None,
+        };
+        apply_tcp_keepalive(fd, &cfg).expect("partial keepalive setup should succeed");
+
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_ne!(so_keepalive, 0, "SO_KEEPALIVE must be enabled");
+
+        #[cfg(target_os = "linux")]
+        let time_name = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let time_name = libc::TCP_KEEPALIVE;
+        let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
+        assert_eq!(time, 300);
+
+        // Interval and probes remain at their kernel defaults — we cannot
+        // assert specific values (they vary by distro/sysctl) but they must
+        // be positive, not zero.
+        let interval = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL);
+        assert!(interval > 0, "TCP_KEEPINTVL default should be positive");
+        let probes = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT);
+        assert!(probes > 0, "TCP_KEEPCNT default should be positive");
+    }
+
+    #[test]
+    fn fd_is_not_closed_after_apply() {
+        // Regression guard for the `socket2::Socket::from_raw_fd` /
+        // `into_raw_fd` pairing — if we forget the `into_raw_fd()` call,
+        // dropping the temporary `Socket` would close the still-live fd
+        // and the next syscall against it would fail with EBADF.
+        let (client, _server) = loopback_pair();
+        let fd = client.as_raw_fd();
+        let cfg = TcpKeepaliveCfg {
+            time_seconds: Some(60),
+            interval_seconds: Some(10),
+            probes: Some(3),
+        };
+        apply_tcp_keepalive(fd, &cfg).expect("keepalive should succeed");
+        // Any further getsockopt would EBADF if the helper accidentally
+        // dropped the borrowed fd.
+        let _ = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
     }
 }

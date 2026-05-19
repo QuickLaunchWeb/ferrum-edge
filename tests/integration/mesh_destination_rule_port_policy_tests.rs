@@ -206,3 +206,187 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
     assert_eq!(dispatch_passive.healthy_after_seconds, 17);
     assert_eq!(dispatch_passive.max_ejection_percent, Some(50));
 }
+
+#[test]
+fn destination_rule_top_level_max_connections_fans_out_to_all_target_ports() {
+    use ferrum_edge::config::types::TcpKeepaliveCfg;
+
+    // Upstream serves a single target port; top-level
+    // `connectionPool.tcp.maxConnections` and `tcpKeepalive` MUST land on
+    // `port_overrides[target_port]` and project through to the proxy's
+    // `dispatch_port_overrides` so the L4 dispatch can see them.
+    let config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    max_connections: Some(50),
+                    tcp_keepalive: Some(TcpKeepaliveCfg {
+                        time_seconds: Some(300),
+                        interval_seconds: Some(30),
+                        probes: Some(3),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let mut config = config;
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let upstream_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("top-level fan-out must populate port 8080");
+    assert_eq!(upstream_override.max_connections, Some(50));
+    let keepalive = upstream_override
+        .tcp_keepalive
+        .as_ref()
+        .expect("keepalive must land on port slot");
+    assert_eq!(keepalive.time_seconds, Some(300));
+    assert_eq!(keepalive.interval_seconds, Some(30));
+    assert_eq!(keepalive.probes, Some(3));
+
+    let dispatch = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|map| map.get(&8080))
+        .expect("dispatch port override projected");
+    assert_eq!(dispatch.max_connections, Some(50));
+    let dispatch_keepalive = dispatch
+        .tcp_keepalive
+        .as_ref()
+        .expect("dispatch keepalive projected");
+    assert_eq!(dispatch_keepalive.time_seconds, Some(300));
+}
+
+#[test]
+fn destination_rule_port_level_max_connections_overrides_top_level() {
+    // Per-port `connectionPool.tcp.maxConnections` overrides the top-level
+    // fan-out for that specific port; ports not enumerated in
+    // `portLevelSettings` keep the top-level cap.
+    use ferrum_edge::config::types::TcpKeepaliveCfg;
+
+    let mut upstream_with_two_ports = upstream();
+    upstream_with_two_ports.targets.push({
+        let mut second = upstream_with_two_ports.targets[0].clone();
+        second.port = 9090;
+        second
+    });
+
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            max_connections: Some(10),
+            tcp_keepalive: Some(TcpKeepaliveCfg {
+                time_seconds: Some(60),
+                interval_seconds: None,
+                probes: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+
+    let config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream_with_two_ports],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    max_connections: Some(100),
+                    tcp_keepalive: Some(TcpKeepaliveCfg {
+                        time_seconds: Some(900),
+                        interval_seconds: Some(60),
+                        probes: Some(9),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let mut config = config;
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    // Port 8080: per-port overrides BOTH fields. The unset
+    // `interval_seconds` / `probes` on the per-port keepalive replace the
+    // top-level keepalive — Istio's per-port-overrides-top-level shape.
+    let p8080 = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("port 8080 entry");
+    assert_eq!(p8080.max_connections, Some(10), "per-port cap wins");
+    let p8080_keepalive = p8080.tcp_keepalive.as_ref().expect("keepalive present");
+    assert_eq!(p8080_keepalive.time_seconds, Some(60));
+    assert!(p8080_keepalive.interval_seconds.is_none());
+    assert!(p8080_keepalive.probes.is_none());
+
+    // Port 9090: top-level fan-out applies because no per-port entry
+    // overrides it.
+    let p9090 = prepared.upstreams[0]
+        .port_overrides
+        .get(&9090)
+        .expect("port 9090 entry from top-level fan-out");
+    assert_eq!(p9090.max_connections, Some(100));
+    let p9090_keepalive = p9090.tcp_keepalive.as_ref().expect("keepalive present");
+    assert_eq!(p9090_keepalive.time_seconds, Some(900));
+    assert_eq!(p9090_keepalive.interval_seconds, Some(60));
+    assert_eq!(p9090_keepalive.probes, Some(9));
+}
+
+#[test]
+fn destination_rule_top_level_max_connections_skips_phantom_ports() {
+    // Top-level fan-out targets only ports actually served by the upstream.
+    // Without this guard, a typo (or wider DR than needed) would silently
+    // create `port_overrides` entries for unreferenced ports.
+    use ferrum_edge::config::types::TcpKeepaliveCfg;
+
+    let config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()], // only target port 8080
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    max_connections: Some(20),
+                    tcp_keepalive: Some(TcpKeepaliveCfg {
+                        time_seconds: Some(120),
+                        ..TcpKeepaliveCfg::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let mut config = config;
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    // Only port 8080 should have an entry; no phantom ports.
+    assert_eq!(prepared.upstreams[0].port_overrides.len(), 1);
+    assert!(prepared.upstreams[0].port_overrides.contains_key(&8080));
+}
