@@ -5,6 +5,7 @@ pub mod audit;
 mod backup;
 pub(crate) mod crud;
 pub mod jwt_auth;
+pub mod mesh_config_drift;
 pub mod spec_codec;
 
 use bytes::Bytes;
@@ -1100,6 +1101,15 @@ pub async fn handle_admin_request(
         // before the first slice — same shape as `/mesh/egress-scope`.
         (Method::GET, ["mesh", "runtime-overlay"]) => handle_mesh_runtime_overlay_get(&state).await,
 
+        // MESH-T6-C: per-DP config drift introspection. Read-only operator
+        // view of the last-applied slice content fingerprint, age, and RTDS
+        // overlay summary. 404 outside mesh mode — same shape as the other
+        // `/mesh/*` endpoints. Optional `?include_overlay=false` to omit the
+        // overlay block.
+        (Method::GET, ["mesh", "config-drift"]) => {
+            handle_mesh_config_drift_get(&state, query.as_deref()).await
+        }
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -1288,6 +1298,81 @@ async fn handle_mesh_runtime_overlay_get(
             "runtime_overlay": &slice.runtime_overlay,
         }),
     ))
+}
+
+/// MESH-T6-C: per-DP config drift introspection.
+///
+/// Returns a structured "where is this DP relative to the CP's last push?"
+/// view. Sees only what this DP has installed — cross-DP comparison is
+/// done by operator tooling that walks `/mesh/config-drift` on every
+/// member of a deployment and diffs the fingerprints.
+///
+/// Returns 404 outside mesh mode (no `mesh_runtime_state` wired in).
+/// Returns 200 with `last_received_at: null` and zeroed `resources` when
+/// mesh runtime is wired but no slice has been installed yet — operators
+/// rely on the difference between "404 (wrong mode)" and "200 with
+/// `last_received_at: null` (mesh mode, not converged yet)".
+async fn handle_mesh_config_drift_get(
+    state: &AdminState,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime state"}),
+        ));
+    };
+
+    let include_overlay = mesh_config_drift::parse_include_overlay(query);
+
+    // `source_protocol` / `source_cp_url` come from the DP's own env config
+    // so the response is populated even before the first slice arrives. The
+    // proxy state is the only place we have `EnvConfig` available — mesh
+    // mode always sets `proxy_state: Some(...)`, but treat `None` as
+    // "fields blank" rather than 503 because the slice/overlay halves of
+    // the response are still useful for debugging unwired test states.
+    let (source_protocol, source_cp_url) = state
+        .proxy_state
+        .as_ref()
+        .map(|ps| {
+            let proto = ps.env_config.mesh_config_protocol.as_str();
+            let cp_url = ps
+                .env_config
+                .resolved_dp_cp_grpc_urls()
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            (proto.to_string(), cp_url)
+        })
+        .unwrap_or_default();
+
+    // Lock-free read of the slice and last-install timestamp; both come
+    // from `ArcSwap` slots on `MeshRuntimeState`.
+    let slice_snapshot = mesh_runtime.snapshot();
+    let last_install_at = mesh_runtime.last_install_at();
+
+    let resp = mesh_config_drift::build_response(mesh_config_drift::MeshConfigDriftInputs {
+        slice: slice_snapshot.as_ref().as_ref(),
+        last_install_at,
+        now: chrono::Utc::now(),
+        source_protocol: &source_protocol,
+        source_cp_url: &source_cp_url,
+        include_overlay,
+    });
+
+    // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize
+    // error as a 500 rather than crashing — the admin path has the same
+    // "never `.unwrap()` on the request side" rule as the proxy hot path.
+    match serde_json::to_value(&resp) {
+        Ok(value) => Ok(json_response(StatusCode::OK, &value)),
+        Err(err) => {
+            error!(error = %err, "failed to serialize mesh config-drift response");
+            Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize mesh config-drift response"}),
+            ))
+        }
+    }
 }
 
 async fn handle_mesh_egress_scope_test(
