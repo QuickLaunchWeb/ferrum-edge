@@ -46,11 +46,12 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     }
 
     let include_key = LpmKey::new(128, CidrKey6::host(dst_ip));
-    if FERRUM_CIDR_INCLUDE6.get(&include_key).is_none() {
-        return Ok(1);
-    }
+    let include_cidr_match = FERRUM_CIDR_INCLUDE6.get(&include_key).is_some();
 
-    if !include_port_allowed(dst_port) {
+    // Include CIDRs and includeOutboundPorts are additive: capture when either
+    // the destination IP matches include CIDRs OR the destination port is
+    // admitted by the per-cgroup includeOutboundPorts policy.
+    if !include_cidr_match && !include_port_allowed(dst_port) {
         return Ok(1);
     }
 
@@ -82,13 +83,13 @@ fn outbound_capture_port() -> u32 {
 }
 
 /// Honor `traffic.sidecar.istio.io/includeOutboundPorts` for IPv6 connect.
-/// Same semantics as the connect4 helper: no map entry → capture everything,
-/// `all_ports != 0` → capture everything, explicit ports → match-or-skip.
+/// Same semantics as the connect4 helper: no map entry → no port-based
+/// expansion, `all_ports != 0` → allow all, explicit ports → match-or-skip.
 #[inline(always)]
 fn include_port_allowed(dst_port: u16) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
     let Some(policy) = (unsafe { FERRUM_INCLUDE_PORTS.get(&cgroup_id) }) else {
-        return true;
+        return false;
     };
     policy_admits_port(policy, dst_port)
 }
