@@ -510,13 +510,21 @@ impl StreamListenerManager {
                 Err(err) => {
                     warn!(
                         listen_port = handle.listen_port,
-                        "Failed to rebuild frontend DTLS config for live swap: {}; keeping previous config",
+                        "Failed to rebuild frontend DTLS config for live swap: {}; \
+                         keeping previous DTLS config on remaining listeners",
                         err
                     );
-                    // Bail on the first failure so we don't partially update
-                    // some listeners with the new config and leave others on
-                    // the old config — keeps all listeners on a coherent
-                    // generation.
+                    // `build_config` is invariant under iteration — the cert/key
+                    // paths and CRL list it closes over do not change across
+                    // listeners — so a failure on iteration N would have failed
+                    // on iteration 0 as well. The only realistic divergence is
+                    // a transient FS race (cert file briefly unreadable). Bail
+                    // out so a stuttering FS does not produce a mix of new and
+                    // old configs across long-lived listeners; the next slice
+                    // apply re-runs the swap and converges everything to the
+                    // newest material. Any listener already swapped this pass
+                    // keeps the new config — that is the desired direction of
+                    // travel.
                     return swapped;
                 }
             }

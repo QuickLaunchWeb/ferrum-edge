@@ -4037,35 +4037,48 @@ async fn apply_mesh_inbound_tls_reload(
             // paths because PeerAuth live reload, per the operating
             // invariant, never rotates cert/key paths — those remain
             // static restart-required inputs. What changes here is the
-            // *mode* (Permissive ↔ Strict) and which client CA bundle to
-            // require, both surfaced via the stream-listener slot.
-            let env = &proxy_state.env_config;
-            let crls = proxy_state.crls.clone();
-            let dtls_cert_key = env
-                .frontend_tls_cert_path
-                .as_deref()
-                .zip(env.frontend_tls_key_path.as_deref())
-                .map(|(c, k)| (c.to_string(), k.to_string()));
-            let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
-            if let Some((cert_path, key_path)) = dtls_cert_key {
-                let swapped = proxy_state
-                    .stream_listener_manager
-                    .swap_active_dtls_frontend_configs(|| {
-                        crate::dtls::build_frontend_dtls_config(
-                            &cert_path,
-                            &key_path,
-                            dtls_client_ca.as_deref(),
-                            &crls,
-                        )
-                    })
-                    .await;
-                if swapped > 0 {
-                    info!(
-                        mesh_slice_version = %slice.version,
-                        ?mtls_mode,
-                        dtls_listeners = swapped,
-                        "Mesh inbound PeerAuthentication DTLS configs reloaded"
-                    );
+            // *mode* (Permissive ↔ Strict) and whether the client CA bundle
+            // is required for mTLS verification.
+            //
+            // Skip the DTLS rebuild entirely on `Disable`: TCP+TLS goes to
+            // plaintext via the cleared slot above, but DTLS cannot speak
+            // plaintext (it is encryption by definition). On topologies
+            // where `Disable` is allowed (Sidecar / EastWestGateway), an
+            // operator with UDP+DTLS listeners is expected to remove
+            // them from the proxy config rather than rely on a PeerAuth
+            // flip; the existing DtlsServer keeps its startup material
+            // so in-flight sessions and any pre-existing handshake
+            // contract remain intact until the listener is reconciled
+            // away.
+            if mtls_mode != config::MtlsMode::Disable {
+                let env = &proxy_state.env_config;
+                let crls = proxy_state.crls.clone();
+                let dtls_cert_key = env
+                    .frontend_tls_cert_path
+                    .as_deref()
+                    .zip(env.frontend_tls_key_path.as_deref())
+                    .map(|(c, k)| (c.to_string(), k.to_string()));
+                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
+                if let Some((cert_path, key_path)) = dtls_cert_key {
+                    let swapped = proxy_state
+                        .stream_listener_manager
+                        .swap_active_dtls_frontend_configs(|| {
+                            crate::dtls::build_frontend_dtls_config(
+                                &cert_path,
+                                &key_path,
+                                dtls_client_ca.as_deref(),
+                                &crls,
+                            )
+                        })
+                        .await;
+                    if swapped > 0 {
+                        info!(
+                            mesh_slice_version = %slice.version,
+                            ?mtls_mode,
+                            dtls_listeners = swapped,
+                            "Mesh inbound PeerAuthentication DTLS configs reloaded"
+                        );
+                    }
                 }
             }
             *last_snapshot = Some(snapshot);
