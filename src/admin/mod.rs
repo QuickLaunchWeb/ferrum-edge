@@ -180,6 +180,23 @@ pub async fn start_admin_listener_with_tls(
     serve_admin_on_listener(listener, state, shutdown, tls_config).await
 }
 
+/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS
+/// slot. Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The
+/// frontend TLS watch task swaps the underlying `ArcSwap` after a validated
+/// cert/key reload; subsequent accepts pick up the new config without
+/// restarting the listener. Existing in-flight admin connections keep their
+/// original `ServerConfig`.
+pub async fn start_admin_listener_with_dynamic_tls(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+) -> Result<(), anyhow::Error> {
+    let listener = TcpListener::bind(addr).await?;
+    info!("Admin API listener started on {}", addr);
+    serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot).await
+}
+
 /// Run the Admin API accept loop on a pre-bound `TcpListener`.
 ///
 /// Useful for tests that allocate an ephemeral port up front: passing the
@@ -231,6 +248,74 @@ pub async fn serve_admin_on_listener(
                             };
 
                             if let Err(e) = result {
+                                debug!("Admin connection handling error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept admin connection: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("Admin API listener shutting down");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Admin HTTPS accept loop that reads the active `Arc<rustls::ServerConfig>`
+/// from a shared `ArcSwap` slot on every new connection, allowing the
+/// frontend TLS file-watch task to atomically swap in a rotated cert/key
+/// pair without restarting the listener.
+///
+/// In-flight admin connections keep their original `ServerConfig` (rustls
+/// consults the config only during the handshake; swapping it does not tear
+/// down live sessions). When the slot holds `None` (e.g., live reload was
+/// turned on with no cert/key configured), the connection is dropped with
+/// a debug log — the admin listener cannot serve TLS without a config and
+/// must not silently downgrade to plaintext.
+pub async fn serve_admin_on_listener_with_dynamic_tls(
+    listener: TcpListener,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+) -> Result<(), anyhow::Error> {
+    let mut shutdown_rx = shutdown;
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, remote_addr)) => {
+                        if !state.admin_allowed_cidrs.is_empty()
+                            && !state.admin_allowed_cidrs.contains(&remote_addr.ip())
+                        {
+                            debug!(
+                                remote_addr = %remote_addr.ip(),
+                                "Admin connection rejected: IP not in FERRUM_ADMIN_ALLOWED_CIDRS"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+
+                        let tls_config = tls_slot.load().as_ref().clone();
+                        let state = state.clone();
+
+                        tokio::spawn(async move {
+                            let Some(tls_config) = tls_config else {
+                                debug!(
+                                    remote_addr = %remote_addr.ip(),
+                                    "Admin HTTPS connection dropped: TLS slot is empty (live-reload race or misconfiguration)"
+                                );
+                                drop(stream);
+                                return;
+                            };
+                            if let Err(e) =
+                                handle_admin_tls_connection(stream, remote_addr, state, tls_config)
+                                    .await
+                            {
                                 debug!("Admin connection handling error: {}", e);
                             }
                         });

@@ -607,7 +607,9 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 
 By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
 
-Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply for mesh HTTP/HBONE termination listeners. Frontend cert/key paths are read and cached at startup, remain static operational inputs, and still require restart. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config and require restart for PeerAuthentication changes. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply for mesh HTTP/HBONE termination listeners. Mesh-materialized TCP+TLS / UDP+DTLS stream listeners keep their startup TLS config and require restart for PeerAuthentication changes. If rebuilding the new `ServerConfig` fails, Ferrum keeps the previous inbound TLS config and logs a warning.
+
+Frontend cert/key paths are independently controlled by `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` (default `false`). When that flag is enabled, the proxy HTTPS / H2 / HTTP/3 and admin HTTPS listeners watch their cert/key files on a poll interval (`FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`, default 30s) and atomically swap a rebuilt `ServerConfig` on validated change. The two flags are orthogonal: PeerAuthentication live reload covers the mesh inbound mTLS mode + client CA verifier surface, frontend live reload covers the operator-supplied cert/key material across the proxy and admin HTTPS surfaces. See [docs/configuration.md](configuration.md#proxy-listener) for full semantics.
 
 ### Disable-mode topology guard
 

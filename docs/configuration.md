@@ -28,6 +28,8 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_KEY_PATH` | If HTTPS | — | PEM private key for the gateway's frontend TLS certificate |
 | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | No | `10` | Seconds allowed for frontend TLS/DTLS handshakes before HTTP header parsing or stream proxy handling begins. `0` disables |
+| `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | No | `false` | Opt in to live reload of the proxy HTTPS / H2 / HTTP/3 and admin HTTPS cert/key files. When `true`, a background poller watches the configured cert/key paths and atomically swaps a validated `ServerConfig` into the listener slot on change. A failed validation (parse / expired / not-yet-valid / key mismatch) keeps the previous config and emits a `warn!`. In-flight TLS sessions keep their original config — rustls consults `ServerConfig` only during handshake — so only newly accepted connections see the rotated cert. The DTLS frontend, operator-supplied per-proxy backend TLS paths, and TCP+TLS / UDP+DTLS stream listeners stay static (restart required) under this flag. Mesh inbound TLS continues to reload through `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` for the verifier + mTLS mode |
+| `FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS` | No | `30` | Poll interval for the frontend TLS file watcher when live reload is enabled. Ignored when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=false`. Clamped to a 1-second minimum so an accidental `0` does not busy-loop the filesystem |
 
 ### Admin API
 

@@ -47,6 +47,26 @@ pub struct Http3ListenerOptions {
     /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
     pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Optional opt-in frontend TLS live-reload inputs. When `Some`, the H3
+    /// listener subscribes to `revision_rx` and, on a bump, reloads the latest
+    /// `Arc<rustls::ServerConfig>` from `tls_slot`, rebuilds the
+    /// `quinn::ServerConfig` (forcing TLS 1.3, reapplying H3 transport
+    /// tuning), and calls `Endpoint::set_server_config(Some(..))`. Existing
+    /// QUIC connections keep serving. A rebuild that fails (e.g., the new
+    /// cert won't bind to QUIC) keeps the previous server config and emits a
+    /// `warn!`.
+    pub frontend_tls_reload: Option<Http3FrontendTlsReload>,
+}
+
+/// Frontend TLS live-reload inputs for the H3 listener. Populated only when
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+pub struct Http3FrontendTlsReload {
+    /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
+    /// from the same slot so they observe the same rotated cert/key pair.
+    pub tls_slot: crate::tls::SharedFrontendTls,
+    /// Revision counter bumped by the file-watch task after every successful
+    /// reload. The H3 listener subscribes so it doesn't poll the slot.
+    pub revision_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 /// Start the HTTP/3 (QUIC) proxy listener.
@@ -77,27 +97,26 @@ pub async fn start_http3_listener(
             client_ca_bundle_path,
             client_crls,
             started_tx: None,
+            frontend_tls_reload: None,
         },
     )
     .await
 }
 
-/// Start the HTTP/3 listener and optionally emit a startup signal after bind.
-pub async fn start_http3_listener_with_signal(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Arc<rustls::ServerConfig>,
-    h3_config: Http3ServerConfig,
+/// Build a fresh `quinn::ServerConfig` from a rustls server config, the
+/// shared TLS policy, and the H3 transport tuning. Used at startup AND on
+/// every successful frontend TLS cert/key reload.
+///
+/// Forces TLS 1.3 (RFC 9001), carries forward client-cert mTLS if configured,
+/// applies 0-RTT and session-ticket resumption from the gateway policy, and
+/// stamps the H3-only ALPN advertisement.
+fn build_h3_quinn_server_config(
+    tls_config: &Arc<rustls::ServerConfig>,
     tls_policy: &TlsPolicy,
-    options: Http3ListenerOptions,
-) -> Result<(), anyhow::Error> {
-    let Http3ListenerOptions {
-        client_ca_bundle_path,
-        client_crls,
-        started_tx,
-    } = options;
-
+    client_ca_bundle_path: Option<&str>,
+    client_crls: &CrlList,
+    h3_config: &Http3ServerConfig,
+) -> Result<quinn::ServerConfig, anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
     // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
     let has_tls13 = tls_policy
@@ -146,8 +165,8 @@ pub async fn start_http3_listener_with_signal(
 
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
-    let mut server_tls_config = if let Some(ref ca_path) = client_ca_bundle_path {
-        match crate::tls::build_client_cert_verifier(ca_path, &client_crls) {
+    let mut server_tls_config = if let Some(ca_path) = client_ca_bundle_path {
+        match crate::tls::build_client_cert_verifier(ca_path, client_crls) {
             Ok(verifier) => h3_builder
                 .with_client_cert_verifier(verifier)
                 .with_cert_resolver(tls_config.cert_resolver.clone()),
@@ -219,6 +238,33 @@ pub async fn start_http3_listener_with_signal(
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     server_config.transport_config(Arc::new(transport_config));
+    Ok(server_config)
+}
+
+/// Start the HTTP/3 listener and optionally emit a startup signal after bind.
+pub async fn start_http3_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Arc<rustls::ServerConfig>,
+    h3_config: Http3ServerConfig,
+    tls_policy: &TlsPolicy,
+    options: Http3ListenerOptions,
+) -> Result<(), anyhow::Error> {
+    let Http3ListenerOptions {
+        client_ca_bundle_path,
+        client_crls,
+        started_tx,
+        frontend_tls_reload,
+    } = options;
+
+    let server_config = build_h3_quinn_server_config(
+        &tls_config,
+        tls_policy,
+        client_ca_bundle_path.as_deref(),
+        &client_crls,
+        &h3_config,
+    )?;
 
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     let bound_addr = endpoint.local_addr().ok();
@@ -236,6 +282,34 @@ pub async fn start_http3_listener_with_signal(
     let handshake_timeout = h3_config.handshake_timeout;
     let drain_seconds = state.env_config.shutdown_drain_seconds;
     let overload_state = state.overload.clone();
+
+    // Capture inputs needed to rebuild the QUIC server config on a frontend
+    // TLS reload. `tls_policy` is borrowed by the outer function, so clone the
+    // few fields we need into owned values that live as long as the accept
+    // loop. The reload path is opt-in — when `frontend_tls_reload` is `None`
+    // the loop ignores the disabled branch entirely.
+    let reload_policy = tls_policy.clone();
+    let reload_client_ca_bundle_path = client_ca_bundle_path.clone();
+    let reload_client_crls = client_crls.clone();
+    let reload_h3_config = h3_config.clone();
+
+    // Decompose the optional reload input into local state. When `None` the
+    // select branch is gated off by `reload_active=false`, but we still need
+    // a valid `reload_rx` value for the macro to expand. The sentinel sender
+    // is held for the loop's lifetime so the sentinel receiver's `.changed()`
+    // never wakes — combined with the `reload_active=false` gate the branch
+    // is effectively dead.
+    let (sentinel_tx, sentinel_rx) = tokio::sync::watch::channel(0u64);
+    let (mut reload_rx, reload_slot, reload_active) = match frontend_tls_reload {
+        Some(Http3FrontendTlsReload {
+            tls_slot,
+            revision_rx,
+        }) => (revision_rx, Some(tls_slot), true),
+        None => (sentinel_rx, None, false),
+    };
+    // Tie the sentinel sender's lifetime to the loop so a `None` reload
+    // input cannot accidentally trigger `.changed()` via channel close.
+    let _sentinel_tx_keep_alive = sentinel_tx;
 
     loop {
         tokio::select! {
@@ -268,6 +342,47 @@ pub async fn start_http3_listener_with_signal(
                     None => {
                         info!("HTTP/3 endpoint closed");
                         break;
+                    }
+                }
+            }
+            reload_change = reload_rx.changed(), if reload_active => {
+                if reload_change.is_err() {
+                    // Sender dropped — reload pipeline is gone. The H3
+                    // listener keeps serving with the last good config.
+                    continue;
+                }
+                let revision = *reload_rx.borrow();
+                let Some(slot) = reload_slot.as_ref() else {
+                    continue;
+                };
+                let new_tls = slot.load_full().as_ref().clone();
+                let Some(new_tls) = new_tls else {
+                    warn!(
+                        revision,
+                        "Frontend TLS reload notified but slot is empty; keeping current HTTP/3 server config"
+                    );
+                    continue;
+                };
+                match build_h3_quinn_server_config(
+                    &new_tls,
+                    &reload_policy,
+                    reload_client_ca_bundle_path.as_deref(),
+                    &reload_client_crls,
+                    &reload_h3_config,
+                ) {
+                    Ok(server_config) => {
+                        endpoint.set_server_config(Some(server_config));
+                        info!(
+                            revision,
+                            "HTTP/3 listener server config swapped after frontend TLS reload"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            revision,
+                            error = %error,
+                            "HTTP/3 listener could not rebuild quinn ServerConfig after frontend TLS reload; keeping previous config"
+                        );
                     }
                 }
             }
