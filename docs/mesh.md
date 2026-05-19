@@ -115,8 +115,106 @@ Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, 
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
 - **DestinationRule support across xDS**: standard CDS/EDS bakes DR traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS alone. Two carrier options for richer semantics:
   - **Native protocol** (`FERRUM_MESH_CONFIG_PROTOCOL=native`): the CP pushes full `MeshDestinationRule` objects via `MeshConfigSync.MeshSubscribe`. Full semantics, recommended for greenfield Ferrum deployments.
-  - **xDS ECDS DR-carrier** (opt-in CP-side): the CP wraps the original DR JSON in a `TypedExtensionConfig` with inner `type_url == type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier` and ships it over ECDS. The DP recognizes the marker, deserializes the inner JSON as a `MeshDestinationRule`, and applies it locally. ECDS resources with other inner type URLs are silently skipped, so the channel coexists with unrelated ECDS consumers. When no carrier resources arrive in a slice with CDS clusters, the DP logs one debug line per slice apply listing the fields that cannot be round-tripped from CDS/EDS alone; the carrier path silences this log.
+  - **xDS ECDS DR-carrier**: opt-in CP-side path that preserves full DR semantics over the standard ADS stream. See [ECDS DestinationRule carrier (full DR semantics over xDS)](#ecds-destinationrule-carrier-full-dr-semantics-over-xds) below.
 - **RTDS subscription** (`type.googleapis.com/envoy.service.runtime.v3.Runtime`): subscribed alongside CDS/EDS/LDS/RDS/SDS/ECDS so operators can flip runtime knobs without churning the entire slice. The xDS client decodes every layer through `translate_rtds_layer`, merging top-level fields into a single `MeshRuntimeOverlay` carried on `MeshSlice.runtime_overlay`. Supported value kinds: numeric (`f64`), string, bool, and Envoy `FractionalPercent`-shaped structs (`{numerator, denominator: HUNDRED | TEN_THOUSAND | MILLION}`). Other struct, list, and null values are silently dropped. The overlay is exposed via `GET /mesh/runtime-overlay` for inspection and fans out on every slice install to the consumers documented in the "[xDS ADS Compatibility](#xds-ads-compatibility)" section below (fault injection rates, request/response transformer gates, and the gateway-wide tracing log level).
+
+#### ECDS DestinationRule carrier (full DR semantics over xDS)
+
+Standard CDS/EDS bakes a `DestinationRule`'s traffic policy (LB algorithm, outlier detection, connection pool, per-subset TLS, subsets) into the Envoy `Cluster` resource at the CP, which means the original DR is unrecoverable from CDS/EDS alone. The ECDS DestinationRule carrier preserves the original DR JSON inside a standard ECDS `TypedExtensionConfig` resource so the Ferrum DP can rebuild the full `MeshDestinationRule` server-side. This is a Ferrum-specific carrier convention layered on top of the standard ECDS resource type — it uses the standard ECDS transport (`type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig`) but a Ferrum-defined inner type URL, so it coexists with unrelated ECDS consumers on the same ADS stream.
+
+The DP recognizes the carrier by an exact match on the inner `type_url` constant:
+
+```
+type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier
+```
+
+(defined as `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` in `src/xds/translator.rs`).
+
+**Envelope shape.** Each DR is one ECDS resource on the wire. The CP wraps an `envoy.config.core.v3.TypedExtensionConfig` message with the carrier marker on its inner `Any`:
+
+```
+ECDS resource (Any)
+  type_url = "type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig"
+  value    = encoded TypedExtensionConfig {
+    name         = "<dr-name>"               # informational, used in DP logs
+    typed_config = Any {
+      type_url = "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier"
+      value    = <raw bytes of the original MeshDestinationRule JSON>
+    }
+  }
+```
+
+The inner `value` is the original DR document as UTF-8 JSON bytes — there is no protobuf wire encoding of the DR itself, just `serde_json` over the `MeshDestinationRule` shape consumed by the DP at `src/modes/mesh/config_consumer/xds_client.rs` (see `dr_carrier_resource()` and the recovery loop). The DP iterates ECDS resources, decodes each `TypedExtensionConfig`, and applies one of three behaviors per inner payload:
+
+- Inner `type_url` matches the carrier constant and JSON parses cleanly: the recovered `MeshDestinationRule` is appended to `slice.destination_rules`.
+- Inner `type_url` is anything else: silently skipped (belongs to an unrelated ECDS consumer).
+- Inner `type_url` matches the carrier constant but JSON fails to parse: the DR is skipped with a `warn!` and the rest of the slice still applies — bad payloads do not fail the whole slice.
+
+**Worked example.** Given this original DestinationRule:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: api-dr
+  namespace: default
+spec:
+  host: api.default.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+    connectionPool:
+      tcp:
+        connectTimeout: 2s
+    tls:
+      mode: ISTIO_MUTUAL
+      sni: api.default.svc.cluster.local
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+```
+
+the CP must emit one ECDS resource whose decoded `TypedExtensionConfig` looks like:
+
+```json
+{
+  "name": "api-dr",
+  "typed_config": {
+    "type_url": "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier",
+    "value": "<UTF-8 bytes of the MeshDestinationRule JSON below>"
+  }
+}
+```
+
+with the inner `value` bytes carrying the original DR as `MeshDestinationRule` JSON (note: the inner shape is the Ferrum `MeshDestinationRule` serde representation, not the Istio CRD YAML — Istio's nested `connectionPool.tcp.connectTimeout` flattens to `traffic_policy.connect_timeout_ms` in milliseconds, `outlierDetection.consecutive5xxErrors` → `outlier_detection.consecutive_errors`, `outlierDetection.interval` (a duration string) → `outlier_detection.interval_seconds` (a `u64`), and `tls.mode` values are lowercase `snake_case` (`istio_mutual`, `simple`, `mutual`, `disable`) per `MtlsMode`):
+
+```json
+{
+  "name": "api-dr",
+  "namespace": "default",
+  "host": "api.default.svc.cluster.local",
+  "traffic_policy": {
+    "connect_timeout_ms": 2000,
+    "load_balancer": {"simple": "ROUND_ROBIN"},
+    "outlier_detection": {"consecutive_errors": 5, "interval_seconds": 30},
+    "tls": {"mode": "istio_mutual", "sni": "api.default.svc.cluster.local"}
+  },
+  "subsets": [{"name": "v1", "labels": {"version": "v1"}}]
+}
+```
+
+The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load_balancer = Simple(RoundRobin)`, `outlier_detection` (consecutive-error + interval), `traffic_policy.connect_timeout_ms` projected onto `Proxy.backend_connect_timeout_ms` (and per-port settings onto `Upstream.port_overrides[port].connect_timeout_ms`), the `tls` block, and the `v1` subset all intact — i.e. every field that would have been baked out by a CDS-only path round-trips. Non-carrier ECDS resources sharing the same response are unaffected, so the channel can be shared with unrelated extension consumers.
+
+**Opt-in and the per-slice diagnostic.** Emission is purely CP-side opt-in — the DP always subscribes ECDS, but a CP that only emits CDS/EDS is fully supported. When the DP receives a slice with CDS clusters but zero carrier ECDS resources, it emits a single one-line `debug!` per slice apply listing the fields that cannot be round-tripped from CDS/EDS alone (`connectTimeout`, `loadBalancer`, `outlierDetection`, `subsets`, `tls.sni`, `tls.subjectAltNames`, `tls.mode`); see the `debug!` guarded by `!dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty()` in `src/modes/mesh/config_consumer/xds_client.rs`. Emitting any carrier resource silences that log for the slice.
+
+**Other notes.**
+
+- Configuration: no `FERRUM_MESH_*` env var gates the carrier path. The DP recognizes the marker whenever `FERRUM_MESH_CONFIG_PROTOCOL=xds`; turning the path on is a CP-authoring decision.
+- Test pin: `ecds_dr_carrier_payload_recovers_destination_rule()` in `src/modes/mesh/config_consumer/xds_client.rs` round-trips the envelope and asserts that `traffic_policy.load_balancer` survives — i.e. fields baked out by a CDS-only path are recovered.
 
 ### Bootstrap Behavior
 
