@@ -899,8 +899,8 @@ The endpoint returns 404 outside mesh mode and 200 with `last_received_at` elide
 
 Operator playbook:
 
-- **Spot a stuck DP**: walk every DP in a deployment, compare `slice.last_received_at`. A significantly older timestamp on one DP flags a missing CP→DP stream. Alert on `slice.age_seconds > 2 * FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (default 120 s with the 60 s primary retry).
-- **Spot split brain**: walk every DP, compare `slice.fingerprint`. All DPs in the same namespace should agree — divergence means at least one DP is on a stale or wrong slice. Operators can recompute the fingerprint offline by serialising the same slice JSON with recursively-sorted object keys (`BTreeMap`-style) and hashing with SHA-256.
+- **Spot a stuck DP**: walk every DP in a deployment, compare `slice.last_received_at`. A significantly older timestamp on one DP flags a missing CP→DP stream. A safe upper bound is `slice.age_seconds > 2 * FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (default 600 s with the 300 s primary retry); operators expecting steadier CP push cadence should tighten the threshold to a small multiple of their observed push interval.
+- **Spot split brain**: walk every DP, compare `slice.fingerprint`. All DPs in the same namespace should agree — divergence means at least one DP is on a stale or wrong slice. Operators can recompute the fingerprint offline by (1) serialising the slice JSON with the `runtime_overlay` field stripped, (2) recursively sorting object keys (`BTreeMap`-style) while preserving array order, (3) SHA-256 hashing the resulting bytes, and (4) prefixing the lower-case hex digest with `sha256-`.
 - **Spot RTDS drift**: compare `runtime_overlay.keys` across DPs. If one DP is missing a key the others all have, its xDS RTDS subscription is broken.
 
 A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
