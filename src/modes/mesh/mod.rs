@@ -14,6 +14,7 @@ pub mod hbone;
 pub mod node_waypoint;
 pub mod outbound_enforcement;
 pub mod policy;
+pub mod policy_deny_log;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
@@ -3083,6 +3084,14 @@ pub async fn run(
         egress = %runtime.egress_listen_addr,
         cp_urls = runtime.cp_urls.len(),
         "Mesh mode starting"
+    );
+
+    // Configure the process-singleton policy-deny recorder before anything can
+    // record into it. This is idempotent and a no-op on subsequent calls
+    // (e.g., a restart-without-fork test harness) so we never wipe history
+    // mid-process.
+    crate::modes::mesh::policy_deny_log::configure_global_capacity(
+        env_config.mesh_policy_deny_log_capacity,
     );
 
     let mesh_state = MeshRuntimeState::new();

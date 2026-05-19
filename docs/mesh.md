@@ -952,6 +952,44 @@ Labels include:
 
 The endpoint is intentionally node-local. In CP/DP or horizontally scaled mesh deployments, scrape every data-plane instance and aggregate source/destination edges in the observability backend.
 
+### Policy-Deny Drilldown
+
+`GET /mesh/policy-denies/recent` (JWT-authenticated, JSON) returns aggregated recent `mesh_authz` denies for ad-hoc triage. Each deny event captured by the plugin is appended to a process-singleton bounded ring (`PolicyDenyRecorder`). The endpoint groups events whose timestamp is inside the requested window by the `(rule, source, destination, reason)` tuple and returns the top-N rows sorted by count descending (tie-break `last_at` descending, then `rule` ascending). The recorder is exception-path only — the proxy hot path never touches it; only the `mesh_authz` deny branch records — so it has no measurable effect on allow-path latency.
+
+| Query | Default | Maximum |
+|---|---|---|
+| `window` | `5m` | `1h` |
+| `limit` | `50` | `1000` |
+
+`window` accepts the compact suffixes `s` / `m` / `h` or a bare integer of seconds. Exceeding the maxima or supplying `window=0` returns `400 Bad Request`. Unknown query parameters are silently ignored so future extensions don't 4xx older deployments.
+
+Response shape:
+
+```json
+{
+  "window_seconds": 300,
+  "limit": 50,
+  "total_denies": 1234,
+  "grouped": [
+    {
+      "rule": "deny-prod-from-staging",
+      "source": "spiffe://cluster.local/ns/staging/sa/web",
+      "destination": "spiffe://cluster.local/ns/prod/sa/api",
+      "reason": "namespace_mismatch",
+      "count": 87,
+      "first_at": "2026-05-18T19:32:11Z",
+      "last_at":  "2026-05-18T19:36:48Z"
+    }
+  ]
+}
+```
+
+`source` and `destination` are omitted (instead of serialised as `null`) when the deny fired before either identity was known — for example unauthenticated HBONE baggage. `total_denies` reports the size of the unfiltered window slice; `grouped` is a `min(distinct_groups, limit)`-sized projection. Returns `404 Not Found` outside mesh mode.
+
+The recorder's ring capacity defaults to `10000` events. Operators can override it with `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY` (set to `0` to disable the recorder entirely; the endpoint still serves an empty `grouped` array). The ring is FIFO; oldest entries are evicted first when capacity is reached.
+
+The endpoint complements `ferrum_mesh_requests_total{response_code="403"}` from the Prometheus dashboard — the metric counts denies in aggregate, while this endpoint preserves the drill-down dimensions an operator needs when diagnosing a misconfigured `AuthorizationPolicy`. Like the service graph, the recorder is node-local; in horizontally scaled deployments query every data-plane instance and merge by `(rule, source, destination, reason)` in the observability backend.
+
 ### Certificate and CA Telemetry
 
 `/metrics` also exposes mesh identity health:

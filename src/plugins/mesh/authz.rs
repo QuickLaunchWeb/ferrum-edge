@@ -32,6 +32,7 @@
 //! metadata.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
@@ -45,6 +46,7 @@ use crate::modes::mesh::policy::{
     evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
     normalize_mesh_policy_header_names,
 };
+use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -227,6 +229,39 @@ impl MeshAuthz {
             }
         }
     }
+
+    /// Push a deny record into the process-singleton policy-deny recorder
+    /// consumed by `GET /mesh/policy-denies/recent`. Exception-path only —
+    /// `mesh_authz` is called on every request, but this helper runs only
+    /// when the decision was a reject. The recorder degrades to a cheap
+    /// `Mutex::lock` + ring push; capacity `0` short-circuits inside the
+    /// recorder so we don't hide a branch behind a feature flag here.
+    fn record_policy_deny(
+        &self,
+        metadata: &HashMap<String, String>,
+        source_principal: Option<&str>,
+    ) {
+        let rule = match metadata.get("mesh_authz.deny_policy") {
+            Some(rule) => rule.clone(),
+            // Defensive: if the deny metadata was stripped (custom plugin
+            // chain) we still record under an unknown-rule bucket so the
+            // operator can see the volume.
+            None => "unknown".to_string(),
+        };
+        // Reason mirrors the rule name today because mesh_authz exposes only
+        // the rule that fired. Keeping them as separate fields lets future
+        // synthesised deny reasons (e.g. `trust_domain_mismatch`) round-trip
+        // without forcing callers to munge `rule` strings. Today the
+        // synthesised-reason rules already use the reason string as their
+        // rule, so the two columns intentionally agree.
+        policy_deny_log::record_global(PolicyDenyEvent {
+            rule: rule.clone(),
+            source: source_principal.map(str::to_string),
+            destination: self.slice.workload_spiffe_id.clone(),
+            reason: rule,
+            at: Utc::now(),
+        });
+    }
 }
 
 fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
@@ -401,6 +436,17 @@ impl Plugin for MeshAuthz {
                     "untrusted_assertor".to_string(),
                 );
             }
+            // Capture the source SPIFFE id we used for authz so the
+            // /mesh/policy-denies/recent drilldown carries the same identity
+            // the rule was evaluated against. For unauthenticated HBONE
+            // baggage paths there's no peer cert and no trusted baggage, so
+            // `peer_spiffe_id` is `None` — record that as a missing source so
+            // operators can still see "unauthenticated_baggage" volume.
+            let source_for_log = ctx
+                .peer_spiffe_id
+                .as_ref()
+                .map(|id| id.as_str().to_string());
+            self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
         }
         result
     }
@@ -419,6 +465,7 @@ impl Plugin for MeshAuthz {
                     .as_deref()
                     .and_then(|value| SpiffeId::new(value).ok())
             });
+        let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let request = MeshAuthzRequest {
             source_principal,
             port: Some(ctx.listen_port),
@@ -429,6 +476,12 @@ impl Plugin for MeshAuthz {
             evaluate_mesh_authorization(&self.slice, &request),
             &mut metadata,
         );
+        if matches!(
+            result,
+            PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+        ) {
+            self.record_policy_deny(&metadata, source_for_log.as_deref());
+        }
         ctx.metadata = (!metadata.is_empty()).then_some(metadata);
         result
     }
