@@ -162,6 +162,7 @@ fn mesh_config_extension_configs_are_served_as_ecds_resources() {
     let mut config = gateway_config();
     config.mesh.as_mut().expect("mesh config").extension_configs = vec![MeshExtensionConfig {
         name: "dr-carrier-api".to_string(),
+        namespace: "default".to_string(),
         type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
         value: b"{\"name\":\"api\"}".to_vec(),
     }];
@@ -484,11 +485,13 @@ fn translator_emits_one_ecds_resource_per_extension_config() {
     let slice = slice_with_extension_configs(vec![
         MeshExtensionConfig {
             name: "dr-carrier-api".to_string(),
+            namespace: "default".to_string(),
             type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
             value: b"{\"name\":\"api\"}".to_vec(),
         },
         MeshExtensionConfig {
             name: "dr-carrier-admin".to_string(),
+            namespace: "default".to_string(),
             type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
             value: b"{\"name\":\"admin\"}".to_vec(),
         },
@@ -507,11 +510,13 @@ fn translator_skips_duplicate_extension_config_names() {
     let slice = slice_with_extension_configs(vec![
         MeshExtensionConfig {
             name: "dup".to_string(),
+            namespace: "default".to_string(),
             type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
             value: b"{\"name\":\"first\"}".to_vec(),
         },
         MeshExtensionConfig {
             name: "dup".to_string(),
+            namespace: "default".to_string(),
             type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
             value: b"{\"name\":\"second\"}".to_vec(),
         },
@@ -525,6 +530,7 @@ fn translator_round_trips_typed_extension_config_payload() {
     let inner_value = b"{\"trafficPolicy\":{\"tls\":{\"mode\":\"ISTIO_MUTUAL\"}}}";
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
         name: "dr-carrier-reviews".to_string(),
+        namespace: "default".to_string(),
         type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
         value: inner_value.to_vec(),
     }]);
@@ -553,6 +559,7 @@ fn translator_round_trips_binary_value_bytes() {
     let binary: Vec<u8> = (0u8..=255).collect();
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
         name: "binary".to_string(),
+        namespace: "default".to_string(),
         type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
         value: binary.clone(),
     }]);
@@ -571,6 +578,7 @@ fn translator_round_trips_binary_value_bytes() {
 fn translator_emits_empty_value_when_extension_has_no_inner_bytes() {
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
         name: "no-bytes".to_string(),
+        namespace: "default".to_string(),
         type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
         value: Vec::new(),
     }]);
@@ -595,6 +603,7 @@ fn mesh_extension_config_serde_round_trips_base64_value() {
     // bytes without corruption.
     let original = MeshExtensionConfig {
         name: "binary".to_string(),
+        namespace: "default".to_string(),
         type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
         value: vec![0u8, 1, 2, 0xff, 0xfe, 0x7f, 0x00],
     };

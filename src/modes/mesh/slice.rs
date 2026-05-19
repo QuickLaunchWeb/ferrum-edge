@@ -226,6 +226,11 @@ pub struct MeshSlice {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshExtensionConfig {
     pub name: String,
+    /// Namespace this extension config is allowed to reach via per-node mesh
+    /// slices. Empty means "unscoped" and is intentionally dropped during
+    /// slice construction to avoid cross-namespace leakage.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
     pub type_url: String,
     #[serde(
         default,
@@ -644,6 +649,12 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
+        let extension_configs: Vec<MeshExtensionConfig> = mesh
+            .extension_configs
+            .iter()
+            .filter(|ext| ext.namespace == *effective_namespace)
+            .cloned()
+            .collect();
         let workloads =
             if request.enforce_sidecar_identity_narrowing && applicable_sidecar.is_some() {
                 narrow_workload_identities(workloads, &services, &request)
@@ -710,7 +721,7 @@ impl MeshSlice {
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
-            extension_configs: mesh.extension_configs.clone(),
+            extension_configs,
             // GAP-3E: the canonical `MeshConfig` does not (yet) carry a
             // declarative RTDS overlay surface. xDS callers populate this
             // through `reverse_translate`; native MeshSubscribe deployments
