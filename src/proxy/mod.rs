@@ -10379,6 +10379,15 @@ async fn handle_proxy_request_inner(
                 .and_then(|v| v.parse::<u64>().ok());
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
                 crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
+            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                crate::proxy::body::size_limited_streaming_h3_body(
+                    h3_resp.recv_stream,
+                    state.max_response_body_size_bytes,
+                    cl,
+                    state.env_config.http3_coalesce_min_bytes,
+                    state.env_config.http3_coalesce_max_bytes,
+                    std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                )
             } else {
                 crate::proxy::body::coalescing_h3_body(
                     h3_resp.recv_stream,
