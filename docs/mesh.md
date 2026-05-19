@@ -190,7 +190,7 @@ the CP must emit one ECDS resource whose decoded `TypedExtensionConfig` looks li
 }
 ```
 
-with the inner `value` bytes carrying the original DR as `MeshDestinationRule` JSON:
+with the inner `value` bytes carrying the original DR as `MeshDestinationRule` JSON (note: the inner shape is the Ferrum `MeshDestinationRule` serde representation, not the Istio CRD YAML — Istio's nested `connectionPool.tcp.connectTimeout` flattens to `traffic_policy.connect_timeout_ms` in milliseconds, `outlierDetection.consecutive5xxErrors` → `outlier_detection.consecutive_errors`, `outlierDetection.interval` (a duration string) → `outlier_detection.interval_seconds` (a `u64`), and `tls.mode` values are lowercase `snake_case` (`istio_mutual`, `simple`, `mutual`, `disable`) per `MtlsMode`):
 
 ```json
 {
@@ -198,16 +198,16 @@ with the inner `value` bytes carrying the original DR as `MeshDestinationRule` J
   "namespace": "default",
   "host": "api.default.svc.cluster.local",
   "traffic_policy": {
+    "connect_timeout_ms": 2000,
     "load_balancer": {"simple": "ROUND_ROBIN"},
-    "outlier_detection": {"consecutive_5xx_errors": 5, "interval": "30s"},
-    "connection_pool": {"tcp": {"connect_timeout": "2s"}},
-    "tls": {"mode": "ISTIO_MUTUAL", "sni": "api.default.svc.cluster.local"}
+    "outlier_detection": {"consecutive_errors": 5, "interval_seconds": 30},
+    "tls": {"mode": "istio_mutual", "sni": "api.default.svc.cluster.local"}
   },
   "subsets": [{"name": "v1", "labels": {"version": "v1"}}]
 }
 ```
 
-The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load_balancer = Simple(RoundRobin)`, `outlier_detection`, the `connection_pool.tcp.connect_timeout` projected onto `Upstream.port_overrides[port].connect_timeout_ms`, the `tls` block, and the `v1` subset all intact — i.e. every field that would have been baked out by a CDS-only path round-trips. Non-carrier ECDS resources sharing the same response are unaffected, so the channel can be shared with unrelated extension consumers.
+The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load_balancer = Simple(RoundRobin)`, `outlier_detection` (consecutive-error + interval), `traffic_policy.connect_timeout_ms` projected onto `Proxy.backend_connect_timeout_ms` (and per-port settings onto `Upstream.port_overrides[port].connect_timeout_ms`), the `tls` block, and the `v1` subset all intact — i.e. every field that would have been baked out by a CDS-only path round-trips. Non-carrier ECDS resources sharing the same response are unaffected, so the channel can be shared with unrelated extension consumers.
 
 **Opt-in and the per-slice diagnostic.** Emission is purely CP-side opt-in — the DP always subscribes ECDS, but a CP that only emits CDS/EDS is fully supported. When the DP receives a slice with CDS clusters but zero carrier ECDS resources, it emits a single one-line `debug!` per slice apply listing the fields that cannot be round-tripped from CDS/EDS alone (`connectTimeout`, `loadBalancer`, `outlierDetection`, `subsets`, `tls.sni`, `tls.subjectAltNames`, `tls.mode`); see the `debug!` guarded by `!dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty()` in `src/modes/mesh/config_consumer/xds_client.rs`. Emitting any carrier resource silences that log for the slice.
 
