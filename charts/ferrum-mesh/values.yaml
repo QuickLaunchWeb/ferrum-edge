@@ -112,6 +112,10 @@ observability:
     # Useful for `grafana.com/folder`-style annotations or routing labels.
     # labels: {}
     # annotations: {}
+    # Override the generated ConfigMap name. Default is
+    # `ferrum-mesh-dashboards`; uncomment to scope it under a release- or
+    # operator-specific name.
+    # configMapName: ferrum-mesh-dashboards
   alerts:
     enabled: true
     certExpiringSeconds: 604800
