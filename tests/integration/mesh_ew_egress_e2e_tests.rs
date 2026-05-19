@@ -7,8 +7,8 @@
 //! - `EastWestGateway`: SNI-passthrough TCP proxies from
 //!   `MultiClusterConfig.east_west_gateways` AND per-service
 //!   passthrough proxies for local mesh services.
-//! - `EgressGateway`: HTTP-family proxies from `ServiceEntry` resources
-//!   with `location: MESH_EXTERNAL`.
+//! - `EgressGateway`: HTTP-family proxies AND stream-family TCP proxies
+//!   (T5-A) from `ServiceEntry` resources with `location: MESH_EXTERNAL`.
 //!
 //! The materialisation is topology-gated — running on any other
 //! topology must be a no-op so a flag flip doesn't accidentally double-
@@ -323,6 +323,232 @@ fn egress_gateway_materialises_distinct_proxies_per_external_entry() {
         .find(|p| p.hosts.iter().any(|h| h.contains("b.example.com")))
         .expect("b proxy");
     assert_ne!(a_proxy.id, b_proxy.id, "distinct proxy IDs per entry");
+}
+
+// ── T5-A: stream-family egress materialization ───────────────────────────
+
+fn external_stream_service_entry(
+    name: &str,
+    host: &str,
+    port: u16,
+    protocol: AppProtocol,
+) -> ServiceEntry {
+    ServiceEntry {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        hosts: vec![host.to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port,
+            protocol,
+            name: Some("stream".to_string()),
+        }],
+        export_to: vec![".".to_string()],
+        workload_selector: None,
+    }
+}
+
+#[test]
+fn egress_gateway_materialises_tcp_stream_proxy_for_external_tcp_service_entry() {
+    // T5-A: a `ServiceEntry` for `redis.external.io:6379/TCP` admitted under
+    // `location: mesh_external` materializes a TCP stream proxy on the egress
+    // gateway. The proxy listens on the SE's own port (6379) and routes by
+    // listen_port, not hosts.
+    use ferrum_edge::config::types::BackendScheme;
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "redis-ext",
+        "redis.external.io",
+        6379,
+        AppProtocol::Redis,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("egress prepared");
+
+    let stream_proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(6379))
+        .expect("stream egress proxy materialised on the SE's port");
+    assert!(
+        stream_proxy.hosts.is_empty(),
+        "stream proxies route by listen_port, not host"
+    );
+    assert!(stream_proxy.listen_path.is_none());
+    assert_eq!(stream_proxy.backend_scheme, Some(BackendScheme::Tcp));
+    assert!(!stream_proxy.passthrough, "egress is NOT SNI passthrough");
+    assert!(
+        stream_proxy.dispatch_kind.is_stream(),
+        "dispatch_kind must resolve to a stream variant"
+    );
+
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id.contains("redis-ext"))
+        .expect("stream egress upstream materialised");
+    assert!(
+        !upstream.targets.is_empty(),
+        "stream egress upstream must carry at least one target"
+    );
+    assert_eq!(upstream.targets[0].host, "redis.external.io");
+    assert_eq!(upstream.targets[0].port, 6379);
+}
+
+#[test]
+fn egress_gateway_materialises_database_protocols_as_tcp_stream_proxies() {
+    // All five TCP-based AppProtocols (Tcp, Mongo, Redis, Mysql, Postgres)
+    // produce TCP stream proxies. Protocol-aware mediation is T5-C.
+    use ferrum_edge::config::types::BackendScheme;
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "ext-mongo",
+        "mongo.external.io",
+        27017,
+        AppProtocol::Mongo,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "ext-pg",
+        "pg.external.io",
+        5432,
+        AppProtocol::Postgres,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "ext-mysql",
+        "mysql.external.io",
+        3306,
+        AppProtocol::Mysql,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("egress prepared");
+
+    for (host, port) in [
+        ("mongo.external.io", 27017_u16),
+        ("pg.external.io", 5432),
+        ("mysql.external.io", 3306),
+    ] {
+        let proxy = prepared
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(port))
+            .unwrap_or_else(|| panic!("stream proxy for {host}:{port} should exist"));
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        let upstream = prepared
+            .upstreams
+            .iter()
+            .find(|u| u.targets.iter().any(|t| t.host == host && t.port == port))
+            .unwrap_or_else(|| panic!("upstream for {host}:{port} should exist"));
+        assert!(!upstream.targets.is_empty());
+    }
+}
+
+#[test]
+fn egress_gateway_materialises_http_and_stream_entries_side_by_side() {
+    // Mixed manifest: an HTTPS SE and a TCP SE coexist. HTTP-family uses
+    // host-routed listener at 15090; stream-family binds its own listen_port.
+    // Both must materialize without interference.
+    use ferrum_edge::config::types::BackendScheme;
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries
+        .push(external_service_entry("ext-api", "api.example.com", 443));
+    mesh.service_entries.push(external_stream_service_entry(
+        "ext-postgres",
+        "pg.example.com",
+        5432,
+        AppProtocol::Postgres,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("egress prepared");
+
+    // HTTP-family: host-routed, listen_port is None.
+    let http_proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.hosts.iter().any(|h| h == "api.example.com"))
+        .expect("http egress proxy materialized");
+    assert!(http_proxy.listen_port.is_none());
+    assert!(http_proxy.dispatch_kind.is_http_family());
+
+    // Stream-family: port-routed, hosts is empty.
+    let stream_proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(5432))
+        .expect("stream egress proxy materialized");
+    assert!(stream_proxy.hosts.is_empty());
+    assert_eq!(stream_proxy.backend_scheme, Some(BackendScheme::Tcp));
+}
+
+#[test]
+fn egress_gateway_skips_stream_service_entries_under_non_egress_topology() {
+    // Topology gate must apply to stream-family materialization the same
+    // way it applies to HTTP-family materialization.
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = DEFAULT_NAMESPACE.to_string();
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "ghost-tcp",
+        "ghost.example.com",
+        9000,
+        AppProtocol::Tcp,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("sidecar prepared");
+
+    assert!(
+        prepared.proxies.iter().all(|p| p.listen_port != Some(9000)),
+        "stream egress proxies must not materialize under non-egress topology"
+    );
+}
+
+#[test]
+fn egress_gateway_stream_port_collision_skips_second_entry() {
+    // Two SEs requesting the same listen_port: the materializer must skip
+    // the second one (only one stream proxy per port). Non-fatal — keeps
+    // the first proxy live and emits a warning for the second.
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "primary",
+        "primary.example.com",
+        6379,
+        AppProtocol::Redis,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "secondary",
+        "secondary.example.com",
+        6379,
+        AppProtocol::Redis,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("prepared");
+
+    let stream_proxies: Vec<_> = prepared
+        .proxies
+        .iter()
+        .filter(|p| p.listen_port == Some(6379))
+        .collect();
+    assert_eq!(
+        stream_proxies.len(),
+        1,
+        "port-collision policy: only the first SE wins on the same listen_port"
+    );
+
+    // The first SE in config order must be the surviving one.
+    let primary_upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.targets.iter().any(|t| t.host == "primary.example.com"))
+        .expect("primary upstream materialized");
+    assert!(!primary_upstream.targets.is_empty());
 }
 
 // ── MeshRuntimeState smoke ────────────────────────────────────────────────
