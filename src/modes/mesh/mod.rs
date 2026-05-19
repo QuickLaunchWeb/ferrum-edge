@@ -1835,8 +1835,21 @@ fn materialize_egress_gateway_proxies(
         return;
     }
 
-    let (proxies, upstreams) =
-        build_egress_proxies_and_upstreams(service_entries, &runtime.namespace);
+    // Stream-family egress proxies bind their own listen_port. Skip ports that
+    // collide with the egress gateway's own mTLS-termination listener
+    // (`egress_listen_addr`, default 15090). Without this guard a ServiceEntry
+    // for, say, `external.io:15090/TCP` would materialize a stream proxy on
+    // the same port the gateway is already binding for HTTP-family egress,
+    // causing the stream listener bind to fail at runtime (EADDRINUSE) with
+    // no actionable signal to the operator.
+    let mut mesh_reserved_ports = std::collections::HashSet::new();
+    mesh_reserved_ports.insert(runtime.egress_listen_addr.port());
+
+    let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        service_entries,
+        &runtime.namespace,
+        &mesh_reserved_ports,
+    );
 
     if proxies.is_empty() {
         debug!("no external service entries produced egress proxies");
@@ -1896,10 +1909,14 @@ fn materialize_egress_gateway_proxies(
 /// SEs requesting the same port are skipped with a warning. The materialized
 /// stream proxy and the outbound capture flow share the destination port so
 /// sidecars dialing the external host are routed to the egress gateway
-/// without rewriting the destination port.
+/// without rewriting the destination port. ServiceEntry ports that collide
+/// with `mesh_reserved_ports` (the egress gateway's own listener port) are
+/// skipped with a warning instead of materializing — letting them through
+/// would fail at listener bind time with EADDRINUSE.
 fn build_egress_proxies_and_upstreams(
     service_entries: &[ServiceEntry],
     namespace: &str,
+    mesh_reserved_ports: &std::collections::HashSet<u16>,
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -1948,6 +1965,7 @@ fn build_egress_proxies_and_upstreams(
                     backend_scheme,
                     namespace,
                     now,
+                    mesh_reserved_ports,
                     &mut materialized_stream_ports,
                     &mut proxies,
                     &mut upstreams,
@@ -2048,10 +2066,34 @@ fn build_stream_egress_for_entry(
     backend_scheme: BackendScheme,
     namespace: &str,
     now: chrono::DateTime<chrono::Utc>,
+    mesh_reserved_ports: &std::collections::HashSet<u16>,
     materialized_stream_ports: &mut std::collections::HashSet<u16>,
     proxies: &mut Vec<Proxy>,
     upstreams: &mut Vec<Upstream>,
 ) {
+    if port_spec.port == 0 {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress ServiceEntry port 0: stream proxy listen_port must be >= 1"
+        );
+        return;
+    }
+
+    if mesh_reserved_ports.contains(&port_spec.port) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress ServiceEntry port: collides with a mesh gateway listener port \
+             (would fail to bind at runtime). Operators should choose a different ServiceEntry \
+             port or relocate the egress gateway listener."
+        );
+        return;
+    }
+
     if materialized_stream_ports.contains(&port_spec.port) {
         warn!(
             service_entry = %entry.name,
@@ -2409,13 +2451,19 @@ fn stream_egress_gateway_proxy(
         retry: None,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: Some(listen_port),
-        // Stream egress proxies terminate the inbound mTLS from sidecars at
-        // the gateway's egress listener (15090, mTLS-terminated upstream)
-        // and emit plain stream bytes to the external backend — they are
-        // NOT raw SNI passthrough (that's the east-west gateway flow).
-        // `frontend_tls: false` here means the per-port stream LISTENER is
-        // plain (the inbound mTLS termination already happened at 15090,
-        // before the workload's outbound capture redirected the connection).
+        // Stream egress proxies own their own per-port plaintext listener
+        // (e.g., 27017 for Mongo) and forward to the external backend with
+        // `BackendScheme::Tcp`. They are NOT raw SNI passthrough (that's the
+        // east-west gateway flow) — passthrough is false so the bytes pass
+        // through the regular TCP proxy pipeline (idle timeouts, transaction
+        // logging, etc.) rather than `splice(2)` between sockets.
+        //
+        // `frontend_tls: false` reflects the per-port stream LISTENER being
+        // plain TCP. Sidecar traffic still routes to the egress gateway by
+        // way of the workload's outbound capture; the inbound mTLS sidecar
+        // boundary lives on the egress mTLS-termination listener (15090) for
+        // HTTP-family flows, which is a sibling listener — it is not the
+        // termination point for this per-port stream listener.
         frontend_tls: false,
         passthrough: false,
         udp_idle_timeout_seconds: 60,
@@ -9296,7 +9344,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9352,7 +9404,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -9381,7 +9437,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -9397,13 +9457,20 @@ mod tests {
         );
         service_entry.namespace = "payments".to_string();
 
-        let (proxies, upstreams) =
-            build_egress_proxies_and_upstreams(&[service_entry.clone()], "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &[service_entry.clone()],
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
 
         service_entry.export_to = vec!["*".to_string()];
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&[service_entry], "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &[service_entry],
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
     }
@@ -9429,7 +9496,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
 
@@ -9460,7 +9531,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(
@@ -9511,7 +9586,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         // Host-only HTTP proxies cannot safely distinguish multiple ports for
         // the same host, so only the first materialized port owns each host.
@@ -9567,7 +9646,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9595,7 +9678,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(upstreams.len(), 2);
         let primary = upstreams
@@ -9617,7 +9704,8 @@ mod tests {
 
     #[test]
     fn egress_empty_service_entries_produces_no_proxies() {
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&[], "default");
+        let (proxies, upstreams) =
+            build_egress_proxies_and_upstreams(&[], "default", &std::collections::HashSet::new());
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
     }
@@ -9800,7 +9888,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9840,7 +9932,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9872,7 +9968,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
     }
@@ -9996,7 +10096,11 @@ mod tests {
             AppProtocol::Tcp,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -10031,7 +10135,11 @@ mod tests {
             AppProtocol::Mongo,
         )];
 
-        let (proxies, _) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, _) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         let proxy = &proxies[0];
@@ -10079,7 +10187,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -10113,7 +10225,11 @@ mod tests {
             ),
         ];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1, "only the first SE wins on port collision");
         assert_eq!(upstreams.len(), 1);
@@ -10143,7 +10259,11 @@ mod tests {
             ),
         ];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 2);
         assert_eq!(upstreams.len(), 2);
@@ -10198,7 +10318,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 2);
         assert_eq!(upstreams.len(), 2);
@@ -10277,5 +10401,99 @@ mod tests {
         prepared
             .validate_stream_proxies()
             .expect("stream proxy validation should pass for a single port");
+    }
+
+    #[test]
+    fn egress_stream_skips_service_entry_port_that_collides_with_mesh_listener() {
+        // ServiceEntry port matching `egress_listen_addr.port()` (default
+        // 15090) would bind on the same socket as the egress gateway's own
+        // mTLS-termination listener. The materializer must skip these entries
+        // with a warning rather than emit a stream proxy that fails to bind
+        // at runtime (EADDRINUSE).
+        let mut reserved = std::collections::HashSet::new();
+        reserved.insert(15090);
+
+        let service_entries = vec![test_external_stream_service_entry(
+            "colliding-tcp",
+            "external.io",
+            15090,
+            AppProtocol::Tcp,
+        )];
+
+        let (proxies, upstreams) =
+            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved);
+
+        assert!(
+            proxies.is_empty(),
+            "stream proxy on the mesh listener port must be skipped"
+        );
+        assert!(
+            upstreams.is_empty(),
+            "no upstream should be emitted when the proxy is skipped"
+        );
+    }
+
+    #[test]
+    fn egress_stream_skips_zero_port_service_entry() {
+        // Stream proxies require listen_port >= 1 (validated by
+        // `validate_stream_proxies`). A ServiceEntry with port: 0 would
+        // produce a proxy that fails validation later, killing the entire
+        // slice apply. Skip with a warning instead.
+        let service_entries = vec![test_external_stream_service_entry(
+            "zero-port",
+            "external.io",
+            0,
+            AppProtocol::Tcp,
+        )];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            proxies.is_empty(),
+            "stream proxy with port 0 must be skipped"
+        );
+        assert!(upstreams.is_empty());
+    }
+
+    #[test]
+    fn egress_materialize_skips_mesh_listener_collision_full_path() {
+        // End-to-end: `materialize_egress_gateway_proxies` populates
+        // `mesh_reserved_ports` from `runtime.egress_listen_addr.port()` and
+        // must skip ServiceEntries that target the same port. This guards
+        // against a regression where the runtime forgets to plumb the
+        // reserved ports through to `build_egress_proxies_and_upstreams`.
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let egress_port = runtime.egress_listen_addr.port();
+
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![test_external_stream_service_entry(
+                    "colliding-tcp",
+                    "external.io",
+                    egress_port,
+                    AppProtocol::Tcp,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|p| p.listen_port == Some(egress_port)),
+            "no stream proxy should bind on the mesh egress listener port"
+        );
     }
 }

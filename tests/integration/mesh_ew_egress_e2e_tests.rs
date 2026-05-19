@@ -551,6 +551,36 @@ fn egress_gateway_stream_port_collision_skips_second_entry() {
     assert!(!primary_upstream.targets.is_empty());
 }
 
+#[test]
+fn egress_gateway_stream_skips_service_entries_that_collide_with_egress_listener_port() {
+    // A ServiceEntry whose port matches the egress gateway's own mTLS-
+    // termination listener (`egress_listen_addr.port()`) would fail to bind
+    // at runtime (EADDRINUSE on the listener manager reconcile). The
+    // materializer skips these with a warning. Without the skip, the stream
+    // listener would crash the slice apply pipeline rather than degrade
+    // gracefully.
+    let mut runtime = egress_runtime();
+    runtime.egress_listen_addr = "127.0.0.1:15090".parse().expect("addr");
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "colliding",
+        "external.io",
+        15090,
+        AppProtocol::Tcp,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .all(|p| p.listen_port != Some(15090)),
+        "stream proxies must not collide with the egress gateway's own listener"
+    );
+}
+
 // ── MeshRuntimeState smoke ────────────────────────────────────────────────
 
 #[test]
