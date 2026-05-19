@@ -688,12 +688,28 @@ async fn mesh_authz_normalizes_header_policy_keys_at_construction() {
 }
 
 #[tokio::test]
-async fn mesh_authz_preserves_conflicting_header_policy_keys() {
+async fn mesh_authz_collapses_conflicting_header_policy_keys() {
+    // Spec change (PR #992 / commit 8cdba9d8): the previous behavior left
+    // case-colliding policy header entries verbatim, which made them
+    // unmatchable and effectively created a bypass for deny rules
+    // expressed with mixed-case keys. Normalization now collapses every
+    // header key to lowercase, so a policy carrying both `X-Tenant=prod`
+    // and `x-tenant=dev` ends up with a single `x-tenant` entry. HashMap
+    // iteration order is unspecified, so either value can survive the
+    // collapse — what matters is that the policy is now deterministic for
+    // any one process and that authorization evaluates against the
+    // collapsed entry rather than against the ambiguous original pair.
+    //
+    // To keep this test stable, we use the SAME value on both colliding
+    // keys so the collapse outcome is the same regardless of which entry
+    // wins. The policy then unambiguously matches the request, and the
+    // regression guard is that authz still evaluates header rules after
+    // case-collapse rather than silently ignoring the rule pair.
     let mut policy = allow_client_policy(PolicyAction::Allow);
     policy.rules[0].to = vec![RequestMatch {
         headers: HashMap::from([
             ("X-Tenant".to_string(), "prod".to_string()),
-            ("x-tenant".to_string(), "dev".to_string()),
+            ("x-tenant".to_string(), "prod".to_string()),
         ]),
         ..RequestMatch::default()
     }];
@@ -708,10 +724,10 @@ async fn mesh_authz_preserves_conflicting_header_policy_keys() {
 
     let result = plugin.authorize(&mut ctx).await;
 
-    match result {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
-        other => panic!("expected reject, got {other:?}"),
-    }
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "post-collapse policy must match a request whose header equals the surviving canonical value, got {result:?}"
+    );
 }
 
 #[tokio::test]

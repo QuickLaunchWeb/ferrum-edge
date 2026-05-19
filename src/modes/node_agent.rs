@@ -1765,6 +1765,15 @@ mod tests {
 
     #[test]
     fn handle_pod_added_enrolls_matching_pod() {
+        // PR #934 (commit 65606d87) requires the inbound tc attach to
+        // succeed before enrollment is accepted; that means
+        // `discover_veth_for_pod` must return `Some(_)`. Tests don't have
+        // a real pod network namespace, so we use the test-only veth
+        // override seam (`crate::ebpf::veth::tests::TestOverrideGuard`)
+        // to feed the production path a stable interface name. The guard
+        // is RAII-scoped — it restores the previous override on drop so
+        // sibling tests stay isolated.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -2463,6 +2472,7 @@ mod tests {
 
     #[test]
     fn handle_pod_added_writes_include_ports_for_annotated_pod() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         // End-to-end happy path: an annotated pod gets a per-cgroup
         // includeOutboundPorts entry in the mock BPF backend keyed by the
         // resolved cgroup's inode (since this test uses a real tempdir for
@@ -2513,6 +2523,9 @@ mod tests {
 
     #[test]
     fn handle_pod_added_wildcard_annotation_writes_all_ports() {
+        // See note on `handle_pod_added_enrolls_matching_pod` for why
+        // this guard is required.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -2560,6 +2573,7 @@ mod tests {
         // the regression guard for the BPF fail-open path: pods without
         // includeOutboundPorts must remain captured exactly as they were
         // before GAP-2K.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -2604,6 +2618,7 @@ mod tests {
         // Malformed annotation → log a warning, leave the pod un-narrowed,
         // continue enrolling it. This matches the rest of the
         // node-agent's "degrade gracefully" policy.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -2645,6 +2660,7 @@ mod tests {
 
     #[test]
     fn handle_pod_removed_removes_include_ports_entry() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
