@@ -1623,6 +1623,7 @@ where
         &state.dns_cache,
         proxy_headers,
         stream_grpc_response,
+        state.max_response_body_size_bytes,
     )
     .await;
 
@@ -1722,6 +1723,7 @@ where
                 &state.dns_cache,
                 proxy_headers,
                 stream_grpc_response,
+                state.max_response_body_size_bytes,
             )
             .await;
         }

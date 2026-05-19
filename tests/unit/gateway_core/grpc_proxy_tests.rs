@@ -333,6 +333,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &dns,
         &proxy_headers,
         false,
+        0,
     )
     .await;
     assert!(
