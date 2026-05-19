@@ -578,6 +578,39 @@ async fn test_mtls_auth_issuer_pass_fingerprint_fail_rejects() {
 }
 
 #[tokio::test]
+async fn test_mtls_auth_ca_fingerprint_rejects_unrelated_extra_cert() {
+    use sha2::{Digest, Sha256};
+
+    let (real_ca_der, client_der) =
+        create_ca_signed_cert("Real Trust CA", None, None, "client.example.com");
+    let (allowed_ca_der, _unused_client_der) = create_ca_signed_cert(
+        "Per Proxy Allowed CA",
+        None,
+        None,
+        "other-client.example.com",
+    );
+
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let index = ConsumerIndex::new(&[consumer]);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&allowed_ca_der);
+    let allowed_fp = hex::encode(hasher.finalize());
+
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_ca_fingerprints_sha256": [allowed_fp]
+    }))
+    .unwrap();
+
+    // Client can send unrelated extra certs, but they must not satisfy CA fingerprint checks.
+    let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![real_ca_der, allowed_ca_der]);
+
+    let result = plugin.authenticate(&mut ctx, &index).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
 async fn test_mtls_auth_ca_fingerprint_case_insensitive() {
     use sha2::{Digest, Sha256};
 
