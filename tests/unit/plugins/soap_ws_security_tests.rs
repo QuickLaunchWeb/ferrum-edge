@@ -1469,6 +1469,48 @@ async fn test_saml_signature_must_cover_enclosing_assertion() {
 }
 
 #[tokio::test]
+async fn test_saml_signature_wrapping_values_inside_signature_are_ignored() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(
+        &bundle,
+        Some("https://my-service.example.com"),
+    ))
+    .unwrap();
+
+    let nb = long_past();
+    let noa = far_future();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-wrapping",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.not_before = Some(&nb);
+    builder.not_on_or_after = Some(&noa);
+    builder.audience = Some("https://my-service.example.com");
+    let assertion = builder.build();
+
+    let wrapped = assertion.replace(
+        "<SignedInfo>",
+        "<Subject><NameID>admin@example.com</NameID></Subject><Conditions NotBefore=\"2099-01-01T00:00:00Z\"><AudienceRestriction><Audience>https://evil-service.example.com</Audience></AudienceRestriction></Conditions><SignedInfo>",
+    );
+
+    let body = wrap_saml_assertion(&wrapped);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "wrapped values inside Signature must be ignored, got {:?}",
+        result
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com"),
+        "must export signed Subject NameID, not unsigned Signature-subtree content"
+    );
+}
+
+#[tokio::test]
 async fn test_saml_multiple_assertions_rejected() {
     // Defense in depth: even when the first Assertion verifies cleanly, a
     // second Assertion in the same WS-Security block is rejected outright
