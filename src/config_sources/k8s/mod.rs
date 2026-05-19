@@ -1076,18 +1076,22 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 ///
 /// Entries carrying predicates we cannot represent in the rule
 /// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
-/// `queryParams.X.regex`, or fully-unsupported keys like `authority`,
-/// `scheme`, `port`, `sourceLabels`, `gateways`, `withoutHeaders`,
-/// `ignoreUriCase`) are skipped by the dispatch-rule extractor — they do NOT
-/// collapse onto the URI-only catch-all branch. The VirtualService translator
-/// emits a separate proxy-scoped `request_termination` artifact for
+/// `queryParams.X.regex`, or fully-unsupported keys like `scheme`, `port`,
+/// `sourceLabels`, `gateways`, `withoutHeaders`) are skipped by the
+/// dispatch-rule extractor — they do NOT collapse onto the URI-only
+/// catch-all branch. The VirtualService translator emits a separate
+/// proxy-scoped `request_termination` artifact for
 /// unsupported-only route candidates so later broader routes do not silently
 /// serve gated traffic. If unsupported entries collapsed here, a mixed
 /// `match[]` with one supported exact rule plus one unsupported regex sibling
 /// would disable `reject_unmatched` and silently forward exactly the requests
-/// the operator gated. `sourceNamespace` is supported as a first-class
-/// exact-string predicate; the request hot path resolves the source workload
-/// namespace from `ctx.peer_spiffe_id`.
+/// the operator gated. `authority` is supported as a first-class
+/// `StringMatch` predicate (exact / prefix / regex), `sourceNamespace`
+/// is supported as a first-class exact-string predicate (the request hot
+/// path resolves the source workload namespace from `ctx.peer_spiffe_id`),
+/// and `ignoreUriCase: true` is also first-class (T1-B.5): the URI's
+/// listen_path is widened to a case-insensitive regex and the dispatch
+/// rule carries the flag so the plugin re-evaluates with ASCII case folding.
 ///
 /// The rule's destination overrides to the route's own destination
 /// (`backend_host`/`backend_port` or `upstream_id`). The destination is
@@ -1168,12 +1172,26 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         // that URI; entries without a URI (or with an unsupported URI
         // shape, which never produces a proxy) apply to every listen_path
         // derived from this http[] rule and are not filtered out here.
-        let entry_path = entry.get("uri").and_then(istio::path_match);
+        // `entry_listen_path` widens to the case-insensitive regex form
+        // when `ignoreUriCase: true` is set on the entry, matching the
+        // listen_path key `match_paths` produced for the proxy (T1-B.5).
+        let entry_path = istio::entry_listen_path(entry);
         if let (Some(entry_path), Some(listen_path)) = (entry_path.as_deref(), listen_path)
             && entry_path != listen_path
         {
             continue;
         }
+
+        // `ignoreUriCase: true` on the source entry — we propagate the URI
+        // predicate + flag onto the dispatch rule so the plugin can re-evaluate
+        // case-folded matching. The listen_path widening above admits both
+        // casings to the proxy; this carries the operator's original match
+        // precision onto the dispatch rule for observability and for the
+        // (rare) collapse cases where multiple URI shapes share a proxy.
+        let ignore_uri_case = entry
+            .get("ignoreUriCase")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut match_criteria = serde_json::Map::new();
         // Track whether this entry carries any non-URI predicate that we
@@ -1268,6 +1286,58 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
                 "source_namespace".to_string(),
                 Value::String(source_namespace.to_string()),
             );
+        }
+
+        // Istio `HTTPMatchRequest.authority` is a single `StringMatch`
+        // predicate per rule (exactly one of `exact` / `prefix` / `regex`).
+        // `exact` emits as the bare-string back-compat form so older
+        // binaries (and existing wire snapshots) keep deserializing it as
+        // an `Exact` matcher; `prefix` and `regex` emit as the tagged form
+        // so the plugin compiles them as the matching predicate type at
+        // config-load time. An entry whose `authority` is missing any of
+        // the three supported keys is treated as unsupported via the
+        // entry-level `had_unsupported_predicate` flag and dropped wholesale
+        // below — never partially extracted.
+        if let Some(authority_obj) = entry.get("authority").and_then(Value::as_object) {
+            if let Some(exact) = authority_obj.get("exact").and_then(Value::as_str) {
+                match_criteria.insert("authority".to_string(), Value::String(exact.to_string()));
+            } else if let Some(prefix) = authority_obj.get("prefix").and_then(Value::as_str) {
+                match_criteria.insert(
+                    "authority".to_string(),
+                    serde_json::json!({ "prefix": prefix }),
+                );
+            } else if let Some(regex) = authority_obj.get("regex").and_then(Value::as_str) {
+                match_criteria.insert(
+                    "authority".to_string(),
+                    serde_json::json!({ "regex": regex }),
+                );
+            }
+        }
+
+        // T1-B.5: project the URI predicate onto the dispatch rule when
+        // `ignoreUriCase: true`. The widened (case-insensitive) listen_path
+        // already routes both casings to this proxy; carrying the original
+        // URI predicate + the case-fold flag here keeps the operator's
+        // match precision intact for collapse cases (multiple URIs on one
+        // proxy) and for admin-API observability of the resolved rule.
+        // When `ignoreUriCase` is false or absent, the dispatch rule does
+        // NOT carry the URI — the proxy's `listen_path` already enforces
+        // it case-sensitively, and adding a redundant URI predicate would
+        // both pay a per-request hash + compare and cloud the operator
+        // view of the resolved rule (legacy wire shape: URI absent).
+        if ignore_uri_case && let Some(uri_obj) = entry.get("uri").and_then(Value::as_object) {
+            let mut uri_value = serde_json::Map::new();
+            if let Some(exact) = uri_obj.get("exact").and_then(Value::as_str) {
+                uri_value.insert("exact".to_string(), Value::String(exact.to_string()));
+            } else if let Some(prefix) = uri_obj.get("prefix").and_then(Value::as_str) {
+                uri_value.insert("prefix".to_string(), Value::String(prefix.to_string()));
+            } else if let Some(regex) = uri_obj.get("regex").and_then(Value::as_str) {
+                uri_value.insert("regex".to_string(), Value::String(regex.to_string()));
+            }
+            if !uri_value.is_empty() {
+                match_criteria.insert("uri".to_string(), Value::Object(uri_value));
+                match_criteria.insert("ignore_uri_case".to_string(), Value::Bool(true));
+            }
         }
 
         if had_unsupported_predicate {
@@ -1528,6 +1598,18 @@ fn header_value_has_supported_predicate(value: &Value) -> bool {
         || value.get("regex").and_then(Value::as_str).is_some()
 }
 
+/// Returns `true` if the `authority` value object carries one of the
+/// predicate operators that `mesh_route_dispatch` supports today. Authority
+/// `StringMatch` support tracks Istio: `exact`, `prefix`, `regex`. The Istio
+/// CRD models `authority` as exactly one predicate per rule (NOT a list),
+/// so this mirrors the single-field shape rather than the headers / query
+/// params collection shape.
+fn authority_value_has_supported_predicate(value: &Value) -> bool {
+    value.get("exact").and_then(Value::as_str).is_some()
+        || value.get("prefix").and_then(Value::as_str).is_some()
+        || value.get("regex").and_then(Value::as_str).is_some()
+}
+
 pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
     if let Some(method) = entry.get("method")
         && method_value_has_supported_predicate(method)
@@ -1562,16 +1644,25 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
     {
         return true;
     }
+    if let Some(authority) = entry.get("authority")
+        && authority_value_has_supported_predicate(authority)
+    {
+        return true;
+    }
     false
 }
 
 pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bool {
-    if let Some(ignore_uri_case) = entry.get("ignoreUriCase") {
-        match ignore_uri_case.as_bool() {
-            Some(true) => return true,
-            Some(false) => {}
-            None => return true,
-        }
+    if let Some(ignore_uri_case) = entry.get("ignoreUriCase")
+        && ignore_uri_case.as_bool().is_none()
+    {
+        // T1-B.5: `ignoreUriCase: true` is now first-class (handled by the
+        // `mesh_route_dispatch` plugin via `match.uri` + `ignore_uri_case`).
+        // A non-bool value (e.g. a typo `ignoreUriCase: "true"`) is still
+        // an operator misconfiguration we fail closed on — the K8s CRD
+        // schema would reject a non-bool, but defensive coding catches
+        // unvalidated inputs from native MeshSubscribe.
+        return true;
     }
 
     // Method `StringMatch` supports `exact` / `prefix` / `regex`. Any other
@@ -1629,11 +1720,24 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         }
     }
 
+    // Authority `StringMatch` supports `exact` / `prefix` / `regex`. Any other
+    // shape (non-object, missing every supported op, unknown op only) is
+    // treated as an unsupported predicate so the route falls closed via
+    // `request_termination` rather than silently widening traffic.
+    if let Some(authority) = entry.get("authority") {
+        if !authority.is_object() {
+            return true;
+        }
+        if !authority_value_has_supported_predicate(authority) {
+            return true;
+        }
+    }
+
     entry.as_object().is_some_and(|obj| {
         obj.keys().any(|key| {
             matches!(
                 key.as_str(),
-                "authority" | "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
+                "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
             )
         })
     })
