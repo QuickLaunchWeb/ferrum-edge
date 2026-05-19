@@ -1333,7 +1333,7 @@ mod inner {
                 upstreams.len()
             );
 
-            Ok(GatewayConfig {
+            let mut config = GatewayConfig {
                 version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
                 proxies,
                 consumers,
@@ -1342,7 +1342,10 @@ mod inner {
                 loaded_at,
                 known_namespaces: Vec::new(),
                 ..Default::default()
-            })
+            };
+            config.resolve_upstream_tls();
+
+            Ok(config)
         }
 
         async fn load_gateway_trust_bundles(

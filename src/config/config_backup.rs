@@ -30,6 +30,7 @@ pub fn load_config_backup(path: &str) -> Option<GatewayConfig> {
         Ok(content) => match serde_json::from_str::<GatewayConfig>(&content) {
             Ok(mut config) => {
                 config.normalize_fields();
+                config.resolve_upstream_tls();
                 info!(
                     "Config backup loaded: {} proxies, {} consumers from {}",
                     config.proxies.len(),
