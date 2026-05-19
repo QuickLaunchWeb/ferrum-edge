@@ -1191,7 +1191,7 @@ nodeAgent:
     excludePorts: []
 ```
 
-Required capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`. Volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2).
+Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` (kernel-backcompat for 5.7.x; drop on 5.8+). Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`, `hostPID: true`. See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
 
 ### Metrics
 

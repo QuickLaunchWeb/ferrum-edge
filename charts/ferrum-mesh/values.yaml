@@ -145,3 +145,38 @@ nodeAgent:
     limits:
       cpu: 500m
       memory: 256Mi
+  # Security posture. See docs/node_agent_security.md for the full reference,
+  # including the kernel APIs each capability grants and why every mount /
+  # host-access flag is required. Default values harden the DaemonSet without
+  # breaking older kernels; every knob is reversible so operators can roll
+  # back individually if their environment needs it.
+  security:
+    # Enforce read-only root filesystem and provision a scratch tmpfs at
+    # /tmp. Set to false only if a downstream image needs to write to its
+    # own image FS.
+    readOnlyRootFilesystem: true
+    # Block setuid-binary privilege escalation inside the container. The
+    # agent does not exec setuid binaries.
+    allowPrivilegeEscalation: false
+    # Add CAP_PERFMON to the container's capability set. Required on
+    # kernel >= 5.8 to read BPF program info / BTF. On kernel < 5.8 the
+    # kernel does not recognise PERFMON and silently ignores it in the
+    # capability set (the cap-set entry is still rendered by the chart
+    # so admission controllers see the requested posture). Set to false
+    # only if an admission webhook rejects PERFMON in your environment.
+    addCapPerfmon: true
+    # Drop CAP_SYS_ADMIN. Modern kernels (5.8+) cover everything via
+    # CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN. Keep false until your fleet
+    # is uniformly on kernel >= 5.8 — dropping prematurely on 5.7.x will
+    # break BPF program load.
+    dropCapSysAdmin: false
+    # Pod-wide seccomp profile. RuntimeDefault is the containerd default
+    # and permits every syscall the agent needs (bpf, setsockopt, sh -c
+    # iptables fallback, etc.). Override with type: Localhost and
+    # localhostProfile: <path> to load a custom tightened profile (see
+    # docs/node_agent_security.md for a template). The whole map is
+    # passed through verbatim, so any other fields the Kubernetes API
+    # supports for SeccompProfile (e.g. future fields) also work.
+    seccompProfile:
+      type: RuntimeDefault
+      # localhostProfile: profiles/ferrum-node-agent.json
