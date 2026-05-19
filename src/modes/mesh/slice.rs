@@ -497,7 +497,11 @@ impl MeshSlice {
             request.labels.clone()
         };
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
-            candidate_label_sets.iter().collect()
+            if candidate_label_sets.is_empty() {
+                vec![&effective_labels]
+            } else {
+                candidate_label_sets.iter().collect()
+            }
         } else {
             vec![&effective_labels]
         };
