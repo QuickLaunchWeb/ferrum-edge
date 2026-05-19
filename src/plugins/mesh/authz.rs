@@ -43,6 +43,7 @@ use crate::modes::mesh::policy::{
     evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
     normalize_mesh_policy_header_names,
 };
+use crate::modes::mesh::config::normalize_request_match_host_pattern;
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -127,6 +128,16 @@ impl MeshAuthz {
 
         for policy in &mut slice.mesh_policies {
             normalize_mesh_policy_header_names(policy);
+            for rule in &mut policy.rules {
+                for request in &mut rule.to {
+                    for host in &mut request.hosts {
+                        *host = normalize_request_match_host_pattern(host);
+                    }
+                    for host in &mut request.not_hosts {
+                        *host = normalize_request_match_host_pattern(host);
+                    }
+                }
+            }
         }
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
         Ok(Self {
