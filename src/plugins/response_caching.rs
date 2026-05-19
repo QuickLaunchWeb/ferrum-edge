@@ -760,16 +760,8 @@ impl Plugin for ResponseCaching {
         true
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
-        // Buffering an unbounded event stream would collect frames until the
-        // configured `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` ceiling is hit and
-        // then 502, instead of streaming events to the client. SSE responses
-        // are not cacheable anyway — `before_proxy` will see no cache hit and
-        // `on_final_response_body` will not be invoked, so the cache state
-        // stays correct without any other code paths needing to special-case
-        // SSE.
-        !super::utils::sse::is_sse_request(ctx)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
     }
 
     async fn before_proxy(
@@ -781,12 +773,6 @@ impl Plugin for ResponseCaching {
             if self.config.invalidate_on_unsafe_methods {
                 self.invalidate_path(ctx);
             }
-            ctx.metadata
-                .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
-            return PluginResult::Continue;
-        }
-
-        if super::utils::sse::headers_accept_sse(headers) {
             ctx.metadata
                 .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
             return PluginResult::Continue;

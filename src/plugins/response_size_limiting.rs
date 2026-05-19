@@ -84,16 +84,8 @@ impl Plugin for ResponseSizeLimiting {
         self.require_buffered_check && self.is_enabled()
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
-        // Buffering an unbounded event stream is exactly what this plugin
-        // would otherwise reject — at `max_size_bytes` the buffer would 502
-        // instead of streaming events. The Content-Length fast path in
-        // `after_proxy` still runs (an SSE backend with an oversized
-        // Content-Length is rejected pre-streaming); per-frame size
-        // enforcement on a streaming response is out of scope for the
-        // current buffered design.
-        self.require_buffered_check && self.is_enabled() && !super::utils::sse::is_sse_request(ctx)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        self.require_buffered_check && self.is_enabled()
     }
 
     async fn after_proxy(
