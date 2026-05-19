@@ -716,9 +716,8 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
     if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
         || value_is_false(labels.and_then(|m| m.get("ferrum.io/mesh")))
-        || annotations
-            .and_then(|m| m.get("ferrum.io/injected"))
-            .is_some()
+        || pod_has_ferrum_sidecar(pod)
+        || (config.capture_mode == CaptureMode::Iptables && pod_has_ferrum_init_container(pod))
     {
         return false;
     }
@@ -765,6 +764,26 @@ fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
             value: Some(json!([])),
         });
     }
+}
+
+fn pod_has_ferrum_sidecar(pod: &Value) -> bool {
+    pod.pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .is_some_and(|containers| {
+            containers.iter().any(|container| {
+                container.get("name").and_then(Value::as_str) == Some("ferrum-edge")
+            })
+        })
+}
+
+fn pod_has_ferrum_init_container(pod: &Value) -> bool {
+    pod.pointer("/spec/initContainers")
+        .and_then(Value::as_array)
+        .is_some_and(|containers| {
+            containers.iter().any(|container| {
+                container.get("name").and_then(Value::as_str) == Some("ferrum-edge-init")
+            })
+        })
 }
 
 fn pod_namespace(
@@ -1166,15 +1185,36 @@ mod tests {
                 "labels": {"ferrum.io/mesh": "enabled"},
                 "annotations": {"ferrum.io/injected": "true"}
             },
-            "spec": {"containers": []}
+            "spec": {
+                "containers": [{"name": "ferrum-edge", "image": "ferrum-edge:latest"}]
+            }
         });
         let patch = build_sidecar_patch_for_namespace(
             &pod,
-            &test_config(true, CaptureMode::Explicit),
+            &test_config(true, CaptureMode::Iptables),
             None,
         )
         .expect("patch");
         assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn patch_does_not_trust_spoofed_injected_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect("patch");
+        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
+        assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
     }
 
     #[test]
