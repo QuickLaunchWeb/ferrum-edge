@@ -2773,7 +2773,7 @@ impl Proxy {
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
-    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+    pub fn validate_fields(&self, upstream_namespace: &str) -> Result<(), Vec<String>> {
         self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
     }
 
@@ -3826,7 +3826,7 @@ impl Upstream {
 
         // Service discovery config
         if let Some(ref sd) = self.service_discovery
-            && let Err(sd_errors) = sd.validate_fields()
+            && let Err(sd_errors) = sd.validate_fields(&self.namespace)
         {
             for e in sd_errors {
                 errors.push(format!("service_discovery.{}", e));
@@ -4097,7 +4097,7 @@ impl PluginConfig {
     }
 
     /// Validate all fields of a plugin config for correctness and safe lengths.
-    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+    pub fn validate_fields(&self, upstream_namespace: &str) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Plugin name length (should already be validated against known plugins,
@@ -4553,6 +4553,11 @@ impl ServiceDiscoveryConfig {
                         }
                         if namespace.is_empty() {
                             errors.push("mesh.namespace must not be empty".to_string());
+                        }
+                        if namespace != upstream_namespace {
+                            errors.push(format!(
+                                "mesh.namespace must match upstream namespace ({upstream_namespace})"
+                            ));
                         }
                     }
                     if let Some(port) = mesh.port

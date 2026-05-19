@@ -1737,6 +1737,7 @@ fn test_mesh_port_zero_rejected() {
 #[test]
 fn test_mesh_valid_optional_fields() {
     let mut upstream = make_upstream("test");
+    upstream.namespace = "production".into();
     upstream.service_discovery = Some(ServiceDiscoveryConfig {
         provider: SdProvider::Mesh,
         dns_sd: None,
@@ -1751,6 +1752,30 @@ fn test_mesh_valid_optional_fields() {
         default_weight: 1,
     });
     assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_mesh_namespace_override_must_match_upstream_namespace() {
+    let mut upstream = make_upstream("test");
+    upstream.namespace = "tenant-a".into();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "api".into(),
+            namespace: Some("tenant-b".into()),
+            port: Some(8080),
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("mesh.namespace must match upstream namespace"))
+    );
 }
 
 // ─── hash_on format validation tests ────────────────────────────────────────
