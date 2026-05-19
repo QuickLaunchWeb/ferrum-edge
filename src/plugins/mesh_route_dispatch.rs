@@ -490,7 +490,9 @@ impl HeaderMatcher {
         match self {
             HeaderMatcher::Exact(expected) => value == expected.as_str(),
             HeaderMatcher::Prefix(prefix) => value.starts_with(prefix.as_str()),
-            HeaderMatcher::Regex(re) => re.is_match(value),
+            HeaderMatcher::Regex(re) => re
+                .find(value)
+                .is_some_and(|m| m.start() == 0 && m.end() == value.len()),
         }
     }
 }
@@ -2025,6 +2027,24 @@ mod tests {
         .unwrap();
         let mut ctx = ctx_with("GET", "/api");
         let mut headers = HashMap::from([("x-tier".to_string(), "user-east".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn regex_header_match_does_not_allow_substring_overmatch() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"authorization": {"regex": "Bearer .+"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([(
+            "authorization".to_string(),
+            "Basic x, Bearer token".to_string(),
+        )]);
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(ctx.route_override_upstream_id.is_none());
     }
