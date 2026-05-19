@@ -6,15 +6,15 @@ use bytes::{Buf, Bytes};
 
 /// Default HTTP/3 per-stream receive window. Larger than quinn's baseline
 /// while keeping the aggregate connection budget modest by default.
-pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 256 * 1024;
 
 /// Default HTTP/3 connection-level receive window. This aggregate connection
 /// budget bounds the sum of active per-stream receive windows.
-pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 32 * 1024 * 1024;
+pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 1024 * 1024;
 
 /// Default HTTP/3 send window. This bounds unacknowledged outbound data per
 /// QUIC connection.
-pub const H3_SEND_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+pub const H3_SEND_WINDOW_DEFAULT: u64 = 256 * 1024;
 
 /// Largest value encodable as a QUIC variable-length integer.
 pub const QUIC_VARINT_MAX_U64: u64 = (1 << 62) - 1;
@@ -149,7 +149,7 @@ impl Http3ServerConfig {
 impl Default for Http3ServerConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_streams: 1000,
+            max_concurrent_streams: 100,
             idle_timeout: Duration::from_secs(30),
             stream_receive_window: H3_STREAM_RECEIVE_WINDOW_DEFAULT,
             receive_window: H3_RECEIVE_WINDOW_DEFAULT,

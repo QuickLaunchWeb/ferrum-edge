@@ -1491,7 +1491,7 @@ impl Default for EnvConfig {
             dtls_record_overhead_bytes: 64,
             enable_http3: false,
             http3_idle_timeout: 30,
-            http3_max_streams: 1000,
+            http3_max_streams: 100,
             http3_stream_receive_window: crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
             http3_receive_window: crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
             http3_send_window: crate::http3::config::H3_SEND_WINDOW_DEFAULT,
@@ -1815,7 +1815,7 @@ impl EnvConfig {
             dtls_record_overhead_bytes: usize = "FERRUM_DTLS_RECORD_OVERHEAD_BYTES" => 64usize;
             enable_http3: bool = "FERRUM_ENABLE_HTTP3" => false;
             http3_idle_timeout: u64 = "FERRUM_HTTP3_IDLE_TIMEOUT" => 30u64;
-            http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 1000u32;
+            http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 100u32;
             http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT;
             http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT;
             http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;

@@ -118,6 +118,9 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+const FRONTEND_HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 65_535;
+const FRONTEND_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1_048_576;
+const FRONTEND_HTTP2_MAX_FRAME_SIZE: u32 = 16_384;
 
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
@@ -4466,14 +4469,13 @@ async fn handle_connection(
             ));
         }
     }
-    let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
         .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
-        .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
-        .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
-        .adaptive_window(pool_cfg.http2_adaptive_window)
-        .max_frame_size(pool_cfg.http2_max_frame_size)
+        .initial_stream_window_size(FRONTEND_HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(FRONTEND_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .adaptive_window(false)
+        .max_frame_size(FRONTEND_HTTP2_MAX_FRAME_SIZE)
         .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
         .max_pending_accept_reset_streams(Some(
             state
@@ -6788,14 +6790,13 @@ async fn handle_tls_connection(
             ));
         }
     }
-    let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
         .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
-        .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
-        .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
-        .adaptive_window(pool_cfg.http2_adaptive_window)
-        .max_frame_size(pool_cfg.http2_max_frame_size)
+        .initial_stream_window_size(FRONTEND_HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(FRONTEND_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .adaptive_window(false)
+        .max_frame_size(FRONTEND_HTTP2_MAX_FRAME_SIZE)
         .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
         .max_pending_accept_reset_streams(Some(
             state
