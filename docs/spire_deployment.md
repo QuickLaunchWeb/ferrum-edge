@@ -102,9 +102,11 @@ SVIDs from cluster B during cross-cluster mTLS.
 
 Ferrum consumes federated bundles two ways:
 
-1. **CP-pushed via mesh slice**: the control plane includes any
-   `RemoteCluster.trust_bundle` in the slice it sends to data planes. This is
-   the bootstrap path.
+1. **CP-pushed via mesh slice**: the control plane delivers
+   `MeshSlice.trust_bundles` (a `TrustBundleSet` carrying `local` plus a
+   `federated: Vec<TrustBundle>`) to data planes. Each entry in `federated`
+   names its `trust_domain` and the X.509/JWT authorities for that remote
+   cluster. This is the bootstrap path.
 2. **Pull-based federation poller** ([`src/modes/mesh/federation.rs`](../src/modes/mesh/federation.rs),
    shipped in [PR #880](https://github.com/ferrum-edge/ferrum-edge/pull/880)):
    a background task hits each `RemoteCluster.federation_endpoint` over HTTPS
@@ -221,9 +223,13 @@ spec:
   workloadSelectorTemplates:
     - "k8s:ns:{{ .PodMeta.Namespace }}"
     - "k8s:sa:{{ .PodSpec.ServiceAccountName }}"
-  ttl: 1h                                  # X.509-SVID lifetime
+  x509SVIDTTL: 1h                          # X.509-SVID lifetime
   federatesWith: []                        # add federated trust domains here
 ```
+
+`x509SVIDTTL` is the current field on the SPIRE controller-manager
+`ClusterSPIFFEID` CRD. Older chart versions accept a deprecated `ttl` shorthand
+— prefer the explicit field name on any fresh install.
 
 For one-off gateways (no controller-manager), the equivalent CLI is:
 
@@ -251,9 +257,9 @@ spec:
   spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
   podSelector:
     matchExpressions:
-      - key: ferrum.io/inject
+      - key: ferrum.io/mesh
         operator: In
-        values: ["true"]
+        values: ["enabled"]
   namespaceSelector:
     matchExpressions:
       - key: kubernetes.io/metadata.name
@@ -262,12 +268,19 @@ spec:
   workloadSelectorTemplates:
     - "k8s:ns:{{ .PodMeta.Namespace }}"
     - "k8s:sa:{{ .PodSpec.ServiceAccountName }}"
-  ttl: 1h
+  x509SVIDTTL: 1h
 ```
 
-This matches the injector's opt-in label
-([`docs/mesh.md` injector section](mesh.md)) so every pod the Ferrum injector
-sidecars also gets an SVID.
+The Ferrum injector accepts two opt-in markers
+([`docs/mesh.md` injector section](mesh.md)): the `ferrum.io/inject=true`
+*annotation* and the `ferrum.io/mesh=enabled` *label*. SPIRE's
+`ClusterSPIFFEID` `podSelector.matchExpressions` matches Kubernetes labels
+only — so the registration entry MUST key off the label, not the annotation.
+Operators that drive injection exclusively via the annotation should also
+stamp `ferrum.io/mesh: enabled` (or some other agreed label) on the same
+pods so SPIRE can pick them up. Alternatively, broaden `podSelector` to
+match an `app.kubernetes.io/part-of` or per-ServiceAccount label that you
+already set on workload pods.
 
 #### 4c. Verify issuance
 
