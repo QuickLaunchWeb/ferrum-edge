@@ -1267,18 +1267,18 @@ paths:
                             still pivot on "rule".
                         source:
                           type: string
-                          nullable: true
                           description: |
                             SPIFFE ID of the source workload, when known.
-                            Omitted when the deny fired before any identity
-                            was established (e.g. unauthenticated HBONE).
+                            Omitted (the field is absent, not `null`) when
+                            the deny fired before any identity was
+                            established (e.g. unauthenticated HBONE).
                         destination:
                           type: string
-                          nullable: true
                           description: |
                             SPIFFE ID of the destination workload (the local
                             mesh workload's identity), when present.
-                            Omitted for stream-only denies.
+                            Omitted (the field is absent, not `null`) for
+                            stream-only denies.
                         reason:
                           type: string
                           description: |
