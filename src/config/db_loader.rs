@@ -2902,13 +2902,25 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        // Use `INSERT ... SELECT ... WHERE NOT EXISTS` to make the attach
+        // idempotent against rows that `batch_create_plugin_configs`
+        // already inserted for `scope=proxy` plugins. Without this, the
+        // batch endpoint fails with a UNIQUE constraint violation when the
+        // same association is listed both inside the proxy's `plugins`
+        // array and implicitly via the scope-proxy plugin_config row.
+        // Works on SQLite, PostgreSQL, and MySQL (the only dialects
+        // `DatabaseStore` targets); MongoDB has its own implementation.
+        let assoc_sql = self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) \
+             SELECT ?, ? WHERE NOT EXISTS (\
+                 SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?\
+             )");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             for proxy in chunk {
                 for assoc in &proxy.plugins {
                     sqlx::query(&assoc_sql)
+                        .bind(&proxy.id)
+                        .bind(&assoc.plugin_config_id)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)
                         .execute(&mut *tx)
