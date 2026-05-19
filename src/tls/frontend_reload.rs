@@ -176,6 +176,11 @@ async fn run_frontend_tls_reload_loop(
             None
         }
     };
+    // Track whether the last stat attempt failed so we only warn on the
+    // transition into the bad state. Without this guard, a deleted file or
+    // a stuck permission error would spam `warn!` every poll interval
+    // (every `interval` seconds) until the file came back.
+    let mut last_stat_failed = last_fingerprint.is_none();
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -200,13 +205,25 @@ async fn run_frontend_tls_reload_loop(
         }
 
         let next_fingerprint = match frontend_tls_fingerprint(&cert_path, &key_path) {
-            Ok(fingerprint) => fingerprint,
+            Ok(fingerprint) => {
+                if last_stat_failed {
+                    info!(
+                        surface,
+                        "Frontend TLS file watcher recovered stat access to cert/key files"
+                    );
+                    last_stat_failed = false;
+                }
+                fingerprint
+            }
             Err(error) => {
-                warn!(
-                    surface,
-                    error = %error,
-                    "Frontend TLS file watcher could not stat cert/key files; keeping current config"
-                );
+                if !last_stat_failed {
+                    warn!(
+                        surface,
+                        error = %error,
+                        "Frontend TLS file watcher could not stat cert/key files; keeping current config (silenced until stat succeeds again)"
+                    );
+                    last_stat_failed = true;
+                }
                 continue;
             }
         };

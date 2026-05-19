@@ -6732,6 +6732,22 @@ impl ListenerTlsSource {
             } => *record_mesh_mtls_metric,
         }
     }
+
+    /// Whether this source REQUIRES a TLS config to serve a connection. When
+    /// `true`, an accept that observes `load() == None` must drop the
+    /// connection rather than fall through to the plaintext handler — the
+    /// listener is bound to a TLS port and a silent downgrade to plain HTTP
+    /// would be a security regression.
+    ///
+    /// `Static { tls_config: None }` is the legitimate plaintext-only path
+    /// (HTTP listener) and returns `false`. `MeshInbound` and `Dynamic` are
+    /// only ever constructed for TLS-terminating listeners and return `true`.
+    fn requires_tls(&self) -> bool {
+        match self {
+            Self::Static { .. } => false,
+            Self::MeshInbound | Self::Dynamic { .. } => true,
+        }
+    }
 }
 
 struct TlsConnectionMetadata {
@@ -6931,6 +6947,24 @@ async fn run_accept_loop(
                                 None
                             };
                         let tls_config = tls_source.load(&state);
+                        // Defense in depth: a TLS-required source (Dynamic
+                        // frontend reload slot, MeshInbound peer-auth slot)
+                        // that observes a `None` payload must NOT fall
+                        // through to the plaintext handler — that would be a
+                        // silent TLS-to-HTTP downgrade on a port bound for
+                        // TLS. Drop the connection and continue. In normal
+                        // operation the slot is initialized with a live
+                        // config and only ever stores `Some(..)`; this guard
+                        // protects against a slot transiently or buggily
+                        // holding `None`.
+                        if tls_config.is_none() && tls_source.requires_tls() {
+                            debug!(
+                                remote_addr = %remote_addr.ip(),
+                                "Dropping TLS connection: TLS slot is empty for a TLS-required listener (live-reload race or misconfiguration)"
+                            );
+                            drop(stream);
+                            continue;
+                        }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
@@ -17372,5 +17406,39 @@ mod tests {
                 .dispatch_port_overrides
                 .is_none()
         );
+    }
+
+    /// Plaintext-only `Static` listener (no TLS configured) must NOT require
+    /// TLS, so the accept loop can correctly route to the plaintext handler.
+    #[test]
+    fn listener_tls_source_static_plaintext_does_not_require_tls() {
+        let source = ListenerTlsSource::Static {
+            tls_config: None,
+            record_mesh_mtls_metric: false,
+        };
+        assert!(
+            !source.requires_tls(),
+            "Static listener with no TLS configured is the legitimate plaintext path"
+        );
+    }
+
+    /// `Dynamic` and `MeshInbound` are only ever constructed for TLS-
+    /// terminating listeners; both must report `requires_tls()=true` so the
+    /// accept loop drops the connection instead of falling through to the
+    /// plaintext handler when the slot transiently or buggily holds `None`.
+    /// Without this, a missing slot config would silently downgrade an HTTPS
+    /// listener to plain HTTP — exactly the regression `requires_tls` is
+    /// here to prevent.
+    #[test]
+    fn listener_tls_source_dynamic_and_mesh_inbound_require_tls() {
+        let slot = crate::tls::empty_frontend_tls_slot();
+        let dynamic = ListenerTlsSource::Dynamic {
+            slot,
+            record_mesh_mtls_metric: false,
+        };
+        assert!(dynamic.requires_tls());
+
+        let mesh = ListenerTlsSource::MeshInbound;
+        assert!(mesh.requires_tls());
     }
 }

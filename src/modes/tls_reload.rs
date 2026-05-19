@@ -41,7 +41,9 @@ pub struct ProxyFrontendTlsReloadHandles {
     /// when live reload is enabled.
     pub revision_rx: Option<watch::Receiver<u64>>,
     /// Handle to the spawned watcher task. `Some` only when live reload is
-    /// enabled; the caller should push it onto the join-on-shutdown handles.
+    /// enabled. The watcher self-terminates when the shutdown receiver it
+    /// holds fires, so callers may safely detach this handle by dropping it
+    /// — the task will exit on its own at gateway shutdown.
     pub watcher_handle: Option<JoinHandle<()>>,
 }
 
@@ -161,7 +163,9 @@ pub struct AdminFrontendTlsReloadHandles {
     /// accept. `Some` only when live reload is enabled.
     pub slot: Option<SharedFrontendTls>,
     /// Handle to the spawned watcher task. `Some` only when live reload is
-    /// enabled.
+    /// enabled. The watcher self-terminates when the shutdown receiver it
+    /// holds fires, so callers may safely detach this handle by dropping
+    /// it — the task will exit on its own at gateway shutdown.
     pub watcher_handle: Option<JoinHandle<()>>,
 }
 
