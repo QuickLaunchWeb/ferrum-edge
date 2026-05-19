@@ -159,10 +159,11 @@ nodeAgent:
     # agent does not exec setuid binaries.
     allowPrivilegeEscalation: false
     # Add CAP_PERFMON to the container's capability set. Required on
-    # kernel >= 5.8 to read BPF program info / BTF. On kernel < 5.8 this
-    # capability does not exist; the chart silently omits it from the
-    # kernel cap-set in that case (no-op). Set to false only if an
-    # admission webhook rejects PERFMON in your environment.
+    # kernel >= 5.8 to read BPF program info / BTF. On kernel < 5.8 the
+    # kernel does not recognise PERFMON and silently ignores it in the
+    # capability set (the cap-set entry is still rendered by the chart
+    # so admission controllers see the requested posture). Set to false
+    # only if an admission webhook rejects PERFMON in your environment.
     addCapPerfmon: true
     # Drop CAP_SYS_ADMIN. Modern kernels (5.8+) cover everything via
     # CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN. Keep false until your fleet
@@ -173,6 +174,9 @@ nodeAgent:
     # and permits every syscall the agent needs (bpf, setsockopt, sh -c
     # iptables fallback, etc.). Override with type: Localhost and
     # localhostProfile: <path> to load a custom tightened profile (see
-    # docs/node_agent_security.md for a template).
+    # docs/node_agent_security.md for a template). The whole map is
+    # passed through verbatim, so any other fields the Kubernetes API
+    # supports for SeccompProfile (e.g. future fields) also work.
     seccompProfile:
       type: RuntimeDefault
+      # localhostProfile: profiles/ferrum-node-agent.json

@@ -87,7 +87,7 @@ A compromised node agent **cannot** (without operator misconfiguration):
   filesystem (no privileged mode, no container runtime socket mount,
   `readOnlyRootFilesystem: true`).
 - Write to the Kubernetes API beyond the read-only `pods`/`nodes` ClusterRole.
-- Mutate other nodes' state (the watcher is fielded-scoped to its own node).
+- Mutate other nodes' state (the watcher is field-scoped to its own node).
 - Escalate to host root via container escape unless the kernel itself has
   a separate vulnerability — running as UID 0 inside the container is
   required for BPF attach, but with `allowPrivilegeEscalation: false`
@@ -262,12 +262,17 @@ Notes:
   The chart provisions this automatically when `nodeAgent.security.readOnlyRootFilesystem`
   is true.
 - `allowPrivilegeEscalation: false` is safe because the agent never
-  exec's a setuid binary; `tokio::process::Command::new("sh")` runs in
-  the iptables fallback inherits the same uid/caps and does not need
-  to escalate.
-- The AppArmor annotation (`container.apparmor.security.beta.kubernetes.io/...`)
-  is a Kubernetes v1.30+ recommended form. Operators on older clusters can
-  use the deprecated `pod.metadata.annotations` syntax instead.
+  exec's a setuid binary; `tokio::process::Command::new("sh")` in the
+  iptables fallback inherits the same uid/caps and does not need to
+  escalate.
+- The AppArmor annotation
+  (`container.apparmor.security.beta.kubernetes.io/<container>`) shown
+  above is the **deprecated** form — it was removed in Kubernetes 1.31.
+  On 1.30+, prefer the GA field form:
+  `securityContext.appArmorProfile.{type: Localhost, localhostProfile: ferrum-node-agent}`
+  on the pod or container `securityContext`. The annotation form is
+  retained in the example for compatibility with clusters older than
+  1.30, where the field form is not recognized.
 
 ## Seccomp profile
 

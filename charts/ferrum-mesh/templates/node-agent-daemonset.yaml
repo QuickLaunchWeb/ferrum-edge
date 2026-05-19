@@ -16,8 +16,19 @@
 {{- if hasKey $sec "readOnlyRootFilesystem" }}{{ $readOnlyRoot = get $sec "readOnlyRootFilesystem" }}{{ end -}}
 {{- $allowEsc := false -}}
 {{- if hasKey $sec "allowPrivilegeEscalation" }}{{ $allowEsc = get $sec "allowPrivilegeEscalation" }}{{ end -}}
-{{- $seccompType := "RuntimeDefault" -}}
-{{- if and (hasKey $sec "seccompProfile") (get $sec "seccompProfile") }}{{ $seccompType = dig "seccompProfile" "type" "RuntimeDefault" $sec }}{{ end -}}
+{{- /*
+  seccompProfile is passed through as-is so callers setting
+  `type: Localhost` can also provide `localhostProfile: <path>` (required by
+  the kubernetes API server for that type). Default to RuntimeDefault when
+  the operator unsets the block entirely.
+*/ -}}
+{{- $seccompProfile := dict "type" "RuntimeDefault" -}}
+{{- if and (hasKey $sec "seccompProfile") (get $sec "seccompProfile") -}}
+{{- $candidate := get $sec "seccompProfile" -}}
+{{- if and (kindIs "map" $candidate) (hasKey $candidate "type") (get $candidate "type") -}}
+{{- $seccompProfile = $candidate -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -42,7 +53,7 @@ spec:
       hostNetwork: true
       securityContext:
         seccompProfile:
-          type: {{ $seccompType }}
+          {{- toYaml $seccompProfile | nindent 10 }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
