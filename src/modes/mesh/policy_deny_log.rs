@@ -16,8 +16,6 @@
 //! descending (tie-breaking on `last_at` descending) and truncates to
 //! `limit`. This is a cold path — admin operators poll at human cadence.
 
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
@@ -250,18 +248,6 @@ impl PolicyDenyRecorder {
         };
         guard.capacity
     }
-
-    /// Drop every retained event. Used by tests to reset the global recorder
-    /// between cases; never called in production.
-    #[cfg(test)]
-    fn clear_for_tests(&self) {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
-        guard.ring.clear();
-        guard.total_recorded = 0;
-    }
 }
 
 fn sanitize_capacity(requested: usize) -> usize {
@@ -343,15 +329,6 @@ pub fn configure_global_capacity(capacity: usize) {
     guard.ring.clear();
     guard.ring.reserve(resolved);
     guard.total_recorded = 0;
-}
-
-/// Reset configuration sentinel for tests. Production code never calls this.
-#[cfg(test)]
-fn reset_global_configured_for_tests() {
-    // `OnceLock` has no `take` on stable for `()` set values, so we cannot
-    // truly reset; tests invoke `configure_global_capacity` once and instead
-    // resize directly through `reset_capacity_for_tests` on the recorder. This
-    // function exists as a documentation hook for future maintainers.
 }
 
 #[cfg(test)]
