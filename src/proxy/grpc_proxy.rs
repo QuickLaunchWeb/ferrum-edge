@@ -1148,6 +1148,7 @@ pub async fn proxy_grpc_request(
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_grpc_recv_size_bytes: usize,
+    max_response_body_size_bytes: usize,
 ) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
     // Collect the incoming body for potential retry replay
     let (parts, body) = req.into_parts();
@@ -1217,6 +1218,7 @@ pub async fn proxy_grpc_request(
         dns_cache,
         proxy_headers,
         stream_response,
+        max_response_body_size_bytes,
     )
     .await;
     (result, body_bytes)
@@ -1251,6 +1253,7 @@ pub async fn proxy_grpc_request_from_bytes(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
+    max_response_body_size_bytes: usize,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     proxy_grpc_request_core(
         method,
@@ -1262,6 +1265,7 @@ pub async fn proxy_grpc_request_from_bytes(
         dns_cache,
         proxy_headers,
         stream_response,
+        max_response_body_size_bytes,
     )
     .await
 }
@@ -1498,6 +1502,7 @@ pub(crate) async fn proxy_grpc_request_core(
     _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
+    max_response_body_size_bytes: usize,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Get or create HTTP/2 connection to backend (round-robins across pool)
     let mut sender = grpc_pool.get_sender(proxy).await?;
@@ -1645,6 +1650,15 @@ pub(crate) async fn proxy_grpc_request_core(
             match frame_result {
                 Ok(frame) => {
                     if let Some(data) = frame.data_ref() {
+                        if max_response_body_size_bytes > 0
+                            && body_bytes.len().saturating_add(data.len())
+                                > max_response_body_size_bytes
+                        {
+                            return Err(GrpcProxyError::ResourceExhausted(format!(
+                                "gRPC response payload size exceeds maximum of {} bytes",
+                                max_response_body_size_bytes
+                            )));
+                        }
                         body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {
                         // Strip RFC 9110 §7.6.1 response-direction
