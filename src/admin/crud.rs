@@ -79,6 +79,10 @@ pub(crate) trait AdminResource:
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
 
+    fn allows_cached_fallback() -> bool {
+        true
+    }
+
     fn response_body(resource: &Self) -> Value {
         json!(resource)
     }
@@ -195,6 +199,13 @@ pub(crate) async fn handle_list<R: AdminResource>(
         }
     }
 
+    if !R::allows_cached_fallback() {
+        return Ok(super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database"}),
+        ));
+    }
+
     if let Some(config) = state.cached_gateway_config() {
         let items: Vec<Value> = R::cached_items(&config)
             .iter()
@@ -236,6 +247,13 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 );
             }
         }
+    }
+
+    if !R::allows_cached_fallback() {
+        return Ok(super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database"}),
+        ));
     }
 
     if let Some(config) = state.cached_gateway_config() {
@@ -722,6 +740,10 @@ impl AdminResource for PluginConfig {
         &config.plugin_configs
     }
 
+    fn allows_cached_fallback() -> bool {
+        false
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(
             StatusCode::BAD_REQUEST,
@@ -1176,6 +1198,10 @@ impl AdminResource for Consumer {
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
         &config.consumers
+    }
+
+    fn allows_cached_fallback() -> bool {
+        false
     }
 
     fn response_body(resource: &Self) -> Value {
