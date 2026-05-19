@@ -2,6 +2,8 @@
 
 `FERRUM_MODE=node_agent` runs the per-node capture manager separately from mesh proxy mode. It owns only capture enrollment, eBPF map programming, and the narrow IPC surface described here; it does not merge policy evaluation or proxy dispatch into the node-agent process.
 
+For the security posture of this mode (required Linux capabilities, mounts, seccomp / AppArmor profiles, NetworkPolicy, compromise containment), see [`docs/node_agent_security.md`](node_agent_security.md).
+
 ## Contract Surface
 
 `CaptureContract` formalizes the node-agent to proxy boundary:

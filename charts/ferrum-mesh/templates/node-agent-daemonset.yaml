@@ -1,4 +1,23 @@
 {{- if .Values.nodeAgent.enabled }}
+{{- /*
+  Resolve security knobs from .Values.nodeAgent.security with hardened defaults.
+  Each toggle is reversible via Helm values so older kernels / strict admission
+  controllers can roll back individually. See docs/node_agent_security.md.
+*/ -}}
+{{- $sec := .Values.nodeAgent.security | default dict -}}
+{{- $addPerfmon := true -}}
+{{- if hasKey $sec "addCapPerfmon" }}{{ $addPerfmon = get $sec "addCapPerfmon" }}{{ end -}}
+{{- $dropSysAdmin := false -}}
+{{- if hasKey $sec "dropCapSysAdmin" }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
+{{- $caps := list "BPF" "NET_ADMIN" -}}
+{{- if $addPerfmon }}{{ $caps = append $caps "PERFMON" }}{{ end -}}
+{{- if not $dropSysAdmin }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
+{{- $readOnlyRoot := true -}}
+{{- if hasKey $sec "readOnlyRootFilesystem" }}{{ $readOnlyRoot = get $sec "readOnlyRootFilesystem" }}{{ end -}}
+{{- $allowEsc := false -}}
+{{- if hasKey $sec "allowPrivilegeEscalation" }}{{ $allowEsc = get $sec "allowPrivilegeEscalation" }}{{ end -}}
+{{- $seccompType := "RuntimeDefault" -}}
+{{- if and (hasKey $sec "seccompProfile") (get $sec "seccompProfile") }}{{ $seccompType = dig "seccompProfile" "type" "RuntimeDefault" $sec }}{{ end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -21,6 +40,9 @@ spec:
       serviceAccountName: ferrum-node-agent
       hostPID: true
       hostNetwork: true
+      securityContext:
+        seccompProfile:
+          type: {{ $seccompType }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
@@ -30,12 +52,14 @@ spec:
             runAsUser: 0
             runAsGroup: 0
             privileged: false
+            allowPrivilegeEscalation: {{ $allowEsc }}
+            readOnlyRootFilesystem: {{ $readOnlyRoot }}
             capabilities:
+              drop: ["ALL"]
               add:
-                - BPF
-                - NET_ADMIN
-                - SYS_ADMIN
-                - SYS_PTRACE
+                {{- range $cap := $caps }}
+                - {{ $cap }}
+                {{- end }}
           env:
             - name: FERRUM_MODE
               value: "node_agent"
@@ -65,6 +89,13 @@ spec:
             - name: cgroup
               mountPath: {{ .Values.nodeAgent.cgroupRoot }}
               readOnly: true
+            {{- if $readOnlyRoot }}
+            # Scratch tmpfs required when readOnlyRootFilesystem=true so the
+            # tokio/tracing runtime can open transient files. See
+            # docs/node_agent_security.md for the full rationale.
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
       volumes:
@@ -76,4 +107,8 @@ spec:
           hostPath:
             path: {{ .Values.nodeAgent.cgroupRoot }}
             type: Directory
+        {{- if $readOnlyRoot }}
+        - name: tmp
+          emptyDir: {}
+        {{- end }}
 {{- end }}
