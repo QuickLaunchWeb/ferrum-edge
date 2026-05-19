@@ -136,3 +136,33 @@ async fn allow_with_methods_and_not_paths_denies_post_to_non_admin_path() {
         "POST /api should fall through to implicit-deny, got {result:?}"
     );
 }
+
+#[tokio::test]
+async fn deny_host_pattern_is_normalized_for_direct_mesh_policies_config() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-admin-host",
+            "namespace": "default",
+            "scope": { "kind": "mesh_wide" },
+            "rules": [{
+                "action": "deny",
+                "from": [],
+                "to": [{ "hosts": ["Admin.Example.COM."] }],
+                "when": [],
+                "request_principals": [],
+                "never_matches": false
+            }]
+        }]
+    }))
+    .expect("plugin config");
+
+    let mut ctx = request_context("GET", "/");
+    ctx.host = Some("admin.example.com".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "mixed-case / trailing-dot deny host pattern should be normalized and reject, got {result:?}"
+    );
+}

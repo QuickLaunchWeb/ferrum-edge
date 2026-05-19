@@ -36,7 +36,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::identity::{SpiffeId, TrustDomain};
-use crate::modes::mesh::config::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
+use crate::modes::mesh::config::{
+    MeshPolicy, PolicyScope, RequestMatch, normalize_request_match_host_pattern,
+    policy_scope_applies_to_workload,
+};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
@@ -126,6 +129,7 @@ impl MeshAuthz {
         }
 
         for policy in &mut slice.mesh_policies {
+            normalize_mesh_policy_request_fields(policy);
             normalize_mesh_policy_header_names(policy);
         }
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
@@ -174,6 +178,29 @@ impl MeshAuthz {
                     headers: HashMap::new(),
                 }
             }
+        }
+    }
+}
+
+fn normalize_mesh_policy_request_fields(policy: &mut MeshPolicy) {
+    for rule in &mut policy.rules {
+        for request in &mut rule.to {
+            normalize_request_match_fields(request);
+        }
+    }
+}
+
+fn normalize_request_match_fields(request: &mut RequestMatch) {
+    for host in &mut request.hosts {
+        *host = normalize_request_match_host_pattern(host);
+    }
+    for host in &mut request.not_hosts {
+        *host = normalize_request_match_host_pattern(host);
+    }
+    for pattern in &mut request.port_patterns {
+        let trimmed = pattern.trim();
+        if trimmed.len() != pattern.len() {
+            *pattern = trimmed.to_string();
         }
     }
 }
