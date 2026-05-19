@@ -385,10 +385,19 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
 
 #[tokio::test]
 async fn request_principal_match_from_jwks_auth_metadata() {
-    // `jwks_auth` populates `metadata["jwks_auth.request_principal"]`
-    // from the validated JWT's `iss/sub`. `mesh_authz` reads that and
-    // matches against `rule.request_principals` globs — this is
-    // Istio's `from[].source.requestPrincipals` semantics.
+    // `jwks_auth` (when configured with `emit_mesh_request_principal_metadata`)
+    // populates `metadata["mesh.request_principal"]` from the validated
+    // JWT's `iss/sub`. `mesh_authz` reads that key and matches against
+    // `rule.request_principals` globs — this is Istio's
+    // `from[].source.requestPrincipals` semantics.
+    //
+    // Spec change (PR #933 / commit 209928da): the metadata key was
+    // renamed from `jwks_auth.request_principal` to
+    // `mesh.request_principal`, and emission is now opt-in via the plugin
+    // config flag so non-mesh jwks_auth deployments don't leak the
+    // identifier into transaction logs. The test simulates the emission
+    // by inserting the metadata directly, mirroring what
+    // `jwks_auth` does after `emit_mesh_request_principal_metadata`.
     let allow = MeshPolicy {
         name: "allow-jwt-issuer".to_string(),
         namespace: DEFAULT_NAMESPACE.to_string(),
@@ -406,7 +415,7 @@ async fn request_principal_match_from_jwks_auth_metadata() {
 
     let mut ok_ctx = ctx_with_principal("GET", "/api", None);
     ok_ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://issuer.example.com/user-42".to_string(),
     );
     assert!(matches!(
@@ -417,7 +426,7 @@ async fn request_principal_match_from_jwks_auth_metadata() {
     // Different issuer → no rule matches → implicit deny.
     let mut blocked_ctx = ctx_with_principal("GET", "/api", None);
     blocked_ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://attacker.com/u".to_string(),
     );
     assert!(matches!(

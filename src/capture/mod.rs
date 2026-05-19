@@ -1360,6 +1360,14 @@ mod tests {
 
     #[test]
     fn iptables_plan_routes_ipv6_include_to_v6_commands_only() {
+        // Spec change (PR #926 / 4b273b1f): when the include-CIDR list
+        // contains only IPv6 entries (so the IPv4 family has no specific
+        // CIDR to redirect), the plan must fall back to a catch-all
+        // IPv4 outbound REDIRECT rather than silently leaving IPv4 traffic
+        // un-captured. Operators who relied on the previous behavior to
+        // narrow capture to one address family should either set
+        // `include_cidrs_explicit=false` (so the catch-all rules out IPv4
+        // entirely) or add an explicit IPv4 CIDR.
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
@@ -1367,10 +1375,12 @@ mod tests {
         let plan = IptablesPlan::for_config(&config);
 
         assert!(
-            !plan.v4_commands.iter().any(|cmd| {
-                cmd.contains("FERRUM_MESH_OUTBOUND") && cmd.contains("REDIRECT --to-ports 15001")
+            plan.v4_commands.iter().any(|cmd| {
+                cmd.contains("FERRUM_MESH_OUTBOUND")
+                    && cmd.contains("-p tcp -j REDIRECT --to-ports 15001")
             }),
-            "no outbound REDIRECT should be emitted when the only include CIDR is IPv6"
+            "IPv6-only include set must fall back to a catch-all IPv4 outbound REDIRECT (fail-closed): {:?}",
+            plan.v4_commands
         );
         assert!(
             plan.v4_commands.iter().any(|cmd| {

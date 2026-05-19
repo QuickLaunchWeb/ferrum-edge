@@ -418,13 +418,20 @@ async fn ipv6_loopback_exact_match() {
 
 #[tokio::test]
 async fn ipv6_shorthand_cidr_match() {
+    // Spec change (commit e7377d94): IPv4-mapped IPv6 addresses
+    // (`::ffff:a.b.c.d`) are now normalised to their plain IPv4 form
+    // before policy matching, so they MUST match against IPv4 rules rather
+    // than the IPv6 mapped-prefix family. This test now uses a true IPv6
+    // address that is NOT a mapped IPv4 form so the IPv6 CIDR parser path
+    // remains exercised.
     let plugin = IpRestriction::new(&json!({
-        "allow": ["::ffff:0:0/96"]
+        "allow": ["2001:db8::/32"]
     }))
     .unwrap();
 
-    // ::ffff:192.168.1.1 in full form is 0000:0000:0000:0000:0000:ffff:c0a8:0101
-    let mut ctx = create_context_with_ip("0000:0000:0000:0000:0000:ffff:c0a8:0101");
+    // Fully-expanded form of 2001:db8::1 — shorthand parser must still
+    // accept the equivalent dot-decomposed form.
+    let mut ctx = create_context_with_ip("2001:0db8:0000:0000:0000:0000:0000:0001");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_continue(result);
 }
@@ -600,8 +607,13 @@ async fn ipv6_rule_with_zone_suffix_is_normalized_to_address() {
 
 #[tokio::test]
 async fn ipv6_mapped_ipv4_form_matches_cidr_without_heap_parser() {
+    // Spec change (commit e7377d94): client IPs supplied in IPv4-mapped
+    // IPv6 form are normalised to plain IPv4 before policy matching, so
+    // they MUST be allowed via IPv4 rules. The companion test
+    // `ipv4_rule_matches_ipv4_mapped_ipv6_client` covers the deny side of
+    // the same contract.
     let plugin = IpRestriction::new(&json!({
-        "allow": ["::ffff:192.168.0.0/112"]
+        "allow": ["192.168.0.0/16"]
     }))
     .unwrap();
 

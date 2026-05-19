@@ -964,14 +964,32 @@ pub(crate) fn request_termination_plugin_for_proxy(
     }
 }
 
-/// Build a `fault_injection` plugin config scoped to a specific proxy.
-pub(crate) fn fault_injection_plugin_for_proxy(
-    proxy_id: &str,
-    namespace: &str,
-    fault: &Value,
-) -> Option<PluginConfig> {
+/// Translate an Istio `VirtualService.http[].fault` block into the
+/// per-rule `mesh_route_dispatch` `fault` action JSON shape.
+///
+/// Returns `None` when the block has no valid sub-actions (e.g. an
+/// `abort` without `httpStatus`, a `delay` with `fixedDelay: "0s"`, an
+/// out-of-range percentage). The previous proxy-scoped `fault_injection`
+/// plugin emission path silently dropped invalid sub-fields too — keep
+/// the same tolerance here so the same VS resources translate identically.
+///
+/// Output shape — what `mesh_route_dispatch::FaultActionConfig` accepts:
+///
+/// ```json
+/// {
+///   "delay": { "duration_ms": 5000, "percentage": 25.0 },
+///   "abort": { "http_status": 503, "percentage": 50.0, "grpc_status": 14 }
+/// }
+/// ```
+///
+/// Carrying the fault per dispatch rule replaces the older proxy-scoped
+/// `fault_injection` plugin emission so the dispatch-rule collapse path
+/// no longer fails closed when sibling routes force a route to merge into
+/// another proxy. See [docs/mesh.md](../../../../docs/mesh.md) for the
+/// operator-facing description.
+pub(crate) fn route_local_fault_value_for_rule(fault: &Value) -> Option<Value> {
     let obj = fault.as_object()?;
-    let mut config = serde_json::Map::new();
+    let mut out = serde_json::Map::new();
 
     if let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
         && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
@@ -979,7 +997,7 @@ pub(crate) fn fault_injection_plugin_for_proxy(
         && (1..=MAX_FAULT_DELAY_MS).contains(&ms)
         && let Some(percentage) = istio_fault_percentage(delay_obj)
     {
-        config.insert(
+        out.insert(
             "delay".to_string(),
             serde_json::json!({
                 "duration_ms": ms,
@@ -991,46 +1009,31 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     if let Some(abort_obj) = obj.get("abort").and_then(Value::as_object)
         && let Some(percentage) = istio_fault_percentage(abort_obj)
     {
-        let mut abort_value = serde_json::Map::new();
-        abort_value.insert("percentage".to_string(), serde_json::json!(percentage));
-
-        if let Some(status) = abort_obj.get("httpStatus").and_then(Value::as_u64)
-            && (200..=599).contains(&status)
-        {
-            abort_value.insert("status_code".to_string(), serde_json::json!(status));
-        }
-
-        if let Some(grpc) = abort_obj
-            .get("grpcStatus")
-            .and_then(parse_istio_grpc_status)
-        {
-            abort_value.insert("grpc_status".to_string(), serde_json::json!(grpc));
-        }
-
-        // Plugin requires status_code; skip the abort sub-field if absent.
-        if abort_value.contains_key("status_code") {
-            config.insert("abort".to_string(), Value::Object(abort_value));
+        let status = abort_obj
+            .get("httpStatus")
+            .and_then(Value::as_u64)
+            .filter(|s| (200..=599).contains(s));
+        if let Some(status) = status {
+            let mut abort_value = serde_json::Map::new();
+            // Per-rule shape: `http_status`, not the plugin's
+            // `status_code`. `mesh_route_dispatch::FaultActionAbort`
+            // defines the field as `http_status: u16`.
+            abort_value.insert("http_status".to_string(), serde_json::json!(status));
+            abort_value.insert("percentage".to_string(), serde_json::json!(percentage));
+            if let Some(grpc) = abort_obj
+                .get("grpcStatus")
+                .and_then(parse_istio_grpc_status)
+            {
+                abort_value.insert("grpc_status".to_string(), serde_json::json!(grpc));
+            }
+            out.insert("abort".to_string(), Value::Object(abort_value));
         }
     }
 
-    if config.is_empty() {
+    if out.is_empty() {
         return None;
     }
-
-    let now = Utc::now();
-    Some(PluginConfig {
-        id: format!("istio-vs-fi-{proxy_id}"),
-        plugin_name: "fault_injection".to_string(),
-        namespace: namespace.to_string(),
-        config: Value::Object(config),
-        scope: PluginScope::Proxy,
-        proxy_id: Some(proxy_id.to_string()),
-        enabled: true,
-        priority_override: None,
-        api_spec_id: None,
-        created_at: now,
-        updated_at: now,
-    })
+    Some(Value::Object(out))
 }
 
 pub(crate) struct MeshRouteDispatchDestination<'a> {
@@ -1141,11 +1144,24 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     route_policy: MeshRouteDispatchPolicy<'_>,
     uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
+    // Per-http[] route-local fault is projected onto every emitted rule
+    // *before* the match-array short-circuit so a VS whose `http[]` has no
+    // `match` block but does have `fault:` still emits a fault-only
+    // dispatch rule. Without this, the K8s-default match-all VS shape
+    // (no `match`) would drop the fault entirely.
+    let route_fault = http.get("fault").and_then(route_local_fault_value_for_rule);
+
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
-        return (Vec::new(), false);
+        return (
+            fault_only_rules(&route_fault, &route_destination, &route_policy),
+            false,
+        );
     };
     if matches.is_empty() {
-        return (Vec::new(), false);
+        return (
+            fault_only_rules(&route_fault, &route_destination, &route_policy),
+            false,
+        );
     }
 
     // VirtualService `headers.{request,response}.{set,add,remove}` is a
@@ -1332,70 +1348,122 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
                 Value::Array(route_response_transform.clone()),
             );
         }
+        if let Some(fault) = route_fault.as_ref() {
+            rule.insert("fault".to_string(), fault.clone());
+        }
         rules.push(Value::Object(rule));
     }
 
-    // URI-only catch-all carrying the http[]-level transforms. Without this,
-    // a VirtualService whose `match` is purely URI-based (e.g. only
-    // `{uri: {prefix: "/v1"}}`) would generate no `mesh_route_dispatch` rule
-    // at all and the per-rule transform channel would have no carrier — the
-    // header `set` / `add` / `remove` directives would be silently dropped.
-    // The rule is emitted LAST so explicit-predicate rules (from this http[]
-    // or stashed siblings) get first-match-wins evaluation; the empty match
-    // is a "default" that catches every other request on this proxy. Per-rule
-    // policy (timeout / retry) and destination are carried so the catch-all
-    // behaves like the regular path. `route_destination` and `route_policy`
-    // already describe the proxy's default backend, so the catch-all is a
-    // semantic no-op for routing — its sole purpose is to publish the
-    // transform Arcs onto `RequestContext`.
+    // URI-only catch-all carrying the http[]-level transforms / fault.
+    // Without this, a VirtualService whose `match` is purely URI-based
+    // (e.g. only `{uri: {prefix: "/v1"}}`) would generate no
+    // `mesh_route_dispatch` rule at all and the per-rule transform /
+    // fault channel would have no carrier — the header `set` / `add` /
+    // `remove` directives and the route-local fault block would be
+    // silently dropped. The rule is emitted LAST so explicit-predicate
+    // rules (from this http[] or stashed siblings) get first-match-wins
+    // evaluation; the empty match is a "default" that catches every other
+    // request on this proxy. Per-rule policy (timeout / retry) and
+    // destination are carried so the catch-all behaves like the regular
+    // path. `route_destination` and `route_policy` already describe the
+    // proxy's default backend, so the catch-all is a semantic no-op for
+    // routing — its sole purpose is to publish the transform Arcs and
+    // fault action onto `RequestContext`.
     let needs_catch_all = has_uri_only_match
-        && (!route_request_transform.is_empty() || !route_response_transform.is_empty());
+        && (!route_request_transform.is_empty()
+            || !route_response_transform.is_empty()
+            || route_fault.is_some());
     if needs_catch_all {
-        let mut destination = serde_json::Map::new();
-        if let Some(uid) = route_destination.upstream_id {
-            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
-        } else {
-            destination.insert(
-                "backend_host".to_string(),
-                Value::String(route_destination.backend_host.to_string()),
-            );
-            destination.insert(
-                "backend_port".to_string(),
-                serde_json::json!(route_destination.backend_port),
-            );
-        }
-        let mut rule = serde_json::Map::new();
-        rule.insert("match".to_string(), Value::Object(serde_json::Map::new()));
-        rule.insert("destination".to_string(), Value::Object(destination));
-        if let Some(timeout_ms) = route_policy.timeout_ms {
-            rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
-        } else if route_policy.timeout_disabled {
-            rule.insert("timeout_disabled".to_string(), Value::Bool(true));
-        }
-        if let Some(retry) = route_policy.retry {
-            rule.insert(
-                "retry".to_string(),
-                serde_json::to_value(retry).expect("RetryConfig serializes"),
-            );
-        } else if route_policy.retry_disabled {
-            rule.insert("retry_disabled".to_string(), Value::Bool(true));
-        }
-        if !route_request_transform.is_empty() {
-            rule.insert(
-                "request_transform".to_string(),
-                Value::Array(route_request_transform),
-            );
-        }
-        if !route_response_transform.is_empty() {
-            rule.insert(
-                "response_transform".to_string(),
-                Value::Array(route_response_transform),
-            );
-        }
-        rules.push(Value::Object(rule));
+        rules.push(Value::Object(catch_all_rule(
+            &route_destination,
+            &route_policy,
+            route_request_transform,
+            route_response_transform,
+            route_fault.clone(),
+        )));
     }
 
     (rules, has_uri_only_match)
+}
+
+/// Build the URI-only catch-all rule that carries http[]-level transforms
+/// and / or a route-local fault when the explicit-match loop produced no
+/// rule but the http[] still needs a per-rule carrier.
+fn catch_all_rule(
+    route_destination: &MeshRouteDispatchDestination<'_>,
+    route_policy: &MeshRouteDispatchPolicy<'_>,
+    route_request_transform: Vec<Value>,
+    route_response_transform: Vec<Value>,
+    route_fault: Option<Value>,
+) -> serde_json::Map<String, Value> {
+    let mut destination = serde_json::Map::new();
+    if let Some(uid) = route_destination.upstream_id {
+        destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+    } else {
+        destination.insert(
+            "backend_host".to_string(),
+            Value::String(route_destination.backend_host.to_string()),
+        );
+        destination.insert(
+            "backend_port".to_string(),
+            serde_json::json!(route_destination.backend_port),
+        );
+    }
+    let mut rule = serde_json::Map::new();
+    rule.insert("match".to_string(), Value::Object(serde_json::Map::new()));
+    rule.insert("destination".to_string(), Value::Object(destination));
+    if let Some(timeout_ms) = route_policy.timeout_ms {
+        rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+    } else if route_policy.timeout_disabled {
+        rule.insert("timeout_disabled".to_string(), Value::Bool(true));
+    }
+    if let Some(retry) = route_policy.retry {
+        rule.insert(
+            "retry".to_string(),
+            serde_json::to_value(retry).expect("RetryConfig serializes"),
+        );
+    } else if route_policy.retry_disabled {
+        rule.insert("retry_disabled".to_string(), Value::Bool(true));
+    }
+    if !route_request_transform.is_empty() {
+        rule.insert(
+            "request_transform".to_string(),
+            Value::Array(route_request_transform),
+        );
+    }
+    if !route_response_transform.is_empty() {
+        rule.insert(
+            "response_transform".to_string(),
+            Value::Array(route_response_transform),
+        );
+    }
+    if let Some(fault) = route_fault {
+        rule.insert("fault".to_string(), fault);
+    }
+    rule
+}
+
+/// When a VirtualService `http[]` has no `match[]` (or an empty one) but
+/// does carry a `fault:` block, emit a single rule that carries the fault
+/// with empty match (which the plugin's `rule_matches` treats as "match
+/// all" when fault is present). Without this, K8s-style fault on a
+/// no-match VS would be silently dropped because the function would
+/// return early.
+fn fault_only_rules(
+    route_fault: &Option<Value>,
+    route_destination: &MeshRouteDispatchDestination<'_>,
+    route_policy: &MeshRouteDispatchPolicy<'_>,
+) -> Vec<Value> {
+    let Some(fault) = route_fault else {
+        return Vec::new();
+    };
+    vec![Value::Object(catch_all_rule(
+        route_destination,
+        route_policy,
+        Vec::new(),
+        Vec::new(),
+        Some(fault.clone()),
+    ))]
 }
 
 /// Extract `headers.{direction}.{set,add,remove}` from a VirtualService

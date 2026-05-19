@@ -49,15 +49,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use crate::plugins::utils::fault_roll::FaultRoller;
 use runtime_overlay::FaultOverridesSnapshot;
 
 pub mod runtime_overlay;
 
 const MAX_DELAY_MS: u64 = 3_600_000;
-const PROBABILITY_DENOMINATOR: u64 = 1 << 32;
 
 struct AbortFault {
     status_code: u16,
@@ -74,7 +73,7 @@ struct DelayFault {
 pub struct FaultInjectionPlugin {
     abort: Option<AbortFault>,
     delay: Option<DelayFault>,
-    counter: AtomicU64,
+    roller: FaultRoller,
     /// Optional RTDS overlay scope. When set, the plugin reads its
     /// `abort.percentage` and `delay.percentage` from
     /// `ferrum.fault_injection.<scope>.{abort,delay}_percent` on every
@@ -208,7 +207,7 @@ impl FaultInjectionPlugin {
         Ok(Self {
             abort,
             delay,
-            counter: AtomicU64::new(0),
+            roller: FaultRoller::new(),
             runtime_overlay_scope,
         })
     }
@@ -280,33 +279,13 @@ fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String
     Ok(pct)
 }
 
-fn probability_hit(sample: u32, percentage: f64) -> bool {
-    if percentage >= 100.0 {
-        return true;
-    }
-    let threshold = ((percentage / 100.0) * PROBABILITY_DENOMINATOR as f64) as u64;
-    u64::from(sample) < threshold
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E3779B97F4A7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
-    value ^ (value >> 31)
-}
-
 impl FaultInjectionPlugin {
     fn decide_faults(&self, overrides: &FaultOverridesSnapshot) -> (bool, bool) {
-        let sample = splitmix64(self.counter.fetch_add(1, Ordering::Relaxed));
-        let delay_sample = (sample >> 32) as u32;
-        let abort_sample = sample as u32;
-        let delay_triggered = self
-            .effective_delay_percentage(overrides)
-            .is_some_and(|pct| probability_hit(delay_sample, pct));
-        let abort_triggered = self
-            .effective_abort_percentage(overrides)
-            .is_some_and(|pct| probability_hit(abort_sample, pct));
-        (delay_triggered, abort_triggered)
+        let outcome = self.roller.roll_pair(
+            self.effective_delay_percentage(overrides),
+            self.effective_abort_percentage(overrides),
+        );
+        (outcome.delay_triggered, outcome.abort_triggered)
     }
 
     fn reject_for_abort(&self, abort: &AbortFault) -> PluginResult {

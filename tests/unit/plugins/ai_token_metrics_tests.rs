@@ -60,7 +60,10 @@ async fn test_plugin_name_and_priority() {
     )));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
     assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
-    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+    // Spec change (PR #956 / commit 55a59396): token-metrics buffering is
+    // no longer POST-only; otherwise non-POST AI responses skip token
+    // accounting entirely.
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
 // ─── OpenAI format ──────────────────────────────────────────────────────
