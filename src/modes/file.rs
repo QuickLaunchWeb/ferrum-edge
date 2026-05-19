@@ -726,6 +726,28 @@ pub async fn serve(
         None
     };
 
+    // Wire opt-in frontend TLS live reload (see modes/database.rs for full
+    // rationale). File-mode listeners participate identically: live reload is
+    // opt-in via FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED and disabled by
+    // default.
+    let proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
+        crate::modes::tls_reload::prepare_proxy_frontend_tls(
+            cfg.clone(),
+            &env_config,
+            &tls_policy,
+            &crls,
+            Some(shutdown_tx.subscribe()),
+        )
+    });
+    if let Some(handles) = proxy_frontend_reload_handles.as_ref()
+        && handles.watcher_handle.is_some()
+    {
+        info!(
+            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            "Frontend TLS live reload enabled for file-mode proxy HTTPS (H1/H2) and HTTP/3"
+        );
+    }
+
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
@@ -854,6 +876,17 @@ pub async fn serve(
             &crls,
         ) {
             Ok(admin_tls_config) => {
+                let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+                    admin_tls_config.clone(),
+                    &env_config,
+                    &admin_tls_policy,
+                    &crls,
+                    Some(shutdown_tx.subscribe()),
+                );
+                if admin_reload_handles.watcher_handle.is_some() {
+                    info!("Frontend TLS live reload enabled for file-mode admin HTTPS");
+                }
+                let admin_tls_slot = admin_reload_handles.slot.clone();
                 if let Some(listener) = prebound.admin_https.take() {
                     bound.admin_https = listener.local_addr().ok();
                     let st = admin_state.clone();
@@ -875,10 +908,19 @@ pub async fn serve(
                     let cfg = Some(admin_tls_config);
                     let h = tokio::spawn(async move {
                         info!("Starting admin HTTPS listener on {}", admin_https_addr);
-                        if let Err(e) =
+                        let result = if let Some(slot) = admin_tls_slot {
+                            admin::start_admin_listener_with_dynamic_tls(
+                                admin_https_addr,
+                                st,
+                                sh,
+                                slot,
+                            )
+                            .await
+                        } else {
                             admin::start_admin_listener_with_tls(admin_https_addr, st, sh, cfg)
                                 .await
-                        {
+                        };
+                        if let Err(e) = result {
                             error!("Admin HTTPS listener error: {}", e);
                         }
                     });
@@ -966,18 +1008,32 @@ pub async fn serve(
             let st = proxy_state.clone();
             let sh = shutdown_tx.subscribe();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let reload_slot = proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone());
             let cfg = Some(tls_cfg_arc.clone());
             let h = tokio::spawn(async move {
                 info!("Starting HTTPS proxy listener on {}", https_addr);
-                if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-                    https_addr,
-                    st,
-                    sh,
-                    cfg,
-                    Some(started_tx),
-                )
-                .await
-                {
+                let result = if let Some(slot) = reload_slot {
+                    proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                        https_addr,
+                        st,
+                        sh,
+                        slot,
+                        Some(started_tx),
+                    )
+                    .await
+                } else {
+                    proxy::start_proxy_listener_with_tls_and_signal(
+                        https_addr,
+                        st,
+                        sh,
+                        cfg,
+                        Some(started_tx),
+                    )
+                    .await
+                };
+                if let Err(e) = result {
                     error!("HTTPS proxy listener error: {}", e);
                 }
             });
@@ -1019,6 +1075,9 @@ pub async fn serve(
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
             let h3_client_crls = crls.clone();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
+                proxy_frontend_reload_handles.as_ref(),
+            );
             let h = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
@@ -1032,6 +1091,7 @@ pub async fn serve(
                         client_ca_bundle_path: h3_client_ca,
                         client_crls: h3_client_crls,
                         started_tx: Some(started_tx),
+                        frontend_tls_reload: h3_reload,
                     },
                 )
                 .await

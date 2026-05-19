@@ -386,6 +386,26 @@ pub struct EnvConfig {
     pub proxy_https_port: u16,
     pub frontend_tls_cert_path: Option<String>,
     pub frontend_tls_key_path: Option<String>,
+    /// Opt in to live reload of frontend TLS cert/key files for the proxy
+    /// HTTPS / H2 / H3 listeners, the admin HTTPS listener, and (in mesh
+    /// mode) the mesh inbound TLS listener. When `false` (the default)
+    /// cert/key paths are read once at startup and require a restart to
+    /// rotate. When `true`, a background watcher polls the configured paths
+    /// every [`frontend_tls_watch_interval_seconds`] seconds and atomically
+    /// swaps a rebuilt `rustls::ServerConfig` into the listener's
+    /// `ArcSwap`-backed slot on a validated change. A rebuild that fails
+    /// validation (parse / expired / not-yet-valid / key mismatch) keeps
+    /// the previous config and emits a `warn!` — the gateway never serves a
+    /// known-bad config. In-flight TLS sessions keep their original
+    /// `ServerConfig`; only new handshakes pick up the new config.
+    /// Operator-supplied per-proxy backend TLS paths and the DTLS frontend
+    /// stay static under this knob.
+    pub frontend_tls_live_reload_enabled: bool,
+    /// Poll interval in seconds for the frontend TLS file watcher when
+    /// [`frontend_tls_live_reload_enabled`] is `true`. Defaults to `30`.
+    /// Ignored when live reload is disabled. Clamped to a 1-second minimum
+    /// so an accidental `0` does not busy-loop the filesystem.
+    pub frontend_tls_watch_interval_seconds: u64,
     /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
     /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
     /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
@@ -1374,6 +1394,8 @@ impl Default for EnvConfig {
             proxy_https_port: 8443,
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_live_reload_enabled: false,
+            frontend_tls_watch_interval_seconds: 30,
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
@@ -1650,6 +1672,8 @@ impl EnvConfig {
             proxy_https_port: u16 = "FERRUM_PROXY_HTTPS_PORT" => 8443u16;
             frontend_tls_cert_path: Option<String> = "FERRUM_FRONTEND_TLS_CERT_PATH";
             frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
+            frontend_tls_live_reload_enabled: bool = "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED" => false;
+            frontend_tls_watch_interval_seconds: u64 = "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             proxy_bind_address: String = "FERRUM_PROXY_BIND_ADDRESS" => "0.0.0.0".to_string();
         }
 
@@ -2074,6 +2098,8 @@ impl EnvConfig {
             proxy_https_port,
             frontend_tls_cert_path,
             frontend_tls_key_path,
+            frontend_tls_live_reload_enabled,
+            frontend_tls_watch_interval_seconds,
             proxy_bind_address,
             admin_http_port,
             admin_https_port,

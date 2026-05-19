@@ -4162,6 +4162,57 @@ fn test_mesh_peer_auth_live_reload_default_disabled() {
 }
 
 #[test]
+fn test_frontend_tls_live_reload_default_disabled() {
+    let config = EnvConfig::default();
+    assert!(
+        !config.frontend_tls_live_reload_enabled,
+        "Frontend TLS cert/key live reload is opt-in; defaults preserve the historic restart-required behavior"
+    );
+    assert_eq!(
+        config.frontend_tls_watch_interval_seconds, 30,
+        "Default frontend TLS watch interval should be 30 seconds when live reload is enabled"
+    );
+}
+
+#[test]
+fn test_frontend_tls_live_reload_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
+            ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "5"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.frontend_tls_live_reload_enabled);
+            assert_eq!(config.frontend_tls_watch_interval_seconds, 5);
+        },
+    );
+}
+
+#[test]
+fn test_frontend_tls_watch_interval_clamps_to_minimum() {
+    // The watcher must not busy-loop the filesystem; an operator who sets 0
+    // gets clamped up to 1 second.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
+            ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_watch_interval_seconds, 1,
+                "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS=0 should clamp up to 1"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_mesh_peer_auth_live_reload_parsed_from_env() {
     with_env_vars(
         &[

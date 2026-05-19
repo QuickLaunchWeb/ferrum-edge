@@ -323,7 +323,7 @@ pub async fn run(
                         "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
                     );
                 }
-                Some(config)
+                config
             }
             Err(e) => {
                 error!("Failed to load admin TLS configuration: {}", e);
@@ -331,16 +331,38 @@ pub async fn run(
             }
         };
 
+        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            &env_config,
+            &tls_policy,
+            &crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for CP admin HTTPS");
+        }
+        let admin_tls_slot = admin_reload_handles.slot.clone();
+
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
-            if let Err(e) = admin::start_admin_listener_with_tls(
-                admin_https_addr,
-                admin_state_for_https,
-                admin_https_shutdown,
-                admin_tls_config,
-            )
-            .await
-            {
+            let result = if let Some(slot) = admin_tls_slot {
+                admin::start_admin_listener_with_dynamic_tls(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    slot,
+                )
+                .await
+            } else {
+                admin::start_admin_listener_with_tls(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    Some(admin_tls_config),
+                )
+                .await
+            };
+            if let Err(e) = result {
                 error!("Admin HTTPS listener error: {}", e);
             }
         }))

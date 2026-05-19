@@ -6621,6 +6621,35 @@ pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
     .await
 }
 
+/// Start the proxy HTTPS listener with a hot-swappable frontend TLS slot.
+///
+/// Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The frontend TLS
+/// watch task swaps the underlying `ArcSwap` after a validated cert/key
+/// reload; subsequent accepts pick up the new config without restarting the
+/// listener. Existing in-flight TLS sessions keep their original
+/// `ServerConfig`. Mirrors [`start_proxy_listener_with_tls_and_signal`] in
+/// every other respect.
+pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Dynamic {
+            slot: tls_slot,
+            record_mesh_mtls_metric: false,
+        },
+        None,
+        started_tx,
+    )
+    .await
+}
+
 /// Start a proxy listener whose TLS config is loaded dynamically from
 /// `ProxyState::mesh_inbound_tls` on every accepted connection.
 ///
@@ -6662,6 +6691,15 @@ enum ListenerTlsSource {
     /// every accept so PeerAuthentication changes can hot-swap future
     /// handshakes without restarting the listener.
     MeshInbound,
+    /// Dynamic frontend TLS loaded from a shared `ArcSwap` slot on every
+    /// accept so a successful cert/key reload (opt-in via
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
+    /// handshake without restarting the listener. Existing in-flight TLS
+    /// sessions keep their old `ServerConfig`.
+    Dynamic {
+        slot: crate::tls::SharedFrontendTls,
+        record_mesh_mtls_metric: bool,
+    },
 }
 
 impl ListenerTlsSource {
@@ -6670,10 +6708,14 @@ impl ListenerTlsSource {
     /// `Static` is the ordinary startup-captured path. `MeshInbound` performs
     /// one `ArcSwap::load()` and one inner `Arc` clone per accept; this is
     /// the narrow mesh live-reload carve-out and is not on the request path.
+    /// `Dynamic` performs one `ArcSwap::load()` and one inner `Arc` clone per
+    /// accept; this is the narrow frontend cert/key live-reload carve-out
+    /// and is not on the request path.
     fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
         match self {
             Self::Static { tls_config, .. } => tls_config.clone(),
             Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
+            Self::Dynamic { slot, .. } => slot.load().as_ref().clone(),
         }
     }
 
@@ -6684,6 +6726,10 @@ impl ListenerTlsSource {
                 ..
             } => *record_mesh_mtls_metric,
             Self::MeshInbound => true,
+            Self::Dynamic {
+                record_mesh_mtls_metric,
+                ..
+            } => *record_mesh_mtls_metric,
         }
     }
 }

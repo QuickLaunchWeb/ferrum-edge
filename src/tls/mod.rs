@@ -15,10 +15,16 @@
 //! both inbound listeners and outbound backend connections.
 
 pub mod backend;
+pub mod frontend_reload;
 // `spiffe` exposes Phase A scaffolding for Phase C — every public item is
 // dead from the binary's perspective until a later phase wires it in.
 #[allow(dead_code)]
 pub mod spiffe;
+
+pub use frontend_reload::{
+    FrontendTlsRebuildFn, FrontendTlsReloadConfig, SharedFrontendTls, empty_frontend_tls_slot,
+    frontend_tls_slot_with, spawn_frontend_tls_reload_task,
+};
 
 #[allow(unused_imports)]
 pub use spiffe::{
