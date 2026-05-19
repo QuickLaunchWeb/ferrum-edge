@@ -992,9 +992,9 @@ fn reconcile_existing_pod_include_ports(
 }
 
 /// Render an `Option<&IncludePortsPolicy>` as a short structured string
-/// for logging. Kept private and allocation-free on the no-op path so
-/// the hot `reconcile_existing_pod_include_ports` diff doesn't pay for
-/// formatting work when there's no real update to log.
+/// for logging. Only invoked from the success/error arms of
+/// `reconcile_existing_pod_include_ports` — never on the diff-skip
+/// no-op path, which returns early before any formatting work runs.
 fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
     match policy {
         None => "none".to_string(),
