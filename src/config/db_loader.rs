@@ -2994,6 +2994,8 @@ impl DatabaseStore {
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let assoc_sql =
+            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
         for pc in configs {
             let config_json = serde_json::to_string(&pc.config)?;
@@ -3015,6 +3017,16 @@ impl DatabaseStore {
                 .bind(pc.updated_at.to_rfc3339())
                 .execute(&mut *tx)
                 .await?;
+
+            if pc.scope == PluginScope::Proxy
+                && let Some(proxy_id) = pc.proxy_id.as_deref()
+            {
+                sqlx::query(&assoc_sql)
+                    .bind(proxy_id)
+                    .bind(&pc.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
 
         let count = configs.len();
