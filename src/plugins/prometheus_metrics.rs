@@ -1063,6 +1063,29 @@ impl MetricsRegistry {
                 snapshot.attach_errors,
                 &ns_label,
             );
+            output.push_str(
+                "# HELP ferrum_node_agent_pod_annotation_updates_applied_total Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map.\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_pod_annotation_updates_applied_total counter\n",
+            );
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_pod_annotation_updates_applied_total",
+                snapshot.pod_annotation_updates_applied,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_pod_annotation_updates_failed_total Mid-life pod includeOutboundPorts annotation changes that failed to re-apply (annotation parse error or BPF map write error). Cgroup-id-unavailable retries are intentionally not counted here because they are routinely observed during early pod startup and are retried on the next Apply event.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_node_agent_pod_annotation_updates_failed_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_pod_annotation_updates_failed_total",
+                snapshot.pod_annotation_updates_failed,
+                &ns_label,
+            );
 
             // Topology-degraded gauge — emitted whenever the node-agent
             // metrics are registered so dashboards can pin "expected: 0"

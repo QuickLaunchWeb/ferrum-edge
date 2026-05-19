@@ -534,17 +534,32 @@ fn include_outbound_ports_to_policy(
     IncludePortsPolicy::explicit(&include.ports)
 }
 
+/// Outcome of writing (or attempting to write) a pod's parsed
+/// `includeOutboundPorts` annotation into the BPF map.
+///
+/// Carries both the cgroup id the entry is keyed on (so removal can use
+/// it without re-statting the cgroup) and the [`IncludePortsPolicy`]
+/// actually written, so the watcher can diff against this baseline on
+/// the next Modified event and skip BPF map churn when the parsed value
+/// has not changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedIncludePorts {
+    cgroup_id: u64,
+    policy: IncludePortsPolicy,
+}
+
 /// Push the parsed per-pod include-port policy into the BPF map. Returns
-/// the cgroup id we wrote to so callers can stash it on
-/// `PodAttachmentState` for the eventual un-enrollment. Returns `None`
-/// when there's nothing to write (no annotation, malformed annotation, or
+/// the cgroup id and policy we wrote so callers can stash both on
+/// `PodAttachmentState`: the cgroup id is the removal key, the policy is
+/// the diff baseline for mid-life Modified events. Returns `None` when
+/// there's nothing to write (no annotation, malformed annotation, or
 /// cgroup-id stat failed) — none of which should abort enrollment.
 fn apply_include_outbound_ports(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
     cgroup_path: &str,
     annotations: &HashMap<String, String>,
-) -> Option<u64> {
+) -> Option<AppliedIncludePorts> {
     let include = match parse_pod_include_outbound_ports(annotations) {
         Ok(Some(include)) => include,
         Ok(None) => return None,
@@ -568,7 +583,7 @@ fn apply_include_outbound_ports(
                 port_count = policy.port_count,
                 "Wrote per-pod includeOutboundPorts entry to BPF map"
             );
-            Some(cgroup_id)
+            Some(AppliedIncludePorts { cgroup_id, policy })
         }
         Err(e) => {
             warn!(
@@ -666,6 +681,13 @@ pub fn handle_pod_added(
     let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
     if let Some(mut state) = pod_states.get_mut(pod_uid) {
         reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+        reconcile_existing_pod_include_ports(
+            backend,
+            metrics,
+            pod_uid,
+            event.annotations,
+            &mut state,
+        );
         debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
         return;
     }
@@ -683,6 +705,7 @@ pub fn handle_pod_added(
         veth_iface: veth_iface.clone(),
         attached: false,
         include_ports_cgroup_id: None,
+        include_ports_policy: None,
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -743,8 +766,12 @@ pub fn handle_pod_added(
             // captured at the cgroup level without per-port narrowing
             // (which is the prior GAP-2K behavior). Enrollment itself
             // must not abort on this.
-            state.include_ports_cgroup_id =
-                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations);
+            if let Some(applied) =
+                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
+            {
+                state.include_ports_cgroup_id = Some(applied.cgroup_id);
+                state.include_ports_policy = Some(applied.policy);
+            }
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -803,6 +830,181 @@ fn reconcile_existing_pod_ip(
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
     }
     state.pod_ip = Some(new_ip);
+}
+
+/// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
+/// pod (Kubernetes `Apply` events conflate "added" and "modified"), and
+/// reprogram the BPF map if and only if the parsed policy differs from
+/// the baseline stashed at enrollment time.
+///
+/// This is the GAP-2K mid-life update gap: prior to this hook, changing
+/// `traffic.sidecar.istio.io/includeOutboundPorts` (or its Ferrum-native
+/// alias) on a live pod was a no-op until the pod restarted, because the
+/// node-agent only wrote the BPF map on first enrollment. With this hook,
+/// a `kubectl annotate pod ...` reconciles within the watcher's normal
+/// debounce window.
+///
+/// Diff-skip is load-bearing: pods receive `Modified` events for many
+/// reasons (status updates, container restarts, condition flips). Writing
+/// the BPF map on every Modified event would burn syscalls and produce
+/// log noise. We compare the *parsed* policy (post-merge of Istio +
+/// Ferrum aliases, post-sort, post-dedupe), not the raw annotation
+/// strings — so re-ordering ports in the annotation is correctly a no-op.
+///
+/// Long-lived flow caveat: the BPF `connect4` / `connect6` programs run
+/// on `connect(2)`, so the new policy takes effect only for *new* outbound
+/// connections issued by the pod after this hook runs. Already-established
+/// flows continue with the redirect their original connect saw — closing
+/// them is a userspace concern outside this module.
+fn reconcile_existing_pod_include_ports(
+    backend: &mut dyn EbpfBackend,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    annotations: &HashMap<String, String>,
+    state: &mut PodAttachmentState,
+) {
+    // Compute the desired policy (or None for absent annotation).
+    let desired = match parse_pod_include_outbound_ports(annotations) {
+        Ok(Some(include)) => Some(include_outbound_ports_to_policy(pod_uid, &include)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                pod_uid,
+                error = %e,
+                "Mid-life pod annotation update failed to parse; keeping previous includeOutboundPorts policy"
+            );
+            metrics
+                .pod_annotation_updates_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    // Hot-path diff-skip: most Modified events are unrelated to capture
+    // annotations (status updates, container restart counts, etc.). The
+    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a
+    // cheap structural compare — no allocations, no syscalls.
+    if desired == state.include_ports_policy {
+        return;
+    }
+
+    // Identity for removal/replace lookups. Prefer the cgroup id stashed
+    // at enrollment (still valid even if the cgroup path was rotated
+    // out from under us); fall back to re-statting the path only when
+    // we have no prior id (the pod was previously unannotated and is
+    // newly transitioning into having a policy).
+    let cgroup_id_for_lookup = state.include_ports_cgroup_id.or_else(|| {
+        state
+            .cgroup_path
+            .as_deref()
+            .and_then(read_cgroup_id_for_pod)
+    });
+
+    match (desired, cgroup_id_for_lookup) {
+        (Some(new_policy), Some(cgroup_id)) => {
+            // Add or replace. `update_pod_include_ports` is an insert-or-
+            // overwrite on the BPF HashMap; the kernel does not require
+            // explicit removal before re-insertion.
+            match backend.update_pod_include_ports(cgroup_id, &new_policy) {
+                Ok(()) => {
+                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+                    let new_summary = describe_policy(Some(&new_policy));
+                    info!(
+                        pod_uid,
+                        cgroup_id,
+                        prev_policy = %prev_summary,
+                        new_policy = %new_summary,
+                        "Re-applied mid-life pod includeOutboundPorts annotation update to BPF map"
+                    );
+                    state.include_ports_cgroup_id = Some(cgroup_id);
+                    state.include_ports_policy = Some(new_policy);
+                    metrics
+                        .pod_annotation_updates_applied
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        pod_uid,
+                        cgroup_id,
+                        error = %e,
+                        "Failed to re-apply mid-life pod includeOutboundPorts update; keeping previous policy"
+                    );
+                    metrics
+                        .pod_annotation_updates_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        (None, Some(cgroup_id)) => {
+            // The pod removed its annotation entirely → drop the BPF
+            // entry so the gate fail-opens back to "capture everything"
+            // for this pod, matching pre-enrollment behavior.
+            match backend.remove_pod_include_ports(cgroup_id) {
+                Ok(()) => {
+                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+                    info!(
+                        pod_uid,
+                        cgroup_id,
+                        prev_policy = %prev_summary,
+                        "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entry"
+                    );
+                    state.include_ports_cgroup_id = None;
+                    state.include_ports_policy = None;
+                    metrics
+                        .pod_annotation_updates_applied
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        pod_uid,
+                        cgroup_id,
+                        error = %e,
+                        "Failed to drop mid-life pod includeOutboundPorts BPF entry; keeping previous policy"
+                    );
+                    metrics
+                        .pod_annotation_updates_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        (Some(_), None) => {
+            // We want to write a new entry but have no cgroup id — most
+            // likely the pod was enrolled before its cgroup path
+            // existed (Kubernetes Pod object reaches the watcher before
+            // kubelet finishes creating the cgroup). Skip and let a
+            // future event retry; do NOT count this as a failure because
+            // it is operationally normal.
+            debug!(
+                pod_uid,
+                "Mid-life includeOutboundPorts update deferred: cgroup id unavailable"
+            );
+        }
+        (None, None) => {
+            // Nothing to write and nothing to remove. Reachable only if
+            // `desired` flipped from `None` to `None` in a way that
+            // disagreed with `state.include_ports_policy` (e.g. the
+            // baseline was `Some(_)` but the cgroup id was unknown when
+            // it was stashed). Clear the baseline so future diffs are
+            // consistent.
+            state.include_ports_policy = None;
+        }
+    }
+}
+
+/// Render an `Option<&IncludePortsPolicy>` as a short structured string
+/// for logging. Kept private and allocation-free on the no-op path so
+/// the hot `reconcile_existing_pod_include_ports` diff doesn't pay for
+/// formatting work when there's no real update to log.
+fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
+    match policy {
+        None => "none".to_string(),
+        Some(p) if p.is_all_ports() => "all".to_string(),
+        Some(p) => {
+            let count = p.port_count as usize;
+            let bounded = count.min(p.ports.len());
+            format!("ports={:?}", &p.ports[..bounded])
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1281,6 +1483,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         pod_states.insert(
@@ -1294,6 +1497,7 @@ mod tests {
                 veth_iface: None,
                 attached: false,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -1677,6 +1881,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         let config = NodeAgentConfig {
@@ -1754,6 +1959,7 @@ mod tests {
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         backend
@@ -1813,6 +2019,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -1858,6 +2065,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -2474,5 +2682,490 @@ mod tests {
             "removal must drop the include-ports entry"
         );
         assert!(!pod_states.contains_key("pod-uid-1"));
+    }
+
+    // --- T4-B: mid-life pod annotation updates (extends GAP-2K) ---
+    //
+    // `Event::Apply` from kube-rs covers both newly-added and modified pods,
+    // so `handle_pod_added` is the watcher's single entry point for both.
+    // The tests below exercise the diff-and-apply path inside the
+    // "already enrolled" branch (`reconcile_existing_pod_include_ports`)
+    // by calling `handle_pod_added` twice with the same `pod_uid` but
+    // different annotations, simulating what kube-rs would emit for a
+    // `kubectl annotate pod ...` against a live pod.
+
+    /// Build the standard test config + cgroup tempdir layout used by
+    /// every T4-B handle_pod_added round-trip test. Returns the tempdir
+    /// (so the test scope keeps it alive), the resolved cgroup root
+    /// path, and a `NodeAgentConfig` pointing at it.
+    fn t4b_test_config(pod_uid: &str) -> (tempfile::TempDir, NodeAgentConfig) {
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        (cgroup_root, config)
+    }
+
+    /// Build a `PodEvent` referencing the supplied labels/annotations.
+    /// Encapsulated so each T4-B test reads as "annotate this pod and
+    /// run handle_pod_added" without inlining the same struct literal
+    /// every time.
+    fn t4b_pod_event<'a>(
+        pod_uid: &'a str,
+        labels: &'a HashMap<String, String>,
+        annotations: &'a HashMap<String, String>,
+    ) -> PodEvent<'a> {
+        PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            labels,
+            annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        }
+    }
+
+    fn t4b_mesh_labels() -> HashMap<String, String> {
+        HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())])
+    }
+
+    #[test]
+    fn handle_pod_updated_with_same_annotation_is_no_op() {
+        // Diff-skip regression guard: Modified events fire many times
+        // for unrelated reasons (status updates, condition flips, image
+        // pull progress). If we wrote the BPF map on every Modified
+        // event we'd burn syscalls and produce log noise.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+
+        // First Apply (the "added" event).
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotations),
+        );
+        assert_eq!(backend.include_ports.len(), 1, "initial write must occur");
+        let snapshot_before = backend.include_ports.clone();
+
+        // Second Apply with identical annotations (the "modified-but-
+        // unchanged" event).
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotations),
+        );
+
+        assert_eq!(
+            backend.include_ports, snapshot_before,
+            "identical annotations must not mutate the BPF map"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            0,
+            "no-op diff must not bump the applied counter"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_failed
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_explicit_writes_new_ports() {
+        // `80` → `80,443`: the parser sorts/dedupes, so the second policy
+        // genuinely differs. The mock backend's HashMap-shaped
+        // `include_ports` overwrites on insert, so we expect the entry
+        // for this pod's cgroup id to reflect the NEW port set.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .expect("pod enrolled")
+            .include_ports_cgroup_id
+            .expect("cgroup id stashed");
+        assert_eq!(backend.include_ports.get(&cgroup_id).unwrap().port_count, 1);
+
+        let updated =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80,443")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &updated),
+        );
+
+        // The entry for this pod's cgroup is replaced — same key, new
+        // value — exactly the contract `update_pod_include_ports`
+        // guarantees on the kernel side.
+        let entry = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("entry replaced under same cgroup key");
+        assert!(!entry.is_all_ports());
+        assert_eq!(entry.port_count, 2);
+        assert_eq!(&entry.ports[..2], &[80, 443]);
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(
+            state.include_ports_policy.as_ref().unwrap().port_count,
+            2,
+            "baseline must advance to the new policy for the next diff"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1,
+            "successful mid-life update must bump the applied counter"
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_wildcard_writes_all_ports_sentinel() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+
+        let updated = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "*")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &updated),
+        );
+
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        let entry = backend.include_ports.get(&cgroup_id).unwrap();
+        assert!(
+            entry.is_all_ports(),
+            "wildcard transition must write the all-ports sentinel"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_absent_removes_bpf_entry() {
+        // When an operator removes the annotation entirely (e.g.
+        // `kubectl annotate pod foo traffic.sidecar.istio.io/includeOutboundPorts-`),
+        // the BPF gate should fail-open back to "capture everything"
+        // for that pod. That's encoded by removing the map entry.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+        let cgroup_id_before = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        assert!(backend.include_ports.contains_key(&cgroup_id_before));
+
+        // Apply with empty annotations — the operator stripped the
+        // includeOutboundPorts key.
+        let empty = HashMap::new();
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &empty),
+        );
+
+        assert!(
+            !backend.include_ports.contains_key(&cgroup_id_before),
+            "removed annotation must drop the BPF entry"
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert!(
+            state.include_ports_cgroup_id.is_none(),
+            "state must forget the cgroup id when the entry is removed"
+        );
+        assert!(state.include_ports_policy.is_none());
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_unannotated_to_explicit_enrolls_new_policy() {
+        // The pod was originally unannotated → no BPF entry. Operator
+        // adds `includeOutboundPorts: 80` → BPF entry should appear.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let empty = HashMap::new();
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &empty),
+        );
+        assert!(
+            backend.include_ports.is_empty(),
+            "unannotated pod has no BPF entry initially"
+        );
+
+        let annotated =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotated),
+        );
+
+        let state = pod_states.get("pod-uid-1").unwrap();
+        let cgroup_id = state
+            .include_ports_cgroup_id
+            .expect("mid-life add must stash a cgroup id");
+        let entry = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("mid-life add must populate the BPF map");
+        assert!(!entry.is_all_ports());
+        assert_eq!(entry.port_count, 1);
+        assert_eq!(entry.ports[0], 80);
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_opt_out_to_opt_in_re_enrolls() {
+        // `ferrum.io/inject: false` → `ferrum.io/inject: true`. This is
+        // handled by the existing enrollment-decision path (the
+        // un-enrolled pod is not in `pod_states`, so the second Apply
+        // hits the cold enrollment branch). The point of this test is
+        // to confirm the watcher doesn't get stuck on a stale "skip"
+        // decision once the operator flips opt-out off.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+
+        let opt_out_labels = t4b_mesh_labels();
+        let opt_out_annotations = annotations_with(&[("ferrum.io/inject", "false")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &opt_out_labels, &opt_out_annotations),
+        );
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "opt-out annotation must skip enrollment"
+        );
+
+        let opt_in_annotations = annotations_with(&[("ferrum.io/inject", "true")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &opt_out_labels, &opt_in_annotations),
+        );
+
+        let state = pod_states
+            .get("pod-uid-1")
+            .expect("opt-in flip must enroll the pod");
+        assert!(state.attached);
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_updated_opt_in_to_opt_out_unenrolls() {
+        // The opposite: a previously enrolled pod gets `ferrum.io/inject:
+        // false` mid-life. The watcher must call the un-enroll path
+        // (which is what `evaluate_enrollment` returning `Skip` for an
+        // already-tracked pod_uid triggers in `handle_pod_added`).
+        //
+        // Long-lived-flow caveat: this test asserts the BPF map and
+        // pod_states are cleaned up. It does NOT assert anything about
+        // already-established TCP connections — those keep flowing
+        // through the rewrite chosen at their original connect(2) call,
+        // because BPF cgroup_sockaddr only runs on new connects.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+
+        let labels = t4b_mesh_labels();
+        let opt_in_annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &opt_in_annotations),
+        );
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert_eq!(backend.include_ports.len(), 1);
+
+        let opt_out_annotations = annotations_with(&[("ferrum.io/inject", "false")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &opt_out_annotations),
+        );
+
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "opt-out flip must un-enroll the pod"
+        );
+        assert!(
+            backend.include_ports.is_empty(),
+            "un-enrollment must drop the BPF includeOutboundPorts entry"
+        );
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_updated_malformed_annotation_keeps_previous_policy() {
+        // The pod was enrolled with a valid `80` policy. Operator then
+        // applies a malformed annotation (e.g. typo in port number).
+        // The previous policy MUST be retained — silently widening
+        // capture to "all ports" on a typo would be a surprise.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let good = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &good),
+        );
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        let before = *backend.include_ports.get(&cgroup_id).unwrap();
+
+        let bad = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "bogus")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &bad),
+        );
+
+        let after = *backend.include_ports.get(&cgroup_id).unwrap();
+        assert_eq!(
+            before, after,
+            "malformed annotation must NOT rewrite the BPF entry"
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(
+            state.include_ports_cgroup_id,
+            Some(cgroup_id),
+            "previous cgroup id must be retained"
+        );
+        assert!(state.include_ports_policy.is_some());
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_failed
+                .load(Ordering::Relaxed),
+            1,
+            "parse failure must bump the failed counter"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

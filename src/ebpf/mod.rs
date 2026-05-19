@@ -190,6 +190,23 @@ pub struct NodeAgentMetrics {
     pub pods_enrolled: AtomicU64,
     pub pods_unenrolled: AtomicU64,
     pub attach_errors: AtomicU64,
+    /// Successful re-applications of an `includeOutboundPorts` annotation
+    /// change on a live pod (Kubernetes Modified event whose parsed policy
+    /// differed from the stashed baseline and was written into the BPF
+    /// map). Excludes the initial enrollment write and excludes Modified
+    /// events whose parsed policy was unchanged (diff-skip). Operators
+    /// can graph this alongside `pods_enrolled_total` to confirm a kubectl
+    /// annotate took effect without a pod restart.
+    pub pod_annotation_updates_applied: AtomicU64,
+    /// Failed attempts to re-apply an `includeOutboundPorts` annotation
+    /// change on a live pod (annotation parse error or BPF map write
+    /// error). The pod stays enrolled with its previous policy so
+    /// capture does not silently widen on failure. Cgroup-id-unavailable
+    /// retries (Pod object reached the watcher before kubelet finished
+    /// creating the cgroup) are intentionally not counted here — they
+    /// are routinely observed during early pod startup and are retried
+    /// on the next Apply event without ever needing operator attention.
+    pub pod_annotation_updates_failed: AtomicU64,
     /// Reason this node fell back from eBPF capture to iptables, or `None`
     /// when running the nominal eBPF capture path. Stored via `ArcSwap` so
     /// the Prometheus render path is lock-free. The value is set exactly
@@ -204,6 +221,8 @@ pub struct NodeAgentMetricsSnapshot {
     pub pods_enrolled: u64,
     pub pods_unenrolled: u64,
     pub attach_errors: u64,
+    pub pod_annotation_updates_applied: u64,
+    pub pod_annotation_updates_failed: u64,
     pub topology_degraded_reason: Option<&'static str>,
 }
 
@@ -213,6 +232,12 @@ impl NodeAgentMetrics {
             pods_enrolled: self.pods_enrolled.load(Ordering::Relaxed),
             pods_unenrolled: self.pods_unenrolled.load(Ordering::Relaxed),
             attach_errors: self.attach_errors.load(Ordering::Relaxed),
+            pod_annotation_updates_applied: self
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            pod_annotation_updates_failed: self
+                .pod_annotation_updates_failed
+                .load(Ordering::Relaxed),
             topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
         }
     }
@@ -239,6 +264,8 @@ impl Default for NodeAgentMetrics {
             pods_enrolled: AtomicU64::new(0),
             pods_unenrolled: AtomicU64::new(0),
             attach_errors: AtomicU64::new(0),
+            pod_annotation_updates_applied: AtomicU64::new(0),
+            pod_annotation_updates_failed: AtomicU64::new(0),
             topology_degraded_reason: ArcSwap::from_pointee(None),
         }
     }
@@ -271,6 +298,16 @@ pub struct PodAttachmentState {
     /// deleted). `None` when the pod is unannotated or the cgroup id
     /// could not be read.
     pub include_ports_cgroup_id: Option<u64>,
+    /// Last `IncludePortsPolicy` applied to the BPF map for this pod, or
+    /// `None` when the pod has no `includeOutboundPorts` annotation in
+    /// effect. Used as the diff baseline on Kubernetes `Apply` (modify)
+    /// events so the watcher can re-evaluate a live pod's annotations
+    /// and only re-program the BPF map when the parsed policy actually
+    /// changed. Without this baseline the node-agent would either churn
+    /// the map on every Modified event (pod status updates fire many)
+    /// or, worse, ignore live edits to `traffic.sidecar.istio.io/includeOutboundPorts`
+    /// (the GAP-2K mid-life update gap this field closes).
+    pub include_ports_policy: Option<IncludePortsPolicy>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
