@@ -145,3 +145,37 @@ nodeAgent:
     limits:
       cpu: 500m
       memory: 256Mi
+  # CNI plugin install (optional). Disabled by default so an upgrade does
+  # not change behaviour. When enabled, the DaemonSet runs an init container
+  # that copies the `ferrum-cni` binary into the host's /opt/cni/bin/ and
+  # drops a chained CNI conflist into /etc/cni/net.d/. The kube-rs watcher
+  # in the node-agent remains the source of truth for enrollment; the CNI
+  # hook is an optimization that closes the kubelet-vs-watcher race at
+  # pod sandbox setup time. See docs/node_agent.md "CNI plugin install".
+  cni:
+    enabled: false
+    # Primary CNI to chain behind. The init container writes a
+    # `*-ferrum.conflist` whose first plugin is the primary's `type`
+    # (calico, cilium, bridge, flannel, etc.) — Ferrum is appended as a
+    # meta-plugin that does NOT allocate IPs or interfaces. Confirm the
+    # value matches the primary CNI installed on the cluster.
+    chainedWith: calico
+    # Path on the host where the CNI plugin binary is dropped. Standard
+    # kubelet location; rarely needs overriding.
+    hostBinDir: /opt/cni/bin
+    # Path on the host where the CNI conflist is written. Standard
+    # kubelet location; rarely needs overriding.
+    hostConfDir: /etc/cni/net.d
+    # Filename for the conflist Ferrum writes. The numeric prefix sorts
+    # AFTER the typical primary CNI conflist (`10-...`) so the chain is
+    # evaluated primary → ferrum.
+    confFileName: "05-ferrum.conflist"
+    # Directory on the host that holds the UDS the node-agent listens on
+    # and the CNI binary connects to. Must be writable by the node-agent
+    # container (which runs as root in this DaemonSet).
+    hostSocketDir: /var/run/ferrum
+    # Filename of the UDS inside `hostSocketDir`. The chart wires both
+    # `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the per-conflist
+    # `ferrum.socketPath` field from this value so the two halves cannot
+    # drift.
+    socketFileName: node-agent-cni.sock

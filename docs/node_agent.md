@@ -72,3 +72,92 @@ The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PO
 - `FERRUM_ADMIN_ALLOWED_CIDRS` is set to a non-empty allowlist.
 
 `FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. If either bind signal is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (default `0.0.0.0`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the two escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
+
+## CNI plugin install (optional)
+
+The node-agent's default enrollment path is the kube-rs pod watcher: it polls the Kubernetes API for pods scheduled to its node and reconciles BPF attachment from the resulting label/annotation snapshots. That works but races kubelet — a freshly-scheduled pod may complete its CNI sandbox setup, attach a network namespace, and start sending traffic *before* the watcher has seen the `Apply` event. During that window outbound traffic is not yet routed through Ferrum's eBPF redirect.
+
+The optional CNI-style install closes that window. A small `ferrum-cni` binary, dropped into the host's `/opt/cni/bin/` directory and chained behind the cluster's primary CNI (Calico, Cilium, etc.), forwards each ADD/DEL/CHECK invocation from kubelet to the long-lived node-agent over a Unix domain socket. The node-agent records the call, returns success, and the kube-rs watcher continues to be the source of truth for actual enrollment (the CNI hook carries no labels/annotations).
+
+### Architecture
+
+```
+                            ┌──────────────────────────────────────────────┐
+                            │                  worker node                 │
+                            │                                              │
+                            │  ┌─────────┐    /opt/cni/bin/ferrum-cni      │
+                            │  │ kubelet │ ───────────────────────┐        │
+                            │  └─────────┘                        │        │
+                            │       │ ADD/DEL/CHECK               ▼        │
+                            │       ▼ (stdin JSON +       ┌──────────────┐ │
+                            │  /etc/cni/net.d/             │  ferrum-cni  │ │
+                            │  ...-ferrum.conflist         │   (binary)   │ │
+                            │  (chained behind primary)    └──────┬───────┘ │
+                            │                                     │         │
+                            │                              UDS    │ length- │
+                            │                              ┌──────▼──────┐  │
+                            │                              │ /var/run/   │  │
+                            │                              │ ferrum/     │  │
+                            │                              │ node-agent- │  │
+                            │                              │ cni.sock    │  │
+                            │                              └──────┬──────┘  │
+                            │                                     │         │
+                            │                          ┌──────────▼──────┐  │
+                            │                          │  node-agent     │  │
+                            │      (kube-rs            │  (DaemonSet)    │  │
+                            │       watcher) ────────▶ │                 │  │
+                            │       fallback           │  ───── eBPF ──▶ │  │
+                            │                          │  redirect maps  │  │
+                            │                          └─────────────────┘  │
+                            └──────────────────────────────────────────────┘
+```
+
+The CNI plugin and the kube-rs watcher feed the same enrollment path. They are deliberately not mutually exclusive: even with the CNI plugin installed, the watcher continues to run and reconcile, so the CNI hook is an **optimization** rather than a hard dependency.
+
+### Install steps
+
+The Helm chart at `charts/ferrum-mesh/` ships an opt-in CNI installer init container, gated by `nodeAgent.cni.enabled`. When enabled:
+
+1. The DaemonSet pod's init container copies the `ferrum-cni` binary out of the node-agent image into the host's `/opt/cni/bin/` (host-path mount).
+2. The init container drops a `*-ferrum.conflist` JSON snippet into `/etc/cni/net.d/` that chains behind the cluster's primary CNI plugin (specified via `nodeAgent.cni.chainedWith`).
+3. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
+4. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
+
+Manual install (no Helm): copy `ferrum-cni` to `/opt/cni/bin/` on every node, write a chained `.conflist` in `/etc/cni/net.d/`, ensure `/var/run/ferrum/` is writable, set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock` (override via `FERRUM_NODE_AGENT_CNI_SOCKET_PATH`).
+
+### Fallback semantics
+
+- **Default disabled.** `nodeAgent.cni.enabled=false` (chart) / `FERRUM_NODE_AGENT_CNI_ENABLED=false` (env) keeps the kube-rs watcher as the sole enrollment path. Existing operators upgrade with zero behavior change.
+- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir, port held by a stale process), the node-agent logs `error!` and continues running with the watcher path active. The CNI binary on the host will then fail every kubelet invocation with `IpcFailed`, and kubelet will eventually mark the pod creation as failed — at which point the operator must either fix the UDS or roll back the chained CNI config. The watcher path will still enroll already-scheduled pods.
+- **CNI plugin installed but node-agent not running.** Same effect as above: kubelet sees a CNI error and may delay sandbox setup. The watcher path is irrelevant here because the node-agent process is absent.
+- **CNI plugin enabled, node-agent running, watcher disabled.** Not a supported configuration. The watcher is the source of truth for enrollment; the CNI hook only acknowledges sandbox-setup events to close the race window.
+
+### Chained CNI compatibility
+
+`ferrum-cni` is a *meta-plugin* in CNI parlance — it doesn't allocate IPs or interfaces. It must be chained **after** a primary CNI that does (Calico, Cilium, Flannel, AWS VPC CNI, etc.). The chart's `nodeAgent.cni.chainedWith` value templates the conflist so the chained `type` and `name` match the primary's. Verify the chained config:
+
+```bash
+$ cat /etc/cni/net.d/05-ferrum.conflist
+{
+  "cniVersion": "0.4.0",
+  "name": "ferrum-mesh-chain",
+  "plugins": [
+    { "type": "calico", ... },
+    { "type": "ferrum-cni",
+      "ferrum": { "socketPath": "/var/run/ferrum/node-agent-cni.sock" } }
+  ]
+}
+```
+
+The chart writes the file at a numeric prefix (`05-`) so it sorts after the primary's typical `10-`. Operators with custom prefixes should preserve that ordering.
+
+### Observability
+
+`/metrics` exposes `ferrum_node_agent_cni_calls_total{verb,outcome}` with closed labels (`verb ∈ {add,del,check}`, `outcome ∈ {success,rejected,error}`). Bounded cardinality (9 series at most). Reset on process restart. Operators use this to confirm the CNI plugin is the primary enrollment path (`success` rate climbs) versus the watcher fallback (`success` rate stays at 0 even though pods are enrolled).
+
+### Deferred follow-ups (not in scope for this PR)
+
+- Install verification (probe to confirm `/opt/cni/bin/ferrum-cni` is present after upgrade).
+- CNI upgrade dance (in-place binary swap without disrupting in-flight kubelet calls).
+- Rollback (auto-remove the conflist + binary if the node-agent never comes up).
+- Admission-time validation of pod CNI metadata.

@@ -188,6 +188,8 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). IPv4/IPv6 capture CIDRs are partitioned into `iptables`/`ip6tables` blocks; `FERRUM_MESH_IP6TABLES_ENABLED=auto|true|false` controls IPv6 fan-out, and cleanup scripts must stay best-effort even when `ip6tables` is missing. SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 
+**Node-agent CNI install** (`src/cni/` + `src/modes/node_agent_cni_server.rs` + `src/bin/ferrum-cni.rs`): opt-in (`FERRUM_NODE_AGENT_CNI_ENABLED=false` by default). When enabled, the node-agent binds a UDS at `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` (default `/var/run/ferrum/node-agent-cni.sock`); the standalone `ferrum-cni` binary, chained behind the cluster's primary CNI (Calico/Cilium/etc.) and dropped into `/opt/cni/bin/` by Helm, forwards every kubelet ADD/DEL/CHECK over that socket. The kube-rs watcher remains the source of truth for actual enrollment — the CNI hook closes the kubelet-vs-watcher race window at sandbox setup time but does NOT carry labels/annotations. Disabling the CNI feature flag falls back transparently to watcher-only enrollment. See [docs/node_agent.md](docs/node_agent.md#cni-plugin-install-optional).
+
 ### Domain Model (`src/config/types.rs`)
 
 `GatewayConfig` → `Proxy`, `Consumer`, `Upstream`, `PluginConfig`. Each has `namespace` (default `"ferrum"`).

@@ -170,10 +170,8 @@ mod cni_main {
             }
             Err(serde_err) => {
                 let _ = std::io::stderr().write_all(
-                    format!(
-                        "ferrum-cni: failed to serialize CNI error result: {serde_err}\n"
-                    )
-                    .as_bytes(),
+                    format!("ferrum-cni: failed to serialize CNI error result: {serde_err}\n")
+                        .as_bytes(),
                 );
                 let _ = std::io::stdout().write_all(
                     br#"{"cniVersion":"0.4.0","code":11,"msg":"internal serialization failure"}"#,

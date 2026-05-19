@@ -94,12 +94,8 @@ impl CniInvocation {
         if container_id.trim().is_empty() {
             return Err(CniError::missing_env("CNI_CONTAINERID"));
         }
-        let netns = env::var("CNI_NETNS")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let ifname = env::var("CNI_IFNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
+        let netns = env::var("CNI_NETNS").ok().filter(|v| !v.trim().is_empty());
+        let ifname = env::var("CNI_IFNAME").ok().filter(|v| !v.trim().is_empty());
         let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
         let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
         Ok(Self {
@@ -158,10 +154,7 @@ impl K8sPodIdentity {
         if namespace.is_empty() || name.is_empty() {
             return None;
         }
-        let pod_uid = args
-            .get("K8S_POD_UID")
-            .cloned()
-            .filter(|v| !v.is_empty());
+        let pod_uid = args.get("K8S_POD_UID").cloned().filter(|v| !v.is_empty());
         let infra_container_id = args
             .get("K8S_POD_INFRA_CONTAINER_ID")
             .cloned()
@@ -190,7 +183,11 @@ pub struct CniNetConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub plugin_type: String,
-    #[serde(rename = "prevResult", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "prevResult",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub prev_result: Option<serde_json::Value>,
     /// Optional Ferrum-specific tuning carried on the conflist entry.
     /// Defaults to `Default` when missing.
@@ -218,7 +215,11 @@ pub struct FerrumCniOptions {
     /// When unset the binary falls back to
     /// [`crate::ebpf::DEFAULT_NODE_AGENT_SOCKET_PATH`]'s sibling
     /// `node-agent-cni.sock`. Operators rarely need to set this.
-    #[serde(rename = "socketPath", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "socketPath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub socket_path: Option<String>,
 }
 
@@ -341,10 +342,7 @@ mod tests {
             Some("demo")
         );
         assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("alpha"));
-        assert_eq!(
-            args.get("K8S_POD_UID").map(String::as_str),
-            Some("abc-123")
-        );
+        assert_eq!(args.get("K8S_POD_UID").map(String::as_str), Some("abc-123"));
     }
 
     #[test]

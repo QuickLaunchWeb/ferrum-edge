@@ -11,6 +11,11 @@ mod admin;
 mod capture;
 mod circuit_breaker;
 mod cli;
+// CNI surface types: shared library for the `ferrum-cni` binary
+// (`src/bin/ferrum-cni.rs`). The `ferrum-edge` binary itself only consumes
+// the `rpc` submodule via `crate::modes::node_agent_cni_server`, so most
+// of the `spec` types appear unused from the gateway's perspective.
+#[allow(dead_code)]
 mod cni;
 mod config;
 mod config_delta;

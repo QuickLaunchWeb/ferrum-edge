@@ -46,9 +46,8 @@ pub fn send_rpc(
     use std::os::unix::net::UnixStream;
 
     let frame = encode_frame(request).map_err(CniError::IpcFailed)?;
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        CniError::IpcFailed(format!("connect {socket_path}: {e}"))
-    })?;
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| CniError::IpcFailed(format!("connect {socket_path}: {e}")))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| CniError::IpcFailed(format!("set_read_timeout: {e}")))?;

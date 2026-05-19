@@ -2760,11 +2760,9 @@ impl EnvConfig {
                 );
             }
             if self.node_agent_cni_enabled && self.node_agent_cni_socket_path.trim().is_empty() {
-                return Err(
-                    "FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
+                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
                      FERRUM_NODE_AGENT_CNI_ENABLED is true"
-                        .into(),
-                );
+                    .into());
             }
         }
 

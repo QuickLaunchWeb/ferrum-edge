@@ -334,7 +334,7 @@ pub fn pod_event_from_request<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+    use crate::cni::rpc::{CniRpcRequest, RpcVerb};
     use std::collections::HashMap;
 
     #[test]
