@@ -243,9 +243,9 @@ impl JwksAuth {
                 // indefinite retries. The background task keeps trying with
                 // exponential backoff (2s → 4s → … → 5min cap) until discovery
                 // succeeds. Once resolved, the JwksKeyStore's own background
-                // task starts immediately; the eager fetch below coalesces with
-                // that task so keys are populated before publication without a
-                // second successful JWKS request.
+                // task starts immediately; we publish the store before eager
+                // fetch so cache-retention sees it as active. The eager fetch
+                // then coalesces with that task.
                 //
                 // This ensures a prolonged IdP outage during gateway startup
                 // does not permanently disable the provider — it self-heals
@@ -278,10 +278,10 @@ impl JwksAuth {
                             Ok(uri) => {
                                 info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
                                 let store = get_or_create_jwks_store(&uri, &client, interval);
+                                slot.store(Arc::new(Some(store.clone())));
                                 if let Err(e) = store.fetch_keys_if_empty().await {
                                     warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
                                 }
-                                slot.store(Arc::new(Some(store)));
                                 return;
                             }
                             Err(e) => {
