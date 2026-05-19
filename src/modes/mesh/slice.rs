@@ -565,7 +565,7 @@ impl MeshSlice {
             .filter(|policy| {
                 policy.namespace == namespace
                     && policy_candidate_labels.iter().any(|labels| {
-                        policy_scope_applies_to_workload(policy, effective_namespace, labels)
+                        policy_scope_applies_to_workload(policy, effective_namespace, *labels)
                     })
             })
             .cloned()
@@ -574,9 +574,9 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                policy_candidate_labels
-                    .iter()
-                    .any(|labels| peer_auth_applies_to_workload(peer_auth, effective_namespace, labels))
+                policy_candidate_labels.iter().any(|labels| {
+                    peer_auth_applies_to_workload(peer_auth, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
@@ -597,9 +597,9 @@ impl MeshSlice {
             .request_authentications
             .iter()
             .filter(|ra| {
-                policy_candidate_labels
-                    .iter()
-                    .any(|labels| scope_applies_to_workload(&ra.scope, effective_namespace, labels))
+                policy_candidate_labels.iter().any(|labels| {
+                    scope_applies_to_workload(&ra.scope, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
@@ -609,7 +609,7 @@ impl MeshSlice {
             .filter(|t| {
                 policy_candidate_labels
                     .iter()
-                    .any(|labels| scope_applies_to_workload(&t.scope, effective_namespace, labels))
+                    .any(|labels| scope_applies_to_workload(&t.scope, effective_namespace, *labels))
             })
             .cloned()
             .collect();
@@ -939,8 +939,7 @@ fn destination_rule_namespace_allowed_for_admitted_service(
                         "{}.{}.svc.{}",
                         service.name, service.namespace, cluster_domain
                     ));
-        host_matches
-            && (dr.namespace == service.namespace || dr.namespace == waypoint_namespace)
+        host_matches && (dr.namespace == service.namespace || dr.namespace == waypoint_namespace)
     })
 }
 
@@ -1022,7 +1021,8 @@ fn inferred_workload_labels_for_request(
     };
     let mut common_labels = first.clone();
     for labels in candidate_label_sets.iter().skip(1) {
-        common_labels.retain(|key, value| labels.get(key).is_some_and(|candidate| candidate == value));
+        common_labels
+            .retain(|key, value| labels.get(key).is_some_and(|candidate| candidate == value));
     }
     common_labels
 }
@@ -3001,14 +3001,18 @@ mod tests {
         assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
         assert!(!slice.labels.contains_key("pod-template-hash"));
         assert_eq!(slice.mesh_policies.len(), 2);
-        assert!(slice
-            .mesh_policies
-            .iter()
-            .any(|policy| policy.name == "common-selector-policy"));
-        assert!(slice
-            .mesh_policies
-            .iter()
-            .any(|policy| policy.name == "replica-specific-policy"));
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .any(|policy| policy.name == "common-selector-policy")
+        );
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .any(|policy| policy.name == "replica-specific-policy")
+        );
     }
 
     #[test]
