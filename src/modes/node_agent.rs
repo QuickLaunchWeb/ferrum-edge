@@ -637,6 +637,7 @@ fn handle_kube_pod_applied(
         annotations: &annotations,
         pod_ip_str: pod_ip,
         pod_pid: None,
+        veth_iface_override: None,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     Some(pod_uid)
@@ -651,6 +652,15 @@ pub struct PodEvent<'a> {
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
     pub pod_pid: Option<u32>,
+    /// Pre-resolved host-side veth interface name for this pod, bypassing
+    /// the production resolver. Production always sets this to `None` and
+    /// relies on the procfs/sysfs probe from either the explicit pod PID or
+    /// the resolved pod cgroup; tests set it to a synthetic interface name
+    /// (e.g., `"veth-mock"`) to satisfy the post-`65606d87` enrollment
+    /// invariant that requires an inbound tc attach before the pod is
+    /// considered enrolled, without needing a real pod PID or a Linux kernel
+    /// under test.
+    pub veth_iface_override: Option<&'a str>,
 }
 
 pub fn handle_pod_added(
@@ -694,7 +704,15 @@ pub fn handle_pod_added(
 
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    let veth_iface = veth::discover_veth_for_pod(event.pod_pid);
+    // Production: the kube-rs caller sets `veth_iface_override = None`; the
+    // resolver first uses an explicit pod PID when available, then falls back
+    // to the resolved pod cgroup to find a live process in that pod.
+    // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
+    // is satisfied without a real pod PID / Linux kernel.
+    let veth_iface = event
+        .veth_iface_override
+        .map(|s| s.to_string())
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
@@ -1789,6 +1807,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1827,6 +1846,9 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            // Cgroup resolution fails first, so veth never matters here —
+            // covers the "missing cgroup short-circuits enrollment" path.
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1857,6 +1879,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1901,6 +1924,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1934,6 +1958,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2031,6 +2056,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2077,6 +2103,9 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_pid: None,
+            // Reconcile path — pod is already enrolled, so the veth check
+            // never runs.
+            veth_iface_override: None,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2494,6 +2523,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2539,6 +2569,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2584,6 +2615,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2630,6 +2662,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2671,6 +2704,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2730,6 +2764,10 @@ mod tests {
             annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            // T4-B tests always exercise the enrollment path, so they need
+            // a synthetic veth name to clear the post-65606d87 inbound-tc
+            // invariant. See `PodEvent::veth_iface_override` for context.
+            veth_iface_override: Some("veth-mock"),
         }
     }
 
