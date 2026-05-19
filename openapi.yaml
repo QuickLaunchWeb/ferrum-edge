@@ -1167,6 +1167,177 @@ paths:
                   error:
                     type: string
 
+  /mesh/policy-denies/recent:
+    get:
+      operationId: getMeshPolicyDeniesRecent
+      summary: Aggregated recent mesh_authz denies for ad-hoc triage
+      description: |
+        Returns the top-N most recent `mesh_authz` deny events grouped by the
+        `(rule, source, destination, reason)` tuple. The recorder is
+        process-singleton, bounded FIFO (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`,
+        default 10000), and exception-path only — the proxy hot path never
+        touches it; only the `mesh_authz` deny branch records into it. The
+        endpoint reads a one-shot snapshot of the ring, filters by `at >=
+        now - window`, groups by the 4-tuple, sorts by count descending
+        (tie-break `last_at` descending, then `rule` ascending), and
+        truncates to `limit`.
+
+        The endpoint complements `ferrum_mesh_requests_total{response_code="403"}`
+        from the Prometheus dashboard — that metric counts denies in
+        aggregate, while this endpoint preserves the drill-down dimensions
+        an operator needs when diagnosing a misconfigured
+        `AuthorizationPolicy`.
+
+        `source` and `destination` are omitted (instead of serialised as
+        `null`) when the deny fired before either identity was known — for
+        example unauthenticated HBONE baggage.
+
+        Returns `404 Not Found` outside mesh mode. Returns `400 Bad Request`
+        when `window` exceeds 1 hour, is `0`, or `limit` exceeds 1000.
+      tags: [Mesh Policy Denies]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: |
+            Aggregation window. Accepts the compact suffixes `s`/`m`/`h`
+            (e.g. `30s`, `5m`, `1h`) or a bare integer of seconds. Defaults
+            to `5m`; maximum is `1h`.
+          schema:
+            type: string
+            default: "5m"
+          examples:
+            short:
+              value: "5m"
+            seconds:
+              value: "300"
+            max:
+              value: "1h"
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum number of grouped rows to return. Defaults to `50`,
+            maximum `1000`. `0` returns no grouped rows but preserves
+            `total_denies` for the window.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000
+            default: 50
+      responses:
+        "200":
+          description: Aggregated recent denies for the requested window
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [window_seconds, limit, total_denies, grouped]
+                properties:
+                  window_seconds:
+                    type: integer
+                    format: int64
+                    description: |
+                      Effective window in seconds after parsing.
+                  limit:
+                    type: integer
+                    description: Effective row limit after clamping.
+                  total_denies:
+                    type: integer
+                    format: int64
+                    description: |
+                      Total individual deny events within the window
+                      (pre-grouping).
+                  grouped:
+                    type: array
+                    items:
+                      type: object
+                      required: [rule, reason, count, first_at, last_at]
+                      properties:
+                        rule:
+                          type: string
+                          description: |
+                            Name (or synthetic identifier) of the
+                            `MeshPolicy` rule that fired. Synthesised
+                            reasons (`unauthenticated_baggage`,
+                            `trust_domain_mismatch`, `untrusted_assertor`)
+                            reuse the reason string here so operators can
+                            still pivot on "rule".
+                        source:
+                          type: string
+                          description: |
+                            SPIFFE ID of the source workload, when known.
+                            Omitted (the field is absent, not `null`) when
+                            the deny fired before any identity was
+                            established (e.g. unauthenticated HBONE).
+                        destination:
+                          type: string
+                          description: |
+                            SPIFFE ID of the destination workload (the local
+                            mesh workload's identity), when present.
+                            Omitted (the field is absent, not `null`) for
+                            stream-only denies.
+                        reason:
+                          type: string
+                          description: |
+                            Categorical reason captured from
+                            `ctx.metadata["mesh_authz.deny_policy"]`.
+                        count:
+                          type: integer
+                          format: int64
+                        first_at:
+                          type: string
+                          format: date-time
+                          description: |
+                            UTC timestamp (RFC 3339) of the oldest event in
+                            this group within the requested window.
+                        last_at:
+                          type: string
+                          format: date-time
+                          description: |
+                            UTC timestamp (RFC 3339) of the newest event in
+                            this group within the requested window.
+              examples:
+                grouped-denies:
+                  value:
+                    window_seconds: 300
+                    limit: 50
+                    total_denies: 1234
+                    grouped:
+                      - rule: deny-prod-from-staging
+                        source: spiffe://cluster.local/ns/staging/sa/web
+                        destination: spiffe://cluster.local/ns/prod/sa/api
+                        reason: namespace_mismatch
+                        count: 87
+                        first_at: "2026-05-18T19:32:11Z"
+                        last_at: "2026-05-18T19:36:48Z"
+        "400":
+          description: |
+            Query parameter rejected. `window` exceeded 1 hour, was `0`, was
+            unparseable, or `limit` exceeded 1000.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: |
+            No active mesh policy-deny recorder — the gateway is running
+            outside mesh mode.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Audit ────────────────────────────────────────────────────────────
   /audit:
     parameters:

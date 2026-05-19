@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use ferrum_edge::config::types::LoadBalancerAlgorithm;
+use ferrum_edge::config::types::{LoadBalancerAlgorithm, Proxy, Upstream};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
     MeshTrafficPolicy, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
@@ -46,17 +46,29 @@ fn destination_rule(traffic_policy: Option<MeshTrafficPolicy>) -> MeshDestinatio
     }
 }
 
+/// PR a8dce394 scoped `apply_destination_rules` to namespace, so this
+/// test module needs the test proxy and upstream to share the same
+/// namespace the DR targets (`DEFAULT_NAMESPACE = "default"`). The
+/// `mesh_test_support` helpers default to the gateway namespace
+/// (`"ferrum"`), so each test rebinds the namespace on the helpers'
+/// output before assembling the config.
+fn align_namespace(proxy: &mut Proxy, upstream: &mut Upstream) {
+    proxy.namespace = DEFAULT_NAMESPACE.to_string();
+    upstream.namespace = DEFAULT_NAMESPACE.to_string();
+}
+
 #[test]
 fn destination_rule_top_level_load_balancer_projects_to_upstream_algorithm() {
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
 
-    let upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let dr = destination_rule(Some(MeshTrafficPolicy {
         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
         ..MeshTrafficPolicy::default()
@@ -82,12 +94,13 @@ fn destination_rule_outlier_detection_projects_to_upstream_passive_health() {
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
 
-    let upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let dr = destination_rule(Some(MeshTrafficPolicy {
         outlier_detection: Some(MeshOutlierDetection {
             consecutive_errors: Some(7),
@@ -125,12 +138,13 @@ fn destination_rule_connect_timeout_projects_to_proxy_connect_timeout() {
     // contract documented in CLAUDE.md.
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let dr = destination_rule(Some(MeshTrafficPolicy {
         connect_timeout_ms: Some(2500),
         ..MeshTrafficPolicy::default()
@@ -202,12 +216,13 @@ fn destination_rule_host_match_is_case_insensitive_against_canonical_host() {
     // should still attach.
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let upstream = http_upstream("reviews-u", "Reviews.Default.SVC.cluster.local", 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", "Reviews.Default.SVC.cluster.local", 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let dr = destination_rule(Some(MeshTrafficPolicy {
         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
         ..MeshTrafficPolicy::default()
@@ -237,12 +252,13 @@ fn destination_rule_short_host_form_resolves_to_namespace_qualified_fqdn() {
     // resolution.
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let upstream = http_upstream("reviews-u", "reviews.default.svc.cluster.local", 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", "reviews.default.svc.cluster.local", 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let mut dr = destination_rule(Some(MeshTrafficPolicy {
         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
         ..MeshTrafficPolicy::default()
@@ -411,12 +427,13 @@ fn destination_rule_combines_multiple_fields_in_a_single_traffic_policy() {
     // three simultaneously rather than the last one wins / first-only.
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
-    let upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
-    let proxy = {
+    let mut upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
+    let mut proxy = {
         let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
         p.upstream_id = Some("reviews-u".to_string());
         p
     };
+    align_namespace(&mut proxy, &mut upstream);
     let dr = destination_rule(Some(MeshTrafficPolicy {
         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
         connect_timeout_ms: Some(3500),

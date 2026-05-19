@@ -1100,6 +1100,16 @@ pub async fn handle_admin_request(
         // before the first slice — same shape as `/mesh/egress-scope`.
         (Method::GET, ["mesh", "runtime-overlay"]) => handle_mesh_runtime_overlay_get(&state).await,
 
+        // MESH-T6-D: aggregated recent mesh_authz denies for ad-hoc triage.
+        // The recorder is process-singleton and exception-path only — only
+        // `mesh_authz` rejects touch it, and they record under a single
+        // `std::sync::Mutex`. The endpoint reads the same recorder via a
+        // bounded snapshot and groups by `(rule, source, destination, reason)`.
+        // 404 outside mesh mode mirrors the other `/mesh/...` endpoints.
+        (Method::GET, ["mesh", "policy-denies", "recent"]) => {
+            handle_mesh_policy_denies_recent_get(&state, query.as_deref()).await
+        }
+
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
@@ -1288,6 +1298,150 @@ async fn handle_mesh_runtime_overlay_get(
             "runtime_overlay": &slice.runtime_overlay,
         }),
     ))
+}
+
+/// Maximum `window` query value accepted by `/mesh/policy-denies/recent`.
+/// One hour bounds the snapshot the handler walks; longer windows should
+/// scrape the Prometheus deny counters instead.
+const MESH_POLICY_DENIES_MAX_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// Default `window` when the query param is absent.
+const MESH_POLICY_DENIES_DEFAULT_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Maximum `limit` query value accepted by `/mesh/policy-denies/recent`. The
+/// recorder's ring already caps total cardinality, but a per-call cap keeps
+/// pathological clients from forcing a 10,000-entry grouped response into
+/// every poll.
+const MESH_POLICY_DENIES_MAX_LIMIT: usize = 1000;
+
+/// Default `limit` when the query param is absent.
+const MESH_POLICY_DENIES_DEFAULT_LIMIT: usize = 50;
+
+async fn handle_mesh_policy_denies_recent_get(
+    state: &AdminState,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // 404 outside mesh mode so non-mesh deployments don't expose a stub
+    // empty list and confuse operators about whether mesh_authz is active.
+    if state.mesh_runtime_state.is_none() {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh policy-deny recorder"}),
+        ));
+    }
+    let (window, limit) = match parse_mesh_policy_denies_query(query) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
+    };
+    let recorder = crate::modes::mesh::policy_deny_log::global();
+    let window_chrono = match chrono::Duration::from_std(window) {
+        Ok(d) => d,
+        Err(e) => {
+            // Should be unreachable — `parse_mesh_policy_denies_query` clamps
+            // to MESH_POLICY_DENIES_MAX_WINDOW which is well under the
+            // chrono limit — but treat overflow defensively rather than
+            // panic in production.
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": format!("window overflow: {e}")}),
+            ));
+        }
+    };
+    let cutoff = Utc::now() - window_chrono;
+    let aggregate = recorder.aggregate_recent(cutoff, limit);
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "window_seconds": window.as_secs(),
+            "limit": limit,
+            "total_denies": aggregate.total_denies,
+            "grouped": aggregate.grouped,
+        }),
+    ))
+}
+
+/// Parse `?window=<dur>&limit=<n>` from the admin query string.
+///
+/// `window` accepts the compact duration suffixes `s`/`m`/`h` (e.g. `30s`,
+/// `5m`, `1h`) as well as bare integer seconds. `limit` is a base-10
+/// integer. Both fall back to their `MESH_POLICY_DENIES_DEFAULT_*` constants
+/// when absent. Anything else returns `Err(...)` for a 4xx.
+fn parse_mesh_policy_denies_query(query: Option<&str>) -> Result<(Duration, usize), String> {
+    let mut window = MESH_POLICY_DENIES_DEFAULT_WINDOW;
+    let mut limit = MESH_POLICY_DENIES_DEFAULT_LIMIT;
+    let Some(raw) = query else {
+        return Ok((window, limit));
+    };
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        match key {
+            "window" => {
+                window = parse_short_duration(value).map_err(|e| format!("invalid window: {e}"))?;
+                if window > MESH_POLICY_DENIES_MAX_WINDOW {
+                    return Err(format!(
+                        "window exceeds maximum of {} seconds",
+                        MESH_POLICY_DENIES_MAX_WINDOW.as_secs()
+                    ));
+                }
+                if window.is_zero() {
+                    return Err("window must be > 0".to_string());
+                }
+            }
+            "limit" => {
+                let parsed: usize = value
+                    .parse()
+                    .map_err(|_| "limit must be a non-negative integer".to_string())?;
+                if parsed > MESH_POLICY_DENIES_MAX_LIMIT {
+                    return Err(format!(
+                        "limit exceeds maximum of {MESH_POLICY_DENIES_MAX_LIMIT}"
+                    ));
+                }
+                limit = parsed;
+            }
+            // Silently ignore unknown query params so future extensions
+            // (e.g., `?rule=`) don't 4xx older deployments mid-rollout.
+            _ => {}
+        }
+    }
+    Ok((window, limit))
+}
+
+/// Parse a short duration string like `30s`, `5m`, `1h`, or a bare integer
+/// number of seconds. Rejects empty input, mixed units, fractional values,
+/// and overflow.
+fn parse_short_duration(raw: &str) -> Result<Duration, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty value".to_string());
+    }
+    let (number_part, unit_seconds): (&str, u64) = match trimmed.as_bytes().last() {
+        Some(b'h') => (&trimmed[..trimmed.len() - 1], 3600),
+        Some(b'm') => (&trimmed[..trimmed.len() - 1], 60),
+        Some(b's') => (&trimmed[..trimmed.len() - 1], 1),
+        Some(b'0'..=b'9') => (trimmed, 1),
+        _ => return Err(format!("unrecognised suffix in '{trimmed}'")),
+    };
+    if number_part.is_empty() {
+        return Err(format!("missing number in '{trimmed}'"));
+    }
+    let value: u64 = number_part
+        .parse()
+        .map_err(|_| format!("not a non-negative integer: '{number_part}'"))?;
+    let total = value
+        .checked_mul(unit_seconds)
+        .ok_or_else(|| format!("duration overflow for '{trimmed}'"))?;
+    Ok(Duration::from_secs(total))
 }
 
 async fn handle_mesh_egress_scope_test(
@@ -3432,5 +3586,77 @@ mod tests {
         assert_eq!(response["pagination"]["offset"], 10);
         assert_eq!(response["pagination"]["limit"], 25);
         assert_eq!(pagination.query_limit_i64(), 25);
+    }
+
+    #[test]
+    fn parse_short_duration_accepts_suffix_units() {
+        assert_eq!(
+            parse_short_duration("30s").unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_short_duration("5m").unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_short_duration("1h").unwrap(),
+            Duration::from_secs(3600)
+        );
+        // Bare integer is treated as seconds — keeps backwards compatibility
+        // with `?window=300`-style queries.
+        assert_eq!(parse_short_duration("42").unwrap(), Duration::from_secs(42));
+    }
+
+    #[test]
+    fn parse_short_duration_rejects_bad_input() {
+        assert!(parse_short_duration("").is_err());
+        assert!(parse_short_duration("m").is_err());
+        assert!(parse_short_duration("5x").is_err());
+        // Fractional seconds — operator should pick a coarser bucket.
+        assert!(parse_short_duration("1.5s").is_err());
+        assert!(parse_short_duration("abc").is_err());
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_defaults_when_absent() {
+        let (window, limit) = parse_mesh_policy_denies_query(None).unwrap();
+        assert_eq!(window, MESH_POLICY_DENIES_DEFAULT_WINDOW);
+        assert_eq!(limit, MESH_POLICY_DENIES_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_honours_overrides() {
+        let (window, limit) = parse_mesh_policy_denies_query(Some("window=15m&limit=200")).unwrap();
+        assert_eq!(window, Duration::from_secs(15 * 60));
+        assert_eq!(limit, 200);
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_rejects_window_over_cap() {
+        let err =
+            parse_mesh_policy_denies_query(Some("window=2h")).expect_err("2h must exceed cap");
+        assert!(err.contains("window exceeds"));
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_rejects_zero_window() {
+        let err =
+            parse_mesh_policy_denies_query(Some("window=0s")).expect_err("zero window not allowed");
+        assert!(err.contains("window must be > 0"));
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_rejects_limit_over_cap() {
+        let err =
+            parse_mesh_policy_denies_query(Some("limit=99999")).expect_err("99999 must exceed cap");
+        assert!(err.contains("limit exceeds"));
+    }
+
+    #[test]
+    fn parse_mesh_policy_denies_query_ignores_unknown_params() {
+        // Future-proof: a new `rule=` filter must not 4xx older deployments.
+        let (window, limit) = parse_mesh_policy_denies_query(Some("rule=foo&window=10m")).unwrap();
+        assert_eq!(window, Duration::from_secs(600));
+        assert_eq!(limit, MESH_POLICY_DENIES_DEFAULT_LIMIT);
     }
 }

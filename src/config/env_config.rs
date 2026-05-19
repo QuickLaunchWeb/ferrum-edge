@@ -652,6 +652,13 @@ pub struct EnvConfig {
     /// old-generation backend pool entries. 0 leaves existing connections to
     /// expire naturally.
     pub mesh_svid_rotation_drain_seconds: u64,
+    /// Ring capacity of the in-memory `mesh_authz` deny recorder consumed by
+    /// `GET /mesh/policy-denies/recent`. Each entry is ~200–400 bytes. The
+    /// recorder is exception-path only (touched only on a deny) and bounded
+    /// FIFO: oldest evicted first. `0` disables the recorder entirely (the
+    /// admin endpoint still returns an empty grouped array with
+    /// `total_denies: 0`). Default `10000`.
+    pub mesh_policy_deny_log_capacity: usize,
 
     // Node agent
     /// Node-agent capture topology between the per-node capture manager and
@@ -1460,6 +1467,7 @@ impl Default for EnvConfig {
             mesh_federation_fail_open: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_svid_rotation_drain_seconds: 0,
+            mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
@@ -1777,6 +1785,7 @@ impl EnvConfig {
             mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
+            mesh_policy_deny_log_capacity: usize = "FERRUM_MESH_POLICY_DENY_LOG_CAPACITY" => crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
@@ -2164,6 +2173,7 @@ impl EnvConfig {
             mesh_federation_fail_open,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_svid_rotation_drain_seconds,
+            mesh_policy_deny_log_capacity,
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,
