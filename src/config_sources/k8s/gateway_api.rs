@@ -892,8 +892,7 @@ fn ensure_route_parent_refs_allowed(
 
     for parent_ref in parent_refs {
         let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        let parent_group =
-            string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
         if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
             continue;
         }
@@ -909,16 +908,16 @@ fn ensure_route_parent_refs_allowed(
             ));
         }
 
-        if let Some(section_name) = string_field(parent_ref, "sectionName") {
-            if !gateway_has_listener(acc, parent_namespace, section_name) {
-                return Err(invalid_resource(
-                    object,
-                    format!(
-                        "{} parentRef.sectionName '{}' does not match any known Gateway listener in namespace '{}'",
-                        object.kind, section_name, parent_namespace
-                    ),
-                ));
-            }
+        if let Some(section_name) = string_field(parent_ref, "sectionName")
+            && !gateway_has_listener(acc, parent_namespace, section_name)
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{} parentRef.sectionName '{}' does not match any known Gateway listener in namespace '{}'",
+                    object.kind, section_name, parent_namespace
+                ),
+            ));
         }
     }
 
