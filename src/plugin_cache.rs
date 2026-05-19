@@ -239,11 +239,20 @@ fn try_create_plugin(
             }
         }
         Ok(None) => {
-            warn!(
-                "Unknown plugin '{}' (plugin_config_id={}), skipping",
-                pc.plugin_name, pc.id
-            );
-            Ok(None)
+            if crate::plugins::is_removed_security_plugin(&pc.plugin_name) {
+                let msg = format!(
+                    "Removed security plugin '{}' (plugin_config_id={}) is not supported; migrate to a supported auth plugin before startup/reload",
+                    pc.plugin_name, pc.id
+                );
+                error!("FATAL: {}", msg);
+                Err(msg)
+            } else {
+                warn!(
+                    "Unknown plugin '{}' (plugin_config_id={}), skipping",
+                    pc.plugin_name, pc.id
+                );
+                Ok(None)
+            }
         }
         Err(e) => {
             if crate::plugins::is_security_plugin(&pc.plugin_name) {
