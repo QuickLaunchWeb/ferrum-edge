@@ -781,7 +781,18 @@ pub async fn run(
             mut known_plugin_config_ids,
             mut known_upstream_ids,
         ) = db_backend::extract_known_ids(&initial_config);
-        let mut last_poll_at: Option<DateTime<Utc>> = Some(initial_config.loaded_at);
+        // If startup used the on-disk backup fallback, force the first
+        // successful poll path to do a full DB reload instead of seeding
+        // incremental polling from `initial_config.loaded_at`.
+        //
+        // Why: backup JSON may omit `loaded_at` (serde defaults to "now"),
+        // which can be newer than many existing DB rows. Starting incremental
+        // from that timestamp can skip unchanged DB state indefinitely.
+        let mut last_poll_at: Option<DateTime<Utc>> = if bootstrap_from_backup {
+            None
+        } else {
+            Some(initial_config.loaded_at)
+        };
 
         loop {
             tokio::select! {
