@@ -697,9 +697,9 @@ async fn handle_fallback(
 async fn handle_fallback_with<F, Fut>(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
-    mut execute: F,
-    startup_ready: Arc<AtomicBool>,
+    _shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    mut _execute: F,
+    _startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error>
 where
     F: FnMut(Vec<String>, &'static str) -> Fut,
@@ -707,42 +707,18 @@ where
 {
     match config.fallback_mode {
         FallbackMode::Iptables => {
-            warn!(
+            error!(
                 kernel_release = %probe.kernel_release,
                 meets_version = probe.meets_version_requirement,
                 cgroup_v2 = probe.cgroup_v2_available,
                 bpf_fs = probe.bpf_fs_available,
-                "Kernel does not support eBPF capture, falling back to iptables mode"
+                "Refusing unsafe node-agent iptables fallback in host network namespace"
             );
-
-            let plan = IptablesPlan::for_config(&config.capture_config);
-            // Always try IPv6 cleanup: an earlier process/config may have
-            // created ip6tables chains even when the current plan has none.
-            let include_v6_cleanup = true;
-            let setup = setup_commands_for_plan(&plan);
-            if let Err(setup_err) = execute(setup, "setup").await {
-                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
-                if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
-                    warn!(
-                        error = %cleanup_err,
-                        "Failed to clean up iptables fallback rules after setup failure"
-                    );
-                }
-                return Err(setup_err);
-            }
-            startup_ready.store(true, Ordering::Release);
-
-            info!("Iptables fallback rules applied, awaiting shutdown signal");
-
-            wait_for_shutdown(shutdown_tx).await;
-
-            info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
-            if let Err(e) = execute(cleanup, "cleanup").await {
-                warn!(error = %e, "Failed to clean up iptables fallback rules");
-            }
-
-            Ok(())
+            anyhow::bail!(
+                "node-agent fallback_mode=iptables is disabled because it applies sidecar iptables capture \
+                 rules in the host network namespace. Use fallback_mode=fail and upgrade kernel/cgroup/bpffs \
+                 support for eBPF capture."
+            );
         }
         FallbackMode::Fail => {
             error!(
@@ -1110,7 +1086,7 @@ mod tests {
     // for command generation, so nothing of value is lost by mocking the
     // executor here.
     #[tokio::test]
-    async fn handle_fallback_iptables_succeeds() {
+    async fn handle_fallback_iptables_is_rejected() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -1127,9 +1103,6 @@ mod tests {
             bpf_fs_available: false,
         };
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        shutdown_tx
-            .send(true)
-            .expect("watch channel should be open");
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -1161,16 +1134,13 @@ mod tests {
         )
         .await
         .expect("handle_fallback should complete within timeout");
-        assert!(result.is_ok());
-        assert!(startup_ready.load(Ordering::Acquire));
-        assert_eq!(
-            *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
-        );
+        assert!(result.is_err());
+        assert!(!startup_ready.load(Ordering::Acquire));
+        assert!(phases.lock().expect("phases mutex").is_empty());
     }
 
     #[tokio::test]
-    async fn handle_fallback_iptables_setup_failure_is_not_ready() {
+    async fn handle_fallback_iptables_does_not_run_commands() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -1216,16 +1186,12 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!startup_ready.load(Ordering::Acquire));
-        assert_eq!(
-            *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
-        );
-        let command_counts = command_counts.lock().expect("command counts mutex");
+        assert!(phases.lock().expect("phases mutex").is_empty());
         assert!(
             command_counts
-                .iter()
-                .any(|(phase, count)| *phase == "setup" && *count > 1),
-            "fallback setup should execute individual plan commands, got {command_counts:?}"
+                .lock()
+                .expect("command counts mutex")
+                .is_empty()
         );
     }
 
@@ -1275,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_fallback_iptables_setup_failure_is_fatal() {
+    async fn handle_fallback_iptables_is_fatal() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -1323,10 +1289,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!startup_ready.load(Ordering::Acquire));
-        assert_eq!(
-            *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
-        );
+        assert!(phases.lock().expect("phases mutex").is_empty());
     }
 
     #[test]
