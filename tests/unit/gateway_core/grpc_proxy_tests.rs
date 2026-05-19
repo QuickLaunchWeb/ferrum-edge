@@ -283,6 +283,25 @@ fn test_response_header_capacity_hint_with_duplicate_names() {
     assert!(resp_headers.len() <= headers.keys_len());
 }
 
+#[test]
+fn test_grpc_buffered_body_capacity_hint_clamps_large_content_length() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", "999999999".parse().unwrap());
+    assert_eq!(
+        grpc_proxy::grpc_buffered_body_capacity_hint(&headers),
+        1024 * 1024
+    );
+}
+
+#[test]
+fn test_grpc_buffered_body_capacity_hint_defaults_without_content_length() {
+    let headers = hyper::HeaderMap::new();
+    assert_eq!(
+        grpc_proxy::grpc_buffered_body_capacity_hint(&headers),
+        16 * 1024
+    );
+}
+
 // --- Streaming mode returns empty body bytes ---
 
 #[tokio::test]

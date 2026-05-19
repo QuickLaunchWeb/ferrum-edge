@@ -1093,6 +1093,18 @@ pub struct GrpcResponse {
     pub trailers: HashMap<String, String>,
 }
 
+const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
+const MAX_GRPC_BUFFERED_PREALLOC_CAPACITY: usize = 1024 * 1024;
+
+pub(crate) fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|len| len.min(MAX_GRPC_BUFFERED_PREALLOC_CAPACITY))
+        .unwrap_or(DEFAULT_GRPC_BUFFERED_CAPACITY)
+}
+
 /// Streaming gRPC response — headers received, body streams frame-by-frame with trailers.
 ///
 /// The `body` field is an `Incoming` body from hyper. When passed through as
@@ -1619,13 +1631,7 @@ pub(crate) async fn proxy_grpc_request_core(
     // amortised-doubling growth as `BytesMut::put_slice`, so only the
     // starting capacity matters for the allocation count — which is the
     // actual fix.
-    const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
-    let body_capacity = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_GRPC_BUFFERED_CAPACITY);
+    let body_capacity = grpc_buffered_body_capacity_hint(response.headers());
     let mut body_bytes = Vec::with_capacity(body_capacity);
     let mut trailers = HashMap::new();
 
