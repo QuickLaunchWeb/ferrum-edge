@@ -111,6 +111,10 @@ fn test_invalid_field_types_are_error() {
             json!({ "mirror_host": "mirror.local", "mirror_request_body": "true" }),
             "'mirror_request_body' must be a boolean",
         ),
+        (
+            json!({ "mirror_host": "mirror.local", "max_in_flight": "10" }),
+            "'max_in_flight' must be an unsigned integer",
+        ),
     ] {
         let err = RequestMirror::new(&config, PluginHttpClient::default())
             .err()
@@ -181,6 +185,16 @@ fn test_percentage_above_100_is_error() {
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn test_max_in_flight_zero_is_error() {
+    let result = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_in_flight": 0 }),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("max_in_flight"));
 }
 
 // ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
@@ -74,6 +75,7 @@ use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestC
 /// protecting against a misbehaving mirror endpoint streaming an unbounded
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
 
 pub struct RequestMirror {
     http_client: PluginHttpClient,
@@ -93,6 +95,8 @@ pub struct RequestMirror {
     /// Monotonic counter for deterministic percentage sampling without rand.
     /// Every Nth request is mirrored based on the percentage threshold.
     request_counter: AtomicU64,
+    /// Bounds concurrent mirror tasks to prevent unbounded background work.
+    mirror_in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl RequestMirror {
@@ -149,6 +153,19 @@ impl RequestMirror {
 
         let mirror_request_body = optional_bool(config, "mirror_request_body")?.unwrap_or(true);
 
+        let max_in_flight = optional_u64(config, "max_in_flight")?
+            .map(|v| {
+                if v == 0 {
+                    Err("request_mirror: 'max_in_flight' must be >= 1".to_string())
+                } else {
+                    usize::try_from(v).map_err(|_| {
+                        "request_mirror: 'max_in_flight' is too large for this platform".to_string()
+                    })
+                }
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_IN_FLIGHT_MIRRORS);
+
         let max_response_body_bytes = parse_max_response_body_bytes(
             config,
             "request_mirror",
@@ -169,6 +186,7 @@ impl RequestMirror {
             max_response_body_bytes,
             mirror_hostname,
             request_counter: AtomicU64::new(0),
+            mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
         })
     }
 
@@ -316,6 +334,17 @@ impl Plugin for RequestMirror {
         self.http_client
             .strip_egress_baggage_in_vec(&mut mirror_headers);
 
+        let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
+                    method, mirror_url
+                );
+                return PluginResult::Continue;
+            }
+        };
+
         // Capture request body if configured and available.
         // Uses the binary-safe `request_body_bytes` field (preserves non-UTF-8
         // payloads like gRPC protobuf), falling back to the UTF-8 metadata key.
@@ -354,6 +383,7 @@ impl Plugin for RequestMirror {
         // The main request proceeds immediately — mirror latency has zero
         // impact on client response time.
         tokio::spawn(async move {
+            let _permit = permit;
             let start = std::time::Instant::now();
 
             let mut req_builder = match method.as_str() {
