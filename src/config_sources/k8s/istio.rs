@@ -155,6 +155,14 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
 
 fn allow_nothing_rule() -> MeshRule {
     MeshRule {
+        // Backward-compatibility safety for older same-major/minor DPs that
+        // do not understand `never_matches`: keep a non-empty impossible
+        // principal so legacy evaluators cannot treat this as match-all.
+        from: vec![PrincipalMatch {
+            spiffe_id_pattern: Some("spiffe://__ferrum_allow_nothing_sentinel__/ns/*/sa/*".into()),
+            namespace_pattern: None,
+            trust_domain: None,
+        }],
         never_matches: true,
         action: PolicyAction::Allow,
         ..MeshRule::default()
@@ -3120,7 +3128,11 @@ mod tests {
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
         assert!(policy.rules[0].never_matches);
-        assert!(policy.rules[0].from.is_empty());
+        assert_eq!(policy.rules[0].from.len(), 1);
+        assert_eq!(
+            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
+            Some("spiffe://__ferrum_allow_nothing_sentinel__/ns/*/sa/*")
+        );
 
         let decision = evaluate_mesh_authorization(
             &MeshSlice {
