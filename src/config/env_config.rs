@@ -2656,10 +2656,13 @@ impl EnvConfig {
                     .to_ascii_lowercase()
                     .as_str()
                 {
-                    "native" | "xds" => {}
+                    "native" => {}
+                    "xds" => {
+                        return Err("FERRUM_MESH_CONFIG_PROTOCOL=xds is temporarily disabled until xDS policy translation enforces mesh authorization semantics".into());
+                    }
                     other => {
                         return Err(format!(
-                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native"
                         ));
                     }
                 }
