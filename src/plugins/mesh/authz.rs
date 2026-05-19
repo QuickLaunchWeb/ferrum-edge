@@ -331,6 +331,16 @@ impl Plugin for MeshAuthz {
             );
         }
         let (source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
+        // Capture the resolved authz principal up front so the
+        // /mesh/policy-denies/recent drilldown records the identity the rule
+        // actually saw, including the HBONE baggage rewrite for trusted
+        // assertors. `source_principal` is moved into `MeshAuthzRequest`
+        // below, so we own a separate `String` here. For the synthesised
+        // deny paths (untrusted_assertor / trust_domain_mismatch /
+        // unauthenticated_baggage) `resolve_source_principal` already
+        // returns the peer cert identity (or `None`), so logging this value
+        // is consistent across all branches.
+        let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
         if trust_domain_mismatch {
@@ -436,16 +446,13 @@ impl Plugin for MeshAuthz {
                     "untrusted_assertor".to_string(),
                 );
             }
-            // Capture the source SPIFFE id we used for authz so the
-            // /mesh/policy-denies/recent drilldown carries the same identity
-            // the rule was evaluated against. For unauthenticated HBONE
-            // baggage paths there's no peer cert and no trusted baggage, so
-            // `peer_spiffe_id` is `None` — record that as a missing source so
-            // operators can still see "unauthenticated_baggage" volume.
-            let source_for_log = ctx
-                .peer_spiffe_id
-                .as_ref()
-                .map(|id| id.as_str().to_string());
+            // `source_for_log` was captured from the resolved authz
+            // principal above (post-baggage-rewrite), so HBONE flows from
+            // trusted assertors record the workload identity that authz
+            // evaluated, not the ztunnel/waypoint peer cert. The
+            // synthesised-deny branches (untrusted_assertor /
+            // trust_domain_mismatch / unauthenticated_baggage) carry the
+            // peer cert identity or `None`, matching the authz request.
             self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
         }
         result
