@@ -210,8 +210,9 @@ pub struct DnsCache {
 impl DnsCache {
     /// Expose the configured backend IP allowlist policy for non-DNS
     /// backend target validation paths (for example, service discovery).
+    /// Cloned because `BackendAllowIps` is no longer `Copy`.
     pub fn backend_allow_ips(&self) -> crate::config::BackendAllowIps {
-        self.backend_allow_ips
+        self.backend_allow_ips.clone()
     }
 
     pub fn new(config: DnsConfig) -> Self {
