@@ -230,6 +230,7 @@ impl MtlsAuth {
     fn verify_issuer_constraints(
         &self,
         peer_cert: &X509Certificate<'_>,
+        peer_cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
     ) -> Result<(), String> {
         // Check allowed_issuers against the peer cert's issuer DN
@@ -254,12 +255,15 @@ impl MtlsAuth {
             use sha2::{Digest, Sha256};
 
             let chain = chain_der.unwrap_or(&[]);
-            let matched = chain.iter().any(|cert_der| {
-                let digest = Sha256::digest(cert_der);
-                let mut fingerprint = [0u8; 32];
-                fingerprint.copy_from_slice(&digest);
-                self.allowed_ca_fingerprints_sha256.contains(&fingerprint)
-            });
+            let matched = self
+                .validated_issuer_chain(peer_cert_der, chain)
+                .into_iter()
+                .any(|cert_der| {
+                    let digest = Sha256::digest(cert_der);
+                    let mut fingerprint = [0u8; 32];
+                    fingerprint.copy_from_slice(&digest);
+                    self.allowed_ca_fingerprints_sha256.contains(&fingerprint)
+                });
             if !matched {
                 return Err(
                     "No certificate in the chain matches any allowed CA fingerprint".to_string(),
@@ -268,6 +272,53 @@ impl MtlsAuth {
         }
 
         Ok(())
+    }
+
+    fn validated_issuer_chain<'a>(
+        &self,
+        leaf_der: &'a [u8],
+        chain: &'a [Vec<u8>],
+    ) -> Vec<&'a [u8]> {
+        let mut verified_chain = Vec::new();
+        let Ok((_, mut current)) = X509Certificate::from_der(leaf_der) else {
+            return verified_chain;
+        };
+
+        let mut used = vec![false; chain.len()];
+        loop {
+            let mut next_idx = None;
+            for (idx, cert_der) in chain.iter().enumerate() {
+                if used[idx] {
+                    continue;
+                }
+                let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
+                    continue;
+                };
+                if candidate.subject() != current.issuer() {
+                    continue;
+                }
+                if current
+                    .verify_signature(Some(&candidate.public_key()))
+                    .is_ok()
+                {
+                    next_idx = Some(idx);
+                    break;
+                }
+            }
+
+            let Some(idx) = next_idx else {
+                break;
+            };
+            used[idx] = true;
+            verified_chain.push(chain[idx].as_slice());
+            if let Ok((_, parsed)) = X509Certificate::from_der(&chain[idx]) {
+                current = parsed;
+            } else {
+                break;
+            }
+        }
+
+        verified_chain
     }
 
     /// Extract the configured field value from a parsed X.509 certificate.
@@ -371,7 +422,7 @@ impl MtlsAuth {
         };
 
         if self.has_issuer_constraints()
-            && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, chain_der)
+            && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, cert_der, chain_der)
         {
             debug!("mtls_auth: issuer constraint failed: {}", reason);
             return VerifyOutcome::Forbidden(serde_json::json!({ "error": reason }).to_string());
