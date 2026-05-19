@@ -2194,7 +2194,12 @@ fn match_paths(http: &Value) -> Vec<Option<String>> {
         // unsupported predicates such as headers/method/queryParams, so do not
         // broaden them into Ferrum catch-all routes.
         .filter(|m| !mesh_route_dispatch_has_unsupported_predicate(m))
-        .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
+        // `entry_listen_path` widens to a case-insensitive regex listen_path
+        // when `ignoreUriCase: true` is set on the entry; for the default
+        // case-sensitive shape it returns the same value as `path_match`.
+        // Going through this shared helper keeps proxy materialization and
+        // dispatch-rule scoping in lock-step (T1-B.5).
+        .filter_map(|m| entry_listen_path(m).map(Some))
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
         .collect();
 
@@ -2237,18 +2242,19 @@ fn unsupported_match_paths(http: &Value) -> Vec<Option<String>> {
         .iter()
         .filter(|entry| mesh_route_dispatch_has_unsupported_predicate(entry))
     {
-        let ignore_uri_case_is_unsupported = entry
-            .get("ignoreUriCase")
-            .is_some_and(|value| value.as_bool() != Some(false));
-        let listen_path = if ignore_uri_case_is_unsupported {
-            Some(URI_LESS_MATCH_LISTEN_PATH.to_string())
-        } else {
-            entry
-                .get("uri")
-                .and_then(path_match)
-                .map(Some)
-                .unwrap_or_else(|| Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
-        };
+        // T1-B.5: `ignoreUriCase: true` is no longer classified as
+        // unsupported, so the dedicated broadening branch is gone. Any
+        // remaining unsupported entry stays scoped to its URI when one
+        // is present; URI-less unsupported entries fail closed on the
+        // synthetic catch-all proxy. A non-bool `ignoreUriCase` value
+        // (operator misconfiguration that escapes CRD validation) keeps
+        // failing closed via `mesh_route_dispatch_has_unsupported_predicate`,
+        // and `entry_listen_path` will simply ignore the malformed flag
+        // and produce the case-sensitive listen_path — the request
+        // termination plugin still applies on that scoped proxy.
+        let listen_path = entry_listen_path(entry)
+            .map(Some)
+            .unwrap_or_else(|| Some(URI_LESS_MATCH_LISTEN_PATH.to_string()));
         if seen_paths.insert(listen_path.clone()) {
             paths.push(listen_path);
         }
@@ -2525,6 +2531,89 @@ pub(super) fn path_match(uri: &Value) -> Option<String> {
         return Some(exact_path_listen_path(exact));
     }
     string_field(uri, "regex").map(|pattern| format!("~{pattern}"))
+}
+
+/// Compute the listen_path that an Istio match entry contributes to.
+///
+/// For `ignoreUriCase: false` (the default), this returns the same value as
+/// [`path_match`] — the existing prefix / exact / regex listen_path
+/// representations are case-sensitive by construction.
+///
+/// For `ignoreUriCase: true` (T1-B.5), widens the path to a case-insensitive
+/// regex listen_path so the proxy router admits both casings:
+///
+/// - `prefix: "/Api"`  →  `~(?i)/Api.*`
+/// - `exact: "/Api"`   →  `~(?i)/Api` (auto-anchored to `^(?i)/Api$`)
+/// - `regex: "<pat>"`  →  `~(?i)<pat>` (only when `<pat>` doesn't already
+///   start with `(?i)` — `regex` tolerates duplicates but the key would
+///   otherwise be a different string and create a spurious extra proxy)
+///
+/// Both [`match_paths`] and [`mesh_route_dispatch_rules_for_proxy`] route
+/// through this helper so the listen_path used at proxy materialization and
+/// the listen_path used at dispatch-rule scoping stay in lock-step — without
+/// the shared helper, a widened proxy would never get its dispatch rule
+/// emitted because the bare `path_match` value (`/Api`) would never equal
+/// the widened key (`~(?i)/Api.*`).
+pub(super) fn entry_listen_path(entry: &Value) -> Option<String> {
+    let uri = entry.get("uri")?;
+    let ignore_uri_case = entry
+        .get("ignoreUriCase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !ignore_uri_case {
+        return path_match(uri);
+    }
+    if let Some(prefix) = string_field(uri, "prefix") {
+        // `prefix` semantics in Istio = "string prefix" (matches `/api`,
+        // `/api/foo`, AND `/apixyz`). Ferrum's prefix listen_path has the
+        // same semantics, so the case-insensitive regex must end with `.*`
+        // to NOT be auto-anchored to `$` (which would degrade prefix to
+        // exact). `anchor_regex_pattern` won't re-add a trailing `$` when
+        // the pattern already ends with one — `.*` covers both anchoring
+        // and the optional path-tail.
+        return Some(format!("~(?i){prefix}.*"));
+    }
+    if let Some(exact) = string_field(uri, "exact") {
+        // No trailing `.*` here — the auto-anchoring (`^...$`) gives us
+        // exact-equality semantics case-insensitively.
+        return Some(format!("~(?i){exact}"));
+    }
+    if let Some(pattern) = string_field(uri, "regex") {
+        // Avoid emitting `~(?i)(?i)...`. `regex` accepts the duplicate but
+        // the listen_path string would differ from the operator-equivalent
+        // case where they wrote `(?i)` themselves, and that string is the
+        // de-duplication key for proxy materialization. Re-using the same
+        // canonical form keeps proxy counts stable across equivalent
+        // operator inputs.
+        let already_case_insensitive = pattern_already_case_insensitive(pattern);
+        return Some(if already_case_insensitive {
+            format!("~{pattern}")
+        } else {
+            format!("~(?i){pattern}")
+        });
+    }
+    None
+}
+
+/// Return `true` when the regex pattern's leading flag group sets the `i`
+/// flag (e.g., `(?i)foo`, `(?si)foo`, `(?im:foo)`). Conservative: patterns
+/// that don't start with `(?` return `false` and the caller wraps them.
+/// False negatives are harmless because `regex` tolerates duplicate flags
+/// (the wrapped form is still semantically equivalent), only the listen_path
+/// string would differ — and listen_path strings are operator-visible so
+/// preferring the operator's canonical form keeps logs stable.
+fn pattern_already_case_insensitive(pattern: &str) -> bool {
+    let Some(after_open) = pattern.strip_prefix("(?") else {
+        return false;
+    };
+    for ch in after_open.chars() {
+        match ch {
+            'i' => return true,
+            ')' | ':' => return false,
+            _ => continue,
+        }
+    }
+    false
 }
 
 fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateError> {
@@ -8500,11 +8589,15 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_ignore_uri_case_match_fails_closed() {
-        // `ignoreUriCase` changes path matching itself, which Ferrum's
-        // router cannot emulate with a normal prefix route. Treat it as an
-        // unsupported predicate and fail closed rather than accidentally
-        // making only one casing reachable.
+    fn virtual_service_ignore_uri_case_match_emits_case_insensitive_proxy_and_dispatch_rule() {
+        // T1-B.5: `ignoreUriCase: true` is now first-class. The translator
+        // widens the URI's listen_path to a case-insensitive regex so the
+        // proxy router admits both casings, and emits a `mesh_route_dispatch`
+        // rule carrying the original URI predicate + `ignore_uri_case: true`
+        // so the plugin re-evaluates with ASCII case folding. The sibling
+        // case-sensitive `/api` proxy is unaffected and gets NO terminating
+        // plugin (the case-insensitive branch is no longer a fail-closed
+        // path).
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8529,6 +8622,35 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
+        // The case-insensitive proxy uses a widened regex listen_path that
+        // matches both `/Api*` and `/api*` (and any other casing).
+        let widened_listen_path = "~(?i)/Api.*";
+        let canary_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some(widened_listen_path)
+                    && p.backend_host == "canary.default.svc.cluster.local"
+            })
+            .expect("ignoreUriCase emits a case-insensitive regex listen_path");
+
+        // The dispatch rule carries the URI predicate + `ignore_uri_case`
+        // so the plugin can re-evaluate at request time.
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(canary_proxy.id.as_str())
+            })
+            .expect("mesh_route_dispatch rule emitted for ignoreUriCase branch");
+        let match_obj = &plugin.config["rules"][0]["match"];
+        assert_eq!(match_obj["uri"]["prefix"].as_str(), Some("/Api"));
+        assert_eq!(match_obj["ignore_uri_case"].as_bool(), Some(true));
+
+        // No fail-closed termination on the sibling case-sensitive proxy.
         let stable_proxy = result
             .config
             .proxies
@@ -8537,17 +8659,162 @@ extensionProviders:
                 p.listen_path.as_deref() == Some("/api")
                     && p.backend_host == "stable.default.svc.cluster.local"
             })
-            .expect("later case-sensitive URI proxy");
+            .expect("later case-sensitive URI proxy still emitted");
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())),
+            "case-insensitive sibling is no longer treated as unsupported, so the \
+             stable proxy gets no terminating plugin"
+        );
+
+        // The plugin must construct from the translator's JSON shape — bad
+        // schema or missing field would error here at load time.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_exact_emits_anchored_case_insensitive_regex() {
+        // `uri.exact: "/Api"` + `ignoreUriCase: true` widens to
+        // `~(?i)/Api`, which auto-anchors to `^(?i)/Api$` — full-equality
+        // matching, case-insensitive. Different from prefix (which ends
+        // with `.*`).
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"exact": "/Api"},
+                            "ignoreUriCase": true
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("~(?i)/Api"))
+            .expect("ignoreUriCase exact emits a regex listen_path without `.*`");
+        assert_eq!(proxy.backend_host, "canary.default.svc.cluster.local");
+
         let plugin = result
             .config
             .plugin_configs
             .iter()
             .find(|p| {
-                p.plugin_name == "request_termination"
-                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
             })
-            .expect("ignoreUriCase branch attaches termination to later proxy");
-        assert!(proxy_has_plugin(stable_proxy, plugin));
+            .expect("dispatch rule emitted for exact ignoreUriCase");
+        let match_obj = &plugin.config["rules"][0]["match"];
+        assert_eq!(match_obj["uri"]["exact"].as_str(), Some("/Api"));
+        assert_eq!(match_obj["ignore_uri_case"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_without_uri_predicate_is_gracefully_ignored() {
+        // `ignoreUriCase: true` has no semantic meaning without a `uri`
+        // predicate — the flag changes URI case folding, and there's no URI
+        // to fold. The translator silently drops the flag and emits a normal
+        // dispatch rule for the supported sibling predicates (here a header
+        // exact match) so the rest of the match remains routable. We do
+        // NOT emit `ignore_uri_case: true` on the dispatch rule — the
+        // plugin would reject `ignore_uri_case: true` without `uri` at
+        // load time, which would break the gateway.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "ignoreUriCase": true,
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // URI-less entry lands on the synthetic catch-all proxy.
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .expect("URI-less header-only entry creates the synthetic catch-all proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("dispatch rule emitted for header-only entry");
+        let match_obj = &plugin.config["rules"][0]["match"];
+        assert_eq!(match_obj["headers"]["x-canary"].as_str(), Some("v2"));
+        assert!(
+            match_obj.get("uri").is_none(),
+            "no URI predicate to fold — `uri` must be omitted from the dispatch rule"
+        );
+        assert!(
+            match_obj.get("ignore_uri_case").is_none(),
+            "the flag is meaningless without a URI predicate and must NOT be emitted \
+             (the plugin would reject `ignore_uri_case: true` without `uri`)"
+        );
+
+        // The plugin must construct from the translator's JSON shape.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_regex_wraps_with_inline_case_flag() {
+        // `uri.regex: "^/api/v[0-9]+"` + `ignoreUriCase: true` widens to
+        // `~(?i)^/api/v[0-9]+` so the regex itself carries case-insensitivity.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"regex": "^/api/v[0-9]+"},
+                            "ignoreUriCase": true
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("~(?i)^/api/v[0-9]+"))
+            .expect("ignoreUriCase regex emits a (?i)-wrapped regex listen_path");
+        assert_eq!(proxy.backend_host, "canary.default.svc.cluster.local");
     }
 
     #[test]
