@@ -427,7 +427,24 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
 }
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
-    ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+    ctx.peer_spiffe_id
+        .as_ref()
+        .is_some_and(is_trusted_hbone_baggage_peer)
+        && is_hbone_request(ctx)
+}
+
+fn is_trusted_hbone_baggage_peer(peer: &SpiffeId) -> bool {
+    let mut segments = peer.path_segments();
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some("ns"), Some(_), Some("sa"), Some(sa))
+            if sa == "ztunnel" || sa.starts_with("waypoint")
+    )
 }
 
 fn is_hbone_request(ctx: &RequestContext) -> bool {
