@@ -1620,6 +1620,32 @@ pub(crate) fn coalescing_h3_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
+pub(crate) fn size_limited_streaming_h3_body(
+    recv_stream: crate::http3::client::H3RequestStream,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    coalesce_min_bytes: usize,
+    coalesce_max_bytes: usize,
+    flush_interval: Duration,
+) -> ProxyBody {
+    let source = H3FrameSource::new(recv_stream);
+    let limited = SizeLimitedFrameSource::new(source, max_bytes);
+    let buffer_capacity = coalesce_max_bytes.clamp(
+        crate::http3::config::H3_COALESCE_MIN_FLOOR,
+        crate::http3::config::H3_COALESCE_MAX_CAP,
+    );
+    let target_bytes =
+        coalesce_min_bytes.clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, buffer_capacity);
+    let body = Coalescing::with_flush_after_and_capacity(
+        limited,
+        target_bytes,
+        buffer_capacity,
+        content_length,
+        Some(flush_interval),
+    );
+    ProxyBody::streaming(Box::pin(body))
+}
+
 pub(crate) fn direct_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
