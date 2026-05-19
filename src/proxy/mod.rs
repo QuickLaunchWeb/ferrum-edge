@@ -8535,6 +8535,7 @@ async fn handle_proxy_request_inner(
                 &state.dns_cache,
                 proxy_headers,
                 grpc_should_stream,
+                state.max_grpc_recv_size_bytes,
             )
             .await;
             (result, grpc_req_body)
@@ -8710,6 +8711,7 @@ async fn handle_proxy_request_inner(
                     &state.dns_cache,
                     proxy_headers,
                     grpc_should_stream,
+                    state.max_grpc_recv_size_bytes,
                 )
                 .await;
             }
