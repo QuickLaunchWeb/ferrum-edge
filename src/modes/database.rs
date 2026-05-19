@@ -874,7 +874,6 @@ pub async fn run(
                                     next_known_plugin_config_ids,
                                     next_known_upstream_ids,
                                 ) = db_backend::extract_known_ids(&new_config);
-                                proxy_state_poll.store_config(Arc::new(new_config.clone())).await;
                                 known_proxy_ids = next_known_proxy_ids;
                                 known_consumer_ids = next_known_consumer_ids;
                                 known_plugin_config_ids = next_known_plugin_config_ids;
@@ -882,7 +881,9 @@ pub async fn run(
                                 last_poll_at = Some(new_config.loaded_at);
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
-                                debug!("Full config reload complete after DB DNS reconnect");
+                                if proxy_state_poll.update_config(new_config) {
+                                    debug!("Full config reload complete after DB DNS reconnect");
+                                }
                             }
                             Err(e) => {
                                 error!(

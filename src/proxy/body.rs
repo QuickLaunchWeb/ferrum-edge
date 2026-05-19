@@ -538,7 +538,7 @@ where
     type Error = B::Error;
 
     fn poll_frame(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // Security hardening: never forward inbound request trailer frames to
@@ -550,7 +550,7 @@ where
         // Loop until we see a data frame, error, end-of-stream, or Pending.
         // Trailer frames are simply consumed and dropped.
         loop {
-            match self.project().inner.poll_frame(cx) {
+            match self.as_mut().project().inner.poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
                 other => return other,
             }

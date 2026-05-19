@@ -298,7 +298,7 @@ impl MtlsAuth {
                     continue;
                 }
                 if current
-                    .verify_signature(Some(&candidate.public_key()))
+                    .verify_signature(Some(candidate.public_key()))
                     .is_ok()
                 {
                     next_idx = Some(idx);

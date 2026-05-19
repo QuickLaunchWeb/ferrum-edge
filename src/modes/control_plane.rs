@@ -19,7 +19,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
@@ -702,7 +702,8 @@ pub async fn run(
                                 ) = db_backend::extract_known_ids(&new_config);
                                 last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                 last_poll_at = Some(new_config.loaded_at);
-                                config_poll.store(Arc::new(new_config.clone()));
+                                let new_config_arc = Arc::new(new_config.clone());
+                                config_poll.store(new_config_arc.clone());
                                 known_proxy_ids = next_known_proxy_ids;
                                 known_consumer_ids = next_known_consumer_ids;
                                 known_plugin_config_ids = next_known_plugin_config_ids;
@@ -710,15 +711,16 @@ pub async fn run(
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
 
-                                let version = new_config.loaded_at.to_rfc3339();
                                 CpGrpcServer::broadcast_update_with_registry(
                                     &update_tx,
                                     &new_config,
-                                    &version,
                                     &dp_registry_poll,
-                                    new_config.trust_bundles.as_deref(),
                                 );
-                                mesh_registry_poll.refresh_from_config(&new_config).await;
+                                MeshGrpcServer::broadcast_full_with_registry(
+                                    &mesh_update_tx,
+                                    new_config_arc,
+                                    &mesh_registry_poll,
+                                );
                                 debug!("Full config reload complete after DB DNS reconnect");
                             }
                             Err(e) => {

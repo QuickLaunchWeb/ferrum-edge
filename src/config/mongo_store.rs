@@ -438,7 +438,7 @@ mod inner {
             let (_file, combined_path) = temp_file.keep().map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to persist combined MongoDB client PEM '{}': {}",
-                    e.path.display(),
+                    e.file.path().display(),
                     e.error
                 )
             })?;

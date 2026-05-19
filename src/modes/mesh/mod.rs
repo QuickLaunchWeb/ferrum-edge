@@ -1223,8 +1223,9 @@ fn apply_destination_rules(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                (upstream.namespace == dr.namespace && destination_rule_matches_upstream(dr, upstream))
-                    .then_some(idx)
+                (upstream.namespace == dr.namespace
+                    && destination_rule_matches_upstream(dr, upstream))
+                .then_some(idx)
             })
             .collect();
 

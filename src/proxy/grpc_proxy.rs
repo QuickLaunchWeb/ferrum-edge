@@ -1106,7 +1106,7 @@ pub struct GrpcResponse {
 const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
 const MAX_GRPC_BUFFERED_PREALLOC_CAPACITY: usize = 1024 * 1024;
 
-pub(crate) fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
+pub fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
     headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -1689,6 +1689,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 }
             }
         }
+        Ok(())
     };
 
     if let Some(timeout_ms) = effective_timeout_ms {
@@ -1703,9 +1704,9 @@ pub(crate) async fn proxy_grpc_request_core(
                     kind: GrpcTimeoutKind::Read,
                     message: format!("Body read timeout after {}ms", timeout_ms),
                 }
-            })?;
+            })??;
     } else {
-        body_collection.await;
+        body_collection.await?;
     }
 
     Ok(GrpcResponseKind::Buffered(GrpcResponse {

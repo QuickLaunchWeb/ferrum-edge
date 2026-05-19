@@ -36,14 +36,15 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::identity::{SpiffeId, TrustDomain};
-use crate::modes::mesh::config::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
+use crate::modes::mesh::config::{
+    MeshPolicy, PolicyScope, normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
     normalize_mesh_policy_header_names,
 };
-use crate::modes::mesh::config::normalize_request_match_host_pattern;
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,

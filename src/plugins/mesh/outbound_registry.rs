@@ -815,10 +815,7 @@ mod tests {
                 "GET".to_string(),
                 "/api".to_string(),
             );
-            admitted.headers = HashMap::from([(
-                "host".to_string(),
-                format!("a{i}.example.com"),
-            )]);
+            admitted.headers = HashMap::from([("host".to_string(), format!("a{i}.example.com"))]);
             assert!(matches!(
                 plugin.on_request_received(&mut admitted).await,
                 PluginResult::Continue

@@ -14,12 +14,12 @@ use crate::config::types::{
     GatewayConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::dns::DnsCache;
-use std::net::IpAddr;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::PluginHttpClient;
 use crate::request_epoch::RequestEpochStore;
 use dashmap::DashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};

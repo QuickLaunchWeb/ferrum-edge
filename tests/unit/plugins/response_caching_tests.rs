@@ -208,7 +208,9 @@ async fn test_query_cache_key_avoids_decoded_delimiter_collision() {
     // Decoded map for `?a=1&b=2`
     let mut victim_ctx = make_ctx_with_query("GET", "/api/data", &[("a", "1"), ("b", "2")]);
     let mut victim_headers = HashMap::new();
-    let victim_result = plugin.before_proxy(&mut victim_ctx, &mut victim_headers).await;
+    let victim_result = plugin
+        .before_proxy(&mut victim_ctx, &mut victim_headers)
+        .await;
     assert!(matches!(victim_result, PluginResult::Continue));
     let victim_key = victim_ctx
         .metadata
@@ -794,7 +796,9 @@ async fn test_identity_without_authorization_header_not_cached_in_shared_cache()
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut response_headers = HashMap::new();
-    plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
     plugin
         .on_final_response_body(&mut ctx, 200, &response_headers, b"alice-private")
         .await;
@@ -803,7 +807,9 @@ async fn test_identity_without_authorization_header_not_cached_in_shared_cache()
     second_ctx.identified_consumer = Some(Arc::new(make_consumer("b", "bob")));
     let mut second_headers = HashMap::new();
     second_headers.insert("x-api-key".to_string(), "bob-key".to_string());
-    let result = plugin.before_proxy(&mut second_ctx, &mut second_headers).await;
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
     assert!(matches!(result, PluginResult::Continue));
 }
 

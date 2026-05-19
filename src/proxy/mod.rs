@@ -4955,7 +4955,7 @@ async fn handle_websocket_request_authenticated(
                             ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                         let ws_gateway_overhead_ms =
                             (ws_total_ms - ws_plugin_execution_ms).max(0.0);
-                        let mut metadata = clone_log_metadata(ctx);
+                        let mut metadata = clone_log_metadata(&ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "websocket_backend_error".to_string(),
@@ -5055,7 +5055,7 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: clone_log_metadata(ctx),
+        metadata: clone_log_metadata(&ctx),
         ..TransactionSummary::default()
     };
 
@@ -5200,7 +5200,7 @@ async fn handle_websocket_request_authenticated(
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
-        metadata: clone_log_metadata(ctx),
+        metadata: clone_log_metadata(&ctx),
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
@@ -5553,7 +5553,7 @@ fn build_websocket_tls_connector(
                         proxy.resolved_tls.san_allow_list.clone(),
                     )?)
                 };
-            b.with_webpki_verifier(verifier)
+            b.dangerous().with_custom_certificate_verifier(verifier)
         }
         Err(e) => {
             warn!(
@@ -5572,7 +5572,9 @@ fn build_websocket_tls_connector(
                         proxy.resolved_tls.san_allow_list.clone(),
                     )?)
                 };
-            rustls::ClientConfig::builder().with_webpki_verifier(verifier)
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
         }
     };
 
@@ -7868,10 +7870,10 @@ async fn handle_proxy_request_inner(
                         ctx.raw_header_get(real_ip_header.as_str())
                     });
             let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for").peekable();
-                values.peek().map(|first| {
-                    let mut combined = String::from(*first);
-                    for value in values.skip(1) {
+                let mut values = ctx.raw_header_values("x-forwarded-for");
+                values.next().map(|first| {
+                    let mut combined = String::from(first);
+                    for value in values {
                         combined.push(',');
                         combined.push_str(value);
                     }
@@ -9080,7 +9082,7 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let mut metadata = clone_log_metadata(ctx);
+                    let mut metadata = clone_log_metadata(&ctx);
                     metadata
                         .entry("request_protocol".to_string())
                         .or_insert_with(|| "grpc".to_string());
@@ -9428,7 +9430,7 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         bytes_sent,
                         bytes_received,
-                        metadata: clone_log_metadata(ctx),
+                        metadata: clone_log_metadata(&ctx),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -9539,7 +9541,7 @@ async fn handle_proxy_request_inner(
                 if !plugins.is_empty() {
                     {
                         let proxy_ref = ctx.matched_proxy.as_ref();
-                        let mut metadata = clone_log_metadata(ctx);
+                        let mut metadata = clone_log_metadata(&ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "grpc_backend_error".to_string(),
@@ -10110,7 +10112,7 @@ async fn handle_proxy_request_inner(
                 error_class: backend_error_class,
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
-                metadata: clone_log_metadata(ctx),
+                metadata: clone_log_metadata(&ctx),
                 ..TransactionSummary::default()
             };
 
@@ -14189,6 +14191,16 @@ async fn proxy_to_backend_http3_retry(
     }
 }
 
+fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17314,14 +17326,5 @@ mod tests {
                 .dispatch_port_overrides
                 .is_none()
         );
-    }
-}
-fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(v6)),
-        other => other,
     }
 }

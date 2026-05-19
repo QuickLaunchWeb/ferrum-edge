@@ -1352,10 +1352,8 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
         claims.get("iss").and_then(|v| v.as_str()),
         claims.get("sub").and_then(|v| v.as_str()),
     ) {
-        ctx.metadata.insert(
-            "mesh.request_principal".to_string(),
-            format!("{iss}/{sub}"),
-        );
+        ctx.metadata
+            .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
     }
 }
 
