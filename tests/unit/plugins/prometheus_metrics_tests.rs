@@ -241,6 +241,17 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     metrics.pods_enrolled.fetch_add(3, Ordering::Relaxed);
     metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
     metrics.attach_errors.fetch_add(2, Ordering::Relaxed);
+    // T4-B mid-life annotation update counters: distinct values so a
+    // regression that swaps applied/failed would be visible in test
+    // output. Render needs to include both irrespective of node-agent
+    // mode being active in this unit test (the registry treats them as
+    // ordinary node-agent counters).
+    metrics
+        .pod_annotation_updates_applied
+        .fetch_add(7, Ordering::Relaxed);
+    metrics
+        .pod_annotation_updates_failed
+        .fetch_add(4, Ordering::Relaxed);
 
     registry.set_node_agent_metrics(metrics);
     let output = registry.render_uncached();
@@ -249,6 +260,14 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("ferrum_node_agent_pods_enrolled_total 3"));
     assert!(output.contains("ferrum_node_agent_pods_unenrolled_total 1"));
     assert!(output.contains("ferrum_node_agent_attach_errors_total 2"));
+    assert!(
+        output.contains("# TYPE ferrum_node_agent_pod_annotation_updates_applied_total counter")
+    );
+    assert!(output.contains("ferrum_node_agent_pod_annotation_updates_applied_total 7"));
+    assert!(
+        output.contains("# TYPE ferrum_node_agent_pod_annotation_updates_failed_total counter")
+    );
+    assert!(output.contains("ferrum_node_agent_pod_annotation_updates_failed_total 4"));
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
