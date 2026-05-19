@@ -5223,8 +5223,9 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
-            || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
+        if crate::plugins::is_comma_folded_list_header(name.as_str())
+            && (sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+                || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values))
         {
             preserved_raw_names.insert(lower_name);
             for value in raw_values {
@@ -14184,7 +14185,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_forwardable_headers_preserve_repeated_non_list_raw_values_when_unmodified() {
+    fn websocket_forwardable_headers_do_not_preserve_repeated_non_list_raw_values() {
         let mut raw = hyper::HeaderMap::new();
         raw.append(
             "x-forwarded-for",
@@ -14212,7 +14213,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(xff_values, vec!["203.0.113.1", "198.51.100.2"]);
+        assert_eq!(xff_values, vec!["198.51.100.2"]);
     }
 
     #[test]
