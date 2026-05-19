@@ -25,6 +25,33 @@ impl KernelProbeResult {
     pub fn supports_ebpf(&self) -> bool {
         self.meets_version_requirement && self.cgroup_v2_available && self.bpf_fs_available
     }
+
+    /// Return the first-failing kernel prerequisite as a stable
+    /// snake_case label, or `None` when all eBPF prerequisites are met.
+    ///
+    /// Used as the Prometheus `reason` label on the
+    /// `ferrum_mesh_node_topology_degraded` gauge so dashboards can
+    /// distinguish operator remediations (kernel upgrade vs cgroup-v2
+    /// remount vs bpffs mount). The label set is closed — one of
+    /// `kernel_too_old`, `cgroup_v1`, `bpffs_missing` — so cardinality is
+    /// bounded regardless of fleet size.
+    ///
+    /// Precedence is most-fundamental first: a kernel below 5.7 cannot
+    /// host the BPF programs even if cgroup v2 and bpffs are present, so
+    /// the kernel-version reason wins. Likewise, without cgroup v2 the
+    /// cgroup_sockaddr programs have no attachment point, so cgroup_v1
+    /// is reported before bpffs_missing.
+    pub fn degradation_reason(&self) -> Option<&'static str> {
+        if !self.meets_version_requirement {
+            Some("kernel_too_old")
+        } else if !self.cgroup_v2_available {
+            Some("cgroup_v1")
+        } else if !self.bpf_fs_available {
+            Some("bpffs_missing")
+        } else {
+            None
+        }
+    }
 }
 
 /// Probe the running kernel for eBPF capture prerequisites.
@@ -144,5 +171,53 @@ mod tests {
     #[test]
     fn check_bpf_fs_nonexistent_path() {
         assert!(!check_bpf_fs("/nonexistent/bpf/path"));
+    }
+
+    #[test]
+    fn degradation_reason_returns_none_when_supported() {
+        let result = KernelProbeResult {
+            kernel_release: "6.1.0".to_string(),
+            meets_version_requirement: true,
+            cgroup_v2_available: true,
+            bpf_fs_available: true,
+        };
+        assert!(result.supports_ebpf());
+        assert_eq!(result.degradation_reason(), None);
+    }
+
+    #[test]
+    fn degradation_reason_reports_kernel_first() {
+        // Kernel-too-old wins even when cgroup v2 or bpffs are also missing —
+        // operators need to know to upgrade the kernel before troubleshooting
+        // downstream mounts.
+        let result = KernelProbeResult {
+            kernel_release: "5.4.0".to_string(),
+            meets_version_requirement: false,
+            cgroup_v2_available: false,
+            bpf_fs_available: false,
+        };
+        assert_eq!(result.degradation_reason(), Some("kernel_too_old"));
+    }
+
+    #[test]
+    fn degradation_reason_reports_cgroup_v1_when_kernel_ok() {
+        let result = KernelProbeResult {
+            kernel_release: "6.1.0".to_string(),
+            meets_version_requirement: true,
+            cgroup_v2_available: false,
+            bpf_fs_available: true,
+        };
+        assert_eq!(result.degradation_reason(), Some("cgroup_v1"));
+    }
+
+    #[test]
+    fn degradation_reason_reports_bpffs_missing_when_kernel_and_cgroup_ok() {
+        let result = KernelProbeResult {
+            kernel_release: "6.1.0".to_string(),
+            meets_version_requirement: true,
+            cgroup_v2_available: true,
+            bpf_fs_available: false,
+        };
+        assert_eq!(result.degradation_reason(), Some("bpffs_missing"));
     }
 }

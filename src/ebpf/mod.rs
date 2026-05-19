@@ -22,8 +22,10 @@ pub use loader::AyaEbpfBackend;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
 pub use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy};
 
@@ -188,6 +190,13 @@ pub struct NodeAgentMetrics {
     pub pods_enrolled: AtomicU64,
     pub pods_unenrolled: AtomicU64,
     pub attach_errors: AtomicU64,
+    /// Reason this node fell back from eBPF capture to iptables, or `None`
+    /// when running the nominal eBPF capture path. Stored via `ArcSwap` so
+    /// the Prometheus render path is lock-free. The value is set exactly
+    /// once at startup (after the kernel probe runs) — operators must
+    /// restart the node agent after a kernel/cgroup/bpffs change, which
+    /// matches the rest of the node-agent contract.
+    pub topology_degraded_reason: ArcSwap<Option<&'static str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +204,7 @@ pub struct NodeAgentMetricsSnapshot {
     pub pods_enrolled: u64,
     pub pods_unenrolled: u64,
     pub attach_errors: u64,
+    pub topology_degraded_reason: Option<&'static str>,
 }
 
 impl NodeAgentMetrics {
@@ -203,7 +213,23 @@ impl NodeAgentMetrics {
             pods_enrolled: self.pods_enrolled.load(Ordering::Relaxed),
             pods_unenrolled: self.pods_unenrolled.load(Ordering::Relaxed),
             attach_errors: self.attach_errors.load(Ordering::Relaxed),
+            topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
         }
+    }
+
+    /// Record that this node agent has fallen back to iptables capture
+    /// because the kernel did not meet eBPF prerequisites. `reason` is a
+    /// closed-set snake_case label from
+    /// [`crate::ebpf::kernel_probe::KernelProbeResult::degradation_reason`].
+    /// Idempotent — repeat calls with the same reason are no-ops.
+    pub fn set_topology_degraded(&self, reason: &'static str) {
+        self.topology_degraded_reason.store(Arc::new(Some(reason)));
+    }
+
+    /// Clear any prior degraded state. Intended for tests; the production
+    /// path sets the reason once at startup and never clears it.
+    pub fn clear_topology_degraded(&self) {
+        self.topology_degraded_reason.store(Arc::new(None));
     }
 }
 
@@ -213,6 +239,7 @@ impl Default for NodeAgentMetrics {
             pods_enrolled: AtomicU64::new(0),
             pods_unenrolled: AtomicU64::new(0),
             attach_errors: AtomicU64::new(0),
+            topology_degraded_reason: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -581,6 +608,30 @@ mod tests {
         assert!(backend.cleaned_up);
         assert!(backend.cgroup_attachments.is_empty());
         assert!(backend.pod_ips.is_empty());
+    }
+
+    #[test]
+    fn node_agent_metrics_default_topology_is_nominal() {
+        let metrics = NodeAgentMetrics::default();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.topology_degraded_reason, None);
+    }
+
+    #[test]
+    fn node_agent_metrics_records_degraded_reason() {
+        let metrics = NodeAgentMetrics::default();
+        metrics.set_topology_degraded("kernel_too_old");
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.topology_degraded_reason, Some("kernel_too_old"));
+    }
+
+    #[test]
+    fn node_agent_metrics_clear_topology_degraded() {
+        let metrics = NodeAgentMetrics::default();
+        metrics.set_topology_degraded("bpffs_missing");
+        metrics.clear_topology_degraded();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.topology_degraded_reason, None);
     }
 
     #[test]
