@@ -6,8 +6,8 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey4, CidrKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo,
-    SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
+    BpfCaptureConfig, CidrKey4, CidrKey6, IncludePortsPolicy, OrigDst4, OrigDst6, OrigDstKey,
+    PodInfo, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -50,6 +50,15 @@ pub static FERRUM_CIDR_INCLUDE6: LpmTrie<CidrKey6, u8> = LpmTrie::with_max_entri
 /// Destination ports to exclude from outbound capture.
 #[map]
 pub static FERRUM_PORT_EXCLUDE: HashMap<u16, u8> = HashMap::with_max_entries(256, 0);
+
+/// Per-cgroup `includeOutboundPorts` narrowing policy, keyed by cgroup id
+/// (`bpf_get_current_cgroup_id`). Absent entry → capture all ports (pod is
+/// not annotated). Entry with `all_ports != 0` → capture all ports (`*`
+/// wildcard). Entry with explicit ports → capture only those ports. See
+/// `IncludePortsPolicy` for the wire shape.
+#[map]
+pub static FERRUM_INCLUDE_PORTS: HashMap<u64, IncludePortsPolicy> =
+    HashMap::with_max_entries(4096, 0);
 
 /// Singleton node-agent capture settings.
 #[map]

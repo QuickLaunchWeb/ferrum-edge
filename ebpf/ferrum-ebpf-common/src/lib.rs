@@ -63,6 +63,71 @@ pub struct BpfCaptureConfig {
     pub hbone_redirect_port: u32,
 }
 
+/// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
+/// BPF gate supports. Sized to cover normal pod annotations (typically 1-5
+/// ports). Pods exceeding this cap fall through to capture-all behavior so
+/// the gate degrades gracefully instead of silently dropping ports — the
+/// userspace loader emits a `warn!` when truncation happens.
+pub const INCLUDE_PORTS_MAX: usize = 16;
+
+/// Per-cgroup outbound `includeOutboundPorts` policy in the
+/// `FERRUM_INCLUDE_PORTS` map, keyed by cgroup id (`bpf_get_current_cgroup_id`).
+///
+/// Semantics:
+/// - No entry for a cgroup → no narrowing, capture every TCP port (preserves
+///   pre-existing un-annotated pod behavior).
+/// - Entry with `all_ports == 1` → matches the `*` wildcard annotation;
+///   capture every port. `port_count` is ignored in this case.
+/// - Entry with `all_ports == 0` and `port_count > 0` → capture only those
+///   ports; everything else returns from the connect hook without rewrite.
+/// - Entry with `all_ports == 0` and `port_count == 0` → fail-open, behaves
+///   like "no entry" (the userspace side should not write this shape; the
+///   BPF program tolerates it defensively).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncludePortsPolicy {
+    /// Non-zero means "capture all outbound ports" (the `*` wildcard).
+    /// `u32` to keep the struct 4-byte aligned for the BPF verifier.
+    pub all_ports: u32,
+    /// Number of valid entries in `ports`. Always `<= INCLUDE_PORTS_MAX`.
+    pub port_count: u32,
+    /// Sorted ascending. Trailing entries beyond `port_count` are ignored
+    /// and may be uninitialized in flight.
+    pub ports: [u16; INCLUDE_PORTS_MAX],
+}
+
+impl IncludePortsPolicy {
+    /// Construct a `*`-style "capture all ports" policy.
+    pub const fn all() -> Self {
+        Self {
+            all_ports: 1,
+            port_count: 0,
+            ports: [0u16; INCLUDE_PORTS_MAX],
+        }
+    }
+
+    /// Construct an explicit-ports policy. Caller must have already sorted
+    /// and deduped `ports`; truncates at `INCLUDE_PORTS_MAX` (the userspace
+    /// side warns when this happens).
+    pub fn explicit(ports: &[u16]) -> Self {
+        let mut storage = [0u16; INCLUDE_PORTS_MAX];
+        let count = ports.len().min(INCLUDE_PORTS_MAX);
+        for (slot, value) in storage.iter_mut().zip(ports.iter().take(count)) {
+            *slot = *value;
+        }
+        Self {
+            all_ports: 0,
+            port_count: count as u32,
+            ports: storage,
+        }
+    }
+
+    /// `true` when this entry encodes the `*` wildcard.
+    pub const fn is_all_ports(&self) -> bool {
+        self.all_ports != 0
+    }
+}
+
 /// IPv4 address payload for `FERRUM_CIDR_INCLUDE` / `FERRUM_CIDR_EXCLUDE`.
 ///
 /// Aya's LPM trie wrapper stores the leading `prefix_len` separately in
@@ -203,6 +268,12 @@ mod tests {
         assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
+        // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
+        assert_eq!(
+            mem::size_of::<IncludePortsPolicy>(),
+            8 + 2 * INCLUDE_PORTS_MAX
+        );
+        assert_eq!(mem::align_of::<IncludePortsPolicy>(), 4);
         // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
         assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
         assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
@@ -218,7 +289,47 @@ mod tests {
         assert_copy::<BpfCaptureConfig>();
         assert_copy::<CidrKey4>();
         assert_copy::<CidrKey6>();
+        assert_copy::<IncludePortsPolicy>();
         assert_copy::<SockOpsRecord>();
+    }
+
+    #[test]
+    fn include_ports_policy_all_sentinel() {
+        let policy = IncludePortsPolicy::all();
+        assert!(policy.is_all_ports());
+        assert_eq!(policy.port_count, 0);
+    }
+
+    #[test]
+    fn include_ports_policy_explicit_within_cap() {
+        let policy = IncludePortsPolicy::explicit(&[80, 443, 5432]);
+        assert!(!policy.is_all_ports());
+        assert_eq!(policy.port_count, 3);
+        assert_eq!(&policy.ports[..3], &[80, 443, 5432]);
+        // Trailing slots remain zero so the kernel sees a well-defined struct.
+        assert!(policy.ports[3..].iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn include_ports_policy_truncates_at_cap() {
+        let mut ports = [0u16; INCLUDE_PORTS_MAX + 4];
+        for (i, slot) in ports.iter_mut().enumerate() {
+            *slot = (i as u16) + 1;
+        }
+        let policy = IncludePortsPolicy::explicit(&ports);
+        assert_eq!(policy.port_count as usize, INCLUDE_PORTS_MAX);
+        // First INCLUDE_PORTS_MAX entries preserved, rest dropped.
+        for i in 0..INCLUDE_PORTS_MAX {
+            assert_eq!(policy.ports[i], ports[i]);
+        }
+    }
+
+    #[test]
+    fn include_ports_policy_empty_is_fail_open_shape() {
+        let policy = IncludePortsPolicy::explicit(&[]);
+        assert!(!policy.is_all_ports());
+        assert_eq!(policy.port_count, 0);
+        assert!(policy.ports.iter().all(|&p| p == 0));
     }
 
     #[test]

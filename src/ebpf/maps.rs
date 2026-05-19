@@ -17,7 +17,9 @@ use aya::maps::lpm_trie::Key as LpmKey;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use ferrum_ebpf_common::{BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, PodInfo as BpfPodInfo};
+use ferrum_ebpf_common::{
+    BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, IncludePortsPolicy, PodInfo as BpfPodInfo,
+};
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -33,6 +35,7 @@ pub struct BpfMaps {
     cidr_include6: LpmTrie<MapData, CidrKey6, u8>,
     port_exclude: BpfHashMap<MapData, u16, u8>,
     capture_config: Option<BpfHashMap<MapData, u32, BpfCaptureConfig>>,
+    include_ports: Option<BpfHashMap<MapData, u64, IncludePortsPolicy>>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -100,6 +103,25 @@ impl BpfMaps {
             }
         };
 
+        // Older BPF ELFs may predate the include-ports gate. Tolerate the
+        // missing map so the node-agent still boots with a stale program;
+        // the BPF `include_port_allowed` helper fail-opens on missing
+        // lookups, so capture stays correct for unannotated pods. Pods
+        // that DO carry `includeOutboundPorts` will be over-captured (no
+        // narrowing), which is the prior GAP-2K behavior.
+        let include_ports = match bpf.map("FERRUM_INCLUDE_PORTS") {
+            Some(map) => Some(
+                BpfHashMap::try_from(map.clone())
+                    .map_err(|e| format!("FERRUM_INCLUDE_PORTS type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_INCLUDE_PORTS map not found; per-pod includeOutboundPorts narrowing disabled (eBPF ELF predates GAP-2K)"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             pod_ips,
             bypass_uids,
@@ -109,6 +131,7 @@ impl BpfMaps {
             cidr_include6,
             port_exclude,
             capture_config,
+            include_ports,
         })
     }
 
@@ -182,6 +205,40 @@ impl BpfMaps {
         let mut map = capture_config.clone();
         map.insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
             .map_err(|e| format!("Failed to update capture config: {e}"))
+    }
+
+    /// Insert (or replace) a per-cgroup `includeOutboundPorts` narrowing
+    /// policy. Absent map (older ELF) is a no-op so the node agent boots
+    /// even when the new gate is unavailable.
+    pub fn insert_include_ports(
+        &self,
+        cgroup_id: u64,
+        policy: &IncludePortsPolicy,
+    ) -> Result<(), String> {
+        let Some(include_ports) = self.include_ports.as_ref() else {
+            return Ok(());
+        };
+        let mut map = include_ports.clone();
+        map.insert(cgroup_id, *policy, 0)
+            .map_err(|e| format!("Failed to insert include-ports for cgroup {cgroup_id}: {e}"))
+    }
+
+    /// Remove a per-cgroup `includeOutboundPorts` entry, e.g. on pod
+    /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
+    /// silently tolerated because the BPF gate fail-opens on missing
+    /// lookups.
+    pub fn remove_include_ports(&self, cgroup_id: u64) -> Result<(), String> {
+        let Some(include_ports) = self.include_ports.as_ref() else {
+            return Ok(());
+        };
+        let mut map = include_ports.clone();
+        if let Err(e) = map.remove(&cgroup_id) {
+            // `aya::maps::HashMap::remove` returns Err on ENOENT; demote
+            // that to a debug log because pods that were never annotated
+            // legitimately have no entry.
+            tracing::debug!(cgroup_id, error = %e, "remove_include_ports: entry missing");
+        }
+        Ok(())
     }
 }
 
