@@ -621,10 +621,10 @@ impl RequestContext {
     /// the full `HashMap<String, String>`. Returns `None` if the raw headers
     /// have already been consumed by `materialize_headers()`.
     ///
-    /// Single hash lookup — the callers (`host`, `x-forwarded-for`, `x-real-ip`)
-    /// are always single-valued. Multiple `Host` headers are rejected earlier by
-    /// `check_protocol_headers()`; XFF uses comma-separated values within one
-    /// header entry, not multiple entries.
+    /// Single hash lookup for call sites that only need one field-line value.
+    /// Multiple `Host` headers are rejected earlier by `check_protocol_headers()`.
+    /// For list-style headers that may span multiple field-lines (for example
+    /// `x-forwarded-for`), use `raw_header_values()` and fold them explicitly.
     #[inline]
     pub fn raw_header_get(&self, name: &str) -> Option<&str> {
         self.raw_headers

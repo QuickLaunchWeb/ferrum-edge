@@ -7645,11 +7645,22 @@ async fn handle_proxy_request_inner(
                         // real_ip_header is pre-lowercased at config load time — no allocation needed
                         ctx.raw_header_get(real_ip_header.as_str())
                     });
+            let xff_chain = {
+                let mut values = ctx.raw_header_values("x-forwarded-for").peekable();
+                values.peek().map(|first| {
+                    let mut combined = String::from(*first);
+                    for value in values.skip(1) {
+                        combined.push(',');
+                        combined.push_str(value);
+                    }
+                    combined
+                })
+            };
             if let Some(resolved) = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
                 addr,
                 real_ip_header_val,
-                ctx.raw_header_get("x-forwarded-for"),
+                xff_chain.as_deref(),
                 &state.trusted_proxies,
             ) {
                 ctx.client_ip = resolved;

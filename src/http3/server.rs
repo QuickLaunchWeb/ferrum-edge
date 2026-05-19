@@ -857,11 +857,22 @@ async fn handle_h3_request(
                     // real_ip_header is already lowercase from env config parsing
                     ctx.raw_header_get(real_ip_header.as_str())
                 });
+        let xff_chain = {
+            let mut values = ctx.raw_header_values("x-forwarded-for").peekable();
+            values.peek().map(|first| {
+                let mut combined = String::from(*first);
+                for value in values.skip(1) {
+                    combined.push(',');
+                    combined.push_str(value);
+                }
+                combined
+            })
+        };
         let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
             socket_ip,
             &socket_addr,
             real_ip_header_val,
-            ctx.raw_header_get("x-forwarded-for"),
+            xff_chain.as_deref(),
             &state.trusted_proxies,
         )
         .unwrap_or_else(|| socket_ip.to_string());
