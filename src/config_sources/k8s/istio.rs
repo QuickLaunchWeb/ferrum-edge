@@ -11454,6 +11454,35 @@ extensionProviders:
     }
 
     #[test]
+    fn destination_rule_rejects_idle_timeout_above_proxy_cap() {
+        // The proxy-level `pool_idle_timeout_seconds` validator caps the
+        // field at `MAX_POOL_IDLE_TIMEOUT` (1 h). The per-target Cow-clone
+        // in `resolve_effective_proxy_for_target` writes the resolved seconds
+        // value directly onto a `Proxy` clone without re-running
+        // `validate_fields()`, so an `idleTimeout` above that cap would
+        // bypass the validator silently. Reject in the translator so the K8s
+        // surface stays consistent with admin-API admission.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"idleTimeout": "7200s"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("idleTimeout above proxy cap must fail");
+        assert!(
+            err.to_string()
+                .contains("exceeds the proxy idle-timeout cap"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
     fn destination_rule_silently_accepts_deferred_http_fields() {
         // `http1MaxPendingRequests`, `maxRetries`, and `h2UpgradePolicy` are
         // tracked T1-C follow-ons. The translator should not fail when
