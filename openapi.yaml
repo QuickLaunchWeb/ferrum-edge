@@ -1167,6 +1167,221 @@ paths:
                   error:
                     type: string
 
+  /mesh/config-drift:
+    get:
+      operationId: getMeshConfigDrift
+      summary: Inspect this DP's installed slice + RTDS overlay drift status
+      description: |
+        Returns a structured "where is this DP relative to the CP's last
+        push?" view (MESH-T6-C). Operators query this on every DP in a
+        deployment and diff the resulting `slice.fingerprint` strings: two
+        DPs in the same namespace that should be running the same slice
+        produce the same fingerprint; divergence flags a split-brain DP.
+
+        The slice block is always present. It carries the resource counts
+        per kind, a stable content fingerprint, and the wall-clock age of
+        the last `install_slice` call. The `runtime_overlay` block (default
+        included) summarises the live RTDS overlay: the number of keys in
+        effect and their names. Pass `?include_overlay=false` to omit it.
+
+        `slice.fingerprint` is a SHA-256 over a deterministic JSON encoding
+        of the slice with its `runtime_overlay` field stripped. Operators
+        wanting to recompute the fingerprint offline must serialise the
+        slice with the same canonicalisation: recursively sort object keys
+        (preserve array order), then hash the resulting bytes and prefix
+        with `sha256-`.
+
+        Returns 404 outside mesh mode (`mesh_runtime_state` not wired).
+        Returns 200 with `slice.last_received_at` elided and zeroed
+        resource counts when mesh mode is active but no slice has been
+        installed yet — operators rely on the difference between "404
+        (wrong mode)" and "200 with no `last_received_at`" (mesh mode, not
+        converged yet).
+
+        Future work: a CP-side endpoint that reports the latest published
+        slice version per connected DP would let external tooling diff
+        what the CP thinks each DP should have against what each DP
+        reports here, without having to walk every DP in lock-step.
+      tags: [Mesh Config Drift]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: include_overlay
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: |
+            When `true` (default), the response includes the
+            `runtime_overlay` block summarising the live RTDS layer. When
+            `false`, the block is omitted entirely. Unrecognised values
+            fall back to the default — the endpoint does not reject typos.
+      responses:
+        "200":
+          description: Current slice + overlay drift snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [slice]
+                properties:
+                  slice:
+                    type: object
+                    required: [resources, source_protocol, source_cp_url]
+                    properties:
+                      last_received_at:
+                        type: string
+                        format: date-time
+                        description: |
+                          Wall-clock timestamp of the most recent
+                          `install_slice` call. Omitted when no slice has
+                          been installed yet.
+                      age_seconds:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                        description: |
+                          `now - last_received_at` in seconds. Omitted
+                          when `last_received_at` is absent. A slice
+                          installed in the future (clock skew) clamps to
+                          zero rather than wrapping around.
+                      version:
+                        type: string
+                        description: |
+                          CP-generated slice version string. Omitted when
+                          no slice has been installed.
+                      namespace:
+                        type: string
+                        description: |
+                          Slice's `namespace` field. Omitted when no slice
+                          has been installed.
+                      resources:
+                        type: object
+                        description: |
+                          Per-resource-kind counts so operators can spot
+                          which kind drifted (e.g. "all DestinationRules
+                          gone"). Always present, defaults to all zeros
+                          before the first slice.
+                        required:
+                          - workloads
+                          - services
+                          - mesh_policies
+                          - peer_authentications
+                          - service_entries
+                          - request_authentications
+                          - destination_rules
+                          - mesh_telemetry
+                          - mesh_proxy_configs
+                          - extension_configs
+                        properties:
+                          workloads: { type: integer, minimum: 0 }
+                          services: { type: integer, minimum: 0 }
+                          mesh_policies: { type: integer, minimum: 0 }
+                          peer_authentications: { type: integer, minimum: 0 }
+                          service_entries: { type: integer, minimum: 0 }
+                          request_authentications: { type: integer, minimum: 0 }
+                          destination_rules: { type: integer, minimum: 0 }
+                          mesh_telemetry: { type: integer, minimum: 0 }
+                          mesh_proxy_configs: { type: integer, minimum: 0 }
+                          extension_configs: { type: integer, minimum: 0 }
+                      fingerprint:
+                        type: string
+                        pattern: "^sha256-[0-9a-f]{64}$"
+                        description: |
+                          Stable content hash of the slice with
+                          `runtime_overlay` stripped. Two DPs expecting
+                          the same slice produce the same hash. Omitted
+                          when no slice has been installed.
+                      source_protocol:
+                        type: string
+                        description: |
+                          Configured mesh source protocol from
+                          `FERRUM_MESH_CONFIG_PROTOCOL` (`native` or
+                          `xds`). Surfaced even before the first slice so
+                          dashboards can label DPs by source.
+                      source_cp_url:
+                        type: string
+                        description: |
+                          First configured CP URL (priority 0). Empty
+                          string when none is configured.
+                  runtime_overlay:
+                    type: object
+                    description: |
+                      Compact summary of the live RTDS overlay. Distinct
+                      from `/mesh/runtime-overlay` — this surface is the
+                      sorted key list, not the typed values, so the
+                      response stays cheap to poll. Omitted when no slice
+                      has been installed or when `?include_overlay=false`.
+                    required: [key_count, keys]
+                    properties:
+                      key_count:
+                        type: integer
+                        minimum: 0
+                      keys:
+                        type: array
+                        description: |
+                          Sorted list of overlay keys currently in
+                          effect. Always sorted so two DPs with the same
+                          overlay produce byte-identical responses.
+                        items:
+                          type: string
+              examples:
+                config-drift-populated:
+                  value:
+                    slice:
+                      last_received_at: "2026-05-18T19:32:11Z"
+                      age_seconds: 45
+                      version: v-2026-05-18T00:00:00Z
+                      namespace: alpha
+                      resources:
+                        workloads: 5
+                        services: 17
+                        mesh_policies: 23
+                        peer_authentications: 5
+                        service_entries: 12
+                        request_authentications: 4
+                        destination_rules: 12
+                        mesh_telemetry: 2
+                        mesh_proxy_configs: 1
+                        extension_configs: 0
+                      fingerprint: "sha256-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                      source_protocol: native
+                      source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
+                    runtime_overlay:
+                      key_count: 2
+                      keys:
+                        - ferrum.fault.sample
+                        - ferrum.log.level
+                config-drift-pre-convergence:
+                  summary: Mesh mode active but no slice installed yet
+                  value:
+                    slice:
+                      resources:
+                        workloads: 0
+                        services: 0
+                        mesh_policies: 0
+                        peer_authentications: 0
+                        service_entries: 0
+                        request_authentications: 0
+                        destination_rules: 0
+                        mesh_telemetry: 0
+                        mesh_proxy_configs: 0
+                        extension_configs: 0
+                      source_protocol: native
+                      source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh runtime state (not in mesh mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Audit ────────────────────────────────────────────────────────────
   /audit:
     parameters:

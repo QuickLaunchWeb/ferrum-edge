@@ -881,6 +881,30 @@ Stream decisions are exported via a sibling counter `ferrum_mesh_outbound_regist
 
 Enforcement is keyed on the runtime's mesh outbound capture listener port set. Stream proxies bound to other ports (inbound, admin, HBONE, east-west gateway, egress gateway) flow through unchanged — outbound policy never gates inbound traffic.
 
+## Config Drift Introspection
+
+`GET /mesh/config-drift` is a JWT-authenticated admin endpoint that surfaces a per-DP "where is this DP relative to the CP's last push?" view. Pair it with `ferrum_mesh_config_last_received_timestamp_seconds` (the gauge the GAP-3E Grafana dashboards already alert on) to triage stuck DPs — the metric tells you when the alert tripped; the endpoint tells you what slice content the DP actually applied.
+
+The response always carries a `slice` block. After the first slice install it carries:
+
+- `last_received_at` / `age_seconds` — wall-clock timestamp + seconds since the most recent slice install. `age_seconds` clamps to zero on backwards clock skew so an alert never fires on a future-stamped slice.
+- `version` / `namespace` — the slice's own `version` string and `namespace` field, surfaced for self-describing cross-DP diffs.
+- `resources` — counts per resource kind (workloads, services, mesh_policies, peer_authentications, service_entries, request_authentications, destination_rules, mesh_telemetry, mesh_proxy_configs, extension_configs). Always present; defaults to all zeros before the first slice so the shape is stable for dashboards.
+- `fingerprint` — `sha256-<64 hex>` over a deterministic JSON encoding of the slice with `runtime_overlay` stripped. Two DPs in the same namespace expecting the same slice produce the same fingerprint; divergence flags split-brain. The hash strips the overlay because RTDS-driven knobs (fault percentages, log level, transformer gates — see "xDS ADS Compatibility / RTDS") intentionally hot-swap without a new slice version; drift in the overlay surfaces under `runtime_overlay` instead.
+- `source_protocol` / `source_cp_url` — configured source from `FERRUM_MESH_CONFIG_PROTOCOL` and the first entry of `FERRUM_DP_CP_GRPC_URLS`. Populated even before the first slice so dashboards can label DPs by source.
+
+The optional `runtime_overlay` block (default included) summarises the live RTDS overlay as `{ key_count, keys }` where `keys` is the sorted list of overlay keys currently in effect. Pass `?include_overlay=false` to omit the block for high-frequency drift polling that only needs the slice fingerprint.
+
+The endpoint returns 404 outside mesh mode and 200 with `last_received_at` elided / zeroed `resources` when mesh mode is active but no slice has been installed yet — operators rely on the difference between "404 (wrong mode)" and "200 with no `last_received_at` (mesh mode, not converged yet)".
+
+Operator playbook:
+
+- **Spot a stuck DP**: walk every DP in a deployment, compare `slice.last_received_at`. A significantly older timestamp on one DP flags a missing CP→DP stream. Alert on `slice.age_seconds > 2 * FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (default 120 s with the 60 s primary retry).
+- **Spot split brain**: walk every DP, compare `slice.fingerprint`. All DPs in the same namespace should agree — divergence means at least one DP is on a stale or wrong slice. Operators can recompute the fingerprint offline by serialising the same slice JSON with recursively-sorted object keys (`BTreeMap`-style) and hashing with SHA-256.
+- **Spot RTDS drift**: compare `runtime_overlay.keys` across DPs. If one DP is missing a key the others all have, its xDS RTDS subscription is broken.
+
+A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
+
 ## DestinationRule
 
 Istio `DestinationRule` resources are translated into Ferrum upstream and proxy configuration at the Kubernetes translation layer. The following fields are supported:

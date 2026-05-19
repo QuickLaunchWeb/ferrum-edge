@@ -1,0 +1,551 @@
+//! Response builder for `GET /mesh/config-drift` (MESH-T6-C).
+//!
+//! The admin endpoint surfaces a DP-local "have we drifted behind the CP?"
+//! view. Because the CP→DP gRPC stream is one-way (DPs cannot synchronously
+//! query the CP's latest published slice from the DP side), drift here means:
+//!
+//!   - When did this DP last install a slice? Compared across DPs, a
+//!     significantly older `last_received_at` flags a DP that is missing
+//!     updates the others received.
+//!   - What's the stable content fingerprint of the slice? Two DPs in the
+//!     same namespace expecting the same slice should produce the same
+//!     fingerprint; divergence flags split brain.
+//!   - What does the RTDS overlay carry? PR #883 ships overlay knobs (fault
+//!     injection percentages, log level, transformer gates) without a fresh
+//!     slice version, so the overlay needs its own surface.
+//!
+//! Cross-checking the DP's view against the CP's "latest published" notion
+//! (Option B in the plan) is a follow-on — that needs a CP-side endpoint
+//! or external tooling to walk DPs in parallel.
+//!
+//! See [docs/mesh.md](../../../docs/mesh.md) "Config drift introspection"
+//! for the operator playbook.
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::modes::mesh::config::MeshRuntimeOverlay;
+use crate::modes::mesh::slice::MeshSlice;
+
+/// Per-resource-kind counts shipped on the `slice.resources` block. Each
+/// field corresponds to a `Vec` on [`MeshSlice`] so operators can spot the
+/// kind that drifted (e.g. "we lost all our DestinationRules").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshResourceCounts {
+    pub workloads: usize,
+    pub services: usize,
+    pub mesh_policies: usize,
+    pub peer_authentications: usize,
+    pub service_entries: usize,
+    pub request_authentications: usize,
+    pub destination_rules: usize,
+    pub mesh_telemetry: usize,
+    pub mesh_proxy_configs: usize,
+    pub extension_configs: usize,
+}
+
+impl MeshResourceCounts {
+    /// Build a counts block from a slice, naming each field after the slice
+    /// `Vec` it shadows so a translation drift (slice field rename / split)
+    /// is caught at compile time.
+    pub fn from_slice(slice: &MeshSlice) -> Self {
+        Self {
+            workloads: slice.workloads.len(),
+            services: slice.services.len(),
+            mesh_policies: slice.mesh_policies.len(),
+            peer_authentications: slice.peer_authentications.len(),
+            service_entries: slice.service_entries.len(),
+            request_authentications: slice.request_authentications.len(),
+            destination_rules: slice.destination_rules.len(),
+            mesh_telemetry: slice.telemetry_resources.len(),
+            mesh_proxy_configs: slice.proxy_configs.len(),
+            extension_configs: slice.extension_configs.len(),
+        }
+    }
+}
+
+/// Slice-block surface returned by `/mesh/config-drift`.
+///
+/// `last_received_at` and `age_seconds` are derived from
+/// [`crate::modes::mesh::runtime::MeshRuntimeState::last_install_at`]
+/// rather than from any in-slice timestamp, because slices don't carry a
+/// per-install wall-clock — only a CP-generated `version` string.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshSliceDriftView {
+    /// Wall-clock timestamp of the most recent `install_slice` call. `None`
+    /// when no slice has been installed yet (boot before first CP message).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_received_at: Option<DateTime<Utc>>,
+    /// `now - last_received_at` in seconds. `None` when `last_received_at`
+    /// is `None`. Operators alert on this exceeding a threshold (typically
+    /// 2-3× `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<u64>,
+    /// CP-generated slice version string. Stable across no-op republishes
+    /// (the CP can re-stamp this on every push or only on content change —
+    /// the drift signal is the fingerprint, not the version).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Slice's `namespace` field (always present when a slice has been
+    /// installed). Surfaced here as well so the response is self-describing
+    /// for cross-DP comparison without a separate `/cluster` call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Per-resource-kind counts. Defaults to all zeros when no slice has
+    /// been installed so the shape is stable for dashboards.
+    pub resources: MeshResourceCounts,
+    /// Stable content hash of the installed slice. Two DPs in the same
+    /// namespace with the same hash agree on every byte. Format:
+    /// `sha256-<64 lowercase hex chars>`. `None` when no slice is
+    /// installed. The hash is computed over the slice serialized as
+    /// canonical JSON (BTreeMap-ordered keys, `MeshRuntimeOverlay` field
+    /// stripped — drift in the overlay surfaces under `runtime_overlay`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Configured mesh config source: `native` (Ferrum MeshSubscribe) or
+    /// `xds` (Envoy ADS). Read from `FERRUM_MESH_CONFIG_PROTOCOL`. Passed
+    /// in by the handler rather than derived from the slice so the field
+    /// is populated even when no slice has been installed.
+    pub source_protocol: String,
+    /// First configured CP URL (priority 0). Empty string when none is
+    /// configured (test or detached runs). Listed individually rather than
+    /// as a `Vec` so the field's shape stays stable on the wire; the full
+    /// list is on the operator's env.
+    pub source_cp_url: String,
+}
+
+/// Runtime overlay summary on `/mesh/config-drift`. Distinct from the full
+/// `/mesh/runtime-overlay` payload — this one is a compact "is anything
+/// overlay-driven?" view, with key names included so operators can see
+/// which knobs are live without correlating to the dashboards.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshRuntimeOverlayDriftView {
+    /// Number of overlay keys currently in effect.
+    pub key_count: usize,
+    /// Sorted list of overlay keys. Always sorted so two DPs with the same
+    /// overlay produce byte-identical responses and split-brain diffs are
+    /// trivial.
+    pub keys: Vec<String>,
+}
+
+impl MeshRuntimeOverlayDriftView {
+    pub fn from_overlay(overlay: &MeshRuntimeOverlay) -> Self {
+        let mut keys: Vec<String> = overlay.fields.keys().cloned().collect();
+        keys.sort();
+        Self {
+            key_count: keys.len(),
+            keys,
+        }
+    }
+}
+
+/// Top-level response shape. The handler in `admin/mod.rs` is a thin
+/// wrapper that builds this struct and serializes it.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshConfigDriftResponse {
+    pub slice: MeshSliceDriftView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_overlay: Option<MeshRuntimeOverlayDriftView>,
+}
+
+/// Inputs for the response builder. Kept as a struct so the unit tests
+/// can stage state without touching `MeshRuntimeState`'s ArcSwap
+/// internals, and so the handler in `admin/mod.rs` is one
+/// `MeshConfigDriftInputs { ... }` literal away from a JSON response.
+pub struct MeshConfigDriftInputs<'a> {
+    /// `None` when no slice has been installed yet — produces a `slice`
+    /// block with `resources: 0`, `last_received_at: None`, etc.
+    pub slice: Option<&'a MeshSlice>,
+    /// Most recent slice-install timestamp from
+    /// [`crate::modes::mesh::runtime::MeshRuntimeState::last_install_at`].
+    pub last_install_at: Option<DateTime<Utc>>,
+    /// Wall-clock "now" used to compute `age_seconds`. Injected so unit
+    /// tests are deterministic.
+    pub now: DateTime<Utc>,
+    /// Operator-configured mesh source protocol from
+    /// `FERRUM_MESH_CONFIG_PROTOCOL`.
+    pub source_protocol: &'a str,
+    /// First configured CP URL (priority 0) or empty when none. Borrowed
+    /// from the runtime; the handler does not need to allocate.
+    pub source_cp_url: &'a str,
+    /// When `true`, include the `runtime_overlay` block. When `false`,
+    /// the block is omitted regardless of slice content.
+    pub include_overlay: bool,
+}
+
+/// Build the response from staged inputs. Pure function — no I/O, no
+/// allocation beyond the JSON-bearing fields, no clock reads. Unit-tested
+/// directly to lock down the shape.
+pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftResponse {
+    let (last_received_at, age_seconds) = inputs.last_install_at.map_or((None, None), |ts| {
+        // `signed_duration_since` returns a `chrono::Duration`. Clamp the
+        // signed seconds to a non-negative `u64`: a slice installed in the
+        // future (clock skew on the gRPC sender) maps to `0` rather than a
+        // huge underflow.
+        let seconds = inputs.now.signed_duration_since(ts).num_seconds().max(0) as u64;
+        (Some(ts), Some(seconds))
+    });
+
+    let slice_view = match inputs.slice {
+        Some(slice) => MeshSliceDriftView {
+            last_received_at,
+            age_seconds,
+            version: Some(slice.version.clone()),
+            namespace: Some(slice.namespace.clone()),
+            resources: MeshResourceCounts::from_slice(slice),
+            fingerprint: Some(fingerprint(slice)),
+            source_protocol: inputs.source_protocol.to_string(),
+            source_cp_url: inputs.source_cp_url.to_string(),
+        },
+        None => MeshSliceDriftView {
+            last_received_at,
+            age_seconds,
+            version: None,
+            namespace: None,
+            resources: MeshResourceCounts::default(),
+            fingerprint: None,
+            source_protocol: inputs.source_protocol.to_string(),
+            source_cp_url: inputs.source_cp_url.to_string(),
+        },
+    };
+
+    let overlay_view = if inputs.include_overlay {
+        inputs
+            .slice
+            .map(|slice| MeshRuntimeOverlayDriftView::from_overlay(&slice.runtime_overlay))
+    } else {
+        None
+    };
+
+    MeshConfigDriftResponse {
+        slice: slice_view,
+        runtime_overlay: overlay_view,
+    }
+}
+
+/// Parse the optional `?include_overlay=...` query param. Defaults to
+/// `true` per the plan so the most useful payload requires no client-side
+/// opt-in. Any non-`true`/`false` value falls back to the default — admin
+/// query parsing should not 400 on a typo, the overlay block is cheap.
+pub fn parse_include_overlay(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return true;
+    };
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(val)) = (parts.next(), parts.next())
+            && key == "include_overlay"
+        {
+            return match val {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                // Tolerate operator typos — the default-on shape is the
+                // safer call than rejecting the request.
+                _ => true,
+            };
+        }
+    }
+    true
+}
+
+/// Stable content fingerprint over the slice excluding `runtime_overlay`.
+///
+/// Two DPs in the same namespace expecting the same slice produce the
+/// same fingerprint. The overlay is stripped because RTDS-driven knobs
+/// (fault injection percentages, log level) intentionally hot-swap
+/// without a new slice version — drift in the overlay surfaces under
+/// `runtime_overlay` instead.
+///
+/// Algorithm: SHA-256 over a canonical JSON encoding (recursively
+/// `BTreeMap`-sorted keys, preserving array order — slices are
+/// translator-built and order is significant). Output is
+/// `sha256-<64 lowercase hex chars>`.
+///
+/// Determinism: `serde_json::to_value` is used to round-trip into
+/// `Value`, which is then walked through `canonical_json_value` to swap
+/// every `Map` for a `BTreeMap` of sorted keys before the final
+/// `to_string`. `serde_json::Map` is not sorted by default, so a direct
+/// `to_string` on the slice would produce different bytes depending on
+/// insertion order across runs.
+fn fingerprint(slice: &MeshSlice) -> String {
+    // Clone-then-strip is intentional: `MeshSlice` does not implement a
+    // "view without overlay" projection, and the slice install cadence
+    // makes the clone cost (~µs at typical mesh sizes) irrelevant
+    // against the SHA-256. Keeping the strip explicit (rather than
+    // post-processing the serialized JSON) means a future slice field
+    // rename can't sneak past this function — the type system catches it.
+    let mut slice_for_hash = slice.clone();
+    slice_for_hash.runtime_overlay = MeshRuntimeOverlay::default();
+
+    let value = match serde_json::to_value(&slice_for_hash) {
+        Ok(value) => value,
+        Err(err) => {
+            // `serde_json::to_value` only fails on map-key types that are
+            // not strings; every map in `MeshSlice` is keyed by `String`.
+            // Fall back to a recognisable sentinel rather than
+            // `.unwrap()`-ing on the hot-path-adjacent admin handler.
+            return format!("sha256-error-{}", hex_digest(err.to_string().as_bytes()));
+        }
+    };
+    let canonical = canonical_json_value(value);
+    let serialized = canonical.to_string();
+    format!("sha256-{}", hex_digest(serialized.as_bytes()))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Recursively rewrite `serde_json::Value::Object` maps as a `BTreeMap`-backed
+/// `Map` so `Value::to_string()` produces a key-sorted, deterministic byte
+/// stream. Array order is preserved (slice translation emits ordered arrays;
+/// re-sorting them here would hide real drift).
+fn canonical_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, canonical_json_value(v)))
+                .collect();
+            let mut canonical = serde_json::Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                canonical.insert(k, v);
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(canonical_json_value).collect()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::mesh::config::{
+        FractionalPercentDenominator, MeshPolicy, PolicyScope, RuntimeFractionalPercent,
+        RuntimeValue,
+    };
+    use crate::modes::mesh::slice::MeshSlice;
+    use chrono::TimeZone;
+    use std::collections::HashMap;
+
+    fn install_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 18, 19, 32, 11).unwrap()
+    }
+
+    fn now_after_install(seconds: i64) -> DateTime<Utc> {
+        install_time() + chrono::Duration::seconds(seconds)
+    }
+
+    fn slice_with(namespace: &str, version: &str) -> MeshSlice {
+        MeshSlice {
+            namespace: namespace.to_string(),
+            version: version.to_string(),
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-all".to_string(),
+                namespace: namespace.to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![],
+            }],
+            ..MeshSlice::default()
+        }
+    }
+
+    fn overlay_with_one_key() -> MeshRuntimeOverlay {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "ferrum.log.level".to_string(),
+            RuntimeValue::String("warn".to_string()),
+        );
+        fields.insert(
+            "ferrum.fault.sample".to_string(),
+            RuntimeValue::FractionalPercent(RuntimeFractionalPercent {
+                numerator: 25,
+                denominator: FractionalPercentDenominator::Hundred,
+            }),
+        );
+        MeshRuntimeOverlay { fields }
+    }
+
+    #[test]
+    fn build_response_empty_when_no_slice_installed() {
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: None,
+            last_install_at: None,
+            now: install_time(),
+            source_protocol: "native",
+            source_cp_url: "grpc://cp.local:50051",
+            include_overlay: true,
+        });
+
+        assert!(resp.slice.last_received_at.is_none());
+        assert!(resp.slice.age_seconds.is_none());
+        assert!(resp.slice.version.is_none());
+        assert!(resp.slice.namespace.is_none());
+        assert!(resp.slice.fingerprint.is_none());
+        assert_eq!(resp.slice.resources, MeshResourceCounts::default());
+        assert_eq!(resp.slice.source_protocol, "native");
+        assert_eq!(resp.slice.source_cp_url, "grpc://cp.local:50051");
+        // No slice means no overlay surface even when `include_overlay=true`.
+        assert!(resp.runtime_overlay.is_none());
+    }
+
+    #[test]
+    fn build_response_populates_counts_and_fingerprint() {
+        let mut slice = slice_with("alpha", "v1");
+        slice.runtime_overlay = overlay_with_one_key();
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: now_after_install(45),
+            source_protocol: "xds",
+            source_cp_url: "grpcs://cp.svc:50051",
+            include_overlay: true,
+        });
+
+        assert_eq!(resp.slice.namespace.as_deref(), Some("alpha"));
+        assert_eq!(resp.slice.version.as_deref(), Some("v1"));
+        assert_eq!(resp.slice.age_seconds, Some(45));
+        assert_eq!(resp.slice.last_received_at, Some(install_time()));
+        assert_eq!(resp.slice.resources.mesh_policies, 1);
+        assert_eq!(resp.slice.resources.services, 0);
+        let fp = resp.slice.fingerprint.as_deref().expect("fingerprint set");
+        assert!(fp.starts_with("sha256-"), "fingerprint prefix: {fp}");
+        assert_eq!(fp.len(), "sha256-".len() + 64);
+
+        let overlay = resp.runtime_overlay.as_ref().expect("overlay present");
+        assert_eq!(overlay.key_count, 2);
+        // Sorted-keys contract — `ferrum.fault.sample` < `ferrum.log.level`.
+        assert_eq!(overlay.keys[0], "ferrum.fault.sample");
+        assert_eq!(overlay.keys[1], "ferrum.log.level");
+    }
+
+    #[test]
+    fn fingerprint_strips_runtime_overlay() {
+        // Two slices with identical resources but different overlays must
+        // produce the same fingerprint, because overlay drift is surfaced
+        // separately under `runtime_overlay`. Without this guarantee, every
+        // RTDS layer update would invalidate the per-DP fingerprint and
+        // operators couldn't tell content drift apart from knob drift.
+        let mut a = slice_with("alpha", "v1");
+        let mut b = slice_with("alpha", "v1");
+        a.runtime_overlay = overlay_with_one_key();
+        b.runtime_overlay = MeshRuntimeOverlay::default();
+
+        let fp_a = fingerprint(&a);
+        let fp_b = fingerprint(&b);
+        assert_eq!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn fingerprint_differs_when_resources_differ() {
+        // A second MeshPolicy with a different name must change the
+        // fingerprint — this is the actual drift signal.
+        let a = slice_with("alpha", "v1");
+        let mut b = a.clone();
+        b.mesh_policies.push(MeshPolicy {
+            name: "allow-foo".to_string(),
+            namespace: "alpha".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![],
+        });
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_across_runs() {
+        // Repeated fingerprint calls on the same slice must produce the
+        // same byte string. Without `canonical_json_value` the underlying
+        // `serde_json::Map` (`IndexMap`) is insertion-ordered, which makes
+        // serialized output non-deterministic for structs whose serde
+        // output goes through `Map`s in non-trivial order.
+        let slice = slice_with("alpha", "v1");
+        assert_eq!(fingerprint(&slice), fingerprint(&slice));
+    }
+
+    #[test]
+    fn include_overlay_false_omits_block() {
+        let slice = slice_with("alpha", "v1");
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: now_after_install(5),
+            source_protocol: "native",
+            source_cp_url: "",
+            include_overlay: false,
+        });
+        assert!(resp.runtime_overlay.is_none());
+        // Slice block is still populated — the overlay flag only gates
+        // the secondary block.
+        assert!(resp.slice.fingerprint.is_some());
+    }
+
+    #[test]
+    fn empty_overlay_still_serializes_as_block_when_included() {
+        // Slice installed with no RTDS layers — overlay key map empty.
+        // The block should still appear (with `key_count: 0`, `keys: []`)
+        // so dashboards can distinguish "no slice yet" (block absent)
+        // from "slice but no overlay layers" (block present, empty).
+        let slice = slice_with("alpha", "v1");
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: now_after_install(0),
+            source_protocol: "native",
+            source_cp_url: "",
+            include_overlay: true,
+        });
+        let overlay = resp
+            .runtime_overlay
+            .as_ref()
+            .expect("overlay block present");
+        assert_eq!(overlay.key_count, 0);
+        assert!(overlay.keys.is_empty());
+    }
+
+    #[test]
+    fn future_install_timestamps_clamp_age_to_zero() {
+        // Clock skew on the gRPC sender could push `last_install_at` past
+        // `now`; without clamping, the unsigned cast underflows to a huge
+        // number that would page operators.
+        let slice = slice_with("alpha", "v1");
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: install_time() - chrono::Duration::seconds(10),
+            source_protocol: "native",
+            source_cp_url: "",
+            include_overlay: true,
+        });
+        assert_eq!(resp.slice.age_seconds, Some(0));
+    }
+
+    #[test]
+    fn parse_include_overlay_defaults_true() {
+        assert!(parse_include_overlay(None));
+        assert!(parse_include_overlay(Some("")));
+        assert!(parse_include_overlay(Some("foo=bar")));
+    }
+
+    #[test]
+    fn parse_include_overlay_honors_explicit_values() {
+        assert!(parse_include_overlay(Some("include_overlay=true")));
+        assert!(parse_include_overlay(Some("include_overlay=1")));
+        assert!(!parse_include_overlay(Some("include_overlay=false")));
+        assert!(!parse_include_overlay(Some("include_overlay=0")));
+        // Unknown values fall back to default (true) rather than 400ing.
+        assert!(parse_include_overlay(Some("include_overlay=maybe")));
+        // Last value wins per query-string convention — but our naive
+        // parser returns the first match, which is the documented
+        // behaviour. Lock it down so a refactor doesn't silently flip it.
+        assert!(!parse_include_overlay(Some(
+            "include_overlay=false&include_overlay=true"
+        )));
+    }
+}

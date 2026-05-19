@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
@@ -166,6 +167,13 @@ impl PolicyScopeCache {
 #[derive(Clone)]
 pub struct MeshRuntimeState {
     current: Arc<ArcSwap<Option<MeshSlice>>>,
+    /// Wall-clock timestamp of the most recent `install_slice` call, exposed as
+    /// the activity signal for `/mesh/config-drift` (T6-C). Stays in lock-step
+    /// with `record_mesh_config_received` (the Prometheus metric backing the
+    /// `ferrum_mesh_config_last_received_timestamp_seconds` gauge) so dashboard
+    /// staleness alerts and the structured drift response observe the same
+    /// install events. `None` until the first slice arrives.
+    last_install_at: Arc<ArcSwap<Option<DateTime<Utc>>>>,
     first_ready: Arc<Notify>,
     has_first: Arc<AtomicBool>,
     revision_tx: Arc<watch::Sender<u64>>,
@@ -178,6 +186,7 @@ impl MeshRuntimeState {
         let (revision_tx, _) = watch::channel(0u64);
         Self {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
+            last_install_at: Arc::new(ArcSwap::new(Arc::new(None))),
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
@@ -189,6 +198,13 @@ impl MeshRuntimeState {
     /// Return the latest mesh slice snapshot.
     pub fn snapshot(&self) -> Arc<Option<MeshSlice>> {
         self.current.load_full()
+    }
+
+    /// Wall-clock timestamp of the most recent slice install, or `None` if no
+    /// slice has been installed yet. Read lock-free by the
+    /// `/mesh/config-drift` admin handler to compute slice staleness.
+    pub fn last_install_at(&self) -> Option<DateTime<Utc>> {
+        *self.last_install_at.load_full().as_ref()
     }
 
     /// True once at least one mesh slice has been installed.
@@ -225,6 +241,10 @@ impl MeshRuntimeState {
         // ArcSwap so the hot path only reads its own state.
         crate::modes::mesh::runtime_overlay_consumers::apply_overlay(&slice.runtime_overlay);
         self.current.store(Arc::new(Some(slice)));
+        // Stamp the install timestamp before publishing the revision bump so
+        // any operator reading `/mesh/config-drift` after observing the new
+        // revision sees a fresh `last_install_at` rather than the stale one.
+        self.last_install_at.store(Arc::new(Some(Utc::now())));
         self.revision_tx.send_modify(|revision| *revision += 1);
         let was_first = self.has_first.swap(true, Ordering::AcqRel);
         if !was_first {
@@ -299,6 +319,42 @@ mod tests {
         )
         .await
         .expect("already-installed slice should not block");
+    }
+
+    #[tokio::test]
+    async fn last_install_at_tracks_each_install() {
+        // The `/mesh/config-drift` admin handler reads this field for the
+        // slice staleness signal, so verify it is `None` pre-install,
+        // populated after the first install, and advances on each
+        // subsequent install (no caching/clamping). Use an explicit
+        // delay between installs because two `Utc::now()` calls inside
+        // the same nanosecond would compare equal on fast machines and
+        // mask a bug where the second install failed to swap the slot.
+        let state = MeshRuntimeState::new();
+        assert!(state.last_install_at().is_none(), "no slice installed yet");
+
+        state.install_slice(MeshSlice {
+            version: "v1".to_string(),
+            ..MeshSlice::default()
+        });
+        let first = state
+            .last_install_at()
+            .expect("first install must stamp last_install_at");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        state.install_slice(MeshSlice {
+            version: "v2".to_string(),
+            ..MeshSlice::default()
+        });
+        let second = state
+            .last_install_at()
+            .expect("second install must keep last_install_at populated");
+
+        assert!(
+            second > first,
+            "second install must advance last_install_at past the first"
+        );
     }
 
     #[test]
