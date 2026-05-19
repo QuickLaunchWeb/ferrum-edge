@@ -2042,4 +2042,68 @@ mod tests {
             "valid.default.svc.cluster.local"
         );
     }
+
+    /// Pin the `docs/mesh.md` "ECDS DestinationRule carrier" worked example
+    /// against the `MeshDestinationRule` schema so doc drift trips a test
+    /// failure. The JSON below is byte-equivalent (whitespace aside) to the
+    /// inner-`value` block under the "with the inner `value` bytes carrying
+    /// the original DR as `MeshDestinationRule` JSON" heading in the doc.
+    /// If the schema renames a field, removes a variant, or changes a serde
+    /// representation, this test fails before the docs ship.
+    #[test]
+    fn ecds_dr_carrier_doc_worked_example_parses() {
+        use crate::modes::mesh::config::{
+            MeshLoadBalancer, MeshSimpleLb, MeshTrafficPolicyTls, MtlsMode,
+        };
+        let dr_json = r#"{
+  "name": "api-dr",
+  "namespace": "default",
+  "host": "api.default.svc.cluster.local",
+  "traffic_policy": {
+    "connect_timeout_ms": 2000,
+    "load_balancer": {"simple": "ROUND_ROBIN"},
+    "outlier_detection": {"consecutive_errors": 5, "interval_seconds": 30},
+    "tls": {"mode": "istio_mutual", "sni": "api.default.svc.cluster.local"}
+  },
+  "subsets": [{"name": "v1", "labels": {"version": "v1"}}]
+}"#;
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", dr_json)],
+                "v1",
+            )
+            .expect("ECDS apply");
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(slice.destination_rules.len(), 1);
+        let dr = &slice.destination_rules[0];
+        assert_eq!(dr.name, "api-dr");
+        assert_eq!(dr.namespace, "default");
+        assert_eq!(dr.host, "api.default.svc.cluster.local");
+        let policy = dr.traffic_policy.as_ref().expect("traffic_policy");
+        assert_eq!(policy.connect_timeout_ms, Some(2000));
+        assert!(matches!(
+            policy.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin))
+        ));
+        let od = policy
+            .outlier_detection
+            .as_ref()
+            .expect("outlier_detection");
+        assert_eq!(od.consecutive_errors, Some(5));
+        assert_eq!(od.interval_seconds, Some(30));
+        let tls: &MeshTrafficPolicyTls = policy.tls.as_ref().expect("tls");
+        assert_eq!(tls.mode, MtlsMode::IstioMutual);
+        assert_eq!(tls.sni.as_deref(), Some("api.default.svc.cluster.local"));
+        assert_eq!(dr.subsets.len(), 1);
+        assert_eq!(dr.subsets[0].name, "v1");
+        assert_eq!(
+            dr.subsets[0].labels.get("version").map(String::as_str),
+            Some("v1")
+        );
+    }
 }
