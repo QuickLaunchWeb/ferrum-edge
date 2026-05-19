@@ -37,6 +37,7 @@ mod mesh_federation_poller_tests;
 mod mesh_hbone_tests;
 mod mesh_k8s_pod_discovery_tests;
 mod mesh_l7_routing_tests;
+mod mesh_outbound_registry_stream_tests;
 mod mesh_peer_auth_live_reload_tests;
 mod mesh_proxy_config_tests;
 mod mesh_runtime_overlay_consumers_tests;

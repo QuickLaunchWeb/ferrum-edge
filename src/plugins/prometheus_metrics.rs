@@ -290,6 +290,18 @@ pub struct MetricsRegistry {
     /// `<denied>` bucket so /metrics stays bounded under hostile traffic.
     pub mesh_outbound_registry_decisions:
         DashMap<Arc<str>, DashMap<Arc<str>, MeshOutboundRegistryDecisionCounters>>,
+    /// Mesh outbound registry decisions for stream-family egress, keyed by
+    /// mesh namespace and protocol (`tcp` / `tcp_tls` / `udp` / `udp_dtls`).
+    ///
+    /// Sibling to `mesh_outbound_registry_decisions` rather than an extra
+    /// label on it, because the Wave-1 Grafana dashboards already consume
+    /// the HTTP-only counter without a `protocol` dimension — adding one
+    /// would split the existing time series in incompatible ways. Stream
+    /// rejects always bucket under a small fixed set of protocol labels,
+    /// so the cardinality stays bounded without the attacker-supplied-host
+    /// concern that the HTTP counter has.
+    pub mesh_outbound_registry_stream_decisions:
+        DashMap<Arc<str>, DashMap<&'static str, MeshOutboundRegistryDecisionCounters>>,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Cached render output with generation timestamp
@@ -331,6 +343,7 @@ impl MetricsRegistry {
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
+            mesh_outbound_registry_stream_decisions: DashMap::new(),
             node_agent_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -452,6 +465,47 @@ impl MetricsRegistry {
             .or_default();
         hosts
             .entry(Arc::from(host))
+            .or_insert_with(|| MeshOutboundRegistryDecisionCounters::new(self.epoch))
+            .increment(decision, self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record an outbound enforcement decision for stream-family egress
+    /// (TCP / TCP+TLS / UDP / UDP+DTLS). Sibling to
+    /// [`Self::record_mesh_outbound_registry_decision`] — see the field
+    /// doc on `mesh_outbound_registry_stream_decisions` for why this is
+    /// a separate counter rather than an extra label on the HTTP one.
+    ///
+    /// `protocol` must be one of the pre-interned `'static` strings
+    /// from [`crate::modes::mesh::outbound_enforcement`] so the metric
+    /// label set stays bounded under hostile traffic. Unlike the HTTP
+    /// counter, there is no per-host label here — stream rejects drop
+    /// the inbound TCP / UDP datagram before SNI / Host material is
+    /// observed in a structured way, so the protocol label is the only
+    /// dimension that matters for dashboards.
+    pub fn record_mesh_outbound_registry_stream_decision(
+        &self,
+        mesh_namespace: &str,
+        protocol: &'static str,
+        decision: &'static str,
+    ) {
+        if let Some(protocols) = self
+            .mesh_outbound_registry_stream_decisions
+            .get(mesh_namespace)
+            && let Some(counters) = protocols.get(protocol)
+        {
+            counters.increment(decision, self.epoch);
+            self.maybe_invalidate_cache();
+            return;
+        }
+
+        let protocols = self
+            .mesh_outbound_registry_stream_decisions
+            .entry(Arc::from(mesh_namespace))
+            .or_default();
+        protocols
+            .entry(protocol)
             .or_insert_with(|| MeshOutboundRegistryDecisionCounters::new(self.epoch))
             .increment(decision, self.epoch);
 
@@ -681,6 +735,12 @@ impl MetricsRegistry {
                 .map(|entry| entry.value().len())
                 .sum::<usize>()
                 * 320
+            + self
+                .mesh_outbound_registry_stream_decisions
+                .iter()
+                .map(|entry| entry.value().len())
+                .sum::<usize>()
+                * 240
             + if self.node_agent_metrics.load().is_some() {
                 512
             } else {
@@ -930,6 +990,38 @@ impl MetricsRegistry {
                         output.push_str(&format!(
                             "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"deny\"{}}} {}\n",
                             mesh_namespace, host, ns_label, deny
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !self.mesh_outbound_registry_stream_decisions.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_outbound_registry_stream_decisions_total Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_mesh_outbound_registry_stream_decisions_total counter\n");
+            for namespace_entry in self.mesh_outbound_registry_stream_decisions.iter() {
+                let mesh_namespace = escape_label_value(namespace_entry.key().as_ref());
+                for protocol_entry in namespace_entry.value().iter() {
+                    // Protocol values come from a fixed, pre-interned set,
+                    // so escape_label_value is defensive only — there is no
+                    // attacker path that supplies these strings.
+                    let protocol = escape_label_value(protocol_entry.key());
+                    let counters = protocol_entry.value();
+                    let admit = counters.admit.value.load(Ordering::Relaxed);
+                    if admit > 0 {
+                        output.push_str(&format!(
+                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"admit\"{}}} {}\n",
+                            mesh_namespace, protocol, ns_label, admit
+                        ));
+                    }
+                    let deny = counters.deny.value.load(Ordering::Relaxed);
+                    if deny > 0 {
+                        output.push_str(&format!(
+                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"deny\"{}}} {}\n",
+                            mesh_namespace, protocol, ns_label, deny
                         ));
                     }
                 }

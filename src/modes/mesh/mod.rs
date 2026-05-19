@@ -12,6 +12,7 @@ pub mod dns_proxy;
 pub mod federation;
 pub mod hbone;
 pub mod node_waypoint;
+pub mod outbound_enforcement;
 pub mod policy;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
@@ -2362,6 +2363,40 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
     ports
 }
 
+/// Refresh the proxy-state mesh outbound enforcement slot from the latest
+/// applied slice (T5-B). Called from the slice-apply loop after a slice
+/// is accepted by `proxy_state.update_config`. Mirrors the HTTP plugin
+/// auto-injection: when the effective policy is `RegistryOnly` AND the
+/// runtime owns at least one mesh outbound capture port, the slot is
+/// populated with the slice-derived registry; otherwise the slot is
+/// cleared so the stream proxies fall through to `Decision::Skip` for
+/// every connect.
+fn refresh_mesh_outbound_enforcement(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    slice: &MeshSlice,
+) {
+    let effective_policy = slice
+        .outbound_traffic_policy
+        .unwrap_or(runtime.outbound_traffic_policy);
+    let next = if matches!(
+        effective_policy,
+        crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
+    ) {
+        let ports = mesh_outbound_registry_listen_ports(runtime);
+        crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement::from_slice(
+            slice,
+            &runtime.cluster_domain,
+            runtime.namespace.clone(),
+            ports,
+        )
+        .map(Arc::new)
+    } else {
+        None
+    };
+    proxy_state.mesh_outbound_enforcement.store(Arc::new(next));
+}
+
 /// Merge applicable `MeshTelemetryResource` entries by scope specificity.
 ///
 /// More specific scopes (WorkloadSelector > Namespace > MeshWide) override
@@ -2798,6 +2833,15 @@ async fn serve_mesh_runtime(
     proxy_state
         .stream_listener_manager
         .set_global_shutdown_rx(shutdown_tx.subscribe());
+
+    // Install the initial mesh outbound enforcement slot (T5-B). The
+    // slice-apply loop refreshes this on every subsequent accepted slice,
+    // but the very first slice was already applied by
+    // `prepare_gateway_config_for_native_slice` before `ProxyState::new`
+    // existed, so the apply-loop wiring would otherwise miss it.
+    if let Some(ref slice) = initial_applied_mesh_slice {
+        refresh_mesh_outbound_enforcement(&proxy_state, &runtime, slice);
+    }
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
@@ -3661,6 +3705,13 @@ fn start_mesh_slice_apply_task(
                                 }
                                 if accepted && let Some(ref dns_proxy) = dns_proxy {
                                     dns_proxy.update_from_slice(slice);
+                                }
+                                if accepted {
+                                    refresh_mesh_outbound_enforcement(
+                                        &proxy_state,
+                                        &runtime,
+                                        slice,
+                                    );
                                 }
                                 if applied {
                                     info!(

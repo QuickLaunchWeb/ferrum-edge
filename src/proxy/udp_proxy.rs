@@ -513,6 +513,13 @@ pub struct UdpListenerConfig {
     /// the reply path attaches it to sendmsg ancillary data, saving one kernel
     /// routing-table lookup per send.
     pub udp_pktinfo_enabled: bool,
+    /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement slot. `None`
+    /// (Option<Arc<...>> stored inside the ArcSwap) outside mesh mode or
+    /// when policy is `AllowAny`. When `Some`, the first datagram of each
+    /// new session is checked against the admitted registry; unadmitted
+    /// destinations are silently dropped (UDP has no RST analogue).
+    pub mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -550,6 +557,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_gro_enabled,
         udp_gso_enabled,
         udp_pktinfo_enabled,
+        mesh_outbound_enforcement,
     } = cfg;
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
@@ -763,6 +771,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &shutdown_rx,
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
+                                                    &mesh_outbound_enforcement,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -803,6 +812,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &shutdown_rx,
                                         global_shutdown_rx.as_ref(),
                                         &overload,
+                                        &mesh_outbound_enforcement,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -880,6 +890,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &shutdown_rx,
                     global_shutdown_rx.as_ref(),
                     &overload,
+                    &mesh_outbound_enforcement,
                 )
                 .await;
                 if let Err(e) = result {
@@ -948,6 +959,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &shutdown_rx,
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
+                                                    &mesh_outbound_enforcement,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -988,6 +1000,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &shutdown_rx,
                                         global_shutdown_rx.as_ref(),
                                         &overload,
+                                        &mesh_outbound_enforcement,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -1034,6 +1047,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &shutdown_rx,
                                     global_shutdown_rx.as_ref(),
                                     &overload,
+                                    &mesh_outbound_enforcement,
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -1101,6 +1115,8 @@ async fn process_datagram(
     listener_shutdown: &watch::Receiver<bool>,
     global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
     // Fast path: check last-client cache before hitting DashMap.
     // Skip the cache when the cached session has been flagged expired
@@ -1153,6 +1169,57 @@ async fn process_datagram(
         .await
         {
             return Ok(());
+        }
+        // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).
+        // Resolved here BEFORE `lookup_or_create_session` so an unadmitted
+        // destination never spawns a backend socket, never advances the
+        // session-limit counter, never opens a DTLS handshake, and never
+        // trips a circuit breaker. UDP has no RST analogue, so the
+        // enforcement is a silent drop with a structured warn! the first
+        // time the (client, backend) pair is rejected within a tight loop.
+        // Per-session caching is unnecessary because we only land here on
+        // the new-session branch — subsequent datagrams hit the
+        // `existing_session` fast path above and skip enforcement.
+        let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+        if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
+            use crate::modes::mesh::outbound_enforcement::{
+                Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS,
+            };
+            // For UDP we have to peek at the resolved backend target — the
+            // proxy could be using an upstream LB, which already picked a
+            // target in `resolve_backend_target`. We mirror that resolution
+            // here against the same load_balancer snapshot so admit/deny
+            // decisions stay consistent with what the create_session path
+            // would actually dial.
+            let (backend_host, backend_port) =
+                resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+            let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
+                PROTOCOL_UDP_DTLS
+            } else {
+                PROTOCOL_UDP
+            };
+            match enforcement.check_destination(listen_port, &backend_host, backend_port) {
+                Decision::Admit => {
+                    enforcement.record_stream_decision(protocol_label, Decision::Admit);
+                }
+                Decision::Deny => {
+                    enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                    // Deny is cold path; the formatting cost here is dwarfed
+                    // by the structured log emission itself. Keep the host
+                    // and port distinct so log queries can filter on either.
+                    warn!(
+                        proxy_id = %view.proxy.id,
+                        client = %client_addr.ip(),
+                        listen_port = listen_port,
+                        backend_host = %backend_host,
+                        backend_port = backend_port,
+                        protocol = protocol_label,
+                        "Mesh REGISTRY_ONLY: dropping UDP datagram to unadmitted destination"
+                    );
+                    return Ok(());
+                }
+                Decision::Skip => {}
+            }
         }
         lookup_or_create_session(
             client_addr,
