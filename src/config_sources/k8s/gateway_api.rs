@@ -349,11 +349,7 @@ fn match_paths(object: &K8sObject, rule: &Value) -> Vec<Option<String>> {
     if object.kind == "GRPCRoute" {
         return matches
             .iter()
-            .map(|m| {
-                m.get("path")
-                    .and_then(http_path_match)
-                    .or_else(|| Some("/".to_string()))
-            })
+            .filter_map(|m| m.get("path").and_then(http_path_match).map(Some))
             .filter(|listen_path| seen_paths.insert(listen_path.clone()))
             .collect();
     }
@@ -891,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn grpc_route_keeps_pathless_matches_as_catch_all() {
+    fn grpc_route_drops_pathless_method_only_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "GRPCRoute",
@@ -910,10 +906,7 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].hosts, vec!["grpc.example.com"]);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
-        assert_eq!(result.config.proxies[0].backend_port, 50051);
+        assert!(result.config.proxies.is_empty());
     }
 
     #[test]
@@ -939,16 +932,8 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
-        assert_eq!(result.config.upstreams.len(), 1);
-        assert_eq!(
-            result.config.proxies[0].upstream_id.as_deref(),
-            Some(result.config.upstreams[0].id.as_str())
-        );
-        assert_eq!(result.config.upstreams[0].targets.len(), 2);
-        assert_eq!(result.config.upstreams[0].targets[0].weight, 90);
-        assert_eq!(result.config.upstreams[0].targets[1].port, 50052);
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
     }
 
     #[test]
