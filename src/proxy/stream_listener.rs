@@ -139,6 +139,13 @@ pub struct StreamListenerManager {
     /// inside `ProxyState::new()` (synchronous) but the watch channel is
     /// created in `main.rs` and threaded into each mode separately.
     global_shutdown_rx: arc_swap::ArcSwap<Option<watch::Receiver<bool>>>,
+    /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement slot shared
+    /// with `ProxyState`. Each spawned TCP / UDP listener gets the same
+    /// `Arc<ArcSwap<...>>` so slice updates that swap the contents are
+    /// observed without restarting the listener. `None` outside mesh mode
+    /// — readers short-circuit on the contained `Option::None`.
+    mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 }
 
 impl StreamListenerManager {
@@ -239,6 +246,74 @@ impl StreamListenerManager {
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
     ) -> Self {
+        Self::new_with_epoch_and_mesh_enforcement(
+            bind_addr,
+            config,
+            dns_cache,
+            request_epoch,
+            circuit_breaker_cache,
+            frontend_tls_config,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            tcp_idle_timeout_seconds,
+            tcp_half_close_max_wait_seconds,
+            frontend_tls_handshake_timeout_seconds,
+            udp_max_sessions,
+            udp_cleanup_interval_seconds,
+            tls_policy,
+            crls,
+            adaptive_buffer,
+            udp_recvmmsg_batch_size,
+            tcp_fastopen_enabled,
+            tcp_listen_backlog,
+            accept_threads,
+            tcp_fastopen_queue_len,
+            overload,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            record_mesh_mtls_metric,
+            so_busy_poll_us,
+            udp_gro_enabled,
+            udp_gso_enabled,
+            udp_pktinfo_enabled,
+            crate::modes::mesh::outbound_enforcement::empty_slot(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_epoch_and_mesh_enforcement(
+        bind_addr: IpAddr,
+        config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
+        dns_cache: DnsCache,
+        request_epoch: Arc<RequestEpochStore>,
+        circuit_breaker_cache: Arc<CircuitBreakerCache>,
+        frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<String>,
+        tcp_idle_timeout_seconds: u64,
+        tcp_half_close_max_wait_seconds: u64,
+        frontend_tls_handshake_timeout_seconds: u64,
+        udp_max_sessions: usize,
+        udp_cleanup_interval_seconds: u64,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+        udp_recvmmsg_batch_size: usize,
+        tcp_fastopen_enabled: bool,
+        tcp_listen_backlog: u32,
+        accept_threads: usize,
+        tcp_fastopen_queue_len: u16,
+        overload: Arc<crate::overload::OverloadState>,
+        ktls_enabled: bool,
+        io_uring_splice_enabled: bool,
+        record_mesh_mtls_metric: bool,
+        so_busy_poll_us: u32,
+        udp_gro_enabled: bool,
+        udp_gso_enabled: bool,
+        udp_pktinfo_enabled: bool,
+        mesh_outbound_enforcement:
+            crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
@@ -275,6 +350,7 @@ impl StreamListenerManager {
             udp_gso_enabled,
             udp_pktinfo_enabled,
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
+            mesh_outbound_enforcement,
         }
     }
 
@@ -582,6 +658,7 @@ impl StreamListenerManager {
                 let udp_pktinfo_enabled = self.udp_pktinfo_enabled;
                 let listener_udp_metrics = Some(metrics.clone());
                 let global_shutdown_for_listener = global_shutdown.clone();
+                let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -609,6 +686,7 @@ impl StreamListenerManager {
                         udp_gro_enabled,
                         udp_gso_enabled,
                         udp_pktinfo_enabled,
+                        mesh_outbound_enforcement,
                     })
                     .await
                     {
@@ -649,6 +727,7 @@ impl StreamListenerManager {
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
                 let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
                 let global_shutdown_for_listener = global_shutdown.clone();
+                let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -680,6 +759,7 @@ impl StreamListenerManager {
                         ktls_enabled,
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
+                        mesh_outbound_enforcement,
                     })
                     .await
                     {

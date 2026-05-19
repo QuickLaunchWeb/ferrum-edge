@@ -387,6 +387,7 @@ async fn try_spawn_tcp_tls_gateway(
             ktls_enabled: false,
             io_uring_splice_enabled: false,
             record_mesh_mtls_metric: false,
+            mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         };
         let _ = start_tcp_listener(cfg).await;
     });

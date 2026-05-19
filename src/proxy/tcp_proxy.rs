@@ -594,6 +594,13 @@ pub struct TcpListenerConfig {
     pub io_uring_splice_enabled: bool,
     /// Whether frontend TCP TLS handshake failures should increment mesh mTLS metrics.
     pub record_mesh_mtls_metric: bool,
+    /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement slot. `None`
+    /// (Option<Arc<...>> stored inside the ArcSwap) outside mesh mode or
+    /// when policy is `AllowAny`. When `Some`, the connect path consults
+    /// the registry before dialing the backend; unadmitted destinations
+    /// are dropped with no backend connect and no circuit-breaker hit.
+    pub mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 }
 
 #[derive(Clone)]
@@ -616,6 +623,8 @@ struct TcpAcceptLoopState {
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     record_mesh_mtls_metric: bool,
+    mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -656,6 +665,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         ktls_enabled,
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
+        mesh_outbound_enforcement,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let backlog = tcp_listen_backlog as i32;
@@ -739,6 +749,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         ktls_enabled,
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
+        mesh_outbound_enforcement,
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -843,6 +854,7 @@ async fn run_tcp_accept_loop(
                 let ktls_enabled = state.ktls_enabled;
                 let io_uring_splice_enabled = state.io_uring_splice_enabled;
                 let record_mesh_mtls_metric = state.record_mesh_mtls_metric;
+                let mesh_outbound_enforcement = state.mesh_outbound_enforcement.clone();
 
                 tokio::spawn(async move {
                     // Track this connection for global overload accounting and graceful drain.
@@ -882,6 +894,11 @@ async fn run_tcp_accept_loop(
                         mesh_direction: None,
                     };
 
+                    // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;
+                    // pull the inner `Option<Arc<...>>` so the borrow is decoupled from
+                    // the guard before the async await suspension.
+                    let mesh_enforcement_snapshot =
+                        mesh_outbound_enforcement.load_full().as_ref().clone();
                     let result = handle_tcp_connection(
                         stream,
                         remote_addr,
@@ -903,6 +920,7 @@ async fn run_tcp_accept_loop(
                         record_mesh_mtls_metric,
                         &overload_for_conn,
                         metrics.as_ref(),
+                        mesh_enforcement_snapshot.as_ref(),
                     )
                     .await;
 
@@ -1264,6 +1282,9 @@ async fn handle_tcp_connection(
     record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
+    mesh_outbound_enforcement: Option<
+        &Arc<crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement>,
+    >,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -1299,6 +1320,7 @@ async fn handle_tcp_connection(
         record_mesh_mtls_metric,
         overload,
         metrics,
+        mesh_outbound_enforcement,
     )
     .await;
 
@@ -1358,6 +1380,9 @@ async fn handle_tcp_connection_inner(
     record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
+    mesh_outbound_enforcement: Option<
+        &Arc<crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement>,
+    >,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Bound the passthrough SNI peek by the same deadline as terminating-TLS
     // handshakes. Without this, a peer that opens a TCP connection and never
@@ -1468,6 +1493,62 @@ async fn handle_tcp_connection_inner(
 
         (params, cb_info)
     };
+
+    // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).
+    // When the runtime carries an enforcement snapshot AND this listener is
+    // a mesh outbound capture port AND the destination is not in the
+    // admitted registry, drop the inbound TCP connection with a graceful
+    // close before dialing the backend. This matches Istio's REGISTRY_ONLY
+    // semantics for stream-family egress: an unadmitted destination must
+    // never reach a backend connect, so backend circuit breakers, pool
+    // entries, and DNS caches stay untouched by hostile traffic.
+    //
+    // The enforcement check sits BEFORE the connect (and even before the
+    // SNI plugin loop for passthrough below); on `Decision::Skip` the
+    // listener is not an outbound capture port (inbound / HBONE / admin
+    // / east-west / egress-gateway) and we flow through unchanged. On
+    // `Decision::Admit` we record the metric and continue. On
+    // `Decision::Deny` we record the metric, log once per
+    // (cgroup-substitute, destination) — keyed by `(stream_ctx.client_ip,
+    // backend_target)` so repeated unauthorised attempts surface without
+    // log spam — and return a typed `StreamSetupError` that the listener
+    // wrapper turns into a closed inbound connection.
+    if let Some(enforcement) = mesh_outbound_enforcement {
+        use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_TCP, PROTOCOL_TCP_TLS};
+        let decision = enforcement.check_destination(
+            stream_ctx.listen_port,
+            &params.backend_host,
+            params.backend_port,
+        );
+        let protocol_label = if matches!(params.backend_scheme, BackendScheme::Tcps) {
+            PROTOCOL_TCP_TLS
+        } else {
+            PROTOCOL_TCP
+        };
+        match decision {
+            Decision::Admit => {
+                enforcement.record_stream_decision(protocol_label, Decision::Admit);
+            }
+            Decision::Deny => {
+                enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %remote_addr.ip(),
+                    listen_port = stream_ctx.listen_port,
+                    backend_target = %backend_info.backend_target,
+                    protocol = protocol_label,
+                    "Mesh REGISTRY_ONLY: rejecting TCP egress to unadmitted destination"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::RejectedByPlugin,
+                    "(mesh REGISTRY_ONLY)",
+                )
+                .into());
+            }
+            Decision::Skip => {}
+        }
+    }
+
     let plugins = epoch
         .plugin_cache
         .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
