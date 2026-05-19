@@ -7624,7 +7624,7 @@ async fn handle_proxy_request_inner(
     };
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    let socket_ip = remote_addr.ip().to_string();
+    let socket_ip = canonicalize_client_ip(remote_addr.ip()).to_string();
 
     // Build request context — pass cloned socket_ip to ctx (client_ip may be
     // overwritten by trusted-proxy resolution below). method and path keep
@@ -17297,5 +17297,14 @@ mod tests {
                 .dispatch_port_overrides
                 .is_none()
         );
+    }
+}
+fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        other => other,
     }
 }
