@@ -8017,9 +8017,18 @@ async fn handle_proxy_request_inner(
     // the H3 frontend so both paths classify requests identically.
     let is_h2_ws = is_h2_websocket_connect(&req);
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let grpc_web_request = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(crate::plugins::grpc_web::is_grpc_web_content_type);
     let request_protocol = match flavor {
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
+        // gRPC-Web requests are intentionally dispatched as plain HTTP on the
+        // backend path, but they still need gRPC-only policy plugins (e.g.
+        // grpc_method_router) in the request plugin chain.
+        HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
     let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
