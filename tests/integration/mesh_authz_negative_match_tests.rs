@@ -58,6 +58,32 @@ fn request_context(method: &str, path: &str) -> RequestContext {
     ctx
 }
 
+fn policy_allow_example_except_admin_mixed_case_not_host() -> MeshPolicy {
+    MeshPolicy {
+        name: "allow-example-except-admin".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+            }],
+            to: vec![RequestMatch {
+                hosts: vec!["*.example.com".to_string()],
+                not_hosts: vec!["Admin.Example.COM.".to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
 #[tokio::test]
 async fn allow_with_methods_and_not_paths_authorizes_get_to_non_admin_path() {
     let plugin = MeshAuthz::new(&json!({
@@ -134,5 +160,23 @@ async fn allow_with_methods_and_not_paths_denies_post_to_non_admin_path() {
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "POST /api should fall through to implicit-deny, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn direct_plugin_config_normalizes_not_hosts() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_allow_example_except_admin_mixed_case_not_host()]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context("GET", "/api/items");
+    ctx.headers
+        .insert("host".to_string(), "admin.example.com".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "admin.example.com should be denied because mixed-case/trailing-dot not_hosts must normalize, got {result:?}"
     );
 }
