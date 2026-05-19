@@ -801,7 +801,6 @@ impl Plugin for AiResponseGuard {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.has_validation_rules
-            && ctx.method == "POST"
             && !is_sse_request(ctx)
             && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
     }

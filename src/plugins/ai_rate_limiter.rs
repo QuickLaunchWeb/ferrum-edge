@@ -344,8 +344,8 @@ impl Plugin for AiRateLimiter {
         true
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.method == "POST"
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
