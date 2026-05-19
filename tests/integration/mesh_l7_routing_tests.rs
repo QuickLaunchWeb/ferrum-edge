@@ -1027,3 +1027,266 @@ async fn mesh_l7_routing_virtual_service_source_namespace_match_routes_and_misse
         }
     ));
 }
+
+// -- VirtualService authority matcher (T1-B.3) ----------------------------
+//
+// VirtualService `match[].authority.{exact,prefix,regex}` is now a
+// first-class mesh_route_dispatch predicate. Each test below exercises the
+// full translator → plugin construction → request hot path: the translator
+// emits the correct StringMatch shape, the plugin compiles the regex once
+// at config-load time and lowercases exact/prefix patterns (DNS names are
+// case-insensitive per RFC 4343), and the request path routes vs 404s
+// based on the pre-compiled matcher resolving the request's
+// `Host`/`:authority` (normalized through
+// `proxy::normalize_request_host_for_routing` so port and trailing dot
+// are stripped consistently with the router).
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_authority_exact_match_routes_and_misses_fall_closed() {
+    // VirtualService `hosts: ["*.example.com"]` admits any subdomain, but a
+    // per-rule `authority.exact: "internal.example.com"` narrows that route
+    // to a single authority. Other admitted hosts on the same proxy must
+    // fail closed via `reject_unmatched`.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["*.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/api"},
+                        "authority": {"exact": "internal.example.com"}
+                    }],
+                    "route": [{"destination": {"host": "internal.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["authority"].as_str(),
+        Some("internal.example.com")
+    );
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true),
+        "guarded-route VS still enforces match semantics via reject_unmatched"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match: request `Host` equals the gated authority → route override applies.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("host".to_string(), "internal.example.com".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("internal.default.svc.cluster.local")
+    );
+    assert_eq!(ctx.route_override_backend_port, Some(8080));
+
+    // Match: case-insensitive comparison (DNS names are case-insensitive).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("host".to_string(), "INTERNAL.EXAMPLE.COM".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("internal.default.svc.cluster.local")
+    );
+
+    // Match: port-bearing Host is normalized (port stripped) before compare.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers =
+        HashMap::from([("host".to_string(), "internal.example.com:8443".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // Miss: a different authority on the same wildcard-admitted proxy must
+    // 404, not silently fall through to the default backend.
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_authority_prefix_match_routes_and_misses_fall_closed() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["*.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/api"},
+                        "authority": {"prefix": "api."}
+                    }],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["authority"]["prefix"].as_str(),
+        Some("api.")
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match: each host starts with "api." → routes to the configured backend.
+    for host in ["api.example.com", "api.staging.example.com"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/items".to_string(),
+        );
+        let mut headers = HashMap::from([("host".to_string(), host.to_string())]);
+        assert!(
+            matches!(
+                dispatch.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "prefix must match {host}"
+        );
+        assert_eq!(
+            ctx.route_override_backend_host.as_deref(),
+            Some("api.default.svc.cluster.local")
+        );
+    }
+
+    // Miss: host doesn't start with the prefix → 404 (reject_unmatched).
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("host".to_string(), "admin.example.com".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_authority_regex_match_routes_and_misses_fall_closed() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["*.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/api"},
+                        "authority": {"regex": "^api\\.(prod|staging)\\.example\\.com$"}
+                    }],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["authority"]["regex"].as_str(),
+        Some("^api\\.(prod|staging)\\.example\\.com$")
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match: hosts that satisfy the regex.
+    for host in ["api.prod.example.com", "api.staging.example.com"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/items".to_string(),
+        );
+        let mut headers = HashMap::from([("host".to_string(), host.to_string())]);
+        assert!(
+            matches!(
+                dispatch.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "regex must match {host}"
+        );
+    }
+
+    // Miss: regex doesn't match → 404.
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("host".to_string(), "api.example.com".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}

@@ -7996,12 +7996,282 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_unsupported_authority_predicate_does_not_disable_reject_unmatched() {
-        // Codex P1 (#3237631705): `authority` is a non-URI predicate we
-        // don't currently extract. An entry consisting of `uri` plus
-        // `authority` is NOT a URI-only catch-all -- it's URI plus an
-        // unsupported predicate. Treating it as URI-only would forward
-        // requests that don't carry the gated authority.
+    fn virtual_service_authority_exact_match_emits_plugin_with_bare_string() {
+        // T1-B.3: VirtualService `authority.exact` is now a first-class
+        // mesh_route_dispatch predicate. The translator emits the
+        // bare-string back-compat form for `exact` (matching how header
+        // and method `exact` matchers are emitted), and the plugin
+        // construction must succeed (predicate compiled at config-load
+        // time, not per request).
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com", "*.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "authority": {"exact": "internal.example.com"}
+                        }],
+                        "route": [{"destination": {"host": "internal.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for authority predicate");
+        let authority_value = &plugin.config["rules"][0]["match"]["authority"];
+        assert!(
+            authority_value.is_string(),
+            "exact authority must emit as bare string for wire back-compat, got: {authority_value}"
+        );
+        assert_eq!(authority_value.as_str(), Some("internal.example.com"));
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "authority exact must NOT cause fail-closed request_termination anymore"
+        );
+
+        // The plugin must load successfully from the translator's JSON shape.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_authority_prefix_match_emits_plugin_with_tagged_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "authority": {"prefix": "api."}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for prefix authority");
+        let authority_value = &plugin.config["rules"][0]["match"]["authority"];
+        assert!(
+            authority_value.is_object(),
+            "prefix authority must emit as tagged StringMatch object, got: {authority_value}"
+        );
+        assert_eq!(authority_value["prefix"].as_str(), Some("api."));
+
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_authority_regex_match_emits_plugin_with_tagged_regex() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "authority": {"regex": "^api\\.(prod|staging)\\.example\\.com$"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for regex authority");
+        let authority_value = &plugin.config["rules"][0]["match"]["authority"];
+        assert!(
+            authority_value.is_object(),
+            "regex authority must emit as tagged StringMatch object, got: {authority_value}"
+        );
+        assert_eq!(
+            authority_value["regex"].as_str(),
+            Some("^api\\.(prod|staging)\\.example\\.com$"),
+            "regex predicate must round-trip the pattern literally"
+        );
+
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_uri_less_authority_only_match_materializes_catch_all_proxy() {
+        // An `http.match[]` that contains only an `authority` predicate (no
+        // URI) is now legitimate, just like the header-only catch-all case
+        // already documented above: it routes "any URI with this authority"
+        // on the listed hosts. Without first-class authority support, this
+        // would have been silently dropped via the unsupported-key list.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "http": [{
+                        "match": [
+                            {"authority": {"prefix": "api."}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // A URI-less, supported-predicate catch-all proxy materializes
+        // and carries the mesh_route_dispatch plugin so the authority
+        // predicate is actually enforced.
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin must be emitted for authority-only catch-all");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1, "single authority-only rule emitted");
+        assert_eq!(
+            rules[0]["match"]["authority"]["prefix"].as_str(),
+            Some("api.")
+        );
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "authority-only predicate must NOT cause fail-closed request_termination"
+        );
+    }
+
+    #[test]
+    fn virtual_service_unsupported_authority_shape_still_fails_closed() {
+        // An `authority` value whose shape is not a StringMatch (e.g., a
+        // bare string in the VS spec, which Istio's CRD does not accept,
+        // or a typo'd operator) is treated as unsupported so the route
+        // falls closed via `request_termination` rather than silently
+        // accepting the route as URI-only.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "authority": "internal.example.com"}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // The unsupported-shape entry should NOT yield a mesh_route_dispatch
+        // rule; instead the URI proxy is guarded by a request_termination so
+        // gated traffic doesn't sneak through.
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        assert!(
+            result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            }),
+            "non-StringMatch authority shape must fail closed"
+        );
+    }
+
+    #[test]
+    fn virtual_service_unsupported_authority_operator_still_fails_closed() {
+        // An `authority` object whose only operator is not in the
+        // supported set (`exact` / `prefix` / `regex`) is treated as
+        // unsupported. Istio does not expose other operators today, but
+        // future-proofing here means an unknown operator can't leak past
+        // the gate.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "authority": {"contains": "internal"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        assert!(
+            result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            }),
+            "unknown authority operator must fail closed"
+        );
+    }
+
+    #[test]
+    fn virtual_service_unsupported_source_labels_predicate_does_not_disable_reject_unmatched() {
+        // Codex P1 (#3237631705): an unsupported non-URI predicate must NOT
+        // disable `reject_unmatched`. An entry consisting of `uri` plus an
+        // unsupported predicate is NOT a URI-only catch-all -- it's URI
+        // plus an unsupported predicate. Treating it as URI-only would
+        // forward requests that don't carry the gated predicate.
+        //
+        // `authority` is now first-class supported (T1-B.3), so this test
+        // uses `sourceLabels` (still unsupported -- sibling PRs cover
+        // `sourceNamespace`, etc.) to keep exercising the fail-closed
+        // sibling path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8010,7 +8280,7 @@ extensionProviders:
                     "http": [{
                         "match": [
                             {"uri": {"prefix": "/api"}, "headers": {"x-canary": {"exact": "v2"}}},
-                            {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
+                            {"uri": {"prefix": "/api"}, "sourceLabels": {"app": "billing"}}
                         ],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
                     }]
@@ -8033,7 +8303,7 @@ extensionProviders:
         assert_eq!(
             rules.len(),
             1,
-            "only the supported header rule survives; authority-bearing sibling is skipped"
+            "only the supported header rule survives; sourceLabels-bearing sibling is skipped"
         );
         assert_eq!(
             plugin
@@ -8041,7 +8311,7 @@ extensionProviders:
                 .get("reject_unmatched")
                 .and_then(Value::as_bool),
             Some(true),
-            "unsupported authority predicate must NOT collapse onto URI-only catch-all"
+            "unsupported sibling predicate must NOT collapse onto URI-only catch-all"
         );
     }
 
