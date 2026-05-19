@@ -214,6 +214,7 @@ impl MeshRouteDispatchConfig {
             rule.response_transform_compiled =
                 compile_transform_field(idx, "response_transform", &rule.response_transform)?;
             rule.methods_compiled = compile_method_matchers(idx, &rule.match_.methods)?;
+            rule.headers_compiled = compile_header_matchers(idx, &rule.match_.headers)?;
         }
         Ok(())
     }
@@ -331,6 +332,12 @@ pub struct RouteRule {
     /// `match.methods` is empty (no method restriction).
     #[serde(skip)]
     methods_compiled: Vec<MethodMatcher>,
+    /// Pre-compiled per-header matchers built during normalize. `Regex`
+    /// values are compiled here, not per request — the hot path only does
+    /// `HashMap::get(name).is_some_and(|v| matcher.matches(v))`.
+    /// Empty when `match.headers` is empty.
+    #[serde(skip)]
+    headers_compiled: HashMap<String, HeaderMatcher>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -355,10 +362,18 @@ pub struct MatchCriteria {
     /// the pre-compiled `Regex` from the rule's `methods_compiled` slot.
     #[serde(default)]
     pub methods: Vec<MethodMatchOp>,
-    /// Header equality matches (all-of). Header names are case-insensitive;
-    /// values match exactly.
+    /// Header matches (all-of). Header names are case-insensitive. The value
+    /// shape is one of:
+    ///
+    /// - a plain string — interpreted as an `Exact` match (back-compat with
+    ///   the original `HashMap<String, String>` shape);
+    /// - an object with exactly one of `exact` / `prefix` / `regex` — the
+    ///   Istio `StringMatch` shape, projected from VirtualService translation.
+    ///
+    /// Regexes compile at config-load time (cold path); the hot path reads
+    /// the pre-compiled `Regex` from the rule's `headers_compiled` slot.
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, HeaderMatchOp>,
     /// Query parameter equality matches (all-of). Names and values match
     /// exactly after percent-decoding (the gateway materializes
     /// `ctx.query_params` from the raw query string).
@@ -430,6 +445,56 @@ impl MethodMatcher {
     }
 }
 
+/// Per-header match operator. Mirrors the Istio `StringMatch` shape (one of
+/// `exact` / `prefix` / `regex`), with an extra wire-compat arm for the
+/// legacy plain-string form (`{"x-canary": "v2"}` → `Exact("v2")`).
+///
+/// Serde-untagged so JSON round-trips byte-identical for both shapes:
+/// a plain-string header value deserializes (and re-serializes) as the legacy
+/// form; the tagged form deserializes (and re-serializes) as the
+/// `StringMatch` object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HeaderMatchOp {
+    /// Back-compat form: bare string, interpreted as `Exact`.
+    Legacy(String),
+    /// Tagged form: `{ "exact" | "prefix" | "regex": "..." }`.
+    Tagged(HeaderStringMatch),
+}
+
+/// Tagged `StringMatch` for headers — exactly one of `exact`, `prefix`, or
+/// `regex` may be present. `deny_unknown_fields` rejects e.g. typos like
+/// `{"prefiks": "..."}` at config-load time rather than silently ignoring them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeaderStringMatch {
+    Exact(String),
+    Prefix(String),
+    Regex(String),
+}
+
+/// Compiled hot-path representation of a `HeaderMatchOp`. Regexes are stored
+/// as `Regex` (compiled once at config load); exact/prefix keep the borrowed
+/// reference into the original config string. `Clone` is cheap because the
+/// `regex` crate's `Regex` is `Arc`-backed internally and clones are
+/// refcount bumps, not pattern recompiles.
+#[derive(Debug, Clone)]
+pub(crate) enum HeaderMatcher {
+    Exact(String),
+    Prefix(String),
+    Regex(Regex),
+}
+
+impl HeaderMatcher {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            HeaderMatcher::Exact(expected) => value == expected.as_str(),
+            HeaderMatcher::Prefix(prefix) => value.starts_with(prefix.as_str()),
+            HeaderMatcher::Regex(re) => re.is_match(value),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteDestination {
     /// Override the proxy's `upstream_id`. Wins over `proxy.upstream_id`
@@ -479,7 +544,7 @@ impl MeshRouteDispatch {
 
 fn normalize_header_match_keys(
     rule_idx: usize,
-    headers: &mut HashMap<String, String>,
+    headers: &mut HashMap<String, HeaderMatchOp>,
 ) -> Result<(), String> {
     if headers.is_empty() {
         return Ok(());
@@ -549,6 +614,52 @@ fn compile_method_matchers(
             }
         };
         compiled.push(matcher);
+    }
+    Ok(compiled)
+}
+
+/// Compile each per-header matcher once, at config load. Regex compilation is
+/// the cold-path work; the request hot path only calls `Regex::is_match`.
+/// Invalid regex (or an empty pattern after the operator-provided string) is a
+/// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
+/// plugin-config-validation rule.
+fn compile_header_matchers(
+    rule_idx: usize,
+    headers: &HashMap<String, HeaderMatchOp>,
+) -> Result<HashMap<String, HeaderMatcher>, String> {
+    let mut compiled = HashMap::with_capacity(headers.len());
+    for (name, op) in headers {
+        let matcher = match op {
+            HeaderMatchOp::Legacy(value) => HeaderMatcher::Exact(value.clone()),
+            HeaderMatchOp::Tagged(HeaderStringMatch::Exact(value)) => {
+                HeaderMatcher::Exact(value.clone())
+            }
+            HeaderMatchOp::Tagged(HeaderStringMatch::Prefix(prefix)) => {
+                if prefix.is_empty() {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].prefix \
+                         must not be empty (every value would match — likely a misconfiguration)"
+                    ));
+                }
+                HeaderMatcher::Prefix(prefix.clone())
+            }
+            HeaderMatchOp::Tagged(HeaderStringMatch::Regex(pattern)) => {
+                if pattern.is_empty() {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
+                         must not be empty"
+                    ));
+                }
+                let re = Regex::new(pattern).map_err(|e| {
+                    format!(
+                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
+                         is invalid: {e}"
+                    )
+                })?;
+                HeaderMatcher::Regex(re)
+            }
+        };
+        compiled.insert(name.clone(), matcher);
     }
     Ok(compiled)
 }
@@ -669,12 +780,14 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
     {
         return false;
     }
-    for (name, expected) in &m.headers {
-        // `before_proxy` receives the in-flight header map; `ctx.headers`
-        // may have been moved out by the dispatcher. Config header names are
-        // normalized at construction time, so this stays allocation-free.
+    // `before_proxy` receives the in-flight header map; `ctx.headers`
+    // may have been moved out by the dispatcher. Config header names are
+    // normalized at construction time and matchers are pre-compiled
+    // (regex included) — the hot path is one HashMap lookup plus the
+    // matcher op per configured header.
+    for (name, matcher) in &rule.headers_compiled {
         match headers.get(name.as_str()) {
-            Some(actual) if actual == expected => {}
+            Some(actual) if matcher.matches(actual) => {}
             _ => return false,
         }
     }
@@ -1748,5 +1861,287 @@ mod tests {
         assert_eq!(arr[0].as_str(), Some("GET"));
         assert!(arr[1].is_object());
         assert_eq!(arr[1]["regex"].as_str(), Some("^(POST|PUT)$"));
+    }
+
+    // ── HeaderMatchOp (exact / prefix / regex) ────────────────────────────
+    //
+    // T1-B.1: VirtualService translation can emit prefix/regex header
+    // matchers; the plugin compiles regex at config-load time and the hot
+    // path stays one HashMap lookup plus the matcher op per header.
+
+    #[test]
+    fn accepts_legacy_bare_string_header_value_as_exact() {
+        // Back-compat: a bare string is the existing wire shape — must keep
+        // round-tripping byte-identical and evaluate as `Exact`.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Canary": "v2"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        let compiled = &plugin.rules()[0].headers_compiled;
+        match compiled.get("x-canary") {
+            Some(HeaderMatcher::Exact(v)) => assert_eq!(v, "v2"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_tagged_exact_header_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Canary": {"exact": "v2"}}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        match plugin.rules()[0].headers_compiled.get("x-canary") {
+            Some(HeaderMatcher::Exact(v)) => assert_eq!(v, "v2"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_prefix_header_match_at_load_and_compiles_no_regex() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tenant": {"prefix": "admin-"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        match plugin.rules()[0].headers_compiled.get("x-tenant") {
+            Some(HeaderMatcher::Prefix(p)) => assert_eq!(p, "admin-"),
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_regex_header_match_at_load_and_compiles_once() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tier": {"regex": "^(gold|platinum)$"}}},
+                "destination": {"upstream_id": "premium"}
+            }]
+        }))
+        .unwrap();
+        match plugin.rules()[0].headers_compiled.get("x-tier") {
+            Some(HeaderMatcher::Regex(re)) => {
+                assert!(re.is_match("gold"));
+                assert!(re.is_match("platinum"));
+                assert!(!re.is_match("silver"));
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_regex_header_match_at_load() {
+        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
+        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tier": {"regex": "["}}},
+                "destination": {"upstream_id": "premium"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
+        assert!(err.contains("x-tier"), "got: {err}");
+        assert!(err.contains("regex"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_regex_header_match_at_load() {
+        // An empty regex (`""`) matches every value, which is almost always
+        // a misconfiguration. Fail loud instead of silently widening traffic.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tier": {"regex": ""}}},
+                "destination": {"upstream_id": "premium"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("regex"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_prefix_header_match_at_load() {
+        // An empty prefix matches every value, see regex rationale above.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tier": {"prefix": ""}}},
+                "destination": {"upstream_id": "premium"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("prefix"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_header_match_operator_at_load() {
+        // `deny_unknown_fields` on `HeaderStringMatch` catches typos like
+        // `{"prefiks": "..."}` at load time so we never compile and ship a
+        // rule that silently never fires.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Tier": {"prefiks": "admin-"}}},
+                "destination": {"upstream_id": "premium"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("mesh_route_dispatch") || err.contains("unknown"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regex_header_match_routes_when_value_matches() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"x-tier": {"regex": "^admin-.*$"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([("x-tier".to_string(), "admin-east".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("admin"));
+    }
+
+    #[tokio::test]
+    async fn regex_header_match_falls_through_when_value_does_not_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"x-tier": {"regex": "^admin-.*$"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([("x-tier".to_string(), "user-east".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn prefix_header_match_routes_when_value_starts_with_prefix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"x-tenant": {"prefix": "admin-"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([("x-tenant".to_string(), "admin-acme".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("admin"));
+    }
+
+    #[tokio::test]
+    async fn prefix_header_match_falls_through_when_value_does_not_start_with_prefix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"x-tenant": {"prefix": "admin-"}}},
+                "destination": {"upstream_id": "admin"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([("x-tenant".to_string(), "user-acme".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_prefix_regex_headers_are_anded() {
+        // All-of semantics across mixed matcher kinds: each header must
+        // independently match. A miss on any one means the rule does not
+        // fire — matches Istio's `headers` map semantics.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "headers": {
+                        "x-canary": {"exact": "v2"},
+                        "x-tenant": {"prefix": "admin-"},
+                        "x-tier": {"regex": "^(gold|platinum)$"}
+                    }
+                },
+                "destination": {"upstream_id": "all-match"}
+            }]
+        }))
+        .unwrap();
+
+        // All match → route override applies.
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([
+            ("x-canary".to_string(), "v2".to_string()),
+            ("x-tenant".to_string(), "admin-acme".to_string()),
+            ("x-tier".to_string(), "gold".to_string()),
+        ]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("all-match"));
+
+        // Regex miss → fall-through.
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([
+            ("x-canary".to_string(), "v2".to_string()),
+            ("x-tenant".to_string(), "admin-acme".to_string()),
+            ("x-tier".to_string(), "silver".to_string()),
+        ]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+
+        // Prefix miss → fall-through.
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([
+            ("x-canary".to_string(), "v2".to_string()),
+            ("x-tenant".to_string(), "user-acme".to_string()),
+            ("x-tier".to_string(), "gold".to_string()),
+        ]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[test]
+    fn legacy_and_tagged_header_form_round_trip_through_serde() {
+        // The schema must keep the two wire shapes byte-stable so existing
+        // configs deserialize unchanged.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "headers": {
+                        "x-canary": "v2",
+                        "x-tier": {"regex": "^(gold|platinum)$"}
+                    }
+                },
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+
+        // The compiled hot-path representation reflects each form correctly.
+        let compiled = &plugin.rules()[0].headers_compiled;
+        match compiled.get("x-canary") {
+            Some(HeaderMatcher::Exact(v)) => assert_eq!(v, "v2"),
+            other => panic!("expected Exact for legacy form, got {other:?}"),
+        }
+        match compiled.get("x-tier") {
+            Some(HeaderMatcher::Regex(_)) => {}
+            other => panic!("expected Regex for tagged form, got {other:?}"),
+        }
+
+        // The serialized JSON for the raw `MatchCriteria.headers` map keeps
+        // the bare string vs object distinction the operator wrote.
+        let raw = serde_json::to_value(&plugin.rules()[0].match_.headers).unwrap();
+        assert!(raw["x-canary"].is_string());
+        assert!(raw["x-tier"].is_object());
+        assert_eq!(raw["x-tier"]["regex"].as_str(), Some("^(gold|platinum)$"));
     }
 }

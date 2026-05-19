@@ -1,133 +1,36 @@
 {{- if and .Values.observability.enabled .Values.observability.dashboards.enabled }}
+{{- /*
+  Bundled Grafana dashboards. Each JSON in `dashboards/` is loaded into the
+  ConfigMap data, and the `grafana_dashboard: "1"` label is the sidecar
+  convention used by `kiwigrid/k8s-sidecar` (the default Grafana Helm chart
+  sidecar) and by the Grafana operator. Operators that already manage
+  dashboards out of band can disable this surface by setting
+  `observability.dashboards.enabled=false` (the default value is `true` so
+  installs that enable observability get the dashboards as a single switch).
+
+  Adding a new dashboard:
+    1. Drop the JSON in `charts/ferrum-mesh/dashboards/<name>.json`.
+    2. No template edits needed — `.Files.Glob` picks it up automatically.
+*/}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: ferrum-mesh-dashboards
+  name: {{ .Values.observability.dashboards.configMapName | default "ferrum-mesh-dashboards" }}
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: ferrum-mesh-observability
     app.kubernetes.io/instance: {{ .Release.Name }}
-    grafana_dashboard: "1"
+    {{- with .Values.observability.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{ .Values.observability.dashboards.sidecarLabel | default "grafana_dashboard" }}: {{ .Values.observability.dashboards.sidecarLabelValue | default "1" | quote }}
+  {{- with .Values.observability.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 data:
-  ferrum-mesh-red.json: |-
-    {
-      "uid": "ferrum-mesh-red",
-      "title": "Ferrum Mesh RED",
-      "schemaVersion": 39,
-      "version": 1,
-      "tags": ["ferrum", "mesh", "istio", "gamma"],
-      "time": { "from": "now-1h", "to": "now" },
-      "refresh": "30s",
-      "panels": [
-        {
-          "type": "timeseries",
-          "title": "Requests by destination service",
-          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
-          "targets": [
-            {
-              "expr": "sum by (destination_service, response_code) (rate(ferrum_mesh_requests_total[5m]))",
-              "legendFormat": "{{ "{{destination_service}}" }} {{ "{{response_code}}" }}"
-            }
-          ]
-        },
-        {
-          "type": "timeseries",
-          "title": "P99 request duration by destination service",
-          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
-          "targets": [
-            {
-              "expr": "histogram_quantile(0.99, sum by (le, destination_service) (rate(ferrum_mesh_request_duration_ms_bucket[5m])))",
-              "legendFormat": "{{ "{{destination_service}}" }} p99"
-            }
-          ]
-        },
-        {
-          "type": "timeseries",
-          "title": "Error rate by source and destination",
-          "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
-          "targets": [
-            {
-              "expr": "sum by (source_workload, destination_service) (rate(ferrum_mesh_requests_total{response_code=~\"5..\"}[5m])) / clamp_min(sum by (source_workload, destination_service) (rate(ferrum_mesh_requests_total[5m])), 1)",
-              "legendFormat": "{{ "{{source_workload}}" }} -> {{ "{{destination_service}}" }}"
-            }
-          ]
-        },
-        {
-          "type": "stat",
-          "title": "mTLS coverage",
-          "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
-          "targets": [
-            {
-              "expr": "sum(rate(ferrum_mesh_requests_total{connection_security_policy=\"mutual_tls\"}[5m])) / clamp_min(sum(rate(ferrum_mesh_requests_total[5m])), 1)",
-              "legendFormat": "mTLS"
-            }
-          ],
-          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
-        },
-        {
-          "type": "stat",
-          "title": "Active service graph edges",
-          "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
-          "targets": [
-            {
-              "expr": "count(count by (source_workload, destination_service) (rate(ferrum_mesh_requests_total[5m])))",
-              "legendFormat": "edges"
-            }
-          ]
-        },
-        {
-          "type": "timeseries",
-          "title": "Certificate expiry",
-          "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
-          "targets": [
-            {
-              "expr": "min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds)",
-              "legendFormat": "{{ "{{source}}" }} {{ "{{spiffe_id}}" }}"
-            }
-          ],
-          "fieldConfig": { "defaults": { "unit": "s" } }
-        },
-        {
-          "type": "timeseries",
-          "title": "Certificate rotation failures",
-          "gridPos": { "x": 0, "y": 22, "w": 12, "h": 7 },
-          "targets": [
-            {
-              "expr": "sum by (source) (increase(ferrum_mesh_cert_rotation_failures_total[1h]))",
-              "legendFormat": "{{ "{{source}}" }}"
-            }
-          ]
-        },
-        {
-          "type": "timeseries",
-          "title": "CA health and trust bundle changes",
-          "gridPos": { "x": 12, "y": 22, "w": 12, "h": 7 },
-          "targets": [
-            {
-              "expr": "min by (ca_type) (ferrum_mesh_ca_health)",
-              "legendFormat": "CA {{ "{{ca_type}}" }}"
-            },
-            {
-              "expr": "sum by (trust_domain, source) (changes(ferrum_mesh_trust_bundle_version[1h]))",
-              "legendFormat": "bundle changes {{ "{{source}}" }} {{ "{{trust_domain}}" }}"
-            }
-          ]
-        },
-        {
-          "type": "timeseries",
-          "title": "USE-lite process resources",
-          "gridPos": { "x": 0, "y": 29, "w": 24, "h": 7 },
-          "targets": [
-            {
-              "expr": "rate(process_cpu_seconds_total[5m])",
-              "legendFormat": "cpu {{ "{{pod}}" }}"
-            },
-            {
-              "expr": "process_resident_memory_bytes",
-              "legendFormat": "rss {{ "{{pod}}" }}"
-            }
-          ]
-        }
-      ]
-    }
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
 {{- end }}

@@ -1,0 +1,317 @@
+{
+  "uid": "ferrum-egress-scope",
+  "title": "Ferrum Mesh Egress Scope",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["ferrum", "mesh"],
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "mesh_namespace",
+        "type": "query",
+        "label": "Mesh namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_outbound_registry_decisions_total, mesh_namespace)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Admit vs deny rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (decision) (rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\"}[5m]))",
+          "legendFormat": "{{decision}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "stacking": {"mode": "normal"}
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Deny ratio (denies / total)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"deny\"}[5m])) / clamp_min(sum(rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\"}[5m])), 1)",
+          "legendFormat": "deny ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.01},
+              {"color": "red", "value": 0.1}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Total denies (rate, 5m)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"deny\"}[5m]))",
+          "legendFormat": "denies/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 4,
+      "title": "Top admitted destinations (5m window)",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "topk(20, sum by (host, mesh_namespace) (rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"admit\"}[5m])))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true},
+            "indexByName": {"host": 0, "mesh_namespace": 1, "Value": 2},
+            "renameByName": {"Value": "admit rate", "host": "destination host", "mesh_namespace": "namespace"}
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"sort": [{"field": "admit rate", "desc": true}]}
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 5,
+      "title": "Top denied destination buckets (5m window)",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "topk(20, sum by (host, mesh_namespace) (rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"deny\"}[5m])))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true},
+            "indexByName": {"host": 0, "mesh_namespace": 1, "Value": 2},
+            "renameByName": {"Value": "deny rate", "host": "destination bucket", "mesh_namespace": "namespace"}
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"sort": [{"field": "deny rate", "desc": true}]}
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 6,
+      "title": "Admitted destinations by host (timeseries)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 18},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (host) (rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"admit\"}[5m])))",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 7,
+      "title": "Cumulative admit vs deny totals",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 26},
+      "targets": [
+        {
+          "expr": "sum(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"admit\"})",
+          "legendFormat": "admitted (total)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"deny\"})",
+          "legendFormat": "denied (total)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 8,
+      "title": "Unique destination hosts (5m window)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 26},
+      "targets": [
+        {
+          "expr": "count(count by (host) (rate(ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=~\"$mesh_namespace\", decision=\"admit\"}[5m])))",
+          "legendFormat": "admitted hosts",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}
