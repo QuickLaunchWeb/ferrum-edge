@@ -58,6 +58,18 @@ fn raw_header_get_reads_before_materialization() {
 }
 
 #[test]
+fn raw_header_values_exposes_all_duplicate_field_lines() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("x-forwarded-for", "198.51.100.10".parse().unwrap());
+    raw.append("x-forwarded-for", "203.0.113.77".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    let values: Vec<&str> = ctx.raw_header_values("x-forwarded-for").collect();
+    assert_eq!(values, vec!["198.51.100.10", "203.0.113.77"]);
+}
+
+#[test]
 fn raw_header_get_returns_none_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();
