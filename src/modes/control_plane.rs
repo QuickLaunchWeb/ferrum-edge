@@ -24,11 +24,12 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_backend::{self, DatabaseBackend, GatewayTrustBundlePoll};
+use crate::config::db_backend::{self, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
+use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
-use crate::grpc::cp_server::CpGrpcServer;
+use crate::grpc::cp_server::{CpGrpcServer, CpScope};
 use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
@@ -40,6 +41,333 @@ use crate::xds::XdsAdsServer;
 
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
+
+/// Resolve which namespaces the CP polling loop should load on each tick.
+///
+/// `Single(ns)` / `Set({ns, ...})` return the explicit list directly; `All`
+/// dynamically discovers namespaces from `db.list_namespaces()` so the CP
+/// picks up new tenants without a restart. Returns at least one namespace
+/// — when `All` is configured but the database is empty, we still load the
+/// gateway's `FERRUM_NAMESPACE` so the admin API works on a fresh cluster.
+async fn resolve_polled_namespaces(
+    db: &dyn DatabaseBackend,
+    scope: &CpScope,
+    fallback: &str,
+) -> Vec<String> {
+    if let Some(explicit) = scope.explicit_namespaces() {
+        return explicit;
+    }
+    // CpScope::All — discover dynamically.
+    match db.list_namespaces().await {
+        Ok(mut ns) if !ns.is_empty() => {
+            ns.sort();
+            ns.dedup();
+            ns
+        }
+        Ok(_) => {
+            // Empty cluster — fall back to FERRUM_NAMESPACE so the admin API
+            // still works.
+            vec![fallback.to_string()]
+        }
+        Err(e) => {
+            warn!(
+                "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                e, fallback
+            );
+            vec![fallback.to_string()]
+        }
+    }
+}
+
+/// Multi-namespace incremental poll. Calls `load_incremental_config` once
+/// per namespace, then concatenates the per-namespace results into a single
+/// `IncrementalResult` so the rest of the polling loop's validate / apply /
+/// partition pipeline stays the same.
+///
+/// The `since` and known-id sets are scoped per namespace inside this
+/// function: each namespace's deletion detection only compares its own
+/// known IDs against its own current IDs (otherwise a removal in namespace
+/// A would look like an unknown ID in namespace B's list and incorrectly
+/// surface). For the back-compat `Single` case, the call collapses to a
+/// single per-namespace fetch identical to the pre-T2-A path.
+#[allow(clippy::too_many_arguments)]
+async fn load_incremental_config_multi(
+    db: &dyn DatabaseBackend,
+    namespaces: &[String],
+    since: chrono::DateTime<chrono::Utc>,
+    known_proxy_ids: &std::collections::HashSet<String>,
+    known_consumer_ids: &std::collections::HashSet<String>,
+    known_plugin_config_ids: &std::collections::HashSet<String>,
+    known_upstream_ids: &std::collections::HashSet<String>,
+    proxy_ns: &std::collections::HashMap<String, String>,
+    consumer_ns: &std::collections::HashMap<String, String>,
+    plugin_config_ns: &std::collections::HashMap<String, String>,
+    upstream_ns: &std::collections::HashMap<String, String>,
+) -> Result<IncrementalResult, anyhow::Error> {
+    if namespaces.len() <= 1 {
+        let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
+        return db
+            .load_incremental_config(
+                ns,
+                since,
+                known_proxy_ids,
+                known_consumer_ids,
+                known_plugin_config_ids,
+                known_upstream_ids,
+            )
+            .await;
+    }
+
+    // Build per-namespace known-id subsets so each call's deletion detection
+    // is scoped correctly. A known ID in namespace A must not be compared
+    // against namespace B's "current" list, or the incremental poll would
+    // see it as removed.
+    use std::collections::HashSet;
+    let split_ids = |ids: &HashSet<String>,
+                     lookup: &std::collections::HashMap<String, String>|
+     -> std::collections::HashMap<String, HashSet<String>> {
+        let mut out: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
+        for id in ids {
+            if let Some(ns) = lookup.get(id) {
+                out.entry(ns.clone()).or_default().insert(id.clone());
+            }
+        }
+        out
+    };
+    let split_proxies = split_ids(known_proxy_ids, proxy_ns);
+    let split_consumers = split_ids(known_consumer_ids, consumer_ns);
+    let split_plugin_configs = split_ids(known_plugin_config_ids, plugin_config_ns);
+    let split_upstreams = split_ids(known_upstream_ids, upstream_ns);
+
+    let empty: HashSet<String> = HashSet::new();
+    let mut combined = IncrementalResult {
+        added_or_modified_proxies: Vec::new(),
+        removed_proxy_ids: Vec::new(),
+        added_or_modified_consumers: Vec::new(),
+        removed_consumer_ids: Vec::new(),
+        added_or_modified_plugin_configs: Vec::new(),
+        removed_plugin_config_ids: Vec::new(),
+        added_or_modified_upstreams: Vec::new(),
+        removed_upstream_ids: Vec::new(),
+        poll_timestamp: chrono::Utc::now(),
+    };
+    for ns in namespaces {
+        let ns_proxies = split_proxies.get(ns).unwrap_or(&empty);
+        let ns_consumers = split_consumers.get(ns).unwrap_or(&empty);
+        let ns_plugin_configs = split_plugin_configs.get(ns).unwrap_or(&empty);
+        let ns_upstreams = split_upstreams.get(ns).unwrap_or(&empty);
+        let mut delta = db
+            .load_incremental_config(
+                ns,
+                since,
+                ns_proxies,
+                ns_consumers,
+                ns_plugin_configs,
+                ns_upstreams,
+            )
+            .await?;
+        combined
+            .added_or_modified_proxies
+            .append(&mut delta.added_or_modified_proxies);
+        combined
+            .removed_proxy_ids
+            .append(&mut delta.removed_proxy_ids);
+        combined
+            .added_or_modified_consumers
+            .append(&mut delta.added_or_modified_consumers);
+        combined
+            .removed_consumer_ids
+            .append(&mut delta.removed_consumer_ids);
+        combined
+            .added_or_modified_plugin_configs
+            .append(&mut delta.added_or_modified_plugin_configs);
+        combined
+            .removed_plugin_config_ids
+            .append(&mut delta.removed_plugin_config_ids);
+        combined
+            .added_or_modified_upstreams
+            .append(&mut delta.added_or_modified_upstreams);
+        combined
+            .removed_upstream_ids
+            .append(&mut delta.removed_upstream_ids);
+        // Use the latest namespace's poll timestamp as the combined value;
+        // the small skew between namespaces is bounded by the per-call
+        // duration and absorbed by the 1-second safety margin in
+        // `load_incremental_config`.
+        combined.poll_timestamp = delta.poll_timestamp;
+    }
+    Ok(combined)
+}
+
+/// Load and merge per-namespace `GatewayConfig`s into a single combined config.
+///
+/// The CP holds one in-memory `GatewayConfig` even when serving multiple
+/// namespaces (so admin / observability paths still see the whole picture).
+/// Per-DP broadcasts filter to a single namespace at send time, and the
+/// DP-side namespace filter in `dp_client::filter_config_to_namespace` is a
+/// defense-in-depth backstop.
+async fn load_full_config_multi(
+    db: &dyn DatabaseBackend,
+    namespaces: &[String],
+) -> Result<GatewayConfig, anyhow::Error> {
+    if namespaces.len() <= 1 {
+        let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
+        return db.load_full_config(ns).await;
+    }
+
+    // First namespace seeds the loaded_at / version / trust_bundles fields,
+    // then we extend with the remaining namespaces' resource vectors.
+    let first = namespaces.first().expect("namespaces is non-empty");
+    let mut combined = db.load_full_config(first).await?;
+    for ns in namespaces.iter().skip(1) {
+        let mut next = db.load_full_config(ns).await?;
+        combined.proxies.append(&mut next.proxies);
+        combined.consumers.append(&mut next.consumers);
+        combined.plugin_configs.append(&mut next.plugin_configs);
+        combined.upstreams.append(&mut next.upstreams);
+        // Per-namespace trust bundles are loaded via the dedicated
+        // `load_gateway_trust_bundles` poll path; the combined snapshot
+        // keeps the first namespace's value for back-compat with the
+        // single-namespace CP. Multi-namespace trust-bundle distribution
+        // is a future-work item tracked separately.
+    }
+    Ok(combined)
+}
+
+/// Partition an `IncrementalResult` by `namespace`, returning a delta for
+/// each namespace that has at least one changed or removed resource.
+///
+/// Resources are matched by their `namespace` field; removed IDs are
+/// partitioned via a `(id → namespace)` lookup built from the CP's current
+/// known-IDs sets so deletions reach the right per-namespace channel.
+fn partition_incremental_by_namespace(
+    result: IncrementalResult,
+    proxy_ns: &std::collections::HashMap<String, String>,
+    consumer_ns: &std::collections::HashMap<String, String>,
+    plugin_config_ns: &std::collections::HashMap<String, String>,
+    upstream_ns: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, IncrementalResult> {
+    use std::collections::HashMap;
+
+    let mut buckets: HashMap<String, IncrementalResult> = HashMap::new();
+    let poll_timestamp = result.poll_timestamp;
+
+    let make_empty = |ts: chrono::DateTime<chrono::Utc>| IncrementalResult {
+        added_or_modified_proxies: Vec::new(),
+        removed_proxy_ids: Vec::new(),
+        added_or_modified_consumers: Vec::new(),
+        removed_consumer_ids: Vec::new(),
+        added_or_modified_plugin_configs: Vec::new(),
+        removed_plugin_config_ids: Vec::new(),
+        added_or_modified_upstreams: Vec::new(),
+        removed_upstream_ids: Vec::new(),
+        poll_timestamp: ts,
+    };
+
+    for p in result.added_or_modified_proxies {
+        buckets
+            .entry(p.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .added_or_modified_proxies
+            .push(p);
+    }
+    for c in result.added_or_modified_consumers {
+        buckets
+            .entry(c.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .added_or_modified_consumers
+            .push(c);
+    }
+    for pc in result.added_or_modified_plugin_configs {
+        buckets
+            .entry(pc.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .added_or_modified_plugin_configs
+            .push(pc);
+    }
+    for u in result.added_or_modified_upstreams {
+        buckets
+            .entry(u.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .added_or_modified_upstreams
+            .push(u);
+    }
+    for id in result.removed_proxy_ids {
+        if let Some(ns) = proxy_ns.get(&id) {
+            buckets
+                .entry(ns.clone())
+                .or_insert_with(|| make_empty(poll_timestamp))
+                .removed_proxy_ids
+                .push(id);
+        }
+    }
+    for id in result.removed_consumer_ids {
+        if let Some(ns) = consumer_ns.get(&id) {
+            buckets
+                .entry(ns.clone())
+                .or_insert_with(|| make_empty(poll_timestamp))
+                .removed_consumer_ids
+                .push(id);
+        }
+    }
+    for id in result.removed_plugin_config_ids {
+        if let Some(ns) = plugin_config_ns.get(&id) {
+            buckets
+                .entry(ns.clone())
+                .or_insert_with(|| make_empty(poll_timestamp))
+                .removed_plugin_config_ids
+                .push(id);
+        }
+    }
+    for id in result.removed_upstream_ids {
+        if let Some(ns) = upstream_ns.get(&id) {
+            buckets
+                .entry(ns.clone())
+                .or_insert_with(|| make_empty(poll_timestamp))
+                .removed_upstream_ids
+                .push(id);
+        }
+    }
+
+    buckets
+}
+
+/// Build an `(id → namespace)` lookup from a full config snapshot. Used by
+/// the multi-namespace incremental path so removal IDs (which don't carry
+/// their own namespace) can still be routed to the right per-namespace
+/// broadcast channel.
+#[allow(clippy::type_complexity)]
+fn build_namespace_lookups(
+    config: &GatewayConfig,
+) -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+) {
+    let proxy_ns = config
+        .proxies
+        .iter()
+        .map(|p| (p.id.clone(), p.namespace.clone()))
+        .collect();
+    let consumer_ns = config
+        .consumers
+        .iter()
+        .map(|c| (c.id.clone(), c.namespace.clone()))
+        .collect();
+    let plugin_config_ns = config
+        .plugin_configs
+        .iter()
+        .map(|pc| (pc.id.clone(), pc.namespace.clone()))
+        .collect();
+    let upstream_ns = config
+        .upstreams
+        .iter()
+        .map(|u| (u.id.clone(), u.namespace.clone()))
+        .collect();
+    (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns)
+}
 
 fn sanitize_gateway_trust_bundles_from_source(
     trust_bundles: Option<Box<MeshTrustBundleSet>>,
@@ -154,11 +482,39 @@ pub async fn run(
     )
     .await?;
 
-    let config = db.load_full_config(&env_config.namespace).await?;
+    // Resolve the CP's namespace scope. Empty `FERRUM_CP_NAMESPACES` keeps
+    // the pre-T2-A single-namespace behavior; `*` makes the CP cluster-wide;
+    // a CSV pins it to an explicit set. The scope determines which DPs may
+    // subscribe AND which namespaces the polling loop loads from the DB.
+    let cp_scope = CpScope::from_env(&env_config.cp_namespaces, &env_config.namespace);
+    info!("CP mode: serving {}", cp_scope.describe());
+    if env_config.cp_require_namespace_claim {
+        info!(
+            "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true — DP/mesh JWTs without an `ns` claim will be rejected"
+        );
+    }
+
+    // Discover the initial namespace list. For `Single`/`Set` this is the
+    // explicit set; for `All` we query the DB and re-discover on every poll
+    // cycle so newly created namespaces are picked up automatically.
+    let polled_namespaces =
+        resolve_polled_namespaces(db.as_ref(), &cp_scope, &env_config.namespace).await;
+    if matches!(cp_scope, CpScope::All) {
+        info!(
+            "CP scope=All: discovered {} namespace(s) at startup: [{}]",
+            polled_namespaces.len(),
+            polled_namespaces.join(", ")
+        );
+    }
+
+    let config = load_full_config_multi(db.as_ref(), &polled_namespaces).await?;
     info!(
-        "CP mode: loaded {} proxies, {} consumers",
+        "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),
-        config.consumers.len()
+        config.consumers.len(),
+        config.plugin_configs.len(),
+        config.upstreams.len(),
+        polled_namespaces.len(),
     );
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -185,15 +541,14 @@ pub async fn run(
     // the CP rejects them before streaming any config.
     let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
     let mesh_registry = Arc::new(crate::grpc::mesh_registry::MeshNodeRegistry::new());
-    let (grpc_server, update_tx) =
-        CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
-            config_arc.clone(),
-            grpc_secret.clone(),
-            env_config.cp_broadcast_channel_capacity,
-            dp_registry.clone(),
-            env_config.cp_dp_grpc_jwt_issuer.clone(),
-            env_config.namespace.clone(),
-        );
+    let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
+        .channel_capacity(env_config.cp_broadcast_channel_capacity)
+        .registry(dp_registry.clone())
+        .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
+        .scope(cp_scope.clone())
+        .require_ns_claim(env_config.cp_require_namespace_claim)
+        .build();
+    let broadcasts = grpc_server.broadcasts();
     let (mesh_grpc_server, mesh_update_tx) =
         MeshGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
@@ -617,10 +972,17 @@ pub async fn run(
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
     let poll_namespace = env_config.namespace.clone();
+    let poll_fallback_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
     let mesh_registry_poll = mesh_registry.clone();
+    let poll_scope = cp_scope.clone();
+    let poll_broadcasts = broadcasts.clone();
+    // Track which polled namespace list we ran the last full reload against.
+    // For `All` we rebuild this every tick from `db.list_namespaces()`. For
+    // `Single`/`Set` we trust the operator-provided list.
+    let _ = polled_namespaces; // moved into the spawn below
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -713,7 +1075,17 @@ pub async fn run(
                     }
 
                     if force_full_reload {
-                        match db_poll.load_full_config(&poll_namespace).await {
+                        // Re-resolve the namespace list every full reload so
+                        // CpScope::All picks up newly created namespaces
+                        // (and Set/Single short-circuits to the explicit
+                        // list).
+                        let nslist = resolve_polled_namespaces(
+                            db_poll.as_ref(),
+                            &poll_scope,
+                            &poll_fallback_namespace,
+                        )
+                        .await;
+                        match load_full_config_multi(db_poll.as_ref(), &nslist).await {
                             Ok(new_config) => {
                                 // Treat pool swap as a new source snapshot.
                                 let (
@@ -733,11 +1105,18 @@ pub async fn run(
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
 
-                                CpGrpcServer::broadcast_update_with_registry(
-                                    &update_tx,
-                                    &new_config,
-                                    &dp_registry_poll,
-                                );
+                                // Per-namespace fan-out. For `Single` this
+                                // is one channel; for `Set`/`All` each DP
+                                // receives only its own namespace's
+                                // resources.
+                                for ns in &nslist {
+                                    CpGrpcServer::broadcast_namespace_update(
+                                        poll_broadcasts.as_ref(),
+                                        ns,
+                                        &new_config,
+                                        &dp_registry_poll,
+                                    );
+                                }
                                 MeshGrpcServer::broadcast_full_with_registry(
                                     &mesh_update_tx,
                                     new_config_arc,
@@ -755,15 +1134,41 @@ pub async fn run(
                             }
                         }
                     } else if let Some(since) = last_poll_at {
+                        // Resolve the polled namespace list. For `Single`
+                        // / `Set` this is the explicit list (no DB call).
+                        // For `All`, list_namespaces() runs once per tick
+                        // — bounded cost vs. the per-resource queries that
+                        // dominate poll time. Snapshot the current config
+                        // for per-namespace deletion routing.
+                        let nslist = resolve_polled_namespaces(
+                            db_poll.as_ref(),
+                            &poll_scope,
+                            &poll_fallback_namespace,
+                        )
+                        .await;
+                        let current_snapshot = config_poll.load_full();
+                        let (
+                            current_proxy_ns,
+                            current_consumer_ns,
+                            current_plugin_config_ns,
+                            current_upstream_ns,
+                        ) = build_namespace_lookups(&current_snapshot);
                         // Incremental poll — only fetch changes since last poll
-                        match db_poll.load_incremental_config(
-                            &poll_namespace,
+                        match load_incremental_config_multi(
+                            db_poll.as_ref(),
+                            &nslist,
                             since,
                             &known_proxy_ids,
                             &known_consumer_ids,
                             &known_plugin_config_ids,
                             &known_upstream_ids,
-                        ).await {
+                            &current_proxy_ns,
+                            &current_consumer_ns,
+                            &current_plugin_config_ns,
+                            &current_upstream_ns,
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 if result.is_empty() {
@@ -797,13 +1202,21 @@ pub async fn run(
                                             source_trust_bundles.clone();
                                         refreshed_config.loaded_at = result.poll_timestamp;
                                         config_poll.store(Arc::new(refreshed_config));
-                                        CpGrpcServer::broadcast_delta_with_registry(
-                                            &update_tx,
-                                            &result,
-                                            &version,
-                                            &dp_registry_poll,
-                                            source_trust_bundles.as_deref(),
-                                        );
+                                        // Trust-bundle-only refreshes are
+                                        // gateway-wide (one row), but the
+                                        // broadcast is still per-namespace
+                                        // because each subscribed channel
+                                        // needs the empty-payload tick.
+                                        for ns in poll_broadcasts.namespaces() {
+                                            CpGrpcServer::broadcast_namespace_delta(
+                                                poll_broadcasts.as_ref(),
+                                                &ns,
+                                                &result,
+                                                &version,
+                                                &dp_registry_poll,
+                                                source_trust_bundles.as_deref(),
+                                            );
+                                        }
                                         last_gateway_trust_bundles =
                                             source_trust_bundles;
                                     }
@@ -932,23 +1345,46 @@ pub async fn run(
                                 // same delta payload. DP and mesh broadcasts are intentionally
                                 // coupled to the same polling cycle so both subscriber types
                                 // converge on the same config version simultaneously.
-                                if trust_bundles_changed {
-                                    CpGrpcServer::broadcast_delta_with_registry(
-                                        &update_tx,
-                                        &result,
+                                //
+                                // Per-namespace fan-out: partition the result
+                                // by namespace and send each partition to
+                                // its dedicated broadcast channel. For
+                                // `Single` scope this collapses to one
+                                // partition (= identical to pre-T2-A
+                                // behavior). For `Set`/`All` each DP sees
+                                // only its own namespace's resources.
+                                let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
+                                    build_namespace_lookups(&new_config);
+                                let trust_bundles_for_broadcast = if trust_bundles_changed {
+                                    new_config.trust_bundles.as_deref()
+                                } else {
+                                    None
+                                };
+                                let partitions = partition_incremental_by_namespace(
+                                    result.clone(),
+                                    &proxy_ns,
+                                    &consumer_ns,
+                                    &plugin_config_ns,
+                                    &upstream_ns,
+                                );
+                                for (ns, ns_delta) in &partitions {
+                                    CpGrpcServer::broadcast_namespace_delta(
+                                        poll_broadcasts.as_ref(),
+                                        ns,
+                                        ns_delta,
                                         &version,
                                         &dp_registry_poll,
-                                        new_config.trust_bundles.as_deref(),
+                                        trust_bundles_for_broadcast,
                                     );
+                                }
+                                if trust_bundles_changed {
                                     last_gateway_trust_bundles = new_config.trust_bundles.clone();
-                                } else {
-                                    CpGrpcServer::broadcast_delta(&update_tx, &result, &version);
-                                    dp_registry_poll.touch_all();
                                 }
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
 
                                 info!(
-                                    "Incremental config update validated and pushed to DPs and mesh nodes (version={})",
+                                    "Incremental config update validated and pushed to {} namespace(s) (version={})",
+                                    partitions.len(),
                                     version
                                 );
                                 last_poll_at = Some(poll_ts);
@@ -959,7 +1395,13 @@ pub async fn run(
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
-                                match db_poll.load_full_config(&poll_namespace).await {
+                                let nslist = resolve_polled_namespaces(
+                                    db_poll.as_ref(),
+                                    &poll_scope,
+                                    &poll_fallback_namespace,
+                                )
+                                .await;
+                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
@@ -971,7 +1413,14 @@ pub async fn run(
                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
-                                        CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
+                                        for ns in &nslist {
+                                            CpGrpcServer::broadcast_namespace_update(
+                                                poll_broadcasts.as_ref(),
+                                                ns,
+                                                &new_config,
+                                                &dp_registry_poll,
+                                            );
+                                        }
                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs and mesh nodes");
                                     }
@@ -980,7 +1429,7 @@ pub async fn run(
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
-                                                match db_poll.load_full_config(&poll_namespace).await {
+                                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
                                                     Ok(new_config) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
@@ -992,7 +1441,14 @@ pub async fn run(
                                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
-                                                        CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
+                                                        for ns in &nslist {
+                                                            CpGrpcServer::broadcast_namespace_update(
+                                                                poll_broadcasts.as_ref(),
+                                                                ns,
+                                                                &new_config,
+                                                                &dp_registry_poll,
+                                                            );
+                                                        }
                                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
                                                         info!("Configuration reloaded from database (failover) and pushed to DPs and mesh nodes");
                                                     }

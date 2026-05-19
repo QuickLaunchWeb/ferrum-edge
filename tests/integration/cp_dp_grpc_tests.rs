@@ -3380,7 +3380,13 @@ async fn test_get_full_config_returns_gateway_trust_bundles_side_channel() {
 /// the DP receives the initial config snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cp_accepts_dp_with_matching_namespace() {
-    let cp_config = create_test_config(2);
+    let mut cp_config = create_test_config(2);
+    // T2-A: CP-side per-namespace partitioning filters the snapshot to the
+    // requested namespace. Tag the test proxies so they land in the
+    // CP/DP's "production" namespace, not the default "ferrum".
+    for proxy in cp_config.proxies.iter_mut() {
+        proxy.namespace = "production".to_string();
+    }
     let (addr, _update_tx, server_handle) =
         start_test_cp_server_with_namespace(cp_config, "production").await;
 
