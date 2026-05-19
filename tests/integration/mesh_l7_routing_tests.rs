@@ -1027,3 +1027,240 @@ async fn mesh_l7_routing_virtual_service_source_namespace_match_routes_and_misse
         }
     ));
 }
+
+// MESH-T1-E: route-local VirtualService.fault is carried as a per-rule
+// action on mesh_route_dispatch rather than failing closed on collapse.
+
+#[tokio::test]
+async fn mesh_l7_routing_route_local_fault_on_method_match_fires_only_on_match() {
+    // VS http[] with method-gated `match` plus a 100% abort fault. The
+    // matched method aborts; other methods fall through to the default
+    // backend without firing the fault.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"method": {"exact": "DELETE"}}],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "fault": {
+                        "abort": {"httpStatus": 503, "percentage": {"value": 100.0}}
+                    }
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("~.*"))
+        .expect("URI-less catch-all proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+
+    // The dispatch rule carries the fault action and reject_unmatched
+    // remains true (no URI-only sibling on this http[]).
+    assert_eq!(
+        plugin_config.config["rules"][0]["fault"]["abort"]["http_status"].as_u64(),
+        Some(503)
+    );
+    assert_eq!(
+        plugin_config.config["rules"][0]["fault"]["abort"]["percentage"].as_f64(),
+        Some(100.0)
+    );
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true)
+    );
+
+    // Confirm no proxy-scoped fault_injection plugin was lifted out —
+    // the dispatch rule is the single source of truth.
+    assert!(
+        result
+            .config
+            .plugin_configs
+            .iter()
+            .all(|p| p.plugin_name != "fault_injection"),
+        "no separate fault_injection plugin should be emitted"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Matching DELETE: abort (100% percentage).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let result_match = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    match result_match {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        other => panic!("expected DELETE to be aborted, got {other:?}"),
+    }
+    // Non-matching GET: reject_unmatched=true fires a 404 (Envoy parity).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let result_miss = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    match result_miss {
+        PluginResult::Reject { status_code, .. } => {
+            // 404 from reject_unmatched, NOT the configured fault status.
+            assert_eq!(status_code, 404);
+        }
+        other => panic!("expected reject_unmatched 404 for GET, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_route_local_fault_grpc_status_surfaces_on_grpc_request() {
+    // gRPC variant: abort with grpc_status returns grpc-status header on
+    // the reject. The proxy's gRPC rejection normalization then converts
+    // this into trailers-only response.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["grpc.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/"}}],
+                    "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                    "fault": {
+                        "abort": {
+                            "httpStatus": 200,
+                            "grpcStatus": "UNAVAILABLE",
+                            "percentage": {"value": 100.0}
+                        }
+                    }
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = &result.config.proxies[0];
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // gRPC content-type → grpc-status surfaces.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc/Method".to_string(),
+    );
+    let mut headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let res = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    match res {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("14"));
+        }
+        other => panic!("expected Reject with grpc-status, got {other:?}"),
+    }
+
+    // Plain HTTP request on the same dispatch rule → no grpc-status leak.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let res = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    match res {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert!(!headers.contains_key("grpc-status"));
+        }
+        other => panic!("expected Reject without grpc-status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_route_local_fault_collapses_with_sibling_route_no_fail_closed() {
+    // Before MESH-T1-E this VS shape failed closed: the canary route
+    // needed to collapse onto the stable route, but the canary's
+    // route-local fault couldn't be carried per dispatch rule and the
+    // translator rejected the resource. Now fault rides on the dispatch
+    // rule and the resource translates cleanly.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}],
+                        "fault": {
+                            "abort": {"httpStatus": 502, "percentage": {"value": 100.0}}
+                        }
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds after MESH-T1-E");
+
+    let stable_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| {
+            p.listen_path.as_deref() == Some("/api")
+                && p.backend_host == "stable.default.svc.cluster.local"
+        })
+        .expect("stable proxy collapsing the canary branch");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, stable_proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Canary header hits the collapsed rule and gets the 502 fault.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    let res = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    match res {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("expected 502 fault for canary, got {other:?}"),
+    }
+
+    // Plain request (no canary header) falls through to stable backend.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let res = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(res, PluginResult::Continue));
+    // The stable proxy's default backend handles non-matching requests —
+    // no route override is published when no rule matches and
+    // reject_unmatched stays false (URI-only sibling exists).
+    assert!(ctx.route_override_backend_host.is_none());
+}

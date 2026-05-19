@@ -19,14 +19,13 @@ use crate::modes::mesh::config::{
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
-    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    fault_injection_plugin_for_proxy, invalid_resource, mesh_route_dispatch_can_emit_rule,
-    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
-    mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
-    port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host,
+    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
+    mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
+    optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    request_termination_plugin_for_proxy, resource_id, route_request_transformer_plugin_for_proxy,
+    route_response_transformer_plugin_for_proxy, selector_from_istio, string_array, string_field,
+    string_map, upstream_for_route, workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -1801,6 +1800,18 @@ fn take_pending_route_dispatch(
     Some(pending.remove(index).1)
 }
 
+/// Returns `true` when any route-local policy on this route candidate
+/// cannot ride on a `mesh_route_dispatch` rule (and so would lose its
+/// scope after collapse with a sibling route into one Ferrum proxy).
+///
+/// Today there are no such surfaces — route-local fault now rides on the
+/// per-rule `fault` action (MESH-T1-E) and the request/response
+/// transformer plugins are auto-emitted inside
+/// `materialize_route_candidate` from per-rule transform arrays already
+/// carried by the dispatch rule. The function is kept as the hook point
+/// for future route-local plugin candidates that would need to fail
+/// closed on collapse (e.g. operator-supplied per-route plugins that
+/// can't be expressed as a dispatch rule action).
 fn route_has_uncollapsible_local_policy(route_plugins: &[PluginConfig]) -> bool {
     !route_plugins.is_empty()
 }
@@ -1955,7 +1966,12 @@ fn virtual_service_routes(
             route_candidates.into_iter().enumerate()
         {
             let is_uri_less_catch_all = listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH);
-            let mut route_plugins = Vec::new();
+            // Per-route plugins; today nothing pushes here at the candidate
+            // site (route-local fault now rides on the dispatch rule), but
+            // `materialize_route_candidate` takes the vec by value and
+            // appends auto-emitted transformer / mesh_route_dispatch /
+            // request_termination plugins downstream.
+            let route_plugins: Vec<PluginConfig> = Vec::new();
             let suffix = if match_count == 1 {
                 index.to_string()
             } else {
@@ -1968,17 +1984,16 @@ fn virtual_service_routes(
                 &suffix,
             );
 
-            // Extract fault injection config and create a proxy-scoped plugin
-            if let Some(fault_value) = http.get("fault")
-                && let Some(plugin) = fault_injection_plugin_for_proxy(
-                    &proxy_id,
-                    &object.metadata.namespace,
-                    fault_value,
-                )
-            {
-                route_plugins.push(plugin);
-            }
-
+            // Route-local fault used to land on a proxy-scoped
+            // `fault_injection` plugin, which fail-closed (rejected the whole
+            // VS translation) whenever the route had to collapse with a
+            // sibling — because the proxy-scoped plugin would fire on the
+            // wrong traffic after collapse. Now fault rides on the
+            // `mesh_route_dispatch` rule itself (see
+            // `mesh_route_dispatch_rules_for_proxy`'s per-rule `fault`
+            // emission), so the collapse path no longer drops it. The
+            // catch-all rule path also picks up route-local fault for
+            // URI-only routes that previously produced no dispatch rule.
             let (current_route_rules, has_uri_only_match) = mesh_route_dispatch_rules_for_proxy(
                 http,
                 listen_path.as_deref(),
@@ -3339,7 +3354,9 @@ fn extract_numeric_comparison(expr: &str) -> Option<Comparison> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
+    use crate::config_sources::k8s::{
+        K8sMetadata, K8sTranslation, K8sTranslationOptions, translate_k8s_objects,
+    };
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
@@ -6538,6 +6555,38 @@ extensionProviders:
 
     // -- VirtualService fault injection / retry / timeout ----------------
 
+    /// Locate the per-rule `fault` carrier emitted on the proxy's
+    /// `mesh_route_dispatch` plugin for these route-local fault tests.
+    /// Route-local fault used to land on a separate `fault_injection`
+    /// plugin; now it rides on the dispatch rule itself (MESH-T1-E).
+    fn vs_route_local_fault(result: &K8sTranslation) -> &Value {
+        assert_eq!(
+            result.config.proxies.len(),
+            1,
+            "single-route VS should produce one proxy, got {:?}",
+            result.config.proxies
+        );
+        let proxy = &result.config.proxies[0];
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("mesh_route_dispatch plugin carrying route-local fault");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("dispatch rules");
+        rules
+            .iter()
+            .find_map(|rule| rule.get("fault"))
+            .expect("fault present on at least one dispatch rule")
+    }
+
     #[test]
     fn virtual_service_extracts_fault_injection_abort() {
         let result = translate_k8s_objects(
@@ -6561,16 +6610,9 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.plugin_configs.len(), 1);
-        let plugin = &result.config.plugin_configs[0];
-        assert_eq!(plugin.plugin_name, "fault_injection");
-        assert_eq!(
-            plugin.proxy_id.as_deref(),
-            Some(result.config.proxies[0].id.as_str())
-        );
-        let abort = plugin.config.get("abort").expect("abort config");
-        assert_eq!(abort["status_code"], 503);
+        let fault = vs_route_local_fault(&result);
+        let abort = fault.get("abort").expect("abort sub-action");
+        assert_eq!(abort["http_status"], 503);
         assert_eq!(abort["percentage"], 50.0);
     }
 
@@ -6597,10 +6639,8 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.plugin_configs.len(), 1);
-        let plugin = &result.config.plugin_configs[0];
-        assert_eq!(plugin.plugin_name, "fault_injection");
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = vs_route_local_fault(&result);
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 5000);
         assert_eq!(delay["percentage"], 25.0);
     }
@@ -6632,11 +6672,9 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        assert!(plugin.config.get("abort").is_some());
-        assert!(plugin.config.get("delay").is_some());
-        assert_eq!(plugin.config["abort"]["status_code"], 500);
-        assert_eq!(plugin.config["delay"]["duration_ms"], 2000);
+        let fault = vs_route_local_fault(&result);
+        assert_eq!(fault["abort"]["http_status"], 500);
+        assert_eq!(fault["delay"]["duration_ms"], 2000);
     }
 
     #[test]
@@ -7108,8 +7146,8 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = vs_route_local_fault(&result);
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 250);
         assert_eq!(delay["percentage"], 100.0);
     }
@@ -7136,8 +7174,8 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = vs_route_local_fault(&result);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["percentage"], 100.0);
     }
 
@@ -7164,7 +7202,18 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        assert!(result.config.plugin_configs.is_empty());
+        // 0% percentage drops the sub-action entirely; with no fault
+        // sub-action surviving, no dispatch rule fault is emitted (and the
+        // URI-only `match` produces no other dispatch rule either).
+        let proxy = &result.config.proxies[0];
+        let dispatch = result.config.plugin_configs.iter().find(|p| {
+            p.plugin_name == "mesh_route_dispatch"
+                && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+        });
+        assert!(
+            dispatch.is_none(),
+            "no dispatch rule should be emitted when the fault is fully dropped"
+        );
     }
 
     #[test]
@@ -7194,10 +7243,9 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.plugin_configs.len(), 1);
-        let plugin = &result.config.plugin_configs[0];
-        assert!(plugin.config.get("abort").is_none());
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = vs_route_local_fault(&result);
+        assert!(fault.get("abort").is_none());
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 100);
         assert_eq!(delay["percentage"], 25.0);
     }
@@ -7253,6 +7301,11 @@ extensionProviders:
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 4);
+        // Each fault block is malformed (out-of-range delay, 0% / out-of-
+        // range percentage), so `route_local_fault_value_for_rule` drops
+        // them all — no dispatch-rule fault, and no other dispatch rule is
+        // emitted either (URI-only matches, no non-URI predicates). The
+        // result is a clean proxy set with no per-route plugins.
         assert!(result.config.plugin_configs.is_empty());
     }
 
@@ -7280,10 +7333,10 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = vs_route_local_fault(&result);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["grpc_status"], 14);
-        assert_eq!(abort["status_code"], 200);
+        assert_eq!(abort["http_status"], 200);
     }
 
     #[test]
@@ -7310,9 +7363,8 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
-        assert_eq!(abort["grpc_status"], 13);
+        let fault = vs_route_local_fault(&result);
+        assert_eq!(fault["abort"]["grpc_status"], 13);
     }
 
     #[test]
@@ -7339,14 +7391,19 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = vs_route_local_fault(&result);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert!(abort.get("grpc_status").is_none());
-        assert_eq!(abort["status_code"], 503);
+        assert_eq!(abort["http_status"], 503);
     }
 
     #[test]
     fn virtual_service_fault_plugin_scoped_to_proxy() {
+        // Route-local fault used to land on its own proxy-scoped
+        // `fault_injection` plugin; MESH-T1-E moves it onto the
+        // `mesh_route_dispatch` plugin instance so it can ride collapse.
+        // The carrier plugin is still proxy-scoped and is still
+        // associated with the proxy.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7368,18 +7425,33 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        let plugin = &result.config.plugin_configs[0];
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("mesh_route_dispatch carrier for route-local fault");
         assert!(matches!(
             plugin.scope,
             crate::config::types::PluginScope::Proxy
         ));
-        assert_eq!(
-            plugin.proxy_id.as_deref(),
-            Some(result.config.proxies[0].id.as_str())
-        );
         assert!(
-            proxy_has_plugin(&result.config.proxies[0], plugin),
-            "generated fault_injection config must be associated with the proxy or PluginCache will not instantiate it"
+            proxy_has_plugin(proxy, plugin),
+            "carrier mesh_route_dispatch must be associated with the proxy"
+        );
+        // No separate fault_injection plugin should be emitted any more.
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "fault_injection"),
+            "route-local fault must not emit a separate fault_injection plugin"
         );
     }
 
@@ -7612,6 +7684,238 @@ extensionProviders:
                 .iter()
                 .all(|p| p.plugin_name != "mesh_route_dispatch"),
             "URI-only match should not emit mesh_route_dispatch"
+        );
+    }
+
+    #[test]
+    fn virtual_service_uri_only_match_with_fault_emits_dispatch_catchall_rule() {
+        // URI-only match + route-local fault: prior to MESH-T1-E this
+        // emitted a separate proxy-scoped fault_injection plugin. Now the
+        // fault rides on a catch-all dispatch rule so it can collapse with
+        // siblings without fail-closed. The dispatch plugin's
+        // reject_unmatched is `false` because the URI-only match is an
+        // unconditional catch-all for the listen_path.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 502,
+                                "percentage": {"value": 25.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let proxy = &result.config.proxies[0];
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("URI-only + fault must emit a mesh_route_dispatch carrier");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("dispatch rules");
+        let catch_all = rules
+            .iter()
+            .find(|r| {
+                r.get("match")
+                    .and_then(Value::as_object)
+                    .is_some_and(|m| m.is_empty())
+            })
+            .expect("empty-match catch-all carrying the fault");
+        let abort = catch_all
+            .get("fault")
+            .and_then(|f| f.get("abort"))
+            .expect("abort on catch-all");
+        assert_eq!(abort["http_status"], 502);
+        assert_eq!(abort["percentage"], 25.0);
+        assert_eq!(
+            plugin.config["reject_unmatched"].as_bool(),
+            Some(false),
+            "URI-only catch-all must keep reject_unmatched=false"
+        );
+    }
+
+    #[test]
+    fn virtual_service_per_rule_fault_with_method_match_emits_dispatch_rule() {
+        // VS with method-gated match plus route-local fault: fault rides
+        // on the dispatch rule's match. Sibling-matching rules without
+        // fault are unaffected.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"method": {"exact": "POST"}},
+                            {"method": {"exact": "GET"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {"fixedDelay": "2s", "percentage": {"value": 50.0}},
+                            "abort": {"httpStatus": 503, "percentage": {"value": 10.0}}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let proxy = &result.config.proxies[0];
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("dispatch carrier");
+        let rules = plugin.config["rules"].as_array().expect("rules");
+        assert_eq!(rules.len(), 2, "one rule per method match");
+        // BOTH rules must carry the same fault — the http[]-level fault
+        // projects onto every emitted rule.
+        for rule in rules {
+            let fault = rule.get("fault").expect("fault on each rule");
+            assert_eq!(fault["delay"]["duration_ms"], 2000);
+            assert_eq!(fault["abort"]["http_status"], 503);
+        }
+    }
+
+    #[test]
+    fn virtual_service_per_rule_fault_does_not_emit_separate_fault_injection_plugin() {
+        // Regression guard for MESH-T1-E: confirm fault no longer lifts
+        // to a proxy-scoped `fault_injection` plugin alongside the
+        // dispatch rule. The bare `mesh_route_dispatch` carrier is the
+        // single source of truth for route-local fault.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {"httpStatus": 503, "percentage": {"value": 10.0}}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "fault_injection"),
+            "fault_injection plugin must not be emitted; route-local fault is on the dispatch rule"
+        );
+    }
+
+    #[test]
+    fn virtual_service_route_local_fault_collapses_with_sibling_route() {
+        // The end-state regression test for MESH-T1-E: an earlier route
+        // with a route-local fault that gets collapsed onto a later
+        // default route used to fail closed (`invalid_resource`). Now it
+        // collapses cleanly because fault rides on the dispatch rule.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}],
+                            "fault": {
+                                "abort": {"httpStatus": 503, "percentage": {"value": 100.0}}
+                            }
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("collapse with route-local fault no longer fails closed");
+
+        // Single Ferrum proxy: canary branch collapsed into the stable
+        // proxy. The collapsed dispatch rule for the canary still carries
+        // its own fault, but the stable default backend serves
+        // non-matching requests as before.
+        let api_proxies: Vec<&Proxy> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_path.as_deref() == Some("/api"))
+            .collect();
+        assert_eq!(
+            api_proxies.len(),
+            1,
+            "guarded-rule collapse must produce one proxy on /api"
+        );
+        let stable_proxy = api_proxies[0];
+        assert_eq!(
+            stable_proxy.backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("dispatch plugin must carry the canary's rule + fault");
+        let rules = plugin.config["rules"].as_array().expect("rules");
+        let canary_rule = rules
+            .iter()
+            .find(|r| {
+                r.get("destination")
+                    .and_then(|d| d.get("backend_host"))
+                    .and_then(Value::as_str)
+                    == Some("canary.default.svc.cluster.local")
+            })
+            .expect("canary rule carried in dispatch");
+        let abort = canary_rule
+            .get("fault")
+            .and_then(|f| f.get("abort"))
+            .expect("fault.abort on canary rule");
+        assert_eq!(abort["http_status"], 503);
+        assert_eq!(abort["percentage"], 100.0);
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "fault_injection"),
+            "no fault_injection plugin should be lifted out for the collapsed canary"
         );
     }
 

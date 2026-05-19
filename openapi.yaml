@@ -6962,15 +6962,16 @@ components:
           minItems: 1
           items:
             type: object
-            required: [destination]
             properties:
               match:
                 type: object
                 description: |
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
-                  `query_params`/`source_namespace` must be configured (an
-                  empty match is rejected at load time).
+                  `query_params`/`source_namespace` must be configured unless
+                  the rule carries route-level `request_transform`/`response_transform`
+                  or a `fault` action (the translator emits empty-match catch-all
+                  rules in those carrier shapes for URI-only VS routes).
                 properties:
                   methods:
                     type: array
@@ -7005,9 +7006,12 @@ components:
               destination:
                 type: object
                 description: |
-                  Override applied on match. At least one field must be set.
-                  `upstream_id` is mutually exclusive with the direct-backend
-                  fields (`backend_host`/`backend_port`/`backend_tls`).
+                  Override applied on match. At least one field must be set
+                  unless the rule is fault- or transforms-only (those
+                  carrier shapes have no routing effect, so the proxy's
+                  default backend serves non-fault traffic). `upstream_id`
+                  is mutually exclusive with the direct-backend fields
+                  (`backend_host`/`backend_port`/`backend_tls`).
                 properties:
                   upstream_id:
                     type: [string, "null"]
@@ -7062,6 +7066,67 @@ components:
                       type: string
                     value:
                       type: string
+              fault:
+                type: object
+                description: |
+                  Per-rule fault action (Istio VirtualService
+                  `http[].fault`). When this rule matches AND the configured
+                  percentile rolls a hit, the dispatch plugin sleeps for
+                  `delay.duration_ms` (if a delay is configured and hits)
+                  and / or short-circuits the response with `abort.http_status`
+                  (or `application/grpc` trailers carrying `grpc-status` for
+                  gRPC requests).
+
+                  At least one of `delay` / `abort` must be set. The static
+                  percentages baked into this action are NOT tunable via the
+                  RTDS `ferrum.fault_injection.<scope>.{abort,delay}_percent`
+                  keys — those keys apply to the `fault_injection` plugin's
+                  `runtime_overlay_scope`. For runtime tunability, configure
+                  a separate `fault_injection` plugin (global or proxy-scoped)
+                  with `runtime_overlay_scope`.
+                properties:
+                  delay:
+                    type: [object, "null"]
+                    required: [duration_ms, percentage]
+                    properties:
+                      duration_ms:
+                        type: integer
+                        format: uint64
+                        minimum: 1
+                        maximum: 3600000
+                        description: Sleep duration in milliseconds (1ms..=1h).
+                      percentage:
+                        type: number
+                        format: double
+                        exclusiveMinimum: 0
+                        maximum: 100
+                        description: Probability of the delay firing per matching request.
+                  abort:
+                    type: [object, "null"]
+                    required: [http_status, percentage]
+                    properties:
+                      http_status:
+                        type: integer
+                        format: uint16
+                        minimum: 200
+                        maximum: 599
+                        description: HTTP status returned when the percentile roll hits.
+                      percentage:
+                        type: number
+                        format: double
+                        exclusiveMinimum: 0
+                        maximum: 100
+                        description: Probability of the abort firing per matching request.
+                      grpc_status:
+                        type: [integer, "null"]
+                        format: uint32
+                        minimum: 0
+                        maximum: 16
+                        description: |
+                          gRPC status code (0–16) emitted via trailers when the
+                          inbound request is `application/grpc`. Plain HTTP
+                          requests still get `http_status`; the gRPC status is
+                          suppressed for non-gRPC content-types.
         reject_unmatched:
           type: boolean
           default: false
