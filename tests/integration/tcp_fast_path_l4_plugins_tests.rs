@@ -361,6 +361,7 @@ async fn try_spawn_fast_path_gateway(
             ktls_enabled: false,
             io_uring_splice_enabled: false,
             record_mesh_mtls_metric: false,
+            mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         };
         tokio::spawn(async move {
             // Errors here would abort the test by leaving `started`

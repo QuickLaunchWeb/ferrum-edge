@@ -1554,6 +1554,20 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement for stream-
+    /// family egress (TCP / UDP / TCP+TLS / UDP+DTLS). `Some` only when
+    /// (a) the gateway runs in mesh mode, (b) the resolved policy is
+    /// `RegistryOnly`, and (c) at least one mesh outbound capture
+    /// listener port is configured. Slice apply hot-swaps the contents
+    /// atomically; non-mesh modes leave the slot at `None` so the hot
+    /// path pays only one `ArcSwap::load()` plus an `Option::None` test.
+    ///
+    /// HTTP-family egress goes through the
+    /// [`crate::plugins::mesh::outbound_registry`] plugin instead — both
+    /// surfaces consume the same slice-derived registry, so behaviour
+    /// stays consistent.
+    pub mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     /// Backend client SVID revision channel.
     ///
     /// The internal consumer side ([`spawn_backend_svid_rotation_task`]) holds
@@ -2190,6 +2204,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
             global_pool_config.clone(),
             dns_cache.clone(),
@@ -2352,7 +2367,7 @@ impl ProxyState {
         let overload = Arc::new(crate::overload::OverloadState::new());
 
         let stream_listener_manager = Arc::new(
-            stream_listener::StreamListenerManager::new_with_epoch(
+            stream_listener::StreamListenerManager::new_with_epoch_and_mesh_enforcement(
                 stream_bind_addr,
                 config_arc.clone(),
                 dns_cache.clone(),
@@ -2468,6 +2483,7 @@ impl ProxyState {
                     }
                     v
                 },
+                mesh_outbound_enforcement.clone(),
             ),
         );
 
@@ -2551,6 +2567,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_outbound_enforcement,
             backend_svid_rotation_tx,
             backend_svid_generation,
             bpf_metrics_state,
