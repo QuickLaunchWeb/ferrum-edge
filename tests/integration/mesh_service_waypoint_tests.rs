@@ -652,6 +652,53 @@ fn slice_filter_cross_namespace_waypoint_resolves_short_destination_rule_hosts_b
 }
 
 #[test]
+fn slice_filter_cross_namespace_waypoint_rejects_peer_namespace_destination_rule_for_target_service()
+{
+    let reviews_sa = "spiffe://cluster.local/ns/default/sa/reviews";
+    let mesh = MeshConfig {
+        services: vec![service_in_namespace(
+            "default",
+            "reviews",
+            8080,
+            vec![reviews_sa],
+        )],
+        workloads: vec![workload_in_namespace("default", reviews_sa)],
+        destination_rules: vec![
+            destination_rule_in_namespace("default", "reviews", "reviews.default.svc.cluster.local"),
+            destination_rule_in_namespace("evil", "steal-reviews", "reviews.default.svc.cluster.local"),
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "shared-waypoint".to_string(),
+            namespace: "infra".to_string(),
+            waypoint_for: "service".to_string(),
+            services: vec![
+                MeshWaypointServiceRef {
+                    namespace: "default".to_string(),
+                    name: "reviews".to_string(),
+                },
+                MeshWaypointServiceRef {
+                    namespace: "evil".to_string(),
+                    name: "decoy".to_string(),
+                },
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "infra".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("shared-waypoint".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    assert_eq!(slice.destination_rules.len(), 1);
+    assert_eq!(slice.destination_rules[0].namespace, "default");
+    assert_eq!(slice.destination_rules[0].name, "reviews");
+}
+
+#[test]
 fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
     let mesh = MeshConfig {
         services: vec![service(
