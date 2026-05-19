@@ -3259,6 +3259,8 @@ mod tests {
             backend_scheme: BackendScheme::Udp,
             listen_port: 5300,
             idle_timeout_ms: 60_000,
+            stop_reply_task: std::sync::atomic::AtomicBool::new(false),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             // Tests build sessions without an overload state; the
             // `Option<ConnectionGuard>` keeps the type constructible without
             // pulling in `OverloadState` for unit tests that exercise summary
@@ -3530,6 +3532,8 @@ mod tests {
             backend_scheme: BackendScheme::Udp,
             listen_port: 5300,
             idle_timeout_ms: 60_000,
+            stop_reply_task: std::sync::atomic::AtomicBool::new(false),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             _overload_guard: Some(crate::overload::ConnectionGuard::new(state)),
         }
     }
