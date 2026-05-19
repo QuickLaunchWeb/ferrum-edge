@@ -26,6 +26,7 @@ mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
+mod k8s_controller_istio_status_tests;
 mod log_schema_integration_tests;
 mod log_schema_registry_tests;
 mod mesh_authz_e2e_tests;

@@ -4449,3 +4449,80 @@ fn test_cp_require_namespace_claim_parses_true() {
         },
     );
 }
+
+// ── T2-B: K8s controller / pod discovery default-on inside a pod ──────────
+//
+// `EnvConfig::from_env()` invokes the helper that's unit-tested in
+// `src/config/env_config.rs::tests`; this layer exercises the
+// end-to-end full-config path so a future refactor of the helper can't
+// silently drop the integration with the K8s switches.
+
+#[test]
+fn test_k8s_controller_default_on_inside_kubernetes_pod() {
+    // Pod-like environment: KUBERNETES_SERVICE_HOST set, FERRUM_K8S_* unset.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+        ],
+        || {
+            // Make sure neither switch is set, then load.
+            remove_var("FERRUM_K8S_CONTROLLER_ENABLED");
+            remove_var("FERRUM_K8S_POD_DISCOVERY_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.k8s_controller_enabled,
+                "in-cluster default should flip k8s_controller_enabled to true"
+            );
+            assert!(
+                config.k8s_pod_discovery_enabled,
+                "in-cluster default should flip k8s_pod_discovery_enabled to true"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_k8s_controller_default_off_outside_pod() {
+    // CLI / docker-style environment: KUBERNETES_SERVICE_HOST absent.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("KUBERNETES_SERVICE_HOST");
+            remove_var("FERRUM_K8S_CONTROLLER_ENABLED");
+            remove_var("FERRUM_K8S_POD_DISCOVERY_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.k8s_controller_enabled,
+                "outside-cluster default must remain false (back-compat)"
+            );
+            assert!(!config.k8s_pod_discovery_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_k8s_controller_explicit_false_overrides_in_cluster_default() {
+    // Pod-like environment + operator explicitly opting OUT.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_K8S_POD_DISCOVERY_ENABLED", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.k8s_controller_enabled,
+                "explicit =false must win over the in-cluster default"
+            );
+            assert!(!config.k8s_pod_discovery_enabled);
+        },
+    );
+}

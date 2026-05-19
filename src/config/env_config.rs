@@ -310,6 +310,46 @@ fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     conf.get(key).map(|v| v.to_string())
 }
 
+/// Detect whether this process is running inside a Kubernetes pod.
+///
+/// The Kubernetes API server injects `KUBERNETES_SERVICE_HOST` and
+/// `KUBERNETES_SERVICE_PORT` into every pod's environment unless the pod
+/// opts out via `enableServiceLinks: false` *and* the operator also removes
+/// the projected ServiceAccount volume — which is unusual. Checking for
+/// `KUBERNETES_SERVICE_HOST` matches the same heuristic used by
+/// `kube::Config::incluster()` and the standard `kubectl`/client-go
+/// libraries, so a pod that loses this var also can't talk to the API
+/// server (and would fail loudly elsewhere anyway).
+///
+/// Used by [`resolve_in_cluster_default_bool`] to flip Kubernetes-related
+/// defaults to `true` for pod deployments without forcing operators to
+/// set the env var explicitly.
+fn is_in_cluster() -> bool {
+    env::var("KUBERNETES_SERVICE_HOST").is_ok_and(|host| !host.trim().is_empty())
+}
+
+/// Resolve a boolean configuration value with a conditional in-cluster
+/// default. An explicit operator value (env var or conf file) always wins;
+/// only when neither is set does the fallback consider in-cluster context.
+///
+/// Returns:
+/// - `Some(v)` (env var or conf file) → use `v` exactly as the operator set it.
+/// - `None` (unset) + in a K8s pod → `true` (default-on for in-cluster).
+/// - `None` (unset) + not in a K8s pod → `false` (default-off for local/dev).
+///
+/// Used by the two `FERRUM_K8S_*_ENABLED` switches that the T2-B follow-on
+/// flipped to default-on inside a Kubernetes pod. CLI / Docker runs without
+/// `KUBERNETES_SERVICE_HOST` see the historic `false` default; explicit
+/// `=false` from the operator still wins over the in-cluster heuristic, so
+/// pod-side opt-out remains one env var away.
+fn resolve_in_cluster_default_bool(conf: &ConfFile, key: &str) -> Result<bool, String> {
+    use env_config_macro::EnvValue;
+    match resolve_var(conf, key) {
+        Some(raw) => <bool as EnvValue>::parse_env(&raw, key),
+        None => Ok(is_in_cluster()),
+    }
+}
+
 /// Tri-state toggle: `auto` (detect at runtime), `true` (force on), `false` (force off).
 ///
 /// Used for Linux-specific optimizations that can probe the kernel at startup.
@@ -1801,8 +1841,6 @@ impl EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
-            k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
-            k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1819,6 +1857,19 @@ impl EnvConfig {
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
             dp_grpc_tls_no_verify: bool = "FERRUM_DP_GRPC_TLS_NO_VERIFY" => false;
         }
+
+        // T2-B: `FERRUM_K8S_CONTROLLER_ENABLED` and
+        // `FERRUM_K8S_POD_DISCOVERY_ENABLED` default to `true` when the
+        // process is running inside a Kubernetes pod (detected via
+        // `KUBERNETES_SERVICE_HOST`). Outside a pod the historic `false`
+        // default applies. Explicit `false` from the operator (env var or
+        // ferrum.conf) always wins, so pod-side opt-out remains one
+        // setting away. See `resolve_in_cluster_default_bool` for the
+        // contract.
+        let k8s_controller_enabled =
+            resolve_in_cluster_default_bool(conf, "FERRUM_K8S_CONTROLLER_ENABLED")?;
+        let k8s_pod_discovery_enabled =
+            resolve_in_cluster_default_bool(conf, "FERRUM_K8S_POD_DISCOVERY_ENABLED")?;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3249,6 +3300,159 @@ mod tests {
         assert!(
             err.contains("`*`"),
             "error should explain the `*` constraint, got: {err}"
+        );
+    }
+
+    // ── T2-B: in-cluster default for K8s controller / pod discovery ────────
+    //
+    // These tests mutate process-global env vars so they hold the global
+    // ENV_LOCK to prevent races with sibling tests.
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_lock<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (key, value) in vars {
+            // SAFETY: ENV_LOCK serialises test access to the process-global env.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        f();
+        for (key, _) in vars {
+            // SAFETY: ENV_LOCK still held; restore to "unset" state.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn in_cluster_default_returns_true_inside_pod_when_unset() {
+        // KUBERNETES_SERVICE_HOST is the standard injected marker for "this
+        // process is running inside a pod". When the operator hasn't set the
+        // K8s switch explicitly, default it to on.
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", Some("10.96.0.1")),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", None),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let resolved =
+                    resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                        .expect("in-cluster default must resolve");
+                assert!(resolved, "in-cluster + unset should default to true");
+            },
+        );
+    }
+
+    #[test]
+    fn in_cluster_default_returns_false_outside_pod_when_unset() {
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", None),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", None),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let resolved =
+                    resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                        .expect("outside-cluster default must resolve");
+                assert!(
+                    !resolved,
+                    "outside-cluster + unset should default to false (back-compat)"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn in_cluster_default_explicit_false_wins_over_pod_default() {
+        // Explicit operator opt-out: pod is in a K8s cluster but operator set
+        // `=false`, so the in-cluster heuristic must be overridden. This is
+        // the documented pod-side disable path.
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", Some("10.96.0.1")),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", Some("false")),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let resolved =
+                    resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                        .expect("explicit false must resolve");
+                assert!(
+                    !resolved,
+                    "explicit operator =false must win over in-cluster auto-on"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn in_cluster_default_explicit_true_wins_outside_cluster() {
+        // Operator force-on outside K8s (CLI debugging, dev container, etc.).
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", None),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", Some("true")),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let resolved =
+                    resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                        .expect("explicit true must resolve");
+                assert!(
+                    resolved,
+                    "explicit operator =true must take effect even outside K8s"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn in_cluster_default_rejects_garbage_value() {
+        // Make sure the in-cluster path still surfaces the standard bool
+        // parser error so typos are caught at startup.
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", Some("10.96.0.1")),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", Some("yes-please")),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let err = resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                    .expect_err("garbage value must be rejected");
+                assert!(err.contains("FERRUM_K8S_CONTROLLER_ENABLED"));
+                assert!(err.contains("yes-please"));
+            },
+        );
+    }
+
+    #[test]
+    fn in_cluster_default_treats_empty_kubernetes_host_as_outside_cluster() {
+        // Some test/CI harnesses set `KUBERNETES_SERVICE_HOST=""` explicitly
+        // — that should not flip the default to true (the var would be
+        // useless to kube-rs anyway).
+        with_env_lock(
+            &[
+                ("KUBERNETES_SERVICE_HOST", Some("")),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", None),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let resolved =
+                    resolve_in_cluster_default_bool(&conf, "FERRUM_K8S_CONTROLLER_ENABLED")
+                        .expect("empty K8s host must not panic");
+                assert!(
+                    !resolved,
+                    "empty KUBERNETES_SERVICE_HOST should not flip default to true"
+                );
+            },
         );
     }
 }

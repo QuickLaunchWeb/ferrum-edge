@@ -48,6 +48,32 @@ rules:
     resources:
       - telemetries
     verbs: ["get", "list", "watch"]
+  # T2-B: status sub-resource patching for the three Istio CRDs where
+  # Ferrum surfaces translation outcome via `kubectl describe`. The
+  # CRDs ship `subresources.status: {}` in Istio's own manifests, so a
+  # standard `istioctl install` already supports this. `update` is
+  # granted alongside `patch` so newer kube-rs SSA paths that fall back
+  # to PUT after a 409 conflict keep working — mirrors the Gateway API
+  # block above. RequestAuthentication / VirtualService / ServiceEntry /
+  # Sidecar / Telemetry / WorkloadEntry status subresources are deferred
+  # to a follow-on; granting them now would broaden RBAC without a
+  # corresponding writer in this PR.
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - authorizationpolicies/status
+      - peerauthentications/status
+    verbs: ["patch", "update"]
+  - apiGroups: ["networking.istio.io"]
+    resources:
+      - destinationrules/status
+    verbs: ["patch", "update"]
+  # T2-B: Events emitted by the controller when it patches the Istio
+  # CRD status so `kubectl describe <kind> <name>` shows the
+  # accept/reject reason in the Events footer.
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["create", "patch"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.meshConfig }}
   - apiGroups: [""]

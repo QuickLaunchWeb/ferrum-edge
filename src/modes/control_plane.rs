@@ -865,8 +865,9 @@ pub async fn run(
     startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 
-    // Kubernetes CRD controller (Layer 8) — opt-in via FERRUM_K8S_CONTROLLER_ENABLED.
-    // When enabled, watches Istio + Gateway API CRDs and reconciles them into
+    // Kubernetes CRD controller (Layer 8) — defaults to ON inside a K8s pod
+    // (T2-B), opt-in via FERRUM_K8S_CONTROLLER_ENABLED outside one. When
+    // enabled, watches Istio + Gateway API CRDs and reconciles them into
     // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
     let _k8s_controller_handle = if env_config.k8s_controller_enabled {
         if env_config.k8s_node_locality_enabled && !env_config.k8s_pod_discovery_enabled {
@@ -875,12 +876,42 @@ pub async fn run(
                  FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
             );
         }
+        // T2-B: when `FERRUM_K8S_WATCH_NAMESPACES` isn't set, fall back to the
+        // CP's namespace scope (T2-A). `CpScope::Single`/`Set` produce an
+        // explicit watch list; `CpScope::All` returns `None` here, which the
+        // controller already interprets as a cluster-wide watch (requires
+        // ClusterRole). Operators with an explicit `FERRUM_K8S_WATCH_NAMESPACES`
+        // value still win — the explicit override is preserved for the
+        // hand-tuned case where the K8s watch scope intentionally differs
+        // from the CP scope (e.g. shadow-watching a tenant namespace).
+        let watch_namespaces = if !env_config.k8s_watch_namespaces.is_empty() {
+            env_config.k8s_watch_namespaces.clone()
+        } else {
+            match cp_scope.explicit_namespaces() {
+                Some(namespaces) => {
+                    info!(
+                        scope = cp_scope.describe(),
+                        namespaces = ?namespaces,
+                        "FERRUM_K8S_WATCH_NAMESPACES unset — deriving watch scope from CP scope"
+                    );
+                    namespaces
+                }
+                None => {
+                    // CpScope::All — empty Vec signals cluster-wide watch.
+                    info!(
+                        "FERRUM_K8S_WATCH_NAMESPACES unset and CP scope=All — \
+                         using cluster-wide K8s CRD watch (requires ClusterRole)"
+                    );
+                    Vec::new()
+                }
+            }
+        };
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
             cluster_domain: env_config.k8s_cluster_domain.clone(),
             istio_root_namespace: env_config.k8s_istio_root_namespace.clone(),
-            watch_namespaces: env_config.k8s_watch_namespaces.clone(),
+            watch_namespaces,
             watch_istio: env_config.k8s_watch_istio_crds,
             watch_mesh_config: env_config.k8s_watch_mesh_config,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
