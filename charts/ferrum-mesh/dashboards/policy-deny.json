@@ -1,0 +1,309 @@
+{
+  "uid": "ferrum-policy-deny",
+  "title": "Ferrum Mesh Policy Denies",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["ferrum", "mesh"],
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "destination_namespace",
+        "type": "query",
+        "label": "Destination namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_requests_total{response_code=\"403\"}, destination_namespace)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "source_namespace",
+        "type": "query",
+        "label": "Source namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_requests_total{response_code=\"403\"}, source_namespace)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Mesh policy deny rate (HTTP 403)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m]))",
+          "legendFormat": "deny rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Deny ratio (403 / total)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])) / clamp_min(sum(rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])), 1)",
+          "legendFormat": "deny ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.01},
+              {"color": "red", "value": 0.1}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Total denies (last 1h)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(increase(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[1h]))",
+          "legendFormat": "denies",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 4,
+      "title": "Top denied source -> destination pairs (5m rate)",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "topk(20, sum by (source_workload, source_namespace, destination_workload, destination_namespace) (rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true},
+            "indexByName": {
+              "source_workload": 0,
+              "source_namespace": 1,
+              "destination_workload": 2,
+              "destination_namespace": 3,
+              "Value": 4
+            },
+            "renameByName": {
+              "Value": "deny rate",
+              "source_workload": "source workload",
+              "source_namespace": "source ns",
+              "destination_workload": "destination workload",
+              "destination_namespace": "destination ns"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"sort": [{"field": "deny rate", "desc": true}]}
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 5,
+      "title": "Denies by source principal (SPIFFE ID)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 18},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (source_principal) (rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])))",
+          "legendFormat": "{{source_principal}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 6,
+      "title": "Denies by destination service",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 18},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (destination_service) (rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])))",
+          "legendFormat": "{{destination_service}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 7,
+      "title": "Denies by mTLS posture (connection_security_policy)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+      "targets": [
+        {
+          "expr": "sum by (connection_security_policy) (rate(ferrum_mesh_requests_total{response_code=\"403\", source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m]))",
+          "legendFormat": "{{connection_security_policy}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 8,
+      "title": "Egress registry denies (TCP/HTTP outbound) by destination",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 26},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (host, mesh_namespace) (rate(ferrum_mesh_outbound_registry_decisions_total{decision=\"deny\"}[5m])))",
+          "legendFormat": "{{mesh_namespace}}/{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}

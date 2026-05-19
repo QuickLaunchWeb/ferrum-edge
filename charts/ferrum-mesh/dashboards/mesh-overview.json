@@ -1,0 +1,369 @@
+{
+  "uid": "ferrum-mesh-overview",
+  "title": "Ferrum Mesh Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["ferrum", "mesh"],
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "source_namespace",
+        "type": "query",
+        "label": "Source namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_requests_total, source_namespace)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "destination_namespace",
+        "type": "query",
+        "label": "Destination namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_requests_total, destination_namespace)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "destination_workload",
+        "type": "query",
+        "label": "Destination workload",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}, destination_workload)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Mesh request rate by destination workload",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (destination_workload) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m]))",
+          "legendFormat": "{{destination_workload}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Mesh error ratio (response_code != 2xx)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (destination_workload) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\", response_code!~\"2..\"}[5m])) / clamp_min(sum by (destination_workload) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m])), 1)",
+          "legendFormat": "{{destination_workload}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Source -> Destination edges (RED rate)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "sum by (source_workload, destination_workload) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m]))",
+          "legendFormat": "{{source_workload}} -> {{destination_workload}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}
+      }
+    },
+    {
+      "id": 4,
+      "title": "Mesh request duration p50 / p95 / p99",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(ferrum_mesh_request_duration_ms_bucket{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(ferrum_mesh_request_duration_ms_bucket{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(ferrum_mesh_request_duration_ms_bucket{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 5,
+      "title": "mTLS coverage",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "sum(rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\", connection_security_policy=\"mutual_tls\"}[5m])) / clamp_min(sum(rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m])), 1)",
+          "legendFormat": "mTLS coverage",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.5},
+              {"color": "green", "value": 0.99}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 6,
+      "title": "Active mesh edges (5m window)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 16},
+      "targets": [
+        {
+          "expr": "count(count by (source_workload, destination_workload) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\"}[5m])))",
+          "legendFormat": "edges",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 7,
+      "title": "mTLS handshake failure rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(ferrum_mesh_mtls_handshake_failures_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 8,
+      "title": "Mesh config freshness (seconds since last slice)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "targets": [
+        {
+          "expr": "time() - max by (namespace) (ferrum_mesh_config_last_received_timestamp_seconds)",
+          "legendFormat": "{{namespace}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 60},
+              {"color": "red", "value": 300}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 9,
+      "title": "Mesh requests by protocol",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "targets": [
+        {
+          "expr": "sum by (request_protocol) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\"}[5m]))",
+          "legendFormat": "{{request_protocol}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 10,
+      "title": "Mesh response flags (errors and disconnects)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "targets": [
+        {
+          "expr": "sum by (response_flags) (rate(ferrum_mesh_requests_total{source_namespace=~\"$source_namespace\", destination_namespace=~\"$destination_namespace\", destination_workload=~\"$destination_workload\", response_flags!=\"-\"}[5m]))",
+          "legendFormat": "{{response_flags}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}
