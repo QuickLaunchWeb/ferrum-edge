@@ -8416,12 +8416,19 @@ async fn handle_proxy_request_inner(
         // stream-of-small-frames RPC into a "wait for the whole body"
         // pattern (500 KB p99 = 732 ms under 100 concurrency).
         let grpc_has_retry = crate::retry::can_retry_connection_failures(proxy.retry.as_ref());
-        let grpc_should_stream = should_stream_response_body(
+        let grpc_plugin_safe_streaming = should_stream_response_body(
             &proxy,
             &plugins,
             &ctx,
             plugin_cache_view.requires_response_body_buffering(),
         );
+        // gRPC response streaming currently forwards backend DATA/TRAILERS
+        // directly via `ProxyBody::streaming_incoming` and therefore cannot
+        // apply the buffered-mode body read timeout / aggregate size checks.
+        // Keep streaming only when those safeguards are effectively disabled.
+        let grpc_limits_allow_streaming =
+            proxy.backend_read_timeout_ms == 0 && state.max_response_body_size_bytes == 0;
+        let grpc_should_stream = grpc_plugin_safe_streaming && grpc_limits_allow_streaming;
 
         // When plugins need request body access (e.g., protobuf validation),
         // collect the body first, run hooks, then dispatch to backend.
