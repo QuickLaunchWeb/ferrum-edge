@@ -447,10 +447,11 @@ pub fn spawn_federation_poller(
         let cluster_name = target.cluster_name.clone();
         let trust_domain = target.trust_domain.clone();
         let endpoint = target.endpoint.clone();
+        let endpoint_for_logs = sanitize_endpoint_for_logging(&endpoint);
         info!(
             cluster = %cluster_name,
             trust_domain = %trust_domain,
-            endpoint = %endpoint,
+            endpoint = %endpoint_for_logs,
             poll_interval_seconds = task_config.poll_interval.as_secs(),
             fail_open = task_config.fail_open,
             "Spawning SPIFFE federation poller"
@@ -474,6 +475,7 @@ async fn poll_federation_loop(
     let cluster_name = target.cluster_name;
     let trust_domain = target.trust_domain;
     let endpoint = target.endpoint;
+    let endpoint_for_logs = sanitize_endpoint_for_logging(&endpoint);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -505,14 +507,14 @@ async fn poll_federation_loop(
                 warn!(
                     cluster = %cluster_name,
                     trust_domain = %trust_domain,
-                    endpoint = %endpoint,
+                    endpoint = %endpoint_for_logs,
                     error = %err,
                     fail_open = config.fail_open,
                     "SPIFFE federation poll failed; keeping last-good bundle if any"
                 );
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_federation_poll_failure(
                     trust_domain.as_str(),
-                    &endpoint,
+                    &endpoint_for_logs,
                 );
                 (false, jittered_backoff(backoff_secs))
             }
@@ -556,7 +558,7 @@ async fn fetch_and_install_bundle(
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(config.request_timeout);
     let response = http_client
-        .execute(request, "mesh_federation_poll")
+        .execute_redacted(request, "mesh_federation_poll", &endpoint_for_logs)
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
     let status = response.status();
@@ -577,7 +579,7 @@ async fn fetch_and_install_bundle(
     // unbounded `Bytes` from a hostile endpoint within the request timeout
     // and OOM the gateway. The cap is enforced frame-by-frame so a
     // streaming response that ignores Content-Length is also caught.
-    let body = read_bounded_body(response, FEDERATION_MAX_BODY_BYTES).await?;
+    let body = read_bounded_body(response, FEDERATION_MAX_BODY_BYTES, &endpoint_for_logs).await?;
     let bundle = parse_federation_document(&body, trust_domain)?;
     validate_polled_bundle(&bundle)?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
@@ -607,12 +609,16 @@ async fn fetch_and_install_bundle(
 async fn read_bounded_body(
     response: reqwest::Response,
     max_bytes: usize,
+    endpoint_for_logs: &str,
 ) -> Result<Vec<u8>, String> {
     use futures_util::StreamExt;
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("reading federation response body: {e}"))?;
+        let chunk = chunk.map_err(|e| {
+            let error_class = crate::retry::classify_reqwest_error(&e);
+            format!("{error_class} reading federation response body from {endpoint_for_logs}")
+        })?;
         if buf.len().saturating_add(chunk.len()) > max_bytes {
             return Err(format!(
                 "federation response body exceeded {max_bytes} bytes; aborting"
@@ -649,8 +655,12 @@ fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
 /// validator keep working. Operators should treat the warn as a strong
 /// hint to migrate.
 pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(endpoint)
-        .map_err(|e| format!("federation_endpoint '{endpoint}' is not a valid URL: {e}"))?;
+    let url = reqwest::Url::parse(endpoint).map_err(|e| {
+        format!(
+            "federation_endpoint '{}' is not a valid URL: {e}",
+            sanitize_endpoint_for_logging(endpoint)
+        )
+    })?;
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
         return Err(format!(
@@ -665,7 +675,8 @@ pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String>
     }
     let Some(host) = url.host() else {
         return Err(format!(
-            "federation_endpoint '{endpoint}' has no host component"
+            "federation_endpoint '{}' has no host component",
+            sanitize_endpoint_for_logging(endpoint)
         ));
     };
     match host {
@@ -1138,6 +1149,14 @@ mod tests {
         assert!(!safe.contains("user"), "userinfo must be stripped: {safe}");
         assert!(!safe.contains("token"), "password must be stripped: {safe}");
         assert!(safe.contains("host.example"), "host preserved: {safe}");
+    }
+
+    #[test]
+    fn validate_federation_endpoint_errors_do_not_echo_userinfo() {
+        let err = validate_federation_endpoint("https://user:token@")
+            .expect_err("invalid credentialed endpoints must be rejected");
+        assert!(!err.contains("user"), "username must be stripped: {err}");
+        assert!(!err.contains("token"), "password must be stripped: {err}");
     }
 
     #[test]
