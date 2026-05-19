@@ -1223,7 +1223,8 @@ fn apply_destination_rules(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                destination_rule_matches_upstream(dr, upstream).then_some(idx)
+                (upstream.namespace == dr.namespace && destination_rule_matches_upstream(dr, upstream))
+                    .then_some(idx)
             })
             .collect();
 
@@ -1313,6 +1314,7 @@ fn apply_destination_rules(
                 let upstream_id = upstream.id.clone();
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                        && proxy.namespace == dr.namespace
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
                         debug!(
@@ -4767,6 +4769,50 @@ mod tests {
                 .iter()
                 .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
         );
+    }
+
+    #[test]
+    fn destination_rule_does_not_apply_across_namespaces() {
+        let mut victim_upstream =
+            destination_rule_test_upstream("u-victim", "reviews.victim.svc.cluster.local");
+        victim_upstream.namespace = "victim".to_string();
+        let mut victim_proxy = destination_rule_test_proxy("p-victim", "u-victim");
+        victim_proxy.namespace = "victim".to_string();
+
+        let mut config = GatewayConfig {
+            proxies: vec![victim_proxy],
+            upstreams: vec![victim_upstream],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "attacker".to_string(),
+                host: "reviews.victim.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "attacker-subset".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+                    traffic_policy: None,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        assert_eq!(
+            config.upstreams[0].algorithm,
+            LoadBalancerAlgorithm::RoundRobin
+        );
+        assert!(config.upstreams[0].subsets.is_none());
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 30_000);
     }
 
     #[test]
