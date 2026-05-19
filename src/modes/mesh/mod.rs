@@ -2552,6 +2552,11 @@ async fn serve_mesh_runtime(
         let resolver = Arc::new(node_waypoint::NodeWaypointIdentityResolver::new(
             env_config.pool_shard_amount,
         ));
+        if let Some(initial_slice) = initial_applied_mesh_slice.as_ref() {
+            let snapshot =
+                resolver.build_policy_scope_snapshot_from_workloads(&initial_slice.workloads);
+            resolver.install_policy_scope_snapshot(snapshot);
+        }
         if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
             resolver.clone(),
             env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
