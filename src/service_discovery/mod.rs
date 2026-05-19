@@ -14,6 +14,7 @@ use crate::config::types::{
     GatewayConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::dns::DnsCache;
+use std::net::IpAddr;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::PluginHttpClient;
@@ -461,7 +462,13 @@ async fn run_discovery_loop(
 
         // Discover targets
         match discoverer.discover().await {
-            Ok(discovered) => {
+            Ok(discovered_raw) => {
+                let discovered = filter_discovered_targets(
+                    upstream_id,
+                    discoverer.provider_name(),
+                    discovered_raw,
+                    dns_cache.backend_allow_ips(),
+                );
                 // A canceled task may have completed its discover() call after
                 // the cancel signal fired.  Check before publishing so we never
                 // overwrite the new config's LB state with stale data.
@@ -623,4 +630,47 @@ pub fn merge_targets(
         }
     }
     merged
+}
+
+/// Validate discovered targets before they become routable.
+///
+/// - Hostnames must pass the same hostname validator as proxy host entries.
+/// - IP literals are accepted only when allowed by `FERRUM_BACKEND_ALLOW_IPS`.
+pub fn filter_discovered_targets(
+    upstream_id: &str,
+    provider_name: &str,
+    targets: Vec<UpstreamTarget>,
+    backend_allow_ips: crate::config::BackendAllowIps,
+) -> Vec<UpstreamTarget> {
+    targets
+        .into_iter()
+        .filter(
+            |target| match validate_discovered_target_host(&target.host, &backend_allow_ips) {
+            Ok(()) => true,
+            Err(reason) => {
+                warn!(
+                    "Service discovery [{}]: upstream {} skipping invalid discovered target {}:{} ({})",
+                    provider_name, upstream_id, target.host, target.port, reason
+                );
+                false
+            }
+            },
+        )
+        .collect()
+}
+
+fn validate_discovered_target_host(
+    host: &str,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        if !crate::config::check_backend_ip_allowed(&addr, backend_allow_ips) {
+            return Err(format!(
+                "IP denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                backend_allow_ips
+            ));
+        }
+        return Ok(());
+    }
+    crate::config::types::validate_host_entry(host)
 }

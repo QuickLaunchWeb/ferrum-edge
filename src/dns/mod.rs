@@ -208,6 +208,12 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
+    /// Expose the configured backend IP allowlist policy for non-DNS
+    /// backend target validation paths (for example, service discovery).
+    pub fn backend_allow_ips(&self) -> crate::config::BackendAllowIps {
+        self.backend_allow_ips
+    }
+
     pub fn new(config: DnsConfig) -> Self {
         let resolver_label: Arc<str> = match &config.resolver_addresses {
             Some(addrs) => Arc::from(addrs.as_str()),
