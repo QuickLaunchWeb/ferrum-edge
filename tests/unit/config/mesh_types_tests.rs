@@ -409,7 +409,14 @@ fn mesh_normalize_lowercases_policy_header_names() {
 }
 
 #[test]
-fn mesh_normalize_preserves_policy_header_case_collisions() {
+fn mesh_normalize_collapses_policy_header_case_collisions() {
+    // Spec change (PR #992 / commit 8cdba9d8): case-colliding policy header
+    // entries were previously preserved verbatim, leaving deny rules
+    // unmatchable. Normalization now canonicalises every entry to lowercase
+    // so authorization evaluation is deterministic; the collision is
+    // collapsed to a single entry (HashMap iteration order picks the
+    // surviving value, so the test only asserts that the lower-cased key
+    // exists and the upper-cased duplicate is gone).
     let mut mesh = MeshConfig {
         mesh_policies: vec![MeshPolicy {
             name: "tenant".to_string(),
@@ -436,8 +443,19 @@ fn mesh_normalize_preserves_policy_header_case_collisions() {
     mesh.normalize();
 
     let headers = &mesh.mesh_policies[0].rules[0].to[0].headers;
-    assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("prod"));
-    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("dev"));
+    assert!(
+        !headers.contains_key("X-Tenant"),
+        "upper-cased entry must be canonicalised away"
+    );
+    assert!(
+        headers.contains_key("x-tenant"),
+        "lower-cased entry must remain after canonicalisation"
+    );
+    assert_eq!(
+        headers.len(),
+        1,
+        "case-colliding entries must collapse to a single canonical entry"
+    );
 }
 
 #[test]
