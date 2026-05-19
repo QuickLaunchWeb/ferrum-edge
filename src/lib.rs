@@ -13,6 +13,7 @@ pub mod admin;
 pub mod capture;
 pub mod circuit_breaker;
 pub mod cli;
+pub mod cni;
 pub mod config;
 pub mod config_delta;
 pub mod config_sources;

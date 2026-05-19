@@ -26,6 +26,7 @@ use crate::capture::{
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
+use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -35,6 +36,9 @@ use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NodeAgentMetrics, PodAttachmentState, PodInfo,
+};
+use crate::modes::node_agent_cni_server::{
+    self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
 };
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -51,6 +55,26 @@ pub struct NodeAgentConfig {
     pub fallback_mode: FallbackMode,
     pub excluded_namespaces: HashSet<String>,
     pub capture_contract: CaptureContract,
+}
+
+/// CNI plugin listener configuration. Resolved from the env config in
+/// `run` so the eBPF path and the fallback path agree on whether the
+/// listener should come up. Empty `socket_path` is normalized to the
+/// default in `EnvConfig`; the boolean `enabled` is the operator switch
+/// that flips the entire CNI hot path on or off.
+#[derive(Debug, Clone)]
+pub struct CniListenerConfig {
+    pub enabled: bool,
+    pub socket_path: String,
+}
+
+impl CniListenerConfig {
+    pub fn from_env_config(env_config: &EnvConfig) -> Self {
+        Self {
+            enabled: env_config.node_agent_cni_enabled,
+            socket_path: env_config.node_agent_cni_socket_path.clone(),
+        }
+    }
 }
 
 impl NodeAgentConfig {
@@ -136,6 +160,8 @@ pub async fn run(
         "Kernel probe complete"
     );
 
+    let cni_config = CniListenerConfig::from_env_config(&env_config);
+
     let result = if !probe.supports_ebpf() {
         handle_fallback(
             &config,
@@ -152,6 +178,7 @@ pub async fn run(
             metrics,
             &shutdown_tx,
             startup_ready,
+            cni_config,
         )
         .await
     };
@@ -331,6 +358,7 @@ async fn run_with_backend(
     metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
     initialize_backend(backend.as_mut(), config)?;
 
@@ -343,6 +371,28 @@ async fn run_with_backend(
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
     let mut init_seen: Option<HashSet<String>> = None;
+
+    // Optional CNI plugin listener: when enabled, spawns a UDS server that
+    // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
+    // loop via the `cni_work_rx` channel. When disabled (the default), the
+    // channel stays empty and the receiver in the select! arm parks
+    // forever — the kube-rs watcher remains the sole enrollment driver.
+    let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
+    let cni_listener_handle = if cni_config.enabled {
+        Some(spawn_cni_listener(
+            cni_config.socket_path.clone(),
+            cni_work_tx.clone(),
+            metrics.clone(),
+            shutdown_tx.subscribe(),
+        ))
+    } else {
+        info!("CNI plugin listener disabled; kube-rs watcher is the sole enrollment path");
+        None
+    };
+    // Drop the local sender so the receiver closes cleanly when the
+    // listener task exits — otherwise the select! would park forever on
+    // the receiver during shutdown.
+    drop(cni_work_tx);
 
     info!(
         "Node agent initialized, watching pod events on node {}",
@@ -413,6 +463,26 @@ async fn run_with_backend(
                     }
                 }
             }
+            cni_work = cni_work_rx.recv() => {
+                match cni_work {
+                    Some(work) => {
+                        process_cni_work_item(
+                            backend.as_mut(),
+                            &pod_states,
+                            config,
+                            metrics.as_ref(),
+                            work,
+                        );
+                    }
+                    None => {
+                        // Channel closed — listener task exited (likely
+                        // shutdown). Stop selecting on this arm by
+                        // breaking; future iterations of select! will
+                        // still respect the shutdown_rx arm.
+                        debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                    }
+                }
+            }
         }
     }
 
@@ -425,7 +495,102 @@ async fn run_with_backend(
     );
     cleanup_all_pods(backend.as_mut(), &pod_states);
 
+    if let Some(handle) = cni_listener_handle
+        && let Err(err) = handle.await
+    {
+        warn!(error = %err, "Node agent CNI listener task panicked");
+    }
+
     Ok(())
+}
+
+/// Apply one CNI plugin RPC to the same state the kube-rs watcher
+/// manipulates. The watcher arm and this arm of the select! loop share
+/// `backend` ownership exclusively — no `Mutex`. Idempotency is
+/// inherited from `handle_pod_added` / `handle_pod_removed`: repeat
+/// calls with the same identity are no-ops.
+///
+/// Why an empty `labels`/`annotations` view? The CNI plugin is invoked
+/// at pod-sandbox setup time, BEFORE the kubelet has finished syncing
+/// the pod spec to the API server (the CNI binary is a one-shot
+/// invocation that runs from kubelet's local PLEG with just the CRI
+/// payload). Real labels/annotations arrive a moment later via the
+/// kube-rs watcher's `Apply` event and the enrollment is reconciled
+/// then. Result: the CNI ADD reserves a `PodAttachmentState` slot
+/// against the pod UID (when present) so the BPF programs attach
+/// during sandbox setup; the watcher fills in `pod_ip` / `include_ports`
+/// narrowing once kube-apiserver catches up. This mirrors Istio's
+/// ambient `istio-cni` pattern.
+fn process_cni_work_item(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    work: CniWorkItem,
+) {
+    let CniWorkItem { request, respond } = work;
+    let response = apply_cni_request(backend, pod_states, config, metrics, &request);
+    // The remote receiver may have been dropped (CNI client timed out or
+    // the listener task is shutting down); that's fine — we still
+    // applied the side-effect. The metric/log already reflect the
+    // outcome from the server's side.
+    let _ = respond.send(response);
+}
+
+/// Pure-function core of [`process_cni_work_item`] so tests can drive
+/// it without an `mpsc` round-trip.
+pub fn apply_cni_request(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    request: &CniRpcRequest,
+) -> CniRpcResponse {
+    let labels: HashMap<String, String> = HashMap::new();
+    let annotations: HashMap<String, String> = HashMap::new();
+    let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
+    match request.verb {
+        RpcVerb::Add => {
+            // `handle_pod_added` short-circuits on empty pod_uid (it's
+            // the DashMap key); the watcher will still pick up the
+            // pod, so this is a soft accept rather than a hard reject.
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
+                        .to_string(),
+                };
+            }
+            handle_pod_added(backend, pod_states, config, metrics, &event);
+            CniRpcResponse::Ok
+        }
+        RpcVerb::Del => {
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
+                        .to_string(),
+                };
+            }
+            handle_pod_removed(backend, pod_states, metrics, event.pod_uid);
+            CniRpcResponse::Ok
+        }
+        RpcVerb::Check => {
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args".to_string(),
+                };
+            }
+            // CHECK is best-effort verification: report Ok when we have
+            // a pod-state entry, Rejected otherwise. kubelet treats
+            // Rejected as a hint that ADD needs replaying.
+            if pod_states.contains_key(event.pod_uid) {
+                CniRpcResponse::Ok
+            } else {
+                CniRpcResponse::Rejected {
+                    reason: "pod not currently enrolled".to_string(),
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {

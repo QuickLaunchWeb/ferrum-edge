@@ -11,6 +11,7 @@ mod admin;
 mod capture;
 mod circuit_breaker;
 mod cli;
+mod cni;
 mod config;
 mod config_delta;
 #[allow(dead_code)]

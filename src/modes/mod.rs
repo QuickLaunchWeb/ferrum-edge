@@ -25,6 +25,7 @@ pub mod injector;
 pub mod mesh;
 pub mod migrate;
 pub mod node_agent;
+pub mod node_agent_cni_server;
 
 use std::sync::Arc;
 

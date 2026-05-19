@@ -197,6 +197,13 @@ pub struct NodeAgentMetrics {
     /// restart the node agent after a kernel/cgroup/bpffs change, which
     /// matches the rest of the node-agent contract.
     pub topology_degraded_reason: ArcSwap<Option<&'static str>>,
+    /// CNI plugin RPC counts split by `(verb, outcome)` where verb is one
+    /// of `add`/`del`/`check` and outcome is `success`/`rejected`/`error`.
+    /// Bounded cardinality (3 × 3 = 9 series at most). Lets operators see
+    /// whether the CNI plugin is the primary enrollment path or the
+    /// kube-rs watcher fallback is doing all the work. Read by the
+    /// Prometheus render path and reset only on process restart.
+    pub cni_calls: [[AtomicU64; 3]; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,15 +212,75 @@ pub struct NodeAgentMetricsSnapshot {
     pub pods_unenrolled: u64,
     pub attach_errors: u64,
     pub topology_degraded_reason: Option<&'static str>,
+    /// Snapshot of [`NodeAgentMetrics::cni_calls`]. Same `[verb][outcome]`
+    /// layout as the source atomics. The outer axis is verb
+    /// (`add`/`del`/`check`); the inner axis is outcome
+    /// (`success`/`rejected`/`error`).
+    pub cni_calls: [[u64; 3]; 3],
+}
+
+/// Closed set of verbs tracked by [`NodeAgentMetrics::cni_calls`].
+/// The discriminant is the row index into the atomic / snapshot matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CniCallVerb {
+    Add = 0,
+    Del = 1,
+    Check = 2,
+}
+
+impl CniCallVerb {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Del => "del",
+            Self::Check => "check",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::Add, Self::Del, Self::Check]
+    }
+}
+
+/// Closed set of CNI RPC outcomes. The discriminant is the column index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CniCallOutcome {
+    Success = 0,
+    Rejected = 1,
+    Error = 2,
+}
+
+impl CniCallOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::Success, Self::Rejected, Self::Error]
+    }
 }
 
 impl NodeAgentMetrics {
     pub fn snapshot(&self) -> NodeAgentMetricsSnapshot {
+        let mut cni_calls = [[0u64; 3]; 3];
+        for verb in CniCallVerb::all() {
+            for outcome in CniCallOutcome::all() {
+                cni_calls[verb as usize][outcome as usize] =
+                    self.cni_calls[verb as usize][outcome as usize].load(Ordering::Relaxed);
+            }
+        }
         NodeAgentMetricsSnapshot {
             pods_enrolled: self.pods_enrolled.load(Ordering::Relaxed),
             pods_unenrolled: self.pods_unenrolled.load(Ordering::Relaxed),
             attach_errors: self.attach_errors.load(Ordering::Relaxed),
             topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
+            cni_calls,
         }
     }
 
@@ -231,6 +298,12 @@ impl NodeAgentMetrics {
     pub fn clear_topology_degraded(&self) {
         self.topology_degraded_reason.store(Arc::new(None));
     }
+
+    /// Increment the CNI call counter for one `(verb, outcome)` cell. The
+    /// node-agent CNI server calls this exactly once per RPC.
+    pub fn record_cni_call(&self, verb: CniCallVerb, outcome: CniCallOutcome) {
+        self.cni_calls[verb as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Default for NodeAgentMetrics {
@@ -240,6 +313,11 @@ impl Default for NodeAgentMetrics {
             pods_unenrolled: AtomicU64::new(0),
             attach_errors: AtomicU64::new(0),
             topology_degraded_reason: ArcSwap::from_pointee(None),
+            cni_calls: [
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            ],
         }
     }
 }

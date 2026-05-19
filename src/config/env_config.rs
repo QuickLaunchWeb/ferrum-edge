@@ -645,6 +645,20 @@ pub struct EnvConfig {
     /// HBONE redirect/listener port included in the node-agent capture
     /// contract and BPF config map. Default: 15008.
     pub node_agent_hbone_redirect_port: u16,
+    /// Opt in to the node-agent CNI plugin lifecycle hook. When `true`, the
+    /// node-agent listens on `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` for ADD /
+    /// DEL / CHECK calls forwarded by the `ferrum-cni` binary that the
+    /// Helm install drops into `/opt/cni/bin/`. Default `false` so existing
+    /// operators with a working install do not change behavior on upgrade;
+    /// the kube-rs pod watcher remains the source of truth for enrollment
+    /// regardless of this flag — CNI is an optimization, not a hard
+    /// dependency.
+    pub node_agent_cni_enabled: bool,
+    /// Path the node-agent listens on for the CNI plugin RPC. Default
+    /// `/var/run/ferrum/node-agent-cni.sock` — a sibling of the existing
+    /// `DEFAULT_NODE_AGENT_SOCKET_PATH` so the two surfaces don't collide.
+    /// Only consulted when `node_agent_cni_enabled` is `true`.
+    pub node_agent_cni_socket_path: String,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1441,6 +1455,8 @@ impl Default for EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
+            node_agent_cni_enabled: false,
+            node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
             k8s_node_locality_enabled: false,
@@ -1756,6 +1772,8 @@ impl EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
+            node_agent_cni_enabled: bool = "FERRUM_NODE_AGENT_CNI_ENABLED" => false;
+            node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
@@ -2141,6 +2159,8 @@ impl EnvConfig {
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,
+            node_agent_cni_enabled,
+            node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
             k8s_node_locality_enabled,
@@ -2736,6 +2756,13 @@ impl EnvConfig {
             if self.node_agent_hbone_redirect_port == ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT {
                 return Err(
                     "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must differ from the outbound capture port"
+                        .into(),
+                );
+            }
+            if self.node_agent_cni_enabled && self.node_agent_cni_socket_path.trim().is_empty() {
+                return Err(
+                    "FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
+                     FERRUM_NODE_AGENT_CNI_ENABLED is true"
                         .into(),
                 );
             }
