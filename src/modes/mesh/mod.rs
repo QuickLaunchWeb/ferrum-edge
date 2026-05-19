@@ -1211,6 +1211,14 @@ fn apply_destination_rules(
                     );
                     continue;
                 }
+                if port_policy.tls.is_some() {
+                    warn!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        port = port,
+                        "DestinationRule portLevelSettings.tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream scope); only port-level connectTimeout/loadBalancer/outlierDetection are applied"
+                    );
+                }
 
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
@@ -1265,6 +1273,9 @@ fn apply_destination_rules(
 }
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
+///
+/// Per-port `tls` is intentionally not applied here today because backend TLS
+/// posture is stored at upstream scope (`backend_tls_*`), not per-port.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,

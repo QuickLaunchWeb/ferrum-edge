@@ -747,6 +747,12 @@ fn translate_port_level_settings(
                 "trafficPolicy.portLevelSettings[].loadBalancer.localityLbSetting is not supported",
             ));
         }
+        if entry.get("tls").is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream scope); only connectTimeout is applied at request time",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
 
         let policy = translate_traffic_policy(acc, object, entry)?;
 
@@ -10094,7 +10100,8 @@ extensionProviders:
                             {
                                 "port": {"number": 8080},
                                 "connectionPool": {"tcp": {"connectTimeout": "750ms"}},
-                                "loadBalancer": {"simple": "LEAST_REQUEST"}
+                                "loadBalancer": {"simple": "LEAST_REQUEST"},
+                                "tls": {"mode": "ISTIO_MUTUAL"}
                             }
                         ]
                     }
@@ -10113,6 +10120,14 @@ extensionProviders:
             policy.load_balancer,
             Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
         ));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("portLevelSettings[].tls is parsed but not enforced per-port")),
+            "expected warning for unenforced per-port tls, got {:?}",
+            result.warnings
+        );
     }
 
     #[test]
