@@ -481,8 +481,8 @@ fn test_requires_response_body_buffering() {
         .headers
         .insert("accept".to_string(), "text/event-stream".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&sse_accept),
-        "SSE clients must keep the response streaming instead of forcing a full-body buffer"
+        plugin.should_buffer_response_body(&sse_accept),
+        "SSE responses must still be buffered when guard validation rules are enabled"
     );
 
     let mut stream_true = ctx_with_content_type("POST", "application/json");
@@ -490,8 +490,8 @@ fn test_requires_response_body_buffering() {
         .metadata
         .insert("ai_request_streaming".to_string(), "true".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&stream_true),
-        "prompt-shield stream:true metadata must prevent unbounded response buffering"
+        plugin.should_buffer_response_body(&stream_true),
+        "client-controlled stream:true metadata must not bypass ai_response_guard enforcement"
     );
 }
 

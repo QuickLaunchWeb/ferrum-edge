@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
-use super::utils::sse::{is_sse_request, parse_sse_data_frames};
+use super::utils::sse::parse_sse_data_frames;
 use super::{Plugin, PluginResult, RequestContext};
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
@@ -800,10 +800,7 @@ impl Plugin for AiResponseGuard {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules
-            && ctx.method == "POST"
-            && !is_sse_request(ctx)
-            && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
+        self.has_validation_rules && ctx.method == "POST"
     }
 
     async fn on_response_body(
