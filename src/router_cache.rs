@@ -811,6 +811,37 @@ impl RouterCache {
             };
 
             if let Some(pattern_str) = listen_path.strip_prefix('~') {
+                if let Some(exact_path) = legacy_k8s_exact_path_from_regex_marker(pattern_str) {
+                    let add_exact_path = |target: &mut Vec<RouteEntry>, proxy: &Arc<Proxy>| {
+                        target.push(RouteEntry {
+                            listen_path: exact_path.to_string(),
+                            proxy: Arc::clone(proxy),
+                        });
+                    };
+
+                    if proxy.hosts.is_empty() {
+                        add_exact_path(&mut catch_all_exact_paths, &arc_proxy);
+                    } else {
+                        for host in &proxy.hosts {
+                            let entry = RouteEntry {
+                                listen_path: exact_path.to_string(),
+                                proxy: Arc::clone(&arc_proxy),
+                            };
+                            if host.starts_with("*.") {
+                                wildcard_hosts_exact_paths
+                                    .entry(host.clone())
+                                    .or_default()
+                                    .push(entry);
+                            } else {
+                                exact_hosts_exact_paths
+                                    .entry(host.clone())
+                                    .or_default()
+                                    .push(entry);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Regex route: compile the pattern
                 // Auto-anchor for full-path matching (^pattern$)
                 let anchored = crate::config::types::anchor_regex_pattern(pattern_str);
@@ -1178,6 +1209,14 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
         .listen_path
         .as_deref()
         .is_some_and(|p| p.starts_with('~'))
+}
+
+fn legacy_k8s_exact_path_from_regex_marker(pattern: &str) -> Option<&str> {
+    const PREFIX: &str = "(?P<__ferrum_k8s_exact_path>";
+    pattern
+        .strip_prefix(PREFIX)
+        .and_then(|tail| tail.strip_suffix(')'))
+        .filter(|path| !path.is_empty() && path.starts_with('/'))
 }
 
 fn is_exact_path_proxy(proxy: &Proxy) -> bool {
@@ -1578,6 +1617,31 @@ mod tests {
             .find_proxy(None, "/admin")
             .expect("non-capturing group regex should match /admin");
         assert_eq!(admin.proxy.id, "regex");
+    }
+
+    #[test]
+    fn legacy_k8s_exact_marker_route_precedes_prefix_catch_all() {
+        let config = GatewayConfig {
+            proxies: vec![
+                minimal_proxy_for_routing("root-prefix", "/"),
+                minimal_proxy_for_routing(
+                    "legacy-exact",
+                    "~(?P<__ferrum_k8s_exact_path>/admin)",
+                ),
+            ],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let exact = cache
+            .find_proxy(None, "/admin")
+            .expect("legacy exact marker path should match");
+        assert_eq!(exact.proxy.id, "legacy-exact");
+
+        let child = cache
+            .find_proxy(None, "/admin/child")
+            .expect("child path should fall back to prefix");
+        assert_eq!(child.proxy.id, "root-prefix");
     }
 
     #[test]
