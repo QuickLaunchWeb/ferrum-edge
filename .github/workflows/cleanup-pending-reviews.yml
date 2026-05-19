@@ -30,8 +30,13 @@ jobs:
     steps:
       - name: Reject stale pending deployment reviews
         run: |
-          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
-          MAX_AGE_MINUTES="${{ github.event.inputs.max_age_minutes || '20' }}"
+          DRY_RUN="${DRY_RUN_INPUT:-false}"
+          MAX_AGE_MINUTES="${MAX_AGE_MINUTES_INPUT:-20}"
+
+          if ! [[ "$MAX_AGE_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "Invalid max_age_minutes input: must be a non-negative integer" >&2
+            exit 1
+          fi
 
           echo "Dry run mode: $DRY_RUN"
           echo "Max age threshold: $MAX_AGE_MINUTES minutes"
@@ -97,10 +102,12 @@ jobs:
               echo "  [DRY RUN] Would reject $ENV_COUNT environment(s) for run $RUN_ID"
             else
               echo "  Rejecting $ENV_COUNT environment(s) for run $RUN_ID..."
-              PAYLOAD=$(jq -n --argjson ids "$ENV_IDS" '{
+              PAYLOAD=$(jq -n \
+                --argjson ids "$ENV_IDS" \
+                --arg max_age "$MAX_AGE_MINUTES" '{
                 environment_ids: $ids,
                 state: "rejected",
-                comment: "Auto-rejected: pending > '"$MAX_AGE_MINUTES"' minutes (cleanup-pending-reviews workflow)"
+                comment: ("Auto-rejected: pending > " + $max_age + " minutes (cleanup-pending-reviews workflow)")
               }')
 
               RESPONSE=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" \
@@ -117,4 +124,6 @@ jobs:
           echo ""
           echo "Summary: $REJECTED_COUNT run(s) rejected, $SKIPPED_COUNT skipped"
         env:
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
+          MAX_AGE_MINUTES_INPUT: ${{ github.event.inputs.max_age_minutes || '20' }}
           GH_TOKEN: ${{ secrets.REVIEW_TOKEN }}
