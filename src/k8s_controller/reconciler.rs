@@ -42,6 +42,7 @@ pub struct ReconcileBroadcasters {
     pub mesh_registry: Arc<MeshNodeRegistry>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
