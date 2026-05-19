@@ -256,7 +256,10 @@ fn test_removed_security_plugin_fails_closed() {
         )],
     );
 
-    let err = PluginCache::new(&config).expect_err("expected fail-closed error");
+    let err = match PluginCache::new(&config) {
+        Ok(_) => panic!("expected fail-closed error"),
+        Err(e) => e,
+    };
     assert!(err.contains("Removed security plugin 'oauth2_auth'"));
 }
 
