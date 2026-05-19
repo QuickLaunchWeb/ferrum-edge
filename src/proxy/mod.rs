@@ -10987,47 +10987,56 @@ async fn proxy_to_backend(
                 }
             };
             if let Some(sender) = direct_h2_sender {
-                let request = match client_request_body {
-                    ClientRequestBody::Streaming(request) => *request,
-                    ClientRequestBody::Buffered(_) => {
-                        debug_assert!(
-                            false,
-                            "direct HTTP/2 pool should not be used when request body is pre-buffered"
-                        );
-                        return (
-                            retry::BackendResponse {
-                                status_code: 500,
-                                body: ResponseBody::Buffered(
-                                    r#"{"error":"Request buffering invariant violated"}"#
-                                        .as_bytes()
-                                        .to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip,
-                                error_class: None,
-                            },
-                            None,
-                        );
-                    }
-                };
-                return (
-                    proxy_to_backend_http2(
-                        state,
-                        direct_h2_proxy,
-                        sender,
-                        backend_url,
-                        method,
-                        headers,
-                        request,
-                        stream_response,
-                        client_ip,
-                        is_tls,
-                        resolved_ip,
-                        ctx_bytes_sent_observed,
-                    )
-                    .await,
-                    None,
+                if state.max_request_body_size_bytes == 0 && state.max_response_body_size_bytes == 0
+                {
+                    let request = match client_request_body {
+                        ClientRequestBody::Streaming(request) => *request,
+                        ClientRequestBody::Buffered(_) => {
+                            debug_assert!(
+                                false,
+                                "direct HTTP/2 pool should not be used when request body is pre-buffered"
+                            );
+                            return (
+                                retry::BackendResponse {
+                                    status_code: 500,
+                                    body: ResponseBody::Buffered(
+                                        r#"{"error":"Request buffering invariant violated"}"#
+                                            .as_bytes()
+                                            .to_vec(),
+                                    ),
+                                    headers: HashMap::new(),
+                                    connection_error: false,
+                                    backend_resolved_ip: resolved_ip,
+                                    error_class: None,
+                                },
+                                None,
+                            );
+                        }
+                    };
+                    return (
+                        proxy_to_backend_http2(
+                            state,
+                            direct_h2_proxy,
+                            sender,
+                            backend_url,
+                            method,
+                            headers,
+                            request,
+                            stream_response,
+                            client_ip,
+                            is_tls,
+                            resolved_ip,
+                            ctx_bytes_sent_observed,
+                        )
+                        .await,
+                        None,
+                    );
+                }
+                debug!(
+                    proxy_id = %proxy.id,
+                    max_request_body_size_bytes = state.max_request_body_size_bytes,
+                    max_response_body_size_bytes = state.max_response_body_size_bytes,
+                    "H2 pool bypassed because body-size limits are enabled — using reqwest path"
                 );
             }
         }
