@@ -166,13 +166,21 @@ who want to investigate a specific feature can
 
 The current run records these `deferred` entries:
 
-- `istio_virtual_service` — `authority.{exact,prefix,regex}` and
-  `ignoreUriCase: true` predicates fall closed via `request_termination`
-  rather than silently widening traffic. Tracked as follow-on PRs.
 - `istio_destination_rule` —
   `trafficPolicy.connectionPool.http.{http1MaxPendingRequests, maxRetries,
   h2UpgradePolicy}` are translator-acknowledged (`debug!`) but not
   projected today. Tracked as T1-C follow-ons.
+
+Previously deferred and now flipped to `supported`:
+
+- `istio_virtual_service.authority.{exact,prefix,regex}` — first-class
+  `mesh_route_dispatch` `StringMatch` predicate (T1-B.3 / PR #899). Regex
+  patterns compile once at config-load time; `exact` / `prefix` operands
+  are lowercased to match the request's normalized `Host` / `:authority`.
+- `istio_virtual_service.ignoreUriCase: true` — first-class via
+  case-insensitive `listen_path` widening + per-rule `ignore_uri_case`
+  flag (T1-B.5 / PR #901). Plugin re-evaluates with ASCII-only case
+  folding; non-ASCII bytes compare byte-for-byte (matches Istio).
 
 ## Out-of-scope entries
 

@@ -271,20 +271,27 @@ async fn vs_method_exact_match() {
     ));
 }
 
-/// VS predicate: `authority` — deferred. The translator treats authority as
-/// an unsupported sibling predicate today: rules carrying it are skipped
-/// while other rules in the same `match[]` still emit. Critically, the
-/// translator does NOT collapse onto a URI-only catch-all (which would forward
-/// requests the operator gated). See the istio.rs::tests
-/// `virtual_service_unsupported_authority_predicate_does_not_disable_reject_unmatched`
-/// for the conformance regression test.
-#[test]
-fn vs_authority_match_deferred() {
+/// VS predicate: `authority.{exact,prefix,regex}` — T1-B.3 (PR #899). The
+/// translator emits the predicate as a first-class `mesh_route_dispatch` rule
+/// (`exact` as a bare string for wire back-compat, `prefix` / `regex` as the
+/// tagged `StringMatch` shape). The plugin compiles the regex once at
+/// config-load time and lowercases `exact` / `prefix` operands (DNS names are
+/// case-insensitive per RFC 4343). The request hot path resolves the
+/// normalized `Host` / `:authority` once and runs the compiled matcher
+/// against it.
+///
+/// Sibling rules in the same `match[]` no longer get dropped: a rule with
+/// `authority: internal.example.com` and a sibling with `headers.x-canary`
+/// both emit as separate dispatch rules with all-of semantics enforced per
+/// rule. `reject_unmatched: true` still applies so requests that miss every
+/// rule 404.
+#[tokio::test]
+async fn vs_authority_match() {
     register_feature!(
         category = CATEGORY,
         feature = "authority.{exact,prefix,regex}",
-        status = Status::Deferred,
-        notes = "Unsupported predicate today: rules with `authority` are skipped, sibling rules still emit, reject_unmatched stays true so gated traffic 404s instead of leaking through.",
+        status = Status::Supported,
+        notes = "T1-B.3 (PR #899): authority is a first-class mesh_route_dispatch StringMatch predicate (exact / prefix / regex); compiled once at config-load time; lowercased operands match normalized Host/:authority; sibling rules continue to emit independently.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -306,7 +313,7 @@ fn vs_authority_match_deferred() {
         .plugin_configs
         .iter()
         .find(|p| p.plugin_name == "mesh_route_dispatch")
-        .expect("dispatch plugin emitted for the supported sibling");
+        .expect("dispatch plugin emitted for the authority + header siblings");
     let rules = plugin
         .config
         .get("rules")
@@ -314,8 +321,18 @@ fn vs_authority_match_deferred() {
         .expect("rules array");
     assert_eq!(
         rules.len(),
-        1,
-        "only the supported header rule survives; authority-bearing sibling is skipped"
+        2,
+        "authority is first-class now (T1-B.3) -- both the header sibling AND the authority-bearing sibling must emit as dispatch rules"
+    );
+    // The authority predicate emits as a bare string (back-compat with the
+    // `Exact` legacy form).
+    let authority_rule = rules
+        .iter()
+        .find(|r| r["match"]["authority"].is_string())
+        .expect("authority-bearing rule must be present with the exact-form bare string");
+    assert_eq!(
+        authority_rule["match"]["authority"].as_str(),
+        Some("internal.example.com")
     );
     assert_eq!(
         plugin
@@ -323,8 +340,46 @@ fn vs_authority_match_deferred() {
             .get("reject_unmatched")
             .and_then(Value::as_bool),
         Some(true),
-        "unsupported authority predicate must NOT relax reject_unmatched -- gated traffic 404s rather than leaking through"
+        "multi-predicate routes keep reject_unmatched=true -- requests that miss every rule 404 (Envoy parity)",
     );
+
+    // Drive the plugin to prove the matcher fires.
+    let dispatch = MeshRouteDispatch::new(&plugin.config).expect("plugin config");
+
+    // Authority match wins: request carries the gated Host.
+    let mut matching = ctx("GET", "/api/items");
+    let mut matching_headers =
+        HashMap::from([("host".to_string(), "internal.example.com".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut matching, &mut matching_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // Header sibling wins: request carries the canary header and any Host.
+    let mut canary = ctx("GET", "/api/items");
+    let mut canary_headers = HashMap::from([
+        ("x-canary".to_string(), "v2".to_string()),
+        ("host".to_string(), "public.example.com".to_string()),
+    ]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // No predicate matches: 404 via reject_unmatched.
+    let mut miss = ctx("GET", "/api/items");
+    let mut miss_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut miss, &mut miss_headers).await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
 }
 
 /// VS predicate: `sourceNamespace` — T1-B.4 (PR #903). Restricts a route
@@ -389,18 +444,22 @@ async fn vs_source_namespace_match() {
     ));
 }
 
-/// VS predicate: `ignoreUriCase: true` — deferred. Ferrum's router cannot
-/// emulate case-insensitive path matching with a normal prefix route, so the
-/// translator emits a `request_termination` plugin attached to a sibling
-/// proxy. This fails closed instead of silently making only one casing
-/// reachable.
-#[test]
-fn vs_ignore_uri_case_falls_closed() {
+/// VS predicate: `ignoreUriCase: true` — T1-B.5 (PR #901). The translator
+/// widens the URI's `listen_path` to a case-insensitive regex (`prefix: "/Api"`
+/// → `~(?i)/Api.*`) so the router admits both casings, and emits a
+/// `mesh_route_dispatch` rule carrying the original URI predicate +
+/// `ignore_uri_case: true`. The plugin re-evaluates with ASCII-only case
+/// folding (non-ASCII bytes compare byte-for-byte, matching Istio's
+/// documented behavior). The sibling case-sensitive `/api` proxy is unaffected
+/// and gets NO `request_termination` — the case-insensitive branch is no
+/// longer a fail-closed path.
+#[tokio::test]
+async fn vs_ignore_uri_case_routes_both_casings() {
     register_feature!(
         category = CATEGORY,
         feature = "ignoreUriCase: true",
-        status = Status::Deferred,
-        notes = "Router can't emulate case-insensitive matching; emits request_termination so case-insensitive intent never silently downgrades to case-sensitive.",
+        status = Status::Supported,
+        notes = "T1-B.5 (PR #901): listen_path is widened to a case-insensitive regex (~(?i)/Api.*) so the router admits both casings; the dispatch rule carries the original URI predicate + ignore_uri_case=true; plugin re-evaluates with ASCII-only case folding (non-ASCII bytes compare byte-for-byte). Sibling case-sensitive routes are unaffected.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -420,14 +479,68 @@ fn vs_ignore_uri_case_falls_closed() {
     )
     .expect("translation succeeds");
 
+    // The canary proxy uses a widened case-insensitive regex listen_path that
+    // matches both `/Api*` and `/api*` (and any other casing).
+    let widened_listen_path = "~(?i)/Api.*";
+    let canary_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| {
+            p.listen_path.as_deref() == Some(widened_listen_path)
+                && p.backend_host == "canary.default.svc.cluster.local"
+        })
+        .expect("ignoreUriCase emits a case-insensitive regex listen_path");
+
+    // The dispatch rule carries the URI predicate + `ignore_uri_case` so the
+    // plugin can re-evaluate at request time.
+    let plugin = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| {
+            p.plugin_name == "mesh_route_dispatch"
+                && p.proxy_id.as_deref() == Some(canary_proxy.id.as_str())
+        })
+        .expect("mesh_route_dispatch rule emitted for ignoreUriCase branch");
+    let match_obj = &plugin.config["rules"][0]["match"];
+    assert_eq!(match_obj["uri"]["prefix"].as_str(), Some("/Api"));
+    assert_eq!(match_obj["ignore_uri_case"].as_bool(), Some(true));
+
+    // The sibling case-sensitive proxy must NOT carry a request_termination
+    // (the case-insensitive branch is no longer treated as unsupported).
+    let stable_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| {
+            p.listen_path.as_deref() == Some("/api")
+                && p.backend_host == "stable.default.svc.cluster.local"
+        })
+        .expect("case-sensitive sibling proxy must still emit");
     assert!(
-        result
+        !result
             .config
             .plugin_configs
             .iter()
-            .any(|p| p.plugin_name == "request_termination"),
-        "ignoreUriCase=true must compile to request_termination (fail-closed)"
+            .any(|p| p.plugin_name == "request_termination"
+                && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())),
+        "ignoreUriCase=true is first-class now; the sibling proxy must NOT be wrapped in a fail-closed request_termination"
     );
+
+    // Drive the plugin to prove ASCII case folding works.
+    let dispatch = MeshRouteDispatch::new(&plugin.config).expect("plugin config");
+    for path in ["/Api/items", "/api/items", "/API/items"] {
+        let mut req = ctx("GET", path);
+        let mut headers = HashMap::new();
+        assert!(
+            matches!(
+                dispatch.before_proxy(&mut req, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "case-insensitive URI prefix must match {path}"
+        );
+    }
 }
 
 /// VS feature: `http[].fault` (route-local fault injection) — T1-E (PR #896).
