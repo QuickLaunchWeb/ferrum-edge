@@ -561,6 +561,23 @@ pub struct EnvConfig {
     /// Higher values trade memory for fewer full-snapshot recoveries under
     /// high config churn. Default: 128.
     pub cp_broadcast_channel_capacity: usize,
+    /// CP namespace scope. Accepts:
+    /// - empty / unset — back-compat: CP serves only `FERRUM_NAMESPACE`.
+    /// - `"*"` — CP serves every namespace present in the database (multi-tenant).
+    /// - CSV (e.g. `"ns-a,ns-b"`) — CP serves only the listed namespaces.
+    ///
+    /// Per-namespace broadcast partitioning ensures a DP subscribing to one
+    /// namespace never receives another namespace's config delta.
+    /// Only meaningful in CP mode. Defaults to the empty list (back-compat).
+    pub cp_namespaces: Vec<String>,
+    /// When `true`, the CP requires every DP/mesh JWT to carry an `ns` claim
+    /// (single string or list of strings). The CP rejects subscriptions whose
+    /// requested namespace is not in the claim. When `false` (default), DPs
+    /// with no claim fall back to the legacy CP-scope check, so existing
+    /// deployments keep working unchanged. Multi-tenant CPs should set this
+    /// to `true` so a compromised DP for tenant A cannot subscribe to tenant
+    /// B by changing only its `FERRUM_NAMESPACE` value.
+    pub cp_require_namespace_claim: bool,
     /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
     /// Default false so existing CP/DP deployments expose only ConfigSync.
     pub xds_enabled: bool,
@@ -1440,6 +1457,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
+            cp_namespaces: Vec::new(),
+            cp_require_namespace_claim: false,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
             mesh_ca_backend: "none".to_string(),
@@ -1757,6 +1776,8 @@ impl EnvConfig {
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
+            cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
+            cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
@@ -2144,6 +2165,8 @@ impl EnvConfig {
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
+            cp_namespaces,
+            cp_require_namespace_claim,
             xds_enabled,
             xds_stream_channel_capacity,
             mesh_ca_backend,
@@ -2775,6 +2798,36 @@ impl EnvConfig {
         validate_k8s_namespace(&self.k8s_istio_root_namespace)
             .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
 
+        // Validate FERRUM_CP_NAMESPACES entries. Special token `"*"` means
+        // "all namespaces" — any other value must be a valid namespace label.
+        // Whitespace-only entries are rejected so a typo like `"ns-a, "` is
+        // caught early rather than producing an unreachable subscriber.
+        for raw in &self.cp_namespaces {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                return Err(
+                    "FERRUM_CP_NAMESPACES contains an empty / whitespace-only entry; \
+                     use `*` for cluster-wide or remove the extra comma"
+                        .to_string(),
+                );
+            }
+            if entry == "*" {
+                continue;
+            }
+            crate::config::types::validate_namespace(entry)
+                .map_err(|e| format!("Invalid FERRUM_CP_NAMESPACES entry '{}': {}", entry, e))?;
+        }
+        // `*` must stand alone. A mixed set like `"*,prod"` is ambiguous: it
+        // implies "everything plus an extra one" or "wildcard subset of one".
+        // Reject so operators choose a single semantics.
+        if self.cp_namespaces.iter().any(|raw| raw.trim() == "*") && self.cp_namespaces.len() > 1 {
+            return Err(
+                "FERRUM_CP_NAMESPACES: `*` (all namespaces) cannot be combined with \
+                 explicit namespace entries; use either `*` alone or a comma-separated list"
+                    .to_string(),
+            );
+        }
+
         // Validate TLS version settings
         match self.tls_min_version.as_str() {
             "1.2" | "1.3" => {}
@@ -3130,5 +3183,72 @@ mod tests {
         config
             .validate()
             .expect("db_pool_min == max should be valid");
+    }
+
+    // ── FERRUM_CP_NAMESPACES validation ────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_empty_cp_namespaces() {
+        // Back-compat default: unset / empty means "single-namespace CP".
+        let mut config = file_mode_config();
+        config.cp_namespaces = Vec::new();
+        config
+            .validate()
+            .expect("empty cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_accepts_star_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["*".to_string()];
+        config.validate().expect("`*` cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_accepts_csv_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["prod".to_string(), "staging".to_string()];
+        config.validate().expect("CSV cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_rejects_empty_entry_in_cp_namespaces() {
+        let mut config = file_mode_config();
+        // Simulates `FERRUM_CP_NAMESPACES="ns-a, ,ns-c"`.
+        config.cp_namespaces = vec!["ns-a".to_string(), " ".to_string(), "ns-c".to_string()];
+        let err = config
+            .validate()
+            .expect_err("whitespace-only entry must be rejected");
+        assert!(
+            err.contains("empty"),
+            "error should mention empty entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_namespace_in_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["Bad Namespace!".to_string()];
+        let err = config
+            .validate()
+            .expect_err("invalid namespace label must be rejected");
+        assert!(
+            err.contains("FERRUM_CP_NAMESPACES"),
+            "error should mention FERRUM_CP_NAMESPACES, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_star_combined_with_explicit_namespace() {
+        // `*` plus an explicit entry is ambiguous — reject.
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["*".to_string(), "prod".to_string()];
+        let err = config
+            .validate()
+            .expect_err("`*` cannot be combined with explicit entries");
+        assert!(
+            err.contains("`*`"),
+            "error should explain the `*` constraint, got: {err}"
+        );
     }
 }

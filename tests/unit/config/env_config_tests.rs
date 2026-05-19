@@ -4341,3 +4341,111 @@ fn test_k8s_istio_root_namespace_rejects_invalid_k8s_namespace() {
         },
     );
 }
+
+// ── FERRUM_CP_NAMESPACES / FERRUM_CP_REQUIRE_NAMESPACE_CLAIM (MESH-T2-A) ─
+
+#[test]
+fn test_cp_namespaces_defaults_to_empty_for_back_compat() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_CP_NAMESPACES");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.cp_namespaces.is_empty(),
+                "default cp_namespaces must be empty (back-compat single-namespace CP)"
+            );
+            assert!(
+                !config.cp_require_namespace_claim,
+                "default cp_require_namespace_claim must be false (back-compat)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_star_for_cluster_wide() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.cp_namespaces, vec!["*".to_string()]);
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_csv() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,staging,dev"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.cp_namespaces,
+                vec!["prod".to_string(), "staging".to_string(), "dev".to_string()]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_star_combined_with_explicit() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*,prod"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES") && err.contains("`*`"),
+                "error should mention FERRUM_CP_NAMESPACES + `*` constraint, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_invalid_namespace_entry() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,Bad Namespace!"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES"),
+                "error should mention FERRUM_CP_NAMESPACES, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_require_namespace_claim_parses_true() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.cp_require_namespace_claim);
+        },
+    );
+}

@@ -14,6 +14,7 @@ mod backend_mtls_tests;
 mod backend_tls_san_allow_list_tests;
 mod connection_pool_tests;
 mod cp_dp_grpc_tests;
+mod cp_multi_namespace_tests;
 mod db_incremental_poll_tests;
 mod db_offline_bootstrap_tests;
 mod deferred_log_tests;
