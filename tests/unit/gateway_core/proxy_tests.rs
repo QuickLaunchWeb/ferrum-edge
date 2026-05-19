@@ -362,6 +362,54 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 }
 
 #[tokio::test]
+async fn test_single_auth_rejects_when_second_factor_missing() {
+    let header_key_auth: Arc<dyn Plugin> = Arc::new(
+        KeyAuth::new(&json!({
+            "key_location": "header:X-API-Key"
+        }))
+        .unwrap(),
+    );
+    let query_key_auth: Arc<dyn Plugin> = Arc::new(
+        KeyAuth::new(&json!({
+            "key_location": "query:api_key"
+        }))
+        .unwrap(),
+    );
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![header_key_auth, query_key_auth];
+    let consumer = Consumer {
+        id: "consumer-1".to_string(),
+        username: "alice".to_string(),
+        auth_type: "key_auth".to_string(),
+        auth_value: "test-api-key".to_string(),
+        plugins: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        namespace: "default".to_string(),
+        groups: Vec::new(),
+        metadata: HashMap::new(),
+    };
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/key-auth".to_string(),
+    );
+    ctx.headers
+        .insert("X-API-Key".to_string(), "test-api-key".to_string());
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    let (status_code, body, headers) = result.expect("missing second factor should reject");
+    assert_eq!(status_code, 401);
+    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some("ferrum-edge")
+    );
+}
+
+#[tokio::test]
 async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
     let rejecting: Arc<dyn Plugin> = Arc::new(

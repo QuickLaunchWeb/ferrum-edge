@@ -7285,6 +7285,7 @@ pub async fn run_authentication_phase(
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                let was_authenticated = request_is_authenticated(ctx);
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -7292,7 +7293,11 @@ pub async fn run_authentication_phase(
                             return Some((reject.status_code, reject.body, reject.headers));
                         }
                     }
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        if !was_authenticated && !request_is_authenticated(ctx) {
+                            return Some(missing_authentication_reject());
+                        }
+                    }
                 }
             }
             if request_is_authenticated(ctx) || auth_plugins.is_empty() {
