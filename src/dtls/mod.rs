@@ -154,7 +154,16 @@ pub fn build_backend_dtls_config(
                     backend_host
                 )
             })?;
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+        let inner = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            if proxy.resolved_tls.san_allow_list.is_empty() {
+                inner
+            } else {
+                Arc::new(crate::tls::backend::SanAllowListVerifier::new(
+                    inner,
+                    proxy.resolved_tls.san_allow_list.clone(),
+                )?)
+            };
         (Some(server_name), Some(verifier as _))
     };
 
