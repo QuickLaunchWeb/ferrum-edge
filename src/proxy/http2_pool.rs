@@ -247,7 +247,13 @@ impl Http2PoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            // Cap server-initiated streams (push) AND advertise our local
+            // initial cap on locally-initiated streams. The server's SETTINGS
+            // frame can raise the local cap later, but the initial value
+            // gives operators a starting bound that maps onto Istio's
+            // `http2MaxRequests` semantics for outbound concurrent requests.
             builder.max_concurrent_streams(max_streams);
+            builder.initial_max_send_streams(max_streams as usize);
         }
 
         builder

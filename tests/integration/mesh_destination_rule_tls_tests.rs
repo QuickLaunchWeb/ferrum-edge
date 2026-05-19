@@ -672,6 +672,7 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
         locality_lb_setting: None,
         max_connections: None,
         tcp_keepalive: None,
+        connection_pool_http: None,
     };
 
     let json = serde_json::to_value(&policy).expect("serialize");
@@ -693,6 +694,11 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
     assert!(
         !object.contains_key("tcp_keepalive"),
         "tcp_keepalive=None must NOT appear in serialized JSON \
+         (wire compatibility): {json}"
+    );
+    assert!(
+        !object.contains_key("connection_pool_http"),
+        "connection_pool_http=None must NOT appear in serialized JSON \
          (wire compatibility): {json}"
     );
     // Sanity: the explicitly-set field is present.

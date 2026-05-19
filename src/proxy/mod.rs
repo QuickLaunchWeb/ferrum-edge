@@ -10609,15 +10609,67 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(override_config) = overrides.get(&target.port) else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(override_ms) = override_config.connect_timeout_ms else {
-        return std::borrow::Cow::Borrowed(proxy);
-    };
-    if override_ms == proxy.backend_connect_timeout_ms {
+
+    // Compare each candidate override against the proxy's current value and
+    // build an owned clone only when at least one field actually differs.
+    // The HTTP-family additions (T1-C) reuse the existing
+    // `connect_timeout_ms` fast path so the common "no override" and "override
+    // matches current value" branches still return a borrowed proxy without
+    // allocating.
+
+    let connect_override = override_config
+        .connect_timeout_ms
+        .filter(|&v| v != proxy.backend_connect_timeout_ms);
+
+    // `pool_http2_max_concurrent_streams` lives on the proxy as
+    // `Option<u32>`; project the per-port value when it differs from what
+    // the proxy already carries (treating `None` as "no proxy default").
+    let h2_streams_override = override_config
+        .h2_max_concurrent_streams
+        .filter(|new| Some(*new) != proxy.pool_http2_max_concurrent_streams);
+
+    // Per-port HTTP idle timeout is exposed as milliseconds on the override
+    // and as whole seconds on the proxy (`pool_idle_timeout_seconds`). The
+    // translator already rejects sub-second durations, so the conversion is
+    // lossless here.
+    let idle_seconds_override = override_config.http_idle_timeout_ms.and_then(|ms| {
+        let secs = ms / 1000;
+        (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
+    });
+
+    // Per-port `maxRequestsPerConnection` is wire-projected end-to-end onto
+    // `Proxy.pool_max_requests_per_connection`. Hyper does not yet expose a
+    // close-after-N-requests builder knob, so the runtime effect remains
+    // pending (same status as the proxy-level field's existing docstring) —
+    // wiring the per-port projection here means the field will light up the
+    // moment a request-count wrapper is introduced. The proxy field is
+    // `Option<u64>`; widen the `u32` override to match the schema.
+    let max_reqs_override = override_config
+        .http_max_requests_per_connection
+        .map(u64::from)
+        .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
+
+    if connect_override.is_none()
+        && h2_streams_override.is_none()
+        && idle_seconds_override.is_none()
+        && max_reqs_override.is_none()
+    {
         return std::borrow::Cow::Borrowed(proxy);
     }
 
     let mut owned = proxy.clone();
-    owned.backend_connect_timeout_ms = override_ms;
+    if let Some(ms) = connect_override {
+        owned.backend_connect_timeout_ms = ms;
+    }
+    if let Some(streams) = h2_streams_override {
+        owned.pool_http2_max_concurrent_streams = Some(streams);
+    }
+    if let Some(secs) = idle_seconds_override {
+        owned.pool_idle_timeout_seconds = Some(secs);
+    }
+    if let Some(n) = max_reqs_override {
+        owned.pool_max_requests_per_connection = Some(n);
+    }
     std::borrow::Cow::Owned(owned)
 }
 
@@ -17186,6 +17238,120 @@ mod tests {
             "missing upstream_target must take the borrowed branch"
         );
         assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
+
+    /// Helper: clone the standard test proxy and add a per-port override
+    /// carrying the three new HTTP fields plus the existing connect timeout
+    /// so each test can dial in only the field it cares about.
+    fn proxy_with_http_overrides_for_test(
+        connect_ms: u64,
+        h2_streams: Option<u32>,
+        http_idle_ms: Option<u64>,
+        max_reqs: Option<u32>,
+    ) -> Proxy {
+        let mut proxy = proxy_with_port_overrides_for_test(connect_ms, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(connect_ms),
+                h2_max_concurrent_streams: h2_streams,
+                http_idle_timeout_ms: http_idle_ms,
+                http_max_requests_per_connection: max_reqs,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_h2_max_concurrent_streams_per_port() {
+        let proxy = proxy_with_http_overrides_for_test(5000, Some(250), None, None);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing h2 cap must take the owned-clone branch"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(250));
+        assert!(
+            proxy.pool_http2_max_concurrent_streams.is_none(),
+            "original proxy is untouched"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_http_idle_timeout_in_seconds() {
+        // Per-port idle_timeout_ms is whole-second-granular (translator
+        // rejects sub-second). Conversion to `Option<u64>` seconds on the
+        // proxy schema is lossless.
+        let proxy = proxy_with_http_overrides_for_test(5000, None, Some(120_000), None);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert_eq!(effective.pool_idle_timeout_seconds, Some(120));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_max_requests_per_connection_as_u64() {
+        // Per-port wire field is `u32`; `Proxy.pool_max_requests_per_connection`
+        // is `Option<u64>` for schema compatibility. The widening conversion
+        // must round-trip without sign drift or truncation.
+        let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_borrows_when_all_http_overrides_match_proxy() {
+        // Set the proxy's fields to the same values the override carries so
+        // every comparison is a no-op. The helper must avoid the clone.
+        let mut proxy =
+            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        proxy.pool_http2_max_concurrent_streams = Some(250);
+        proxy.pool_idle_timeout_seconds = Some(120);
+        proxy.pool_max_requests_per_connection = Some(40);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "all-overrides-match path must avoid the owned clone"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_proxy_combines_connect_timeout_and_http_overrides() {
+        // Mixed override: only `connect_timeout` and `h2_max_concurrent_streams`
+        // differ; the others match the proxy's existing values. The owned
+        // clone must carry both diffs without resetting unrelated proxy
+        // fields.
+        let mut proxy =
+            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
+        proxy.pool_idle_timeout_seconds = Some(120); // matches override
+        proxy.pool_max_requests_per_connection = Some(40); // matches override
+        // h2 streams currently None → override Some(250) differs.
+        // Override `connect_timeout_ms` to a different value so it's a diff
+        // too: but we already set proxy=5000 and override=5000 above → matches.
+        // Adjust the override to 750 to force the connect-timeout diff path.
+        if let Some(overrides) = proxy.dispatch_port_overrides.as_mut()
+            && let Some(ovr) = overrides.get_mut(&8080)
+        {
+            ovr.connect_timeout_ms = Some(750);
+        }
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        let std::borrow::Cow::Owned(owned) = effective else {
+            panic!("mixed diff must take owned-clone branch");
+        };
+        assert_eq!(owned.backend_connect_timeout_ms, 750);
+        assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
+        // Unchanged fields preserved from proxy:
+        assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
+        assert_eq!(owned.pool_max_requests_per_connection, Some(40));
     }
 
     #[test]
