@@ -1092,6 +1092,17 @@ The node agent exposes Prometheus counters on the read-only admin `/metrics` end
 - `ferrum_node_agent_pods_enrolled_total` -- total pods successfully enrolled for capture.
 - `ferrum_node_agent_pods_unenrolled_total` -- total pods unenrolled (deletion or shutdown).
 - `ferrum_node_agent_attach_errors_total` -- total BPF attachment or map update failures.
+- `ferrum_mesh_node_topology_degraded{reason}` -- gauge. `1` with `reason ∈ {kernel_too_old, cgroup_v1, bpffs_missing}` when the node fell back from eBPF capture to iptables; `0` with `reason="none"` when the eBPF path is nominal. See [node_agent.md](node_agent.md#kernel-fallback) for the full reason table and remediations.
+
+### Mixed-kernel clusters
+
+Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent gracefully falls back to iptables capture on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`); the rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
+
+1. Alert on `ferrum_mesh_node_topology_degraded == 1` to track the degraded set.
+2. Label degraded nodes (e.g., `ferrum.io/capture-mode=iptables`) and configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers on those nodes.
+3. Upgrade kernels to >= 5.7 with cgroup v2 + bpffs as the long-term remediation.
+
+Set `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` if you prefer the node agent to refuse startup on degraded nodes (the pod readiness probe will fail and the DaemonSet pod will not become Ready).
 
 ### Environment Variables
 
@@ -1104,7 +1115,7 @@ The node agent exposes Prometheus counters on the read-only admin `/metrics` end
 | `FERRUM_NODE_AGENT_PROXY_MODE` | `local_pod` | Capture topology contract: `local_pod` or `node_waypoint` |
 | `FERRUM_NODE_AGENT_ADMIN_ENABLED` | `false` | Enables the node-agent read-only admin listener for metrics/health. When enabled, defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set; JWT does not affect bind because metrics/health are unauthenticated. |
 | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT` | `15008` | HBONE redirect/listener port written into the capture contract and BPF config map. Must match the mesh proxy HBONE listener (`15008` today). |
-| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behaviour when eBPF prerequisites are missing (kernel < 5.7, cgroup v1, or bpffs unmounted). Default `iptables` falls back to host iptables capture and sets `ferrum_mesh_node_topology_degraded=1`. `fail` refuses startup with a structured error. See [node_agent.md](node_agent.md#kernel-fallback). |
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude from capture (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
@@ -1347,7 +1358,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_NODE_AGENT_PROXY_MODE` | `local_pod` | Capture topology contract: `local_pod` or `node_waypoint` |
 | `FERRUM_NODE_AGENT_ADMIN_ENABLED` | `false` | Enables the node-agent read-only admin listener for metrics/health. When enabled, defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set; JWT does not affect bind because metrics/health are unauthenticated. |
 | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT` | `15008` | HBONE redirect/listener port written into the capture contract and BPF config map. Must match the mesh proxy HBONE listener. |
-| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behaviour when eBPF prerequisites are missing (kernel < 5.7, cgroup v1, or bpffs unmounted). Default `iptables` falls back to host iptables capture and sets `ferrum_mesh_node_topology_degraded=1`. `fail` refuses startup with a structured error. See [node_agent.md](node_agent.md#kernel-fallback). |
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |

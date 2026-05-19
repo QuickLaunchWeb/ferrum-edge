@@ -249,6 +249,36 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("ferrum_node_agent_pods_enrolled_total 3"));
     assert!(output.contains("ferrum_node_agent_pods_unenrolled_total 1"));
     assert!(output.contains("ferrum_node_agent_attach_errors_total 2"));
+    // Nominal topology: gauge emitted as 0 with reason=none so dashboards
+    // can always pin the expected value.
+    assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
+    assert!(output.contains("ferrum_mesh_node_topology_degraded{reason=\"none\"} 0"));
+}
+
+#[tokio::test]
+async fn test_registry_renders_topology_degraded_gauge_with_reason() {
+    let registry = MetricsRegistry::new();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    metrics.set_topology_degraded("kernel_too_old");
+
+    registry.set_node_agent_metrics(metrics);
+    let output = registry.render_uncached();
+
+    assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
+    assert!(output.contains("ferrum_mesh_node_topology_degraded{reason=\"kernel_too_old\"} 1"));
+    // The nominal series must NOT appear when degraded — operators alert
+    // on the single emitted series.
+    assert!(!output.contains("ferrum_mesh_node_topology_degraded{reason=\"none\"}"));
+}
+
+#[tokio::test]
+async fn test_registry_omits_topology_degraded_gauge_without_node_agent_metrics() {
+    // Non-node-agent processes (database/file/cp/dp/mesh) never register a
+    // NodeAgentMetrics handle. The gauge must not appear in their /metrics —
+    // it would be a misleading "I am a node agent" signal.
+    let registry = MetricsRegistry::new();
+    let output = registry.render_uncached();
+    assert!(!output.contains("ferrum_mesh_node_topology_degraded"));
 }
 
 #[tokio::test]

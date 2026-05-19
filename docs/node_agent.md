@@ -29,6 +29,40 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_pods_enrolled_total` | Pods successfully enrolled for capture. |
 | `ferrum_node_agent_pods_unenrolled_total` | Pods unenrolled due to deletion, label changes, or shutdown. |
 | `ferrum_node_agent_attach_errors_total` | BPF attachment or map update failures. |
+| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`} when the node fell back from eBPF capture to iptables. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). Set once at startup after the kernel probe runs — a kernel/cgroup/bpffs change requires restarting the node agent for the gauge to refresh. |
+
+## Kernel Fallback
+
+The node agent probes the kernel once at startup (see `KernelProbeResult::supports_ebpf`):
+
+1. Linux kernel version >= 5.7 (required for cgroup_sockaddr BPF programs).
+2. cgroup v2 mounted at `FERRUM_NODE_AGENT_CGROUP_ROOT` (default `/sys/fs/cgroup`).
+3. bpffs mounted at `FERRUM_NODE_AGENT_BPF_FS_PATH` (default `/sys/fs/bpf`).
+
+If any prerequisite is missing, the node agent does not crash by default. It logs ONE structured `warn!` with the first-failing prerequisite as `degradation_reason`, sets the `ferrum_mesh_node_topology_degraded{reason="<...>"}` gauge to `1`, and applies host-level iptables rules to keep the data plane serving while operators remediate. `FERRUM_NODE_AGENT_FALLBACK_MODE` controls the behaviour:
+
+| Value | Behaviour |
+|---|---|
+| `iptables` (default) | Apply host iptables capture rules and continue serving. The gauge records the reason; pod-level eBPF enrollment is skipped. Existing pods that were enrolled before degradation keep working until the next reconcile; new pods rely on the iptables capture path. |
+| `fail` | Refuse to start, surface the kernel deficiency in the error log, and exit. Use this when you want degraded nodes to fail their readiness probe instead of silently routing without eBPF telemetry. |
+
+Suggested remediations by reason label:
+
+| `reason` | Remediation |
+|---|---|
+| `kernel_too_old` | Upgrade the node to a kernel >= 5.7. Most modern distributions (RHEL 9 / Ubuntu 22.04 / Debian 12 / Amazon Linux 2023) already satisfy this. |
+| `cgroup_v1` | Mount the unified cgroup v2 hierarchy (`systemd.unified_cgroup_hierarchy=1` on systemd hosts). cgroup_sockaddr BPF programs require cgroup v2 and cannot attach to the v1 hierarchy. |
+| `bpffs_missing` | Mount `bpffs` at the configured `FERRUM_NODE_AGENT_BPF_FS_PATH`: `mount -t bpf bpffs /sys/fs/bpf`. The DaemonSet manifest in `charts/ferrum-node-agent/` mounts this automatically when configured. |
+
+### Mixed-kernel clusters
+
+In a cluster with heterogeneous kernels, the recommended pattern is:
+
+1. Deploy the node-agent DaemonSet to every node. Degraded nodes fall back to iptables capture for whole-host traffic and the gauge identifies them.
+2. Configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers for pods scheduled on degraded nodes. The injector decides this from a Helm-templated `NodeSelector` driven by your node labels (e.g., `ferrum.io/capture-mode=iptables`).
+3. Alert on `ferrum_mesh_node_topology_degraded == 1` so the degraded set stays small while operators upgrade kernels. The gauge is unauthenticated (`/metrics` is unauthenticated), so the same allowlist guidance applies as for the rest of the node-agent admin surface.
+
+The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `mesh_workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.
 
 The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PORT` unless that port is set to `0`. Node-agent mode does not start an HTTPS admin listener yet, even when `FERRUM_ADMIN_HTTPS_PORT` is set.
 

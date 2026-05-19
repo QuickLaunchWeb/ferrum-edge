@@ -971,6 +971,35 @@ impl MetricsRegistry {
                 snapshot.attach_errors,
                 &ns_label,
             );
+
+            // Topology-degraded gauge — emitted whenever the node-agent
+            // metrics are registered so dashboards can pin "expected: 0"
+            // even on healthy nodes. `reason` is a closed snake_case set
+            // from KernelProbeResult::degradation_reason (kernel_too_old,
+            // cgroup_v1, bpffs_missing) plus a single "none" series on
+            // nominal nodes — total cardinality is bounded per node.
+            output.push_str(
+                "# HELP ferrum_mesh_node_topology_degraded \
+                 Node-agent fell back from eBPF capture to iptables because the kernel \
+                 did not meet eBPF prerequisites. 1 with a reason label means degraded, \
+                 0 with reason=\"none\" means nominal.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_node_topology_degraded gauge\n");
+            let (reason, value) = match snapshot.topology_degraded_reason {
+                Some(reason) => (reason, 1u64),
+                None => ("none", 0u64),
+            };
+            if ns_label.is_empty() {
+                output.push_str(&format!(
+                    "ferrum_mesh_node_topology_degraded{{reason=\"{}\"}} {}\n",
+                    reason, value,
+                ));
+            } else {
+                output.push_str(&format!(
+                    "ferrum_mesh_node_topology_degraded{{reason=\"{}\"{}}} {}\n",
+                    reason, ns_label, value,
+                ));
+            }
         }
 
         output

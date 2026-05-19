@@ -133,7 +133,14 @@ pub async fn run(
     );
 
     let result = if !probe.supports_ebpf() {
-        handle_fallback(&config, &probe, &shutdown_tx, startup_ready).await
+        handle_fallback(
+            &config,
+            &probe,
+            metrics.as_ref(),
+            &shutdown_tx,
+            startup_ready,
+        )
+        .await
     } else {
         run_with_backend(
             create_backend(),
@@ -676,12 +683,14 @@ pub fn handle_pod_removed(
 async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
+    metrics: &NodeAgentMetrics,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     handle_fallback_with(
         config,
         probe,
+        metrics,
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
@@ -698,6 +707,7 @@ async fn handle_fallback(
 async fn handle_fallback_with<F, Fut>(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
+    metrics: &NodeAgentMetrics,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     mut execute: F,
     startup_ready: Arc<AtomicBool>,
@@ -706,6 +716,16 @@ where
     F: FnMut(Vec<String>, &'static str) -> Fut,
     Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
+    // Stamp the degradation reason on the shared metrics handle BEFORE the
+    // warn/fallback decision so /metrics consistently reports `1` for the
+    // exact reason that drove the fallback, even if iptables setup later
+    // fails. `degradation_reason()` is `None` only when supports_ebpf() is
+    // true — but we only reach this function when supports_ebpf() is false,
+    // so the unwrap-or-fallback branch is purely defensive (e.g., a future
+    // caller that probes more capability bits than the helper checks).
+    let reason = probe.degradation_reason().unwrap_or("unknown");
+    metrics.set_topology_degraded(reason);
+
     match config.fallback_mode {
         FallbackMode::Iptables => {
             warn!(
@@ -713,7 +733,12 @@ where
                 meets_version = probe.meets_version_requirement,
                 cgroup_v2 = probe.cgroup_v2_available,
                 bpf_fs = probe.bpf_fs_available,
-                "Kernel does not support eBPF capture, falling back to iptables mode"
+                degradation_reason = reason,
+                "Kernel does not support eBPF capture, falling back to iptables mode. \
+                 Remediation: upgrade kernel to >= 5.7 with cgroup v2 + bpffs mounted, \
+                 or set FERRUM_NODE_AGENT_FALLBACK_MODE=fail to refuse startup on degraded nodes. \
+                 Per-pod ambient capture remains available via iptables injection — \
+                 configure the injector NodeSelector so pods on this node receive an iptables init container."
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
@@ -751,15 +776,18 @@ where
                 meets_version = probe.meets_version_requirement,
                 cgroup_v2 = probe.cgroup_v2_available,
                 bpf_fs = probe.bpf_fs_available,
+                degradation_reason = reason,
                 "Kernel does not support eBPF capture and fallback_mode=fail"
             );
             anyhow::bail!(
                 "eBPF capture requires kernel >= 5.7 with cgroup v2 and bpffs. \
-                 Detected: kernel={}, cgroup_v2={}, bpf_fs={}. \
-                 Set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables to use iptables instead.",
+                 Detected: kernel={}, cgroup_v2={}, bpf_fs={}, reason={}. \
+                 Set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables to use iptables instead \
+                 (default).",
                 probe.kernel_release,
                 probe.cgroup_v2_available,
                 probe.bpf_fs_available,
+                reason,
             );
         }
     }
@@ -1143,6 +1171,7 @@ mod tests {
             .send(true)
             .expect("watch channel should be open");
         let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
@@ -1155,6 +1184,7 @@ mod tests {
             handle_fallback_with(
                 &config,
                 &probe,
+                &metrics,
                 &shutdown_tx,
                 move |commands, phase| {
                     let phases = std::sync::Arc::clone(&phases_for_runner);
@@ -1179,6 +1209,14 @@ mod tests {
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
         );
+        // The degraded gauge must reflect the first-failing kernel
+        // prerequisite even when iptables setup succeeded — operators rely
+        // on it to filter dashboards by remediation type.
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("kernel_too_old"),
+            "kernel-version failure should set the degraded gauge"
+        );
     }
 
     #[tokio::test]
@@ -1200,6 +1238,7 @@ mod tests {
         };
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
         let command_counts =
@@ -1209,6 +1248,7 @@ mod tests {
         let result = handle_fallback_with(
             &config,
             &probe,
+            &metrics,
             &shutdown_tx,
             move |commands, phase| {
                 let phases = std::sync::Arc::clone(&phases_for_runner);
@@ -1238,6 +1278,13 @@ mod tests {
                 .iter()
                 .any(|(phase, count)| *phase == "setup" && *count > 1),
             "fallback setup should execute individual plan commands, got {command_counts:?}"
+        );
+        // Iptables setup failure does not erase the degraded gauge — the
+        // node is still degraded, just also failed. Operators can read
+        // both signals together: gauge=1 + missing pod-enrollment counts.
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("kernel_too_old"),
         );
     }
 
@@ -1305,12 +1352,14 @@ mod tests {
         };
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
 
         let result = handle_fallback_with(
             &config,
             &probe,
+            &metrics,
             &shutdown_tx,
             move |commands, phase| {
                 let phases = std::sync::Arc::clone(&phases_for_runner);
@@ -1676,13 +1725,75 @@ mod tests {
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
 
         assert!(
-            handle_fallback(&config, &probe, &shutdown_tx, startup_ready.clone())
-                .await
-                .is_err()
+            handle_fallback(
+                &config,
+                &probe,
+                &metrics,
+                &shutdown_tx,
+                startup_ready.clone()
+            )
+            .await
+            .is_err()
         );
         assert!(!startup_ready.load(Ordering::Acquire));
+        // Even in fail mode the gauge briefly records the reason before
+        // the process exits — operators scraping during the failure window
+        // (or in tests like this) get a structured diagnostic.
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("kernel_too_old"),
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fallback_records_cgroup_v1_reason() {
+        // Newer kernel but cgroup v2 unavailable — the gauge must report
+        // cgroup_v1 so dashboards route the operator to remount the cgroup
+        // hierarchy rather than to upgrade the kernel.
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let probe = kernel_probe::KernelProbeResult {
+            kernel_release: "6.1.0".to_string(),
+            meets_version_requirement: true,
+            cgroup_v2_available: false,
+            bpf_fs_available: true,
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx
+            .send(true)
+            .expect("watch channel should be open");
+        let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_fallback_with(
+                &config,
+                &probe,
+                &metrics,
+                &shutdown_tx,
+                |_cmds, _phase| async { Ok(()) },
+                startup_ready.clone(),
+            ),
+        )
+        .await
+        .expect("handle_fallback should complete within timeout");
+
+        assert!(result.is_ok());
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("cgroup_v1"),
+        );
     }
 
     #[tokio::test]
