@@ -2294,6 +2294,7 @@ fn inject_mesh_request_auth_plugin(
     let jwks_config = serde_json::json!({
         "providers": providers,
         "require_exp": false,
+        "emit_mesh_request_principal_metadata": true,
     });
 
     ensure_global_plugin(

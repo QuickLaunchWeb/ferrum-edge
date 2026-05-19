@@ -84,6 +84,7 @@ pub struct JwksAuth {
     consumer_header_claim: String,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    emit_mesh_request_principal_metadata: bool,
 }
 
 /// A single identity provider configuration.
@@ -155,6 +156,8 @@ impl JwksAuth {
             Some(value) => parse_claim_path_value("consumer_header_claim", value)?,
             None => consumer_identity_claim.clone(),
         };
+        let emit_mesh_request_principal_metadata =
+            optional_bool(config_obj, "emit_mesh_request_principal_metadata")?.unwrap_or(false);
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
@@ -335,6 +338,7 @@ impl JwksAuth {
             consumer_header_claim,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            emit_mesh_request_principal_metadata,
         })
     }
 
@@ -561,9 +565,9 @@ impl JwksAuth {
                         {
                             ctx.auth_method = Some("jwks_auth");
                         }
-                        // Emit `iss/sub` request principal for mesh
-                        // authorization policy `requestPrincipals` matching.
-                        set_request_principal_metadata(&claims, ctx);
+                        if self.emit_mesh_request_principal_metadata {
+                            set_mesh_request_principal_metadata(&claims, ctx);
+                        }
 
                         if !provider.forward_original_token {
                             mark_original_token_stripping_metadata(ctx, provider);
@@ -1341,16 +1345,15 @@ async fn discover_jwks_uri(
         .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())
 }
 
-/// Set `jwks_auth.request_principal` metadata to `{iss}/{sub}` when both
-/// claims are present. This enables Istio-style `requestPrincipals` matching
-/// in mesh authorization policies without changing the external plugin API.
-fn set_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
+/// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are
+/// present.
+fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
         claims.get("sub").and_then(|v| v.as_str()),
     ) {
         ctx.metadata.insert(
-            "jwks_auth.request_principal".to_string(),
+            "mesh.request_principal".to_string(),
             format!("{iss}/{sub}"),
         );
     }
