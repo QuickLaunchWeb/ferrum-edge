@@ -14,6 +14,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use regex::{Regex, RegexSet};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -439,11 +440,18 @@ impl RouterCache {
         host: Option<&str>,
         path: &str,
     ) -> Option<RouteMatch> {
+        // Route matching must treat encoded slashes as path separators so that
+        // "/api%2Fadmin" follows the same route policy as "/api/admin".
+        // This normalization is for routing only; backend forwarding keeps the
+        // original URI bytes untouched.
+        let route_path = normalize_route_path_for_matching(path);
+        let route_path = route_path.as_ref();
+
         // Fast path: use thread-local buffer for cache lookup to avoid String
         // allocation on cache hits (99%+ of requests). Only allocate on misses.
         let hit = CACHE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
-            write_cache_key(&mut buf, host, path);
+            write_cache_key(&mut buf, host, route_path);
 
             // Fast path 1: check prefix cache (includes negative entries for total misses)
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
@@ -483,10 +491,10 @@ impl RouterCache {
         }
 
         // Slow path: search the host route table (cache miss)
-        let result = Self::search_route_table(table, host, path);
+        let result = Self::search_route_table(table, host, route_path);
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
-        let cache_key = make_cache_key(host, path);
+        let cache_key = make_cache_key(host, route_path);
 
         // Cache the result in the appropriate partition.
         // Increment sketch on insert so the new entry starts with a frequency of 1.
@@ -1004,6 +1012,46 @@ impl RouterCache {
             has_host_only_routes,
         }
     }
+}
+
+fn normalize_route_path_for_matching(path: &str) -> Cow<'_, str> {
+    if !path.as_bytes().windows(3).any(|w| {
+        matches!(
+            w,
+            [b'%', b'2', b'F'] | [b'%', b'2', b'f'] | [b'%', b'2', b'5']
+        )
+    }) {
+        return Cow::Borrowed(path);
+    }
+
+    let mut normalized = String::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'2' {
+            match bytes[i + 2] {
+                b'F' | b'f' => {
+                    normalized.push('/');
+                    i += 3;
+                    continue;
+                }
+                b'5' if i + 5 < bytes.len()
+                    && (bytes[i + 3] == b'2' || bytes[i + 3] == b'3')
+                    && bytes[i + 4] == b'F'
+                    && (bytes[i + 5] == b'F' || bytes[i + 5] == b'f') =>
+                {
+                    normalized.push('/');
+                    i += 6;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        normalized.push(bytes[i] as char);
+        i += 1;
+    }
+
+    Cow::Owned(normalized)
 }
 
 impl IndexedExactPathRoutes {
@@ -1559,6 +1607,33 @@ mod tests {
             .find_proxy(None, "/api.v1/users")
             .expect("child path should fall back to prefix");
         assert_eq!(child.proxy.id, "root-prefix");
+    }
+
+    #[test]
+    fn encoded_slash_matches_protected_prefix_before_catch_all() {
+        let config = GatewayConfig {
+            proxies: vec![
+                minimal_proxy_for_routing("catch-all", "/"),
+                minimal_proxy_for_routing("protected-api", "/api"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let plain = cache
+            .find_proxy(None, "/api/admin")
+            .expect("plain slash should match protected route");
+        assert_eq!(plain.proxy.id, "protected-api");
+
+        let encoded = cache
+            .find_proxy(None, "/api%2Fadmin")
+            .expect("encoded slash should match protected route");
+        assert_eq!(encoded.proxy.id, "protected-api");
+
+        let double_encoded = cache
+            .find_proxy(None, "/api%252Fadmin")
+            .expect("double-encoded slash should still map to protected separator semantics");
+        assert_eq!(double_encoded.proxy.id, "protected-api");
     }
 
     #[test]
