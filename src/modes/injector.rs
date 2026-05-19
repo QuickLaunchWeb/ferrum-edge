@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -509,7 +509,9 @@ pub async fn run(
     let config = InjectorConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
     let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
+    let max_connections = env_config.max_connections.max(1);
     let config = Arc::new(config);
+    let connection_limiter = Arc::new(Semaphore::new(max_connections));
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(
         listen_addr = %config.listen_addr,
@@ -526,7 +528,17 @@ pub async fn run(
                     Ok((stream, remote_addr)) => {
                         let config = Arc::clone(&config);
                         let tls_acceptor = tls_acceptor.clone();
+                        let limiter = Arc::clone(&connection_limiter);
+                        let Ok(connection_permit) = limiter.try_acquire_owned() else {
+                            warn!(
+                                remote_addr = %remote_addr,
+                                max_connections,
+                                "Injector connection rejected: max concurrent connections reached"
+                            );
+                            continue;
+                        };
                         tokio::spawn(async move {
+                            let _connection_permit = connection_permit;
                             if let Some(acceptor) = tls_acceptor {
                                 match tls::accept_with_optional_timeout(
                                     &acceptor,
