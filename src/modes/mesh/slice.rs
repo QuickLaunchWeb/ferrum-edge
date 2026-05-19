@@ -490,10 +490,16 @@ impl MeshSlice {
             .cloned()
             .collect();
         let effective_namespace = namespace.as_str();
+        let candidate_label_sets = inferred_workload_label_sets_for_request(&workloads, &request);
         let effective_labels = if request.labels.is_empty() {
-            inferred_workload_labels_for_request(&workloads, &request)
+            inferred_workload_labels_for_request(&candidate_label_sets)
         } else {
             request.labels.clone()
+        };
+        let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
+            candidate_label_sets.iter().collect()
+        } else {
+            vec![&effective_labels]
         };
 
         // Resolve the effective applicable Sidecar egress scope for this
@@ -554,11 +560,9 @@ impl MeshSlice {
             .iter()
             .filter(|policy| {
                 policy.namespace == namespace
-                    && policy_scope_applies_to_workload(
-                        policy,
-                        effective_namespace,
-                        &effective_labels,
-                    )
+                    && policy_candidate_labels.iter().any(|labels| {
+                        policy_scope_applies_to_workload(policy, effective_namespace, labels)
+                    })
             })
             .cloned()
             .collect();
@@ -566,7 +570,9 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                peer_auth_applies_to_workload(peer_auth, effective_namespace, &effective_labels)
+                policy_candidate_labels
+                    .iter()
+                    .any(|labels| peer_auth_applies_to_workload(peer_auth, effective_namespace, labels))
             })
             .cloned()
             .collect();
@@ -587,14 +593,20 @@ impl MeshSlice {
             .request_authentications
             .iter()
             .filter(|ra| {
-                scope_applies_to_workload(&ra.scope, effective_namespace, &effective_labels)
+                policy_candidate_labels
+                    .iter()
+                    .any(|labels| scope_applies_to_workload(&ra.scope, effective_namespace, labels))
             })
             .cloned()
             .collect();
         let telemetry_resources: Vec<MeshTelemetryResource> = mesh
             .telemetry_resources
             .iter()
-            .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
+            .filter(|t| {
+                policy_candidate_labels
+                    .iter()
+                    .any(|labels| scope_applies_to_workload(&t.scope, effective_namespace, labels))
+            })
             .cloned()
             .collect();
         let destination_rules: Vec<MeshDestinationRule> = mesh
@@ -974,38 +986,39 @@ fn narrow_workload_identities(
         .collect()
 }
 
-fn inferred_workload_labels_for_request(
+fn inferred_workload_label_sets_for_request(
     workloads: &[Workload],
     request: &MeshSliceRequest,
-) -> BTreeMap<String, String> {
+) -> Vec<BTreeMap<String, String>> {
     let Some(spiffe_id) = request.workload_spiffe_id.as_deref() else {
-        return BTreeMap::new();
+        return Vec::new();
     };
-    let mut matches = workloads
+    let matches: Vec<BTreeMap<String, String>> = workloads
         .iter()
-        .filter(|workload| workload.spiffe_id.as_str() == spiffe_id);
-    let Some(first) = matches.next() else {
-        return BTreeMap::new();
-    };
-    let mut common_labels = labels_to_btree(&first.selector.labels);
-    let mut match_count = 1usize;
-    for workload in matches {
-        match_count += 1;
-        common_labels.retain(|key, value| {
-            workload
-                .selector
-                .labels
-                .get(key)
-                .is_some_and(|candidate| candidate == value)
-        });
-    }
-    if match_count > 1 && common_labels.is_empty() {
+        .filter(|workload| workload.spiffe_id.as_str() == spiffe_id)
+        .map(|workload| labels_to_btree(&workload.selector.labels))
+        .collect();
+    if matches.len() > 1 {
         warn!(
             node_id = %request.node_id,
             namespace = %request.namespace,
             workload_spiffe_id = %spiffe_id,
-            "Mesh slice request matched multiple workloads with the same SPIFFE ID but no shared labels; explicit workload labels are required for selector-scoped policy"
+            matched_workloads = matches.len(),
+            "Mesh slice request matched multiple workloads with the same SPIFFE ID; explicit workload labels are required for deterministic selector scoping"
         );
+    }
+    matches
+}
+
+fn inferred_workload_labels_for_request(
+    candidate_label_sets: &[BTreeMap<String, String>],
+) -> BTreeMap<String, String> {
+    let Some(first) = candidate_label_sets.first() else {
+        return BTreeMap::new();
+    };
+    let mut common_labels = first.clone();
+    for labels in candidate_label_sets.iter().skip(1) {
+        common_labels.retain(|key, value| labels.get(key).is_some_and(|candidate| candidate == value));
     }
     common_labels
 }
@@ -2863,7 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn from_gateway_config_does_not_inherit_labels_from_ambiguous_spiffe_id() {
+    fn from_gateway_config_includes_selector_policies_for_ambiguous_spiffe_id() {
         let td = td();
         let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
         let mut web = make_workload(
@@ -2908,7 +2921,8 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
 
         assert!(slice.labels.is_empty());
-        assert!(slice.mesh_policies.is_empty());
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "web-selector-policy");
     }
 
     #[test]
@@ -2982,8 +2996,15 @@ mod tests {
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
         assert!(!slice.labels.contains_key("pod-template-hash"));
-        assert_eq!(slice.mesh_policies.len(), 1);
-        assert_eq!(slice.mesh_policies[0].name, "common-selector-policy");
+        assert_eq!(slice.mesh_policies.len(), 2);
+        assert!(slice
+            .mesh_policies
+            .iter()
+            .any(|policy| policy.name == "common-selector-policy"));
+        assert!(slice
+            .mesh_policies
+            .iter()
+            .any(|policy| policy.name == "replica-specific-policy"));
     }
 
     #[test]
