@@ -19,7 +19,7 @@ A comprehensive feature list for Ferrum Edge.
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
-- **Mesh** — service-mesh data plane with four topologies (sidecar, ambient, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices or standard xDS ADS, waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), REGISTRY_ONLY outbound policy, transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
+- **Mesh** — service-mesh data plane with six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices or standard xDS ADS, waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), REGISTRY_ONLY outbound policy, transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
 - **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars and init capture containers into opted-in workloads. Derives SPIFFE IDs from pod service accounts, supports iptables/eBPF capture modes, and injects JWT secrets via Kubernetes SecretKeyRef
 
 ## Routing
@@ -61,7 +61,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Service Mesh
 
-- **Four topologies** — `sidecar` (inbound mTLS on 15006 + outbound capture on 15001), `ambient` (HBONE termination on 15008), `east_west_gateway` (SNI-routed passthrough on 15443), `egress_gateway` (mTLS inbound on 15090 → external ServiceEntry backends)
+- **Six topologies** — `sidecar` (inbound mTLS on 15006 + outbound capture on 15001), `ambient` (HBONE termination on 15008), `node_waypoint` (HBONE on 15008, per-pod identity resolved from node-agent/eBPF socket-cookie records), `service_waypoint` (HBONE on 15008, service-scoped Ambient waypoint for Istio GAMMA traffic), `east_west_gateway` (SNI-routed passthrough on 15443), `egress_gateway` (mTLS inbound on 15090 → external ServiceEntry backends)
 - **Config consumption** — native `MeshSubscribe` gRPC (Ferrum-native) or standard xDS ADS (CDS/EDS/LDS/RDS/SDS) with multi-CP failover and jittered exponential backoff
 - **SPIFFE identity** — extracted from mTLS peer certificates and HBONE W3C Baggage headers with trust-domain aliasing for federated multi-cluster
 - **Mesh authorization** — identity-based `MeshPolicy` with `PolicyScope` filtering (MeshWide / Namespace / WorkloadSelector), DENY-first evaluation, Istio-compatible implicit deny semantics, principal/request/condition matching with glob patterns
