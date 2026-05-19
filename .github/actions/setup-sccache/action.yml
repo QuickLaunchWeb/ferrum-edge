@@ -1,6 +1,6 @@
 name: Setup sccache
 description: >-
-  Installs sccache via mozilla-actions/sccache-action and wires it as the
+  Installs sccache directly and wires it as the
   cargo rustc wrapper. The checked-in `.cargo/config.toml` hardcodes
   `[build] rustc-wrapper = "sccache"` so local developers get caching for
   free once sccache is on PATH; this action provides the CI half of that
@@ -16,8 +16,17 @@ runs:
   using: composite
   steps:
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      shell: bash
       continue-on-error: true
+      run: |
+        if command -v sccache &> /dev/null; then
+          echo "sccache already installed"
+        elif command -v cargo &> /dev/null; then
+          cargo install sccache --locked
+        else
+          echo "cargo unavailable; cannot install sccache"
+          exit 1
+        fi
 
     - name: Configure sccache
       shell: bash
