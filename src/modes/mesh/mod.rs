@@ -5221,8 +5221,15 @@ mod tests {
     }
 
     fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
+        // PR a8dce394 scoped DestinationRule application to namespace, so
+        // the test proxy must share the namespace of the test upstream and
+        // the test DR (both `"default"`) — otherwise the namespace gate
+        // skips the projection and tests inherit the un-updated upstream
+        // defaults. `destination_rule_does_not_apply_across_namespaces`
+        // covers the cross-namespace deny path explicitly.
         serde_json::from_value(serde_json::json!({
             "id": id,
+            "namespace": "default",
             "hosts": [format!("{id}.example.com")],
             "backend_host": "",
             "backend_port": 0,
@@ -5318,7 +5325,9 @@ mod tests {
             LoadBalancerAlgorithm::RoundRobin
         );
         assert!(config.upstreams[0].subsets.is_none());
-        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 30_000);
+        // DR didn't apply — proxy keeps its `default_connect_timeout()`
+        // (5000 ms) rather than picking up the cross-namespace DR value.
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 5_000);
     }
 
     #[test]
