@@ -7186,6 +7186,110 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_method_regex_match_emits_plugin_with_tagged_regex() {
+        // T1-B.2: VirtualService `method.regex` is now a first-class
+        // mesh_route_dispatch predicate. The translator must emit the
+        // tagged `{regex: "..."}` shape, NOT the legacy bare-string form
+        // (which would compile as Exact), and the plugin construction must
+        // succeed (regex compiled at config load time, not per request).
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"regex": "^(POST|PUT|PATCH)$"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for regex method");
+        let methods = plugin.config["rules"][0]["match"]["methods"]
+            .as_array()
+            .expect("methods array");
+        assert_eq!(methods.len(), 1);
+        let method_entry = &methods[0];
+        assert!(
+            method_entry.is_object(),
+            "regex method must emit as tagged StringMatch object, got: {method_entry}"
+        );
+        assert_eq!(
+            method_entry["regex"].as_str(),
+            Some("^(POST|PUT|PATCH)$"),
+            "regex predicate must round-trip the pattern literally"
+        );
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "method regex must NOT cause fail-closed request_termination anymore"
+        );
+
+        // The plugin must load successfully from the translator's JSON shape
+        // (regex compiled at config-load time). A bad shape would error here.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_method_prefix_match_emits_plugin_with_tagged_prefix() {
+        // T1-B.2 sibling of the regex case: `prefix` method matchers are
+        // also now first-class. Tagged shape required for the plugin to
+        // pick the Prefix matcher arm instead of Exact.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"prefix": "PO"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for prefix method");
+        let methods = plugin.config["rules"][0]["match"]["methods"]
+            .as_array()
+            .expect("methods array");
+        let method_entry = &methods[0];
+        assert!(
+            method_entry.is_object(),
+            "prefix method must emit as tagged StringMatch object, got: {method_entry}"
+        );
+        assert_eq!(method_entry["prefix"].as_str(), Some("PO"));
+
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
     fn virtual_service_uri_only_match_does_not_emit_plugin() {
         // URI-only matches still get the env-var path translated, but no
         // mesh_route_dispatch plugin is emitted because there are no
@@ -7538,14 +7642,18 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_unsupported_method_regex_does_not_disable_reject_unmatched() {
+    fn virtual_service_unsupported_sibling_predicate_does_not_disable_reject_unmatched() {
         // Codex P1 (#3237631705): a `match[]` mixing one supported
-        // `method.exact` rule with one unsupported `method.regex` rule
-        // must NOT collapse the regex entry onto the URI-only catch-all
+        // `method.exact` rule with one unsupported sibling rule must NOT
+        // collapse the unsupported entry onto the URI-only catch-all
         // branch. Doing so would flip `reject_unmatched` to false and
-        // forward requests the operator gated (e.g., DELETE traffic
-        // sneaking past a route that only allows GET via `.exact` and
-        // hoped to allow POST/PUT via `.regex`).
+        // forward requests the operator gated (e.g., requests sneaking past
+        // a route that only allows GET via `.exact` and hoped to allow
+        // matching traffic via a sibling predicate the translator does not
+        // honor). `method.regex` is now first-class supported (T1-B.2), so
+        // we use `authority` here to keep exercising the fail-closed
+        // sibling path — sibling PRs cover `authority` /
+        // `sourceNamespace` / `ignoreUriCase` separately.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7554,7 +7662,7 @@ extensionProviders:
                     "http": [{
                         "match": [
                             {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
-                            {"uri": {"prefix": "/api"}, "method": {"regex": "PO.*"}}
+                            {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
                         ],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
                     }]
@@ -7577,7 +7685,7 @@ extensionProviders:
         assert_eq!(
             rules.len(),
             1,
-            "supported method.exact rule emitted; unsupported method.regex sibling skipped"
+            "supported method.exact rule emitted; unsupported authority sibling skipped"
         );
         assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
         assert_eq!(
@@ -7586,7 +7694,7 @@ extensionProviders:
                 .get("reject_unmatched")
                 .and_then(Value::as_bool),
             Some(true),
-            "unsupported predicate sibling must NOT relax reject_unmatched -- DELETE traffic should 404 instead of leaking through"
+            "unsupported predicate sibling must NOT relax reject_unmatched -- gated traffic should 404 instead of leaking through"
         );
     }
 
@@ -7941,7 +8049,9 @@ extensionProviders:
     fn virtual_service_ignore_uri_case_false_with_other_unsupported_predicate_stays_uri_scoped() {
         // If some other predicate is unsupported, an explicit
         // `ignoreUriCase: false` should not broaden the fail-closed proxy to
-        // the synthetic URI-less catch-all.
+        // the synthetic URI-less catch-all. `method.regex` is now first-class
+        // supported (T1-B.2); use `authority` (still unsupported) to keep
+        // exercising the fail-closed sibling path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7951,7 +8061,7 @@ extensionProviders:
                         "match": [{
                             "uri": {"prefix": "/Api"},
                             "ignoreUriCase": false,
-                            "method": {"regex": "GET|POST"}
+                            "authority": {"exact": "internal.example.com"}
                         }],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                     }]
@@ -7975,7 +8085,7 @@ extensionProviders:
                 p.plugin_name == "request_termination"
                     && p.proxy_id.as_deref() == Some(proxy.id.as_str())
             })
-            .expect("unsupported method regex terminates the URI-scoped proxy");
+            .expect("unsupported authority predicate terminates the URI-scoped proxy");
         assert!(proxy_has_plugin(proxy, plugin));
         assert!(
             !result
@@ -8076,7 +8186,9 @@ extensionProviders:
         // same listen_path is not, preserve the supported dispatch rule but
         // keep reject_unmatched enabled after collapse. Otherwise traffic that
         // might have matched the unsupported predicate would leak to the later
-        // default route.
+        // default route. `method.regex` is now first-class supported
+        // (T1-B.2); use `authority` (still unsupported) here to keep
+        // exercising the fail-closed sibling path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8086,7 +8198,7 @@ extensionProviders:
                         {
                             "match": [
                                 {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
-                                {"uri": {"prefix": "/api"}, "method": {"regex": "PO.*"}}
+                                {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
                             ],
                             "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                         },
