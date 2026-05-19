@@ -1444,6 +1444,10 @@ async fn test_batch_create_plugin_configs() {
     let (status, body) = admin_post(&base_url, "/batch", &token, &plugin_batch).await;
     assert_eq!(status, 201, "Batch plugin create failed: {:?}", body);
     assert_eq!(body["created"]["plugin_configs"], 2);
+
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/bp1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(proxy_body["plugins"][0]["plugin_config_id"], "pc1");
 }
 
 #[tokio::test]
