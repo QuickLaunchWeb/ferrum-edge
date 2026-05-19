@@ -771,6 +771,7 @@ pub async fn run(
         // Initialized lazily on the first successful resolution.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let mut last_replica_ips: Option<Vec<IpAddr>> = None;
+        let mut force_full_reload = false;
 
         // Seed incremental state from the initial config load
         let initial_config = proxy_state_poll.current_config();
@@ -804,14 +805,21 @@ pub async fn run(
                                 "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
                                 hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
                             );
-                            if let Err(e) = db_poll.reconnect(&db_url_for_reconnect).await {
-                                error!(
-                                    "Failed to reconnect database pool after DNS change for '{}': {}",
-                                    hostname, e
-                                );
+                            match db_poll.reconnect(&db_url_for_reconnect).await {
+                                Ok(_) => {
+                                    last_db_ips = Some(ips);
+                                    force_full_reload = true;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to reconnect database pool after DNS change for '{}': {}",
+                                        hostname, e
+                                    );
+                                }
                             }
+                        } else {
+                            last_db_ips = Some(ips);
                         }
-                        last_db_ips = Some(ips);
                     }
 
                     // Check if the read replica FQDN now resolves to different IPs
@@ -844,7 +852,37 @@ pub async fn run(
                         last_replica_ips = Some(ips);
                     }
 
-                    if let Some(since) = last_poll_at {
+                    if force_full_reload {
+                        match db_poll.load_full_config(&poll_namespace).await {
+                            Ok(new_config) => {
+                                // Keep known ID sets and incremental cursor consistent with the
+                                // newly connected database snapshot.
+                                let (
+                                    next_known_proxy_ids,
+                                    next_known_consumer_ids,
+                                    next_known_plugin_config_ids,
+                                    next_known_upstream_ids,
+                                ) = db_backend::extract_known_ids(&new_config);
+                                proxy_state_poll.store_config(Arc::new(new_config.clone())).await;
+                                known_proxy_ids = next_known_proxy_ids;
+                                known_consumer_ids = next_known_consumer_ids;
+                                known_plugin_config_ids = next_known_plugin_config_ids;
+                                known_upstream_ids = next_known_upstream_ids;
+                                last_poll_at = Some(new_config.loaded_at);
+                                force_full_reload = false;
+                                db_available_poll.store(true, Ordering::Relaxed);
+                                debug!("Full config reload complete after DB DNS reconnect");
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed full config reload after DB DNS reconnect; keeping existing config and retrying: {}",
+                                    e
+                                );
+                                db_available_poll.store(false, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                    } else if let Some(since) = last_poll_at {
                         // Incremental poll — only fetch changes since last poll
                         match db_poll.load_incremental_config(
                             &poll_namespace,
