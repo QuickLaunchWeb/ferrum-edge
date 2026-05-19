@@ -858,10 +858,10 @@ async fn handle_h3_request(
                     ctx.raw_header_get(real_ip_header.as_str())
                 });
         let xff_chain = {
-            let mut values = ctx.raw_header_values("x-forwarded-for").peekable();
-            values.peek().map(|first| {
-                let mut combined = String::from(*first);
-                for value in values.skip(1) {
+            let mut values = ctx.raw_header_values("x-forwarded-for");
+            values.next().map(|first| {
+                let mut combined = String::from(first);
+                for value in values {
                     combined.push(',');
                     combined.push_str(value);
                 }
