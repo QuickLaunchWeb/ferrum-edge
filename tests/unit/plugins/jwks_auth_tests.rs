@@ -1533,7 +1533,9 @@ async fn test_jwks_auth_sets_request_principal_metadata() {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
 
     let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
-    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    let mut config = single_provider_config(&jwks_uri);
+    config["emit_mesh_request_principal_metadata"] = json!(true);
+    let plugin = JwksAuth::new(&config, default_client()).unwrap();
     plugin.warmup_jwks().await;
 
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1550,7 +1552,7 @@ async fn test_jwks_auth_sets_request_principal_metadata() {
     assert_continue(result);
     assert_eq!(
         ctx.metadata
-            .get("jwks_auth.request_principal")
+            .get("mesh.request_principal")
             .map(String::as_str),
         Some("https://auth.example.com/user-42")
     );
@@ -1562,7 +1564,9 @@ async fn test_jwks_auth_request_principal_not_set_without_iss() {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
 
     let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
-    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    let mut config = single_provider_config(&jwks_uri);
+    config["emit_mesh_request_principal_metadata"] = json!(true);
+    let plugin = JwksAuth::new(&config, default_client()).unwrap();
     plugin.warmup_jwks().await;
 
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1576,7 +1580,7 @@ async fn test_jwks_auth_request_principal_not_set_without_iss() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(
-        !ctx.metadata.contains_key("jwks_auth.request_principal"),
+        !ctx.metadata.contains_key("mesh.request_principal"),
         "request_principal should not be set without iss claim"
     );
 }
@@ -1587,7 +1591,9 @@ async fn test_jwks_auth_no_request_principal_when_no_token() {
         "../../../tests/fixtures/test_rsa_public.pem"
     ))
     .await;
-    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    let mut config = single_provider_config(&jwks_uri);
+    config["emit_mesh_request_principal_metadata"] = json!(true);
+    let plugin = JwksAuth::new(&config, default_client()).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
 
     let mut ctx = make_ctx();
@@ -1595,7 +1601,7 @@ async fn test_jwks_auth_no_request_principal_when_no_token() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(
-        !ctx.metadata.contains_key("jwks_auth.request_principal"),
+        !ctx.metadata.contains_key("mesh.request_principal"),
         "request_principal should not be set for anonymous requests"
     );
 }

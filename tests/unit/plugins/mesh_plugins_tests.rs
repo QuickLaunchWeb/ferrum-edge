@@ -1745,7 +1745,7 @@ async fn mesh_authz_slice_embedded_identity_drives_scope_filter() {
 //
 // These tests pin the Istio-compatible `requestPrincipals` semantics:
 //
-// 1. `jwks_auth` sets `ctx.metadata["jwks_auth.request_principal"]` = `{iss}/{sub}`.
+// 1. `jwks_auth` sets `ctx.metadata["mesh.request_principal"]` = `{iss}/{sub}`.
 // 2. `mesh_authz` passes that metadata value as `MeshAuthzRequest.request_principal`.
 // 3. `MeshRule.request_principals` (from `from[].source.requestPrincipals`)
 //    filters rules by glob-matching the request principal.
@@ -1779,7 +1779,7 @@ async fn mesh_authz_request_principals_allow_matching_jwt() {
     .expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://auth.example.com/user-123".to_string(),
     );
 
@@ -1803,7 +1803,7 @@ async fn mesh_authz_request_principals_deny_non_matching_jwt() {
     .expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://auth.example.com/user-123".to_string(),
     );
 
@@ -1833,7 +1833,7 @@ async fn mesh_authz_request_principals_deny_missing_jwt() {
     }))
     .expect("plugin config");
     let mut ctx = request_context(None);
-    // No jwks_auth.request_principal metadata — anonymous request
+    // No mesh.request_principal metadata — anonymous request
 
     let result = plugin.authorize(&mut ctx).await;
 
@@ -1855,7 +1855,7 @@ async fn mesh_authz_request_principals_wildcard_matches_any_jwt() {
     .expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://any-issuer.example.com/any-subject".to_string(),
     );
 
@@ -1901,7 +1901,7 @@ async fn mesh_authz_request_principals_deny_rule_blocks_jwt() {
     .expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://auth.example.com/admin-root".to_string(),
     );
 
@@ -1932,7 +1932,7 @@ async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
     .expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://auth.example.com/user-123".to_string(),
     );
 
