@@ -335,7 +335,7 @@ async fn try_spawn_fast_path_gateway(
             config: config_swap,
             dns_cache,
             request_epoch,
-            frontend_tls_config: None,
+            frontend_tls_slot: Arc::new(ArcSwap::new(Arc::new(None))),
             shutdown: shutdown_rx,
             global_shutdown: None,
             metrics: listener_metrics,

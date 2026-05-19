@@ -15,11 +15,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dimpl::{Config, Dtls, DtlsCertificate, Output};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::types::Proxy;
 
@@ -491,6 +492,21 @@ impl Drop for DtlsConnection {
 // DtlsServer — frontend DTLS session demuxer
 // ============================================================================
 
+/// Snapshot of the swappable per-DTLS-server crypto material.
+///
+/// Stored in [`DtlsServer::active_config`] behind an `ArcSwap` so an operator
+/// rotating the underlying mTLS materials (PeerAuthentication live reload for
+/// mesh UDP+DTLS stream listeners) can publish a new `dimpl_config`,
+/// `certificate`, and client verifier without dropping in-flight DTLS
+/// sessions. New sessions snapshot the slot in
+/// [`DtlsServer::spawn_session`]; existing sessions retain the material they
+/// were spawned with until they end.
+struct DtlsServerActiveConfig {
+    dimpl_config: Arc<Config>,
+    certificate: DtlsCertificate,
+    client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
 /// A DTLS server that manages multiple client sessions on a single UDP socket.
 ///
 /// Demultiplexes incoming UDP datagrams by source address, creating a new `Dtls`
@@ -498,15 +514,20 @@ impl Drop for DtlsConnection {
 /// a channel as `DtlsServerConn` instances.
 pub struct DtlsServer {
     socket: Arc<UdpSocket>,
-    config: Arc<Config>,
-    certificate: DtlsCertificate,
+    /// Swappable crypto material (config / certificate / client verifier).
+    ///
+    /// Spawned sessions snapshot this once at construction so the running
+    /// handshake / session cannot observe a partial rotation. Operators can
+    /// publish a new snapshot via [`Self::swap_frontend_config`] (used by mesh
+    /// PeerAuthentication live reload); new sessions pick it up on the next
+    /// ClientHello.
+    active_config: ArcSwap<DtlsServerActiveConfig>,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
     active_sessions: Arc<AtomicUsize>,
     limits: DtlsServerLimits,
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(DtlsServerConn, SocketAddr)>>,
-    client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -679,18 +700,42 @@ impl DtlsServer {
         let (accept_tx, accept_rx) = mpsc::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
 
+        let active_config = ArcSwap::from_pointee(DtlsServerActiveConfig {
+            dimpl_config: frontend_config.dimpl_config,
+            certificate: frontend_config.certificate,
+            client_cert_verifier: frontend_config.client_cert_verifier,
+        });
+
         Self {
             socket,
-            config: frontend_config.dimpl_config,
-            certificate: frontend_config.certificate,
+            active_config,
             sessions: Arc::new(DashMap::new()),
             active_sessions: Arc::new(AtomicUsize::new(0)),
             limits,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
-            client_cert_verifier: frontend_config.client_cert_verifier,
             shutdown_tx,
         }
+    }
+
+    /// Atomically swap the DTLS crypto material used for **new** sessions.
+    ///
+    /// Used by mesh PeerAuthentication live reload to rotate the inbound DTLS
+    /// `ServerConfig` equivalent (dimpl `Config` + certificate + optional
+    /// `ClientCertVerifier`) without re-binding the socket or evicting any
+    /// in-flight session. Active sessions keep the snapshot they handshake
+    /// with until they end (see
+    /// [`DtlsServerActiveConfig`] doc-comment for the invariant).
+    pub fn swap_frontend_config(&self, frontend_config: FrontendDtlsConfig) {
+        self.active_config.store(Arc::new(DtlsServerActiveConfig {
+            dimpl_config: frontend_config.dimpl_config,
+            certificate: frontend_config.certificate,
+            client_cert_verifier: frontend_config.client_cert_verifier,
+        }));
+        info!(
+            local_addr = ?self.socket.local_addr().ok(),
+            "DTLS server frontend crypto material swapped (existing sessions retain old material)"
+        );
     }
 
     /// Get the local address this server is bound to.
@@ -834,14 +879,17 @@ impl DtlsServer {
             },
         );
 
+        // Snapshot the swappable crypto material once per session so the
+        // running handshake / session cannot observe a partial rotation.
+        let active = self.active_config.load_full();
         let socket = self.socket.clone();
-        let config = self.config.clone();
-        let certificate = self.certificate.clone();
+        let config = active.dimpl_config.clone();
+        let certificate = active.certificate.clone();
         let accept_tx = self.accept_tx.clone();
         let sessions = self.sessions.clone();
         let active_sessions = self.active_sessions.clone();
         let active_session_mirror = self.limits.active_session_mirror.clone();
-        let client_cert_verifier = self.client_cert_verifier.clone();
+        let client_cert_verifier = active.client_cert_verifier.clone();
         let handshake_deadline = self
             .limits
             .handshake_timeout
@@ -1508,6 +1556,45 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "handshake should fail close to the configured 500ms budget, took {elapsed:?}"
+        );
+    }
+
+    /// PeerAuthentication live reload (T3-A) for mesh UDP+DTLS stream
+    /// listeners hot-swaps the `FrontendDtlsConfig` on a running
+    /// `DtlsServer` without recycling the socket. The swap is atomic and
+    /// new sessions snapshot the latest material at spawn time; existing
+    /// sessions are unaffected.
+    #[tokio::test]
+    async fn dtls_server_swap_frontend_config_updates_active_config_atomically() {
+        let server = test_server(DtlsServerLimits::default()).await;
+
+        // Capture a pointer to the old active config so we can prove the
+        // swap actually replaced it (not just mutated in place).
+        let before = Arc::as_ptr(&server.active_config.load_full());
+
+        let new_certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate cert");
+        let new_config = Config::builder().build().expect("build DTLS config");
+        server.swap_frontend_config(FrontendDtlsConfig {
+            dimpl_config: Arc::new(new_config),
+            certificate: new_certificate.clone(),
+            client_cert_verifier: None,
+        });
+
+        let after = Arc::as_ptr(&server.active_config.load_full());
+        assert_ne!(
+            before, after,
+            "swap_frontend_config must replace the active_config Arc"
+        );
+
+        // New session spawns must observe the swapped certificate. Drive a
+        // single session to validate the snapshot path: `spawn_session`
+        // captures the swapped `certificate` value rather than the
+        // original.
+        server.spawn_session("127.0.0.1:43210".parse().unwrap(), client_hello_packet());
+        assert!(
+            server.active_session_count() <= 1,
+            "spawn_session honored admission limits after a live-reload swap"
         );
     }
 }

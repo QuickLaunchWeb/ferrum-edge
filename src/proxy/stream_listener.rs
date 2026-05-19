@@ -21,6 +21,11 @@ use crate::tls::TlsPolicy;
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
 
+/// Live slot for a per-listener `DtlsServer`. The inner `Option<Arc<...>>` is
+/// `None` until the listener task publishes the server (post-bind) and
+/// becomes `Some` for the lifetime of the listener.
+type DtlsServerSlot = Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>>>;
+
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
@@ -33,6 +38,13 @@ struct ListenerHandle {
     started: Arc<AtomicBool>,
     tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
+    /// Live DTLS server slot for UDP+DTLS listeners. The collector task
+    /// publishes the server into this slot once
+    /// `start_dtls_frontend_listener` has bound and constructed it. Held so
+    /// mesh PeerAuth live reload can call
+    /// [`crate::dtls::DtlsServer::swap_frontend_config`] on the same instance
+    /// the recv loop is using. `None` for TCP/UDP-plain listeners.
+    dtls_server: Option<DtlsServerSlot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +93,14 @@ pub struct StreamListenerManager {
     request_epoch: Arc<RequestEpochStore>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
-    /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
-    /// (e.g., in file mode where TLS certs are validated after the proxy state is built).
-    frontend_tls_config: arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>,
+    /// Uses `Arc<ArcSwap<...>>` so the **same** slot can be cloned into every
+    /// TCP accept loop and snapshotted per accept. This lets mesh
+    /// PeerAuthentication live reload swap the slot once and have every
+    /// active TCP+TLS listener pick up the new `ServerConfig` on the next
+    /// handshake without rebinding the listener. The TLS config may also be
+    /// loaded after `ProxyState::new()` (e.g., file mode where TLS certs are
+    /// validated after the proxy state is built).
+    frontend_tls_config: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     /// DTLS cert/key paths for frontend DTLS termination on UDP proxies.
     /// When a UDP proxy has `frontend_tls: true`, these paths are used to build
     /// the DTLS server config. Requires ECDSA P-256 or P-384 certificates.
@@ -332,7 +349,7 @@ impl StreamListenerManager {
             dns_cache,
             request_epoch,
             circuit_breaker_cache,
-            frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
+            frontend_tls_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(frontend_tls_config))),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
@@ -423,6 +440,88 @@ impl StreamListenerManager {
                 err
             );
         }
+    }
+
+    /// Live-swap the frontend TLS `ServerConfig` used by mesh-shared TCP+TLS
+    /// stream listeners.
+    ///
+    /// Unlike [`Self::set_frontend_tls_config`] this does NOT trigger a
+    /// reconcile — the slot is shared with every active TCP+TLS accept loop,
+    /// which snapshots it per accept. Existing connections keep the
+    /// `ServerConfig` they handshake with until they end (rustls consults
+    /// the config only at handshake time). New accepts use the swapped
+    /// config on the next handshake.
+    ///
+    /// Used by mesh PeerAuthentication live reload alongside
+    /// [`Self::swap_active_dtls_frontend_configs`]; ordinary HTTPS / non-mesh
+    /// modes continue to use [`Self::set_frontend_tls_config`] at startup
+    /// (followed by a static lifetime — those modes do not call swap).
+    pub fn swap_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
+        self.frontend_tls_config.store(Arc::new(tls_config));
+    }
+
+    /// Returns a snapshot of the current frontend TLS slot value. Tests use
+    /// pointer-equality on the inner `Arc<ServerConfig>` to prove
+    /// [`Self::swap_frontend_tls_config`] replaced the slot rather than
+    /// mutated in place; non-test callers may also use this to observe the
+    /// startup-set frontend TLS config.
+    #[allow(dead_code)] // Test / introspection surface.
+    pub fn snapshot_frontend_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.frontend_tls_config.load().as_ref().clone()
+    }
+
+    /// Live-swap the frontend DTLS crypto material on every active DTLS
+    /// server held by this manager.
+    ///
+    /// `build_config` is invoked once per active DTLS listener so the caller
+    /// can rebuild a fresh `FrontendDtlsConfig` for each (cloning the
+    /// `DtlsCertificate` and verifier is cheap; the dimpl `Config` itself
+    /// can be re-used since the build is symmetric). Existing in-flight
+    /// DTLS sessions keep the snapshot they handshake with until they end;
+    /// new sessions pick up the swapped material on the next ClientHello.
+    ///
+    /// Returns the number of listeners whose DTLS server was swapped.
+    /// Listeners whose `dtls_server` slot has not yet been populated by the
+    /// collector task (a brief race window post-bind) are skipped — the
+    /// next slice apply re-runs this swap, and the in-flight session would
+    /// have been rejected anyway since no peer can complete a handshake
+    /// before the listener binds.
+    pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
+    where
+        F: FnMut() -> Result<crate::dtls::FrontendDtlsConfig, anyhow::Error>,
+    {
+        let mut swapped = 0usize;
+        let listeners = self.listeners.lock().await;
+        for handle in listeners.values() {
+            let Some(slot) = handle.dtls_server.as_ref() else {
+                continue;
+            };
+            let snapshot = slot.load();
+            let Some(server) = snapshot.as_ref().clone() else {
+                // Collector task has not yet published the server (race with
+                // bind). Skip — the next live-reload swap will catch it.
+                continue;
+            };
+            match build_config() {
+                Ok(cfg) => {
+                    server.swap_frontend_config(cfg);
+                    swapped += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        listen_port = handle.listen_port,
+                        "Failed to rebuild frontend DTLS config for live swap: {}; keeping previous config",
+                        err
+                    );
+                    // Bail on the first failure so we don't partially update
+                    // some listeners with the new config and leave others on
+                    // the old config — keeps all listeners on a coherent
+                    // generation.
+                    return swapped;
+                }
+            }
+        }
+        swapped
     }
 
     /// Reconcile active listeners against the current config.
@@ -658,7 +757,7 @@ impl StreamListenerManager {
             // listener observes both per-listener removal AND global SIGTERM.
             let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
-            let (join_handle, tcp_metrics, udp_metrics) = if scheme.is_udp() {
+            let (join_handle, tcp_metrics, udp_metrics, dtls_server) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -709,6 +808,16 @@ impl StreamListenerManager {
                 let listener_udp_metrics = Some(metrics.clone());
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                // Reserve a oneshot so the listener can publish the live
+                // `Arc<DtlsServer>` back here once it has bound. Only meaningful
+                // for actual DTLS listeners; plain UDP listeners drop the
+                // sender unused.
+                let (dtls_server_tx, dtls_server_rx) = tokio::sync::oneshot::channel();
+                let dtls_server_tx = if *frontend_tls && !*passthrough {
+                    Some(dtls_server_tx)
+                } else {
+                    None
+                };
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -720,6 +829,7 @@ impl StreamListenerManager {
                         global_shutdown: global_shutdown_for_listener,
                         metrics,
                         frontend_dtls_config,
+                        dtls_server_tx,
                         tls_no_verify,
                         tls_ca_bundle_path,
                         max_sessions: udp_max_sessions,
@@ -748,15 +858,42 @@ impl StreamListenerManager {
                         );
                     }
                 });
-                (join_handle, None, listener_udp_metrics)
+                // The DTLS server `Arc` will be published shortly after the
+                // listener task binds. Stash a shared slot here so the spawned
+                // collector task can store it once `start_dtls_frontend_listener`
+                // sends. Reconcile does not block waiting for the bind; if the
+                // first PeerAuth live-reload swap fires before the collector
+                // resolves, the swap path simply finds an empty slot for that
+                // listener and skips it (re-reconcile or the next swap picks
+                // it up — the swap is idempotent over slice apply).
+                let dtls_server_slot: Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>>> =
+                    Arc::new(arc_swap::ArcSwap::from_pointee(None));
+                let dtls_server_slot_for_collector = Arc::clone(&dtls_server_slot);
+                tokio::spawn(async move {
+                    if let Ok(server) = dtls_server_rx.await {
+                        dtls_server_slot_for_collector.store(Arc::new(Some(server)));
+                    }
+                });
+                (
+                    join_handle,
+                    None,
+                    listener_udp_metrics,
+                    Some(dtls_server_slot),
+                )
             } else {
                 let started_for_listener = started.clone();
                 // TCP or TcpTls listener
                 // Passthrough proxies forward raw encrypted bytes — no TLS termination.
-                let tls_config = if *frontend_tls && !*passthrough {
-                    self.frontend_tls_config.load().as_ref().clone()
+                // Hand the shared TLS slot to the listener so PeerAuth live reload
+                // (mesh mode) can swap the inbound TLS config under a running
+                // listener; the accept loop snapshots per accept. For listeners
+                // that never terminate TLS (passthrough or non-TLS schemes) we
+                // hand them a fresh per-listener empty slot so the listener task
+                // is unconditionally typed and we don't fork the call path.
+                let tls_slot = if *frontend_tls && !*passthrough {
+                    Arc::clone(&self.frontend_tls_config)
                 } else {
-                    None
+                    Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
                 let listener_tcp_metrics = Some(metrics.clone());
@@ -786,7 +923,7 @@ impl StreamListenerManager {
                         config,
                         dns_cache,
                         request_epoch,
-                        frontend_tls_config: tls_config,
+                        frontend_tls_slot: tls_slot,
                         shutdown: shutdown_rx,
                         global_shutdown: global_shutdown_for_listener,
                         metrics,
@@ -821,7 +958,7 @@ impl StreamListenerManager {
                         );
                     }
                 });
-                (join_handle, listener_tcp_metrics, None)
+                (join_handle, listener_tcp_metrics, None, None)
             };
 
             info!(
@@ -845,6 +982,7 @@ impl StreamListenerManager {
                     started,
                     tcp_metrics,
                     udp_metrics,
+                    dtls_server,
                 },
             );
         }

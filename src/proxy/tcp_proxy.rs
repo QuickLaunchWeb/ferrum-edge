@@ -706,7 +706,12 @@ pub struct TcpListenerConfig {
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
-    pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Shared frontend TLS slot. The accept loop snapshots this per accept so
+    /// a mesh PeerAuthentication live reload that swaps the slot is picked up
+    /// on the next inbound TCP+TLS handshake without rebinding the listener.
+    /// In-flight TLS sessions keep the config they handshake with until they
+    /// end (rustls consults the `ServerConfig` only at handshake time).
+    pub frontend_tls_slot: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     pub shutdown: watch::Receiver<bool>,
     /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
     /// the accept loop exits as soon as either this OR the per-listener
@@ -772,7 +777,10 @@ struct TcpAcceptLoopState {
     proxy_id: Arc<str>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
-    frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Shared frontend TLS slot. Snapshotted per accept so the latest
+    /// `ServerConfig` (e.g. after a mesh PeerAuthentication live reload swap)
+    /// is used for the next handshake without rebinding the listener.
+    frontend_tls_slot: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     metrics: Arc<TcpProxyMetrics>,
     backend_tls_cache: Option<Arc<CachedBackendTlsConfig>>,
     global_tcp_idle_timeout: u64,
@@ -805,7 +813,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         config,
         dns_cache,
         request_epoch,
-        frontend_tls_config,
+        frontend_tls_slot,
         shutdown,
         global_shutdown,
         metrics,
@@ -898,7 +906,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         proxy_id: proxy_id.clone(),
         dns_cache,
         request_epoch,
-        frontend_tls_config,
+        frontend_tls_slot,
         metrics,
         backend_tls_cache,
         global_tcp_idle_timeout,
@@ -1002,7 +1010,12 @@ async fn run_tcp_accept_loop(
                 let proxy_id = state.proxy_id.clone();
                 let dns_cache = state.dns_cache.clone();
                 let request_epoch = state.request_epoch.clone();
-                let frontend_tls = state.frontend_tls_config.clone();
+                // Snapshot the live frontend TLS slot once per accept so the
+                // handshake uses whatever rustls::ServerConfig is current at
+                // this instant. Mesh PeerAuthentication live reload swaps this
+                // slot under us; in-flight handshakes complete with the
+                // snapshot they got.
+                let frontend_tls = state.frontend_tls_slot.load().as_ref().clone();
                 let metrics = state.metrics.clone();
                 let backend_tls = state.backend_tls_cache.clone();
                 let cb_cache = state.circuit_breaker_cache.clone();

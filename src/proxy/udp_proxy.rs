@@ -479,6 +479,14 @@ pub struct UdpListenerConfig {
     /// DTLS server config for frontend termination. When `Some`, the listener
     /// accepts DTLS connections from clients instead of plain UDP.
     pub frontend_dtls_config: Option<crate::dtls::FrontendDtlsConfig>,
+    /// Optional sender that receives the `Arc<DtlsServer>` once the DTLS
+    /// listener has bound and constructed its server instance. Used by
+    /// [`crate::proxy::stream_listener::StreamListenerManager`] so mesh
+    /// PeerAuthentication live reload can call
+    /// [`crate::dtls::DtlsServer::swap_frontend_config`] on the same instance
+    /// the recv loop is using. `None` for non-mesh paths and for plain UDP
+    /// listeners (no DTLS server is built).
+    pub dtls_server_tx: Option<tokio::sync::oneshot::Sender<Arc<crate::dtls::DtlsServer>>>,
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     pub tls_ca_bundle_path: Option<String>,
@@ -543,6 +551,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         global_shutdown,
         metrics,
         frontend_dtls_config,
+        dtls_server_tx,
         tls_no_verify,
         tls_ca_bundle_path,
         max_sessions,
@@ -576,6 +585,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             global_shutdown,
             metrics,
             dtls_config,
+            dtls_server_tx,
             tls_no_verify,
             tls_ca_bundle_path,
             max_sessions,
@@ -587,6 +597,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         )
         .await;
     }
+    // Plain-UDP listeners have no DTLS server to publish; if a sender was
+    // supplied we drop it here, which makes any waiting receiver see
+    // `oneshot` closure semantics rather than blocking forever.
+    let _ = dtls_server_tx;
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
@@ -1461,6 +1475,7 @@ async fn start_dtls_frontend_listener(
     global_shutdown: Option<watch::Receiver<bool>>,
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: crate::dtls::FrontendDtlsConfig,
+    dtls_server_tx: Option<tokio::sync::oneshot::Sender<Arc<crate::dtls::DtlsServer>>>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<String>,
     max_sessions: usize,
@@ -1485,6 +1500,15 @@ async fn start_dtls_frontend_listener(
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
+    // Publish the live DTLS server handle so mesh PeerAuthentication live
+    // reload (extending the existing HTTP/HBONE carve-out to UDP+DTLS stream
+    // listeners) can call `swap_frontend_config` on the same instance the
+    // recv loop is using. Send-failure is benign: the receiver may have been
+    // dropped (non-mesh path) or the manager may have moved on without
+    // wanting the handle.
+    if let Some(tx) = dtls_server_tx {
+        let _ = tx.send(server.clone());
+    }
     ensure_coarse_timer_started();
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
