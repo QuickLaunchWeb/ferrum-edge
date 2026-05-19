@@ -783,6 +783,30 @@ async fn test_authorization_response_with_public_can_be_cached() {
     );
 }
 
+#[tokio::test]
+async fn test_identity_without_authorization_header_not_cached_in_shared_cache() {
+    let plugin = default_plugin();
+
+    let mut ctx = make_ctx("GET", "/api/private");
+    ctx.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
+    let mut headers = HashMap::new();
+    headers.insert("x-api-key".to_string(), "alice-key".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut response_headers = HashMap::new();
+    plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"alice-private")
+        .await;
+
+    let mut second_ctx = make_ctx("GET", "/api/private");
+    second_ctx.identified_consumer = Some(Arc::new(make_consumer("b", "bob")));
+    let mut second_headers = HashMap::new();
+    second_headers.insert("x-api-key".to_string(), "bob-key".to_string());
+    let result = plugin.before_proxy(&mut second_ctx, &mut second_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
 // === X-Cache-Status header ===
 
 #[tokio::test]
