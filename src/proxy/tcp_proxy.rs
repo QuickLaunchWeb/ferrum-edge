@@ -4726,10 +4726,9 @@ async fn splice_one_direction_no_guard(
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        // Destination not ready — yield to tokio scheduler and retry.
-                        // yield_now() is correct here (async splice runs on a tokio worker).
-                        // sleep(1ms) would add unnecessary latency per retry.
-                        tokio::task::yield_now().await;
+                        // Destination not ready — back off briefly before retrying
+                        // so idle sockets cannot busy-spin the worker thread.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
                     return Err((
@@ -4745,8 +4744,9 @@ async fn splice_one_direction_no_guard(
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                // Source not ready — yield to tokio scheduler and retry.
-                tokio::task::yield_now().await;
+                // Source not ready — back off briefly before retrying
+                // so idle sockets cannot busy-spin the worker thread.
+                tokio::time::sleep(Duration::from_millis(1)).await;
                 continue;
             }
             return Err((
