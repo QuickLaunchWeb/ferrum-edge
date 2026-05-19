@@ -5295,6 +5295,8 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-key"
             | "sec-websocket-version"
             | "sec-websocket-accept"
+            | "x-consumer-username"
+            | "x-consumer-custom-id"
     )
 }
 
@@ -5305,6 +5307,11 @@ fn push_forwardable_header_override(
 ) {
     headers.retain(|(existing_name, _)| !existing_name.eq_ignore_ascii_case(name));
     headers.push((name.to_string(), value));
+}
+
+fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
+    headers.remove("x-consumer-username");
+    headers.remove("x-consumer-custom-id");
 }
 
 /// Build a WebSocket backend URL using a specific target host/port,
@@ -8222,9 +8229,10 @@ async fn handle_proxy_request_inner(
     // Inject identity headers when authentication resolved a principal.
     if let Some(username) = ctx.backend_consumer_username() {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        headers.insert("X-Consumer-Username".to_string(), username.to_string());
+        sanitize_reserved_consumer_identity_headers(headers);
+        headers.insert("x-consumer-username".to_string(), username.to_string());
         if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
+            headers.insert("x-consumer-custom-id".to_string(), custom_id.to_string());
         }
     }
     // Egress baggage strip — operator-configured key prefixes are removed
