@@ -29,9 +29,18 @@ struct ListenerHandle {
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
+    backend_tls_reload_key: Option<BackendTlsReloadKey>,
     started: Arc<AtomicBool>,
     tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BackendTlsReloadKey {
+    verify_server_cert: bool,
+    server_ca_cert_path: Option<String>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -431,27 +440,46 @@ impl StreamListenerManager {
         let mut listeners = self.listeners.lock().await;
 
         // Collect all desired stream proxies from config
-        let desired: std::collections::HashMap<String, (u16, BackendScheme, bool, bool)> =
-            current_config
-                .proxies
-                .iter()
-                .filter(|p| p.dispatch_kind.is_stream())
-                .filter_map(|p| {
-                    p.listen_port.map(|port| {
+        let desired: std::collections::HashMap<
+            String,
+            (u16, BackendScheme, bool, bool, Option<BackendTlsReloadKey>),
+        > = current_config
+            .proxies
+            .iter()
+            .filter(|p| p.dispatch_kind.is_stream())
+            .filter_map(|p| {
+                p.listen_port.map(|port| {
+                    let backend_tls_reload_key =
+                        if p.dispatch_kind == crate::config::types::DispatchKind::TcpTls {
+                            Some(BackendTlsReloadKey {
+                                verify_server_cert: p.backend_tls_verify_server_cert,
+                                server_ca_cert_path: p.backend_tls_server_ca_cert_path.clone(),
+                                client_cert_path: p.backend_tls_client_cert_path.clone(),
+                                client_key_path: p.backend_tls_client_key_path.clone(),
+                            })
+                        } else {
+                            None
+                        };
+                    (
+                        p.id.clone(),
                         (
-                            p.id.clone(),
-                            (port, p.effective_scheme(), p.frontend_tls, p.passthrough),
-                        )
-                    })
+                            port,
+                            p.effective_scheme(),
+                            p.frontend_tls,
+                            p.passthrough,
+                            backend_tls_reload_key,
+                        ),
+                    )
                 })
-                .collect();
+            })
+            .collect();
 
         // Detect passthrough port groups: multiple passthrough proxies sharing a port.
         // These get a single shared listener keyed by "__sni_{port}" instead of individual
         // proxy_id keys. The listener dispatches connections based on SNI.
         let mut passthrough_groups: std::collections::HashMap<u16, Vec<String>> =
             std::collections::HashMap::new();
-        for (proxy_id, (port, _protocol, _frontend_tls, passthrough)) in &desired {
+        for (proxy_id, (port, _protocol, _frontend_tls, passthrough, _)) in &desired {
             if *passthrough {
                 passthrough_groups
                     .entry(*port)
@@ -476,22 +504,40 @@ impl StreamListenerManager {
         #[allow(clippy::type_complexity)]
         let mut effective_desired: std::collections::HashMap<
             String,
-            (u16, BackendScheme, bool, bool, Option<Vec<String>>),
+            (
+                u16,
+                BackendScheme,
+                bool,
+                bool,
+                Option<BackendTlsReloadKey>,
+                Option<Vec<String>>,
+            ),
         > = std::collections::HashMap::new();
 
-        for (proxy_id, (port, scheme, frontend_tls, passthrough)) in &desired {
+        for (proxy_id, (port, scheme, frontend_tls, passthrough, backend_tls_reload_key)) in
+            &desired
+        {
             if grouped_proxy_ids.contains(proxy_id.as_str()) {
                 continue; // Handled as part of a group below
             }
             effective_desired.insert(
                 proxy_id.clone(),
-                (*port, *scheme, *frontend_tls, *passthrough, None),
+                (
+                    *port,
+                    *scheme,
+                    *frontend_tls,
+                    *passthrough,
+                    backend_tls_reload_key.clone(),
+                    None,
+                ),
             );
         }
         for (port, ids) in &passthrough_groups {
             let key = format!("__sni_{}", port);
             // Use the first proxy's scheme for the listener
-            if let Some((_, scheme, frontend_tls, passthrough)) = desired.get(&ids[0]) {
+            if let Some((_, scheme, frontend_tls, passthrough, backend_tls_reload_key)) =
+                desired.get(&ids[0])
+            {
                 effective_desired.insert(
                     key,
                     (
@@ -499,6 +545,7 @@ impl StreamListenerManager {
                         *scheme,
                         *frontend_tls,
                         *passthrough,
+                        backend_tls_reload_key.clone(),
                         Some(ids.clone()),
                     ),
                 );
@@ -512,11 +559,12 @@ impl StreamListenerManager {
                 None => {
                     to_remove.push(key.clone());
                 }
-                Some((port, scheme, frontend_tls, passthrough, _)) => {
+                Some((port, scheme, frontend_tls, passthrough, backend_tls_reload_key, _)) => {
                     if handle.listen_port != *port
                         || handle.scheme != *scheme
                         || handle.frontend_tls != *frontend_tls
                         || handle.passthrough != *passthrough
+                        || handle.backend_tls_reload_key != *backend_tls_reload_key
                     {
                         to_remove.push(key.clone());
                     }
@@ -537,7 +585,9 @@ impl StreamListenerManager {
         }
 
         // Start listeners for new or restarted entries
-        for (key, (port, scheme, frontend_tls, passthrough, sni_ids)) in &effective_desired {
+        for (key, (port, scheme, frontend_tls, passthrough, backend_tls_reload_key, sni_ids)) in
+            &effective_desired
+        {
             if listeners.contains_key(key) {
                 continue;
             }
@@ -791,6 +841,7 @@ impl StreamListenerManager {
                     scheme: *scheme,
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
+                    backend_tls_reload_key: backend_tls_reload_key.clone(),
                     started,
                     tcp_metrics,
                     udp_metrics,
