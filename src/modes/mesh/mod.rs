@@ -1282,6 +1282,25 @@ fn apply_destination_rules(
                 }
             }
 
+            // Top-level `connectionPool.http.*` fans out to every port served
+            // by this upstream so a single DR `trafficPolicy.connectionPool`
+            // block applies uniformly across the upstream. Per-port
+            // `portLevelSettings.connectionPool.http` overrides per-port
+            // below. Service-discovery upstreams skip the fan-out because
+            // their target ports aren't known at apply time (the per-port loop
+            // below still applies if the operator explicitly listed
+            // `portLevelSettings`). Mirrors the T1-D fan-out for
+            // `connectionPool.tcp.{maxConnections,tcpKeepalive}`.
+            if let Some(ref tp) = dr.traffic_policy
+                && let Some(ref http) = tp.connection_pool_http
+                && !has_service_discovery
+            {
+                for port in &upstream_target_ports {
+                    let override_slot = upstream.port_overrides.entry(*port).or_default();
+                    apply_connection_pool_http_to_port_override(override_slot, http);
+                }
+            }
+
             // Second pass: per-port traffic policy overrides land on the
             // upstream's `port_overrides` slot. Pool-level dispatch already
             // keys per destination port, so per-port policy naturally scopes
@@ -1467,6 +1486,34 @@ fn apply_traffic_policy_to_port_override(
     }
     if let Some(ref keepalive) = policy.tcp_keepalive {
         slot.tcp_keepalive = Some(keepalive.clone());
+    }
+    // Per-port `connectionPool.http.*`. Per-port overrides win over any
+    // top-level fan-out applied earlier; an unset per-port field leaves the
+    // existing slot value (which may have come from the top-level fan-out) in
+    // place rather than clearing it, matching Istio's "per-port settings
+    // layer over top-level" semantics for connectionPool fields.
+    if let Some(ref http) = policy.connection_pool_http {
+        apply_connection_pool_http_to_port_override(slot, http);
+    }
+}
+
+/// Project an HTTP connection-pool overlay onto a per-port slot.
+///
+/// Each field is overlaid independently — `None` leaves the existing slot
+/// value untouched so a per-port partial overlay can layer over a top-level
+/// fan-out without clearing fields the operator did not respecify.
+fn apply_connection_pool_http_to_port_override(
+    slot: &mut UpstreamPortOverride,
+    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
+) {
+    if let Some(max) = http.max_requests_per_connection {
+        slot.http_max_requests_per_connection = Some(max);
+    }
+    if let Some(idle_ms) = http.idle_timeout_ms {
+        slot.http_idle_timeout_ms = Some(idle_ms);
+    }
+    if let Some(max_streams) = http.http2_max_requests {
+        slot.h2_max_concurrent_streams = Some(max_streams);
     }
 }
 

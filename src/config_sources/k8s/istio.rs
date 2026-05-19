@@ -779,6 +779,13 @@ fn translate_traffic_policy(
         .transpose()?
         .filter(|cfg| !cfg.is_empty());
 
+    let connection_pool_http = value
+        .get("connectionPool")
+        .and_then(|cp| cp.get("http"))
+        .map(|http| translate_connection_pool_http(object, http))
+        .transpose()?
+        .flatten();
+
     let outlier_detection = value
         .get("outlierDetection")
         .map(|od| translate_outlier_detection(object, od))
@@ -817,6 +824,7 @@ fn translate_traffic_policy(
         locality_lb_setting,
         max_connections,
         tcp_keepalive,
+        connection_pool_http,
     })
 }
 
@@ -949,6 +957,144 @@ fn parse_keepalive_duration_seconds(
         ));
     }
     Ok(seconds as u32)
+}
+
+/// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
+///
+/// Supported fields (T1-C scope): `maxRequestsPerConnection`, `idleTimeout`,
+/// `http2MaxRequests`. Deferred fields (`http1MaxPendingRequests`,
+/// `maxRetries`, `h2UpgradePolicy`) are detected and emitted as a `debug!`
+/// line so operators see the gateway acknowledging the field but otherwise
+/// dropped. Returning `Ok(None)` from this function signals "block was
+/// present but no supported field was set" so the caller can skip emitting
+/// an empty overlay on the slice.
+fn translate_connection_pool_http(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
+    use crate::modes::mesh::config::MeshConnectionPoolHttp;
+
+    let max_requests_per_connection = match http.get("maxRequestsPerConnection") {
+        Some(v) => Some(translate_http_uint32(
+            object,
+            "maxRequestsPerConnection",
+            v,
+        )?),
+        None => None,
+    };
+    let idle_timeout_ms = match string_field(http, "idleTimeout") {
+        Some(raw) => Some(parse_http_idle_timeout_ms(object, raw)?),
+        None => None,
+    };
+    let http2_max_requests = match http.get("http2MaxRequests") {
+        Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v)?),
+        None => None,
+    };
+
+    // Deferred fields: surface a debug line so operators know the gateway
+    // saw the field but is not yet enforcing it. Keep this list in sync
+    // with docs/mesh.md's `connectionPool.http.*` status table.
+    for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
+        if http.get(field).is_some() {
+            tracing::debug!(
+                rule = %object.metadata.name,
+                namespace = %object.metadata.namespace,
+                field = field,
+                "DestinationRule connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)"
+            );
+        }
+    }
+
+    let overlay = MeshConnectionPoolHttp {
+        max_requests_per_connection,
+        idle_timeout_ms,
+        http2_max_requests,
+    };
+    if overlay == MeshConnectionPoolHttp::default() {
+        Ok(None)
+    } else {
+        Ok(Some(overlay))
+    }
+}
+
+/// Parse a `connectionPool.http.*` `uint32`-typed field. Rejects negative
+/// values, zero (every supported field's semantics require at least one),
+/// and values > `u32::MAX`.
+fn translate_http_uint32(
+    object: &K8sObject,
+    field: &str,
+    value: &Value,
+) -> Result<u32, K8sTranslateError> {
+    let raw = value.as_i64().ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("trafficPolicy.connectionPool.http.{field} must be an integer"),
+        )
+    })?;
+    if raw <= 0 {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.connectionPool.http.{field} must be positive, got {raw}"),
+        ));
+    }
+    if raw > i64::from(u32::MAX) {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.connectionPool.http.{field} ({raw}) exceeds u32::MAX"),
+        ));
+    }
+    Ok(raw as u32)
+}
+
+/// Parse `connectionPool.http.idleTimeout` (`google.protobuf.Duration`
+/// string) into milliseconds. Sub-second precision is rejected because the
+/// downstream `Proxy.pool_idle_timeout_seconds` field is whole-second
+/// granular and silently rounding `500ms` to `1s` would not match the
+/// operator's intent. Zero is rejected for the same reason (the H1/H2 pool
+/// treats `0s` as "no idle reuse" which is almost certainly a misconfig).
+///
+/// Upper bound mirrors `crate::config::types::MAX_POOL_IDLE_TIMEOUT` (1
+/// hour). The per-target Cow-clone in `resolve_effective_proxy_for_target`
+/// writes the resolved seconds value directly onto `Proxy` without re-running
+/// `validate_fields()`, so an `idleTimeout` above the proxy-level cap would
+/// silently bypass that validator. Rejecting here keeps the translate path
+/// and the admin admit path consistent.
+fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sTranslateError> {
+    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' is not a valid Istio duration"
+            ),
+        )
+    })?;
+    if ms == 0 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.http.idleTimeout must be at least 1s, got '{raw}'"
+            ),
+        ));
+    }
+    if ms % 1000 != 0 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' must be a whole number of seconds (sub-second precision is not supported by the proxy idle-timeout field)"
+            ),
+        ));
+    }
+    let max_ms = crate::config::types::MAX_POOL_IDLE_TIMEOUT.saturating_mul(1_000);
+    if ms > max_ms {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' exceeds the proxy idle-timeout cap of {}s",
+                crate::config::types::MAX_POOL_IDLE_TIMEOUT
+            ),
+        ));
+    }
+    Ok(ms)
 }
 
 fn translate_locality_lb_setting(
@@ -11309,6 +11455,318 @@ extensionProviders:
             err.to_string().contains("port.number is required"),
             "expected port.number required error, got {err}"
         );
+    }
+
+    // ── DestinationRule connectionPool HTTP (T1-C) ───────────────────────
+
+    #[test]
+    fn destination_rule_translates_top_level_connection_pool_http_supported_fields() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": {
+                                "maxRequestsPerConnection": 100,
+                                "idleTimeout": "300s",
+                                "http2MaxRequests": 1000
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        let http = tp.connection_pool_http.as_ref().expect("http overlay");
+        assert_eq!(http.max_requests_per_connection, Some(100));
+        assert_eq!(http.idle_timeout_ms, Some(300_000));
+        assert_eq!(http.http2_max_requests, Some(1000));
+    }
+
+    #[test]
+    fn destination_rule_translates_partial_connection_pool_http() {
+        // Operators commonly set only one knob — verify that partial overlays
+        // round-trip without auto-filling other fields.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": {"http2MaxRequests": 500}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let http = dr
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .connection_pool_http
+            .as_ref()
+            .unwrap();
+        assert_eq!(http.http2_max_requests, Some(500));
+        assert!(http.max_requests_per_connection.is_none());
+        assert!(http.idle_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn destination_rule_translates_port_level_connection_pool_http() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {
+                                        "maxRequestsPerConnection": 50,
+                                        "idleTimeout": "60s",
+                                        "http2MaxRequests": 200
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let port_policy = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        let http = port_policy
+            .connection_pool_http
+            .as_ref()
+            .expect("port http overlay");
+        assert_eq!(http.max_requests_per_connection, Some(50));
+        assert_eq!(http.idle_timeout_ms, Some(60_000));
+        assert_eq!(http.http2_max_requests, Some(200));
+    }
+
+    #[test]
+    fn destination_rule_skips_empty_connection_pool_http_block() {
+        // An operator who writes `connectionPool: { http: {} }` should not
+        // wind up with an `Some(overlay)` that gets materialised onto every
+        // port — empty overlays must collapse to `None` so the apply pass
+        // sees "no HTTP overlay configured".
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        assert!(
+            dr.traffic_policy
+                .as_ref()
+                .and_then(|tp| tp.connection_pool_http.as_ref())
+                .is_none(),
+            "empty connectionPool.http must collapse to None"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_negative_max_requests_per_connection() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"maxRequestsPerConnection": -5}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative maxRequestsPerConnection must fail");
+        assert!(
+            err.to_string()
+                .contains("maxRequestsPerConnection must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_http2_max_requests() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"http2MaxRequests": 0}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero http2MaxRequests must fail");
+        assert!(
+            err.to_string()
+                .contains("http2MaxRequests must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_sub_second_idle_timeout() {
+        // `Proxy.pool_idle_timeout_seconds` is whole-second granular —
+        // silently rounding `500ms` to `1s` would not match the operator's
+        // configured idle window, so reject at translate time.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"idleTimeout": "500ms"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("sub-second idleTimeout must fail");
+        assert!(
+            err.to_string().contains("whole number of seconds"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_idle_timeout() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"idleTimeout": "0s"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero idleTimeout must fail");
+        assert!(
+            err.to_string().contains("idleTimeout must be at least 1s"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_unparseable_idle_timeout() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"idleTimeout": "not-a-duration"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unparseable idleTimeout must fail");
+        assert!(
+            err.to_string().contains("not a valid Istio duration"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_idle_timeout_above_proxy_cap() {
+        // The proxy-level `pool_idle_timeout_seconds` validator caps the
+        // field at `MAX_POOL_IDLE_TIMEOUT` (1 h). The per-target Cow-clone
+        // in `resolve_effective_proxy_for_target` writes the resolved seconds
+        // value directly onto a `Proxy` clone without re-running
+        // `validate_fields()`, so an `idleTimeout` above that cap would
+        // bypass the validator silently. Reject in the translator so the K8s
+        // surface stays consistent with admin-API admission.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"idleTimeout": "7200s"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("idleTimeout above proxy cap must fail");
+        assert!(
+            err.to_string()
+                .contains("exceeds the proxy idle-timeout cap"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_silently_accepts_deferred_http_fields() {
+        // `http1MaxPendingRequests`, `maxRetries`, and `h2UpgradePolicy` are
+        // tracked T1-C follow-ons. The translator should not fail when
+        // operators set them (they would never be able to upgrade off Istio
+        // otherwise); the gateway logs a debug line and drops them.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": {
+                                "http1MaxPendingRequests": 1024,
+                                "maxRetries": 5,
+                                "h2UpgradePolicy": "UPGRADE",
+                                "http2MaxRequests": 250
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds despite deferred fields");
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let http = dr
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .connection_pool_http
+            .as_ref()
+            .unwrap();
+        // Only the supported field landed on the overlay.
+        assert_eq!(http.http2_max_requests, Some(250));
+        assert!(http.max_requests_per_connection.is_none());
+        assert!(http.idle_timeout_ms.is_none());
     }
 
     // ── Sidecar translator ──────────────────────────────────────────────

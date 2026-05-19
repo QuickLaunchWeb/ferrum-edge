@@ -390,3 +390,174 @@ fn destination_rule_top_level_max_connections_skips_phantom_ports() {
     assert_eq!(prepared.upstreams[0].port_overrides.len(), 1);
     assert!(prepared.upstreams[0].port_overrides.contains_key(&8080));
 }
+
+// ── T1-C: connectionPool.http per-port projection ───────────────────────
+
+#[test]
+fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // Single target on port 8080. A top-level `trafficPolicy.connectionPool.http`
+    // block should fan out onto every port served by an upstream's targets,
+    // mirroring the T1-D `connectionPool.tcp.{maxConnections,tcpKeepalive}`
+    // fan-out pattern. Without service discovery the fan-out is bounded to
+    // the static target ports; here we expect exactly port 8080 to receive
+    // the overlay.
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        max_requests_per_connection: Some(75),
+                        idle_timeout_ms: Some(45_000),
+                        http2_max_requests: Some(250),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("top-level http overlay fan-out lands on every target port");
+    assert_eq!(port_override.http_max_requests_per_connection, Some(75));
+    assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
+
+    // Dispatch projection: the per-port overlay reaches every referencing
+    // proxy via `resolve_dispatch_port_overrides`.
+    let dispatch_override = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .expect("proxy dispatch port override projected");
+    assert_eq!(dispatch_override.http_max_requests_per_connection, Some(75));
+    assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
+}
+
+#[test]
+fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out() {
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // Top-level fan-out sets every field; per-port `portLevelSettings.http`
+    // overrides just one of them. The other two fields must survive the
+    // per-port apply (Istio "per-port settings layer over top-level"
+    // semantics).
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                // Only override http2_max_requests; the other two fields stay
+                // from the top-level fan-out.
+                http2_max_requests: Some(999),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        max_requests_per_connection: Some(75),
+                        idle_timeout_ms: Some(45_000),
+                        http2_max_requests: Some(250),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("per-port overlay present");
+    // Per-port wins for the field it sets:
+    assert_eq!(port_override.h2_max_concurrent_streams, Some(999));
+    // Fields not respecified by per-port survive from the fan-out:
+    assert_eq!(port_override.http_max_requests_per_connection, Some(75));
+    assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
+}
+
+#[test]
+fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // No top-level overlay; only port 8080 carries the HTTP block via
+    // `portLevelSettings`. The single-port overlay should land only on
+    // port 8080 and not bleed onto any other port.
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                max_requests_per_connection: Some(10),
+                idle_timeout_ms: Some(30_000),
+                http2_max_requests: Some(20),
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("per-port overlay present");
+    assert_eq!(port_override.http_max_requests_per_connection, Some(10));
+    assert_eq!(port_override.http_idle_timeout_ms, Some(30_000));
+    assert_eq!(port_override.h2_max_concurrent_streams, Some(20));
+
+    // Phantom-port guard: 9090 isn't on any target, so it must NOT receive
+    // the per-port overlay either (would be a phantom-port skip with warn).
+    assert!(!prepared.upstreams[0].port_overrides.contains_key(&9090));
+}
+
+// `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field
+// projection and Cow::Borrowed/Owned branches are tested inline in
+// `src/proxy/mod.rs` (see the `resolve_effective_proxy_*` tests block).

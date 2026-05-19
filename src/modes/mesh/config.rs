@@ -1092,6 +1092,51 @@ pub struct MeshTrafficPolicy {
     /// the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
+    /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
+    /// When present, the K8s translator has parsed at least one of the
+    /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
+    /// `idleTimeout`, `http2MaxRequests`); the mesh apply layer projects
+    /// these onto the matching upstream's `port_overrides[port]` slot
+    /// (top-level fan-out applies to every target port; per-port
+    /// `portLevelSettings` overrides per-port). Old DPs reading new slices
+    /// see this as a no-op via the serde default. Currently-deferred
+    /// Istio HTTP knobs (`http1MaxPendingRequests`, `maxRetries`,
+    /// `h2UpgradePolicy`) are intentionally absent — the K8s translator
+    /// emits a debug line when an operator sets them and otherwise drops
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_pool_http: Option<MeshConnectionPoolHttp>,
+}
+
+/// Subset of Istio `ConnectionPoolSettings.HTTPSettings` parsed and
+/// projected by the gateway. Each field is independently optional so the
+/// translator can express "operator set N of M fields"; the apply pass
+/// only overlays fields that are `Some`. See
+/// [`crate::config::types::UpstreamPortOverride`] for the corresponding
+/// resolved slots and dispatch wiring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshConnectionPoolHttp {
+    /// Mapped from `maxRequestsPerConnection`. Wire-projected end-to-end
+    /// (admitted, persisted on slice, and reaches dispatch via
+    /// `Proxy.pool_max_requests_per_connection`) but hyper does not yet
+    /// expose a close-after-N-requests builder knob, so the runtime
+    /// effect is pending. Tracked as a follow-on; documented same as the
+    /// proxy-level field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u32>,
+    /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
+    /// as milliseconds). Translator rejects sub-second durations because
+    /// the proxy-level `pool_idle_timeout_seconds` field is whole-second
+    /// granular and silently rounding `500ms` would not match the
+    /// operator's intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    /// Mapped from `http2MaxRequests`. Projects to
+    /// `Proxy.pool_http2_max_concurrent_streams` per port via
+    /// `resolve_effective_proxy_for_target` and threads into the H2/gRPC
+    /// builder knobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2_max_requests: Option<u32>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's

@@ -260,6 +260,40 @@ pub struct UpstreamPortOverride {
     /// (HTTP-family dispatch is a follow-on PR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
+    /// Per-port HTTP `maxRequestsPerConnection` mapped from DestinationRule
+    /// `connectionPool.http.maxRequestsPerConnection`. Projected onto the
+    /// per-target effective proxy's existing `pool_max_requests_per_connection`
+    /// schema field. Hyper does not yet expose a "close-after-N-requests"
+    /// builder knob, so the field is wire-projected end-to-end but its
+    /// runtime effect remains pending — same status as the proxy-level field.
+    /// Tracked as a follow-on once hyper grows the knob or a request-count
+    /// wrapper is introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_max_requests_per_connection: Option<u32>,
+    /// Per-port HTTP idle-timeout mapped from DestinationRule
+    /// `connectionPool.http.idleTimeout` (milliseconds). Projected onto the
+    /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
+    /// seconds, with sub-second values rejected at translate time).
+    ///
+    /// Pool keys intentionally exclude policy fields, so when two proxies
+    /// share the same pool entry but configure different per-port idle
+    /// timeouts the first proxy to materialise the entry wins for that
+    /// shared `reqwest::Client`. Identical to the existing `connect_timeout_ms`
+    /// per-port + cross-proxy sharing tradeoff documented in CLAUDE.md's
+    /// "Policy cross-proxy sharing" note — operators who need strict
+    /// per-proxy isolation fragment via `dns_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule
+    /// `connectionPool.http.http2MaxRequests`. Projected onto the per-target
+    /// effective proxy's `pool_http2_max_concurrent_streams` and threaded
+    /// into the H2/gRPC backend builders via
+    /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
+    /// `initial_max_send_streams` (local outbound-stream initial cap).
+    /// Applies to direct-H2 and gRPC pool entries; reqwest's H2 path does
+    /// not expose the same builder knob today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -311,6 +345,9 @@ pub struct ResolvedPortOverride {
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     pub max_connections: Option<u32>,
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
+    pub http_max_requests_per_connection: Option<u32>,
+    pub http_idle_timeout_ms: Option<u64>,
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 impl ResolvedPortOverride {
@@ -323,6 +360,9 @@ impl ResolvedPortOverride {
             locality_lb_setting: value.locality_lb_setting.clone(),
             max_connections: value.max_connections,
             tcp_keepalive: value.tcp_keepalive.clone(),
+            http_max_requests_per_connection: value.http_max_requests_per_connection,
+            http_idle_timeout_ms: value.http_idle_timeout_ms,
+            h2_max_concurrent_streams: value.h2_max_concurrent_streams,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -335,6 +375,9 @@ impl ResolvedPortOverride {
             && self.locality_lb_setting.is_none()
             && self.max_connections.is_none()
             && self.tcp_keepalive.is_none()
+            && self.http_max_requests_per_connection.is_none()
+            && self.http_idle_timeout_ms.is_none()
+            && self.h2_max_concurrent_streams.is_none()
     }
 }
 
@@ -1511,11 +1554,16 @@ pub struct Proxy {
     /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
     #[serde(default)]
     pub pool_http3_connections_per_backend: Option<usize>,
-    /// Reserved for Istio DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`. Reqwest/hyper do not
-    /// expose a stable per-connection request cap for the shared client pool
-    /// yet, so this is validated and persisted as a schema-compatibility field
-    /// but has no runtime effect. `None` (default) = no configured cap.
+    /// Istio DestinationRule `connectionPool.http.maxRequestsPerConnection`
+    /// (wire-projected). Populated at admit time directly, and at dispatch
+    /// time by `resolve_effective_proxy_for_target` from
+    /// `Upstream.port_overrides[port].http_max_requests_per_connection`.
+    /// Reqwest/hyper do not yet expose a stable close-after-N-requests
+    /// builder knob for the shared client pool, so the field is admitted,
+    /// persisted, and routed end-to-end but has no live runtime effect —
+    /// once hyper grows the knob (or a request-count wrapper is added) the
+    /// field will activate without further schema or projection work.
+    /// `None` (default) = no configured cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
     /// Optional upstream ID for load-balanced backends.

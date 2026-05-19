@@ -287,6 +287,83 @@ fn upstream_port_override_locality_lb_setting_round_trips_through_serde() {
 }
 
 #[test]
+fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde() {
+    use ferrum_edge::config::types::UpstreamPortOverride;
+
+    // Default omits the three new HTTP fields so old DPs reading new slices
+    // see a no-op (wire-compatibility invariant for `#[serde(default,
+    // skip_serializing_if = "Option::is_none")]`).
+    let default_override = UpstreamPortOverride::default();
+    let default_json = serde_json::to_value(&default_override).expect("serialize default");
+    let object = default_json.as_object().expect("object");
+    for field in [
+        "http_max_requests_per_connection",
+        "http_idle_timeout_ms",
+        "h2_max_concurrent_streams",
+    ] {
+        assert!(
+            !object.contains_key(field),
+            "UpstreamPortOverride.{field} must be omitted when None (wire compatibility)"
+        );
+    }
+
+    // Round-trip with each field set independently — verifies that partial
+    // overlays don't auto-fill the other fields.
+    let override_with_http = UpstreamPortOverride {
+        http_max_requests_per_connection: Some(100),
+        http_idle_timeout_ms: Some(90_000),
+        h2_max_concurrent_streams: Some(500),
+        ..UpstreamPortOverride::default()
+    };
+    let json = serde_json::to_value(&override_with_http).expect("serialize override");
+    let object = json.as_object().expect("object");
+    assert_eq!(
+        object.get("http_max_requests_per_connection"),
+        Some(&serde_json::json!(100))
+    );
+    assert_eq!(
+        object.get("http_idle_timeout_ms"),
+        Some(&serde_json::json!(90_000))
+    );
+    assert_eq!(
+        object.get("h2_max_concurrent_streams"),
+        Some(&serde_json::json!(500))
+    );
+
+    let round_tripped: UpstreamPortOverride =
+        serde_json::from_value(json).expect("round-trip override");
+    assert_eq!(round_tripped.http_max_requests_per_connection, Some(100));
+    assert_eq!(round_tripped.http_idle_timeout_ms, Some(90_000));
+    assert_eq!(round_tripped.h2_max_concurrent_streams, Some(500));
+}
+
+#[test]
+fn resolved_port_override_from_upstream_override_projects_http_fields() {
+    use ferrum_edge::config::types::{ResolvedPortOverride, UpstreamPortOverride};
+
+    let port_override = UpstreamPortOverride {
+        http_max_requests_per_connection: Some(40),
+        http_idle_timeout_ms: Some(60_000),
+        h2_max_concurrent_streams: Some(250),
+        ..UpstreamPortOverride::default()
+    };
+
+    let resolved = ResolvedPortOverride::from_upstream_override(&port_override)
+        .expect("non-empty overlay produces Some");
+    assert_eq!(resolved.http_max_requests_per_connection, Some(40));
+    assert_eq!(resolved.http_idle_timeout_ms, Some(60_000));
+    assert_eq!(resolved.h2_max_concurrent_streams, Some(250));
+
+    // Empty overlay returns None so empty entries don't bloat
+    // `Proxy.dispatch_port_overrides`.
+    let empty = UpstreamPortOverride::default();
+    assert!(
+        ResolvedPortOverride::from_upstream_override(&empty).is_none(),
+        "empty overlay must collapse to None"
+    );
+}
+
+#[test]
 fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
     let mut upstream = make_upstream("reviews-u");
     upstream.backend_tls_sni = Some("reviews.mesh.internal".to_string());
