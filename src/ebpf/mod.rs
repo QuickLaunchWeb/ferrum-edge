@@ -25,6 +25,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
+pub use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy};
 
 pub const DEFAULT_NODE_AGENT_SOCKET_PATH: &str = "/run/ferrum/node-agent.sock";
 pub const BPF_MAP_ORIG_DST4: &str = "FERRUM_ORIG_DST4";
@@ -36,6 +37,7 @@ pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
 pub const BPF_MAP_CIDR_INCLUDE4: &str = "FERRUM_CIDR_INCLUDE4";
 pub const BPF_MAP_CIDR_INCLUDE6: &str = "FERRUM_CIDR_INCLUDE6";
 pub const BPF_MAP_PORT_EXCLUDE: &str = "FERRUM_PORT_EXCLUDE";
+pub const BPF_MAP_INCLUDE_PORTS: &str = "FERRUM_INCLUDE_PORTS";
 pub const BPF_MAP_CAPTURE_CONFIG: &str = "FERRUM_CAPTURE_CONFIG";
 
 /// Name of the BPF ringbuf map that ferries SOCK_OPS event records from the
@@ -101,6 +103,7 @@ pub struct CaptureBpfMaps {
     pub cidr_include4: &'static str,
     pub cidr_include6: &'static str,
     pub port_exclude: &'static str,
+    pub include_ports: &'static str,
     pub capture_config: &'static str,
 }
 
@@ -116,6 +119,7 @@ impl Default for CaptureBpfMaps {
             cidr_include4: BPF_MAP_CIDR_INCLUDE4,
             cidr_include6: BPF_MAP_CIDR_INCLUDE6,
             port_exclude: BPF_MAP_PORT_EXCLUDE,
+            include_ports: BPF_MAP_INCLUDE_PORTS,
             capture_config: BPF_MAP_CAPTURE_CONFIG,
         }
     }
@@ -232,6 +236,14 @@ pub struct PodAttachmentState {
     pub cgroup_path: Option<String>,
     pub veth_iface: Option<String>,
     pub attached: bool,
+    /// Set when this pod has an active `includeOutboundPorts` entry in
+    /// `FERRUM_INCLUDE_PORTS`. The cgroup id is the BPF lookup key
+    /// (matches `bpf_get_current_cgroup_id`), captured at enrollment so
+    /// un-enrollment can remove the entry without re-statting the
+    /// cgroup path (which may already be gone by the time the pod is
+    /// deleted). `None` when the pod is unannotated or the cgroup id
+    /// could not be read.
+    pub include_ports_cgroup_id: Option<u64>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
@@ -275,6 +287,22 @@ pub trait EbpfBackend: Send + Sync {
     fn update_cidr_exclude(&mut self, cidr: &str) -> Result<(), String>;
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String>;
     fn update_port_exclude(&mut self, port: u16) -> Result<(), String>;
+    /// Insert a per-cgroup `includeOutboundPorts` narrowing policy. The
+    /// node-agent calls this when an annotated pod enrolls so the BPF
+    /// `connect4` / `connect6` programs skip rewriting traffic to ports
+    /// outside the pod's `traffic.sidecar.istio.io/includeOutboundPorts`
+    /// list. Pods with no annotation never get an entry — the BPF gate
+    /// fail-opens on missing lookups so unannotated traffic stays
+    /// captured exactly like before this gate existed.
+    fn update_pod_include_ports(
+        &mut self,
+        cgroup_id: u64,
+        policy: &IncludePortsPolicy,
+    ) -> Result<(), String>;
+    /// Counterpart to `update_pod_include_ports`. Called on pod
+    /// un-enrollment / removal. Tolerates ENOENT (pod was never
+    /// annotated) by returning `Ok(())`.
+    fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String>;
     fn cleanup_all(&mut self) -> Result<(), String>;
 
     /// Attach the SOCK_OPS program to the cgroup root and pin the event
@@ -299,6 +327,11 @@ pub struct MockEbpfBackend {
     pub cidr_includes: Vec<String>,
     pub port_excludes: Vec<u16>,
     pub capture_config: Option<BpfCaptureConfig>,
+    /// Per-cgroup `includeOutboundPorts` writes ordered by the order the
+    /// node-agent issued them. Insert overwrites the previous entry for
+    /// the same `cgroup_id`. Tests assert on this map to verify a pod's
+    /// annotation parsed correctly all the way down to the BPF surface.
+    pub include_ports: HashMap<u64, IncludePortsPolicy>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
@@ -371,10 +404,25 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn update_pod_include_ports(
+        &mut self,
+        cgroup_id: u64,
+        policy: &IncludePortsPolicy,
+    ) -> Result<(), String> {
+        self.include_ports.insert(cgroup_id, *policy);
+        Ok(())
+    }
+
+    fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
+        self.include_ports.remove(&cgroup_id);
+        Ok(())
+    }
+
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.cgroup_attachments.clear();
         self.tc_attachments.clear();
         self.pod_ips.clear();
+        self.include_ports.clear();
         self.sock_ops_attached_cgroup_root = None;
         self.cleaned_up = true;
         Ok(())

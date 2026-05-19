@@ -9,11 +9,11 @@ use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE6, FERRUM_CIDR_INCLUDE6,
-    FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE,
+    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE,
 };
 use ferrum_ebpf_common::{
-    CidrKey6, OrigDst6, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO,
-    OUTBOUND_CAPTURE_PORT,
+    CidrKey6, IncludePortsPolicy, OrigDst6, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY,
+    IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -50,6 +50,10 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
+    if !include_port_allowed(dst_port) {
+        return Ok(1);
+    }
+
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
     let orig = OrigDst6 {
@@ -75,4 +79,35 @@ fn outbound_capture_port() -> u32 {
         Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
         _ => OUTBOUND_CAPTURE_PORT as u32,
     }
+}
+
+/// Honor `traffic.sidecar.istio.io/includeOutboundPorts` for IPv6 connect.
+/// Same semantics as the connect4 helper: no map entry → capture everything,
+/// `all_ports != 0` → capture everything, explicit ports → match-or-skip.
+#[inline(always)]
+fn include_port_allowed(dst_port: u16) -> bool {
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    let Some(policy) = (unsafe { FERRUM_INCLUDE_PORTS.get(&cgroup_id) }) else {
+        return true;
+    };
+    policy_admits_port(policy, dst_port)
+}
+
+#[inline(always)]
+fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
+    if policy.all_ports != 0 {
+        return true;
+    }
+    let count = policy.port_count as usize;
+    if count == 0 {
+        return true;
+    }
+    let mut i = 0;
+    while i < count && i < policy.ports.len() {
+        if policy.ports[i] == dst_port {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }

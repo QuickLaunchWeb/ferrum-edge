@@ -5,8 +5,9 @@
 //! 2. Skip if destination port is excluded
 //! 3. Skip if destination IP matches an exclude CIDR
 //! 4. Skip if include CIDRs are configured and destination doesn't match
-//! 5. Store original destination in `FERRUM_ORIG_DST4` keyed by socket cookie
-//! 6. Rewrite destination to 127.0.0.1:15001 (outbound capture port)
+//! 5. Skip if pod has `includeOutboundPorts` and dest port is NOT in the list
+//! 6. Store original destination in `FERRUM_ORIG_DST4` keyed by socket cookie
+//! 7. Rewrite destination to 127.0.0.1:15001 (outbound capture port)
 
 use aya_ebpf::macros::cgroup_sock_addr;
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
@@ -15,11 +16,11 @@ use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE4, FERRUM_CIDR_INCLUDE4,
-    FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE,
+    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE,
 };
 use ferrum_ebpf_common::{
-    CidrKey4, OrigDst4, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO,
-    OUTBOUND_CAPTURE_PORT,
+    CidrKey4, IncludePortsPolicy, OrigDst4, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY,
+    IPV4_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect4)]
@@ -56,6 +57,10 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
+    if !include_port_allowed(dst_port) {
+        return Ok(1);
+    }
+
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
     let orig = OrigDst4 {
@@ -80,4 +85,45 @@ fn outbound_capture_port() -> u32 {
         Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
         _ => OUTBOUND_CAPTURE_PORT as u32,
     }
+}
+
+/// Honor `traffic.sidecar.istio.io/includeOutboundPorts`. Returns `true`
+/// when the connect should proceed to rewrite (either the pod has no
+/// include-port narrowing, the policy is the `*` wildcard, or the dest
+/// port is in the explicit allow-list). Lookup is keyed by the calling
+/// task's cgroup id, so each annotated pod gets its own per-cgroup
+/// policy.
+#[inline(always)]
+fn include_port_allowed(dst_port: u16) -> bool {
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    let Some(policy) = (unsafe { FERRUM_INCLUDE_PORTS.get(&cgroup_id) }) else {
+        // No per-cgroup policy means the pod is unannotated — preserve
+        // the prior "capture everything that survived the earlier
+        // checks" behavior.
+        return true;
+    };
+    policy_admits_port(policy, dst_port)
+}
+
+#[inline(always)]
+fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
+    if policy.all_ports != 0 {
+        return true;
+    }
+    let count = policy.port_count as usize;
+    // Defensive fail-open: an entry without explicit ports and without the
+    // wildcard flag is treated as "no narrowing". Userspace never writes
+    // this shape but kernel-space should not silently drop traffic if the
+    // map is ever populated unexpectedly.
+    if count == 0 {
+        return true;
+    }
+    let mut i = 0;
+    while i < count && i < policy.ports.len() {
+        if policy.ports[i] == dst_port {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
