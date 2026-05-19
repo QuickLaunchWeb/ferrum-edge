@@ -4001,7 +4001,7 @@ fn plan_mesh_inbound_tls_reload(
     }
 }
 
-fn apply_mesh_inbound_tls_reload(
+async fn apply_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
     mtls_mode: config::MtlsMode,
@@ -4014,7 +4014,73 @@ fn apply_mesh_inbound_tls_reload(
             snapshot,
             tls_config,
         } => {
-            proxy_state.mesh_inbound_tls.store(Arc::new(tls_config));
+            proxy_state
+                .mesh_inbound_tls
+                .store(Arc::new(tls_config.clone()));
+            // Extend the live carve-out to mesh-shared TCP+TLS stream
+            // listeners: swap the shared `rustls::ServerConfig` slot that
+            // every TCP+TLS accept loop snapshots per accept. Existing
+            // sessions keep the `ServerConfig` they handshake with until
+            // they end; new accepts use the swapped config on the next
+            // handshake. Skips when the slot is empty (PeerAuth resolved
+            // to `Disable`).
+            proxy_state
+                .stream_listener_manager
+                .swap_frontend_tls_config(tls_config);
+            // And the same for UDP+DTLS: rebuild a `FrontendDtlsConfig`
+            // from the current env-config inputs and have every active
+            // `DtlsServer` swap atomically. Existing DTLS sessions keep
+            // the crypto material they handshake with; new sessions pick
+            // up the swap on the next ClientHello.
+            //
+            // The DTLS rebuild reuses operator-supplied cert/key/client-CA
+            // paths because PeerAuth live reload, per the operating
+            // invariant, never rotates cert/key paths — those remain
+            // static restart-required inputs. What changes here is the
+            // *mode* (Permissive ↔ Strict) and whether the client CA bundle
+            // is required for mTLS verification.
+            //
+            // Skip the DTLS rebuild entirely on `Disable`: TCP+TLS goes to
+            // plaintext via the cleared slot above, but DTLS cannot speak
+            // plaintext (it is encryption by definition). On topologies
+            // where `Disable` is allowed (Sidecar / EastWestGateway), an
+            // operator with UDP+DTLS listeners is expected to remove
+            // them from the proxy config rather than rely on a PeerAuth
+            // flip; the existing DtlsServer keeps its startup material
+            // so in-flight sessions and any pre-existing handshake
+            // contract remain intact until the listener is reconciled
+            // away.
+            if mtls_mode != config::MtlsMode::Disable {
+                let env = &proxy_state.env_config;
+                let crls = proxy_state.crls.clone();
+                let dtls_cert_key = env
+                    .frontend_tls_cert_path
+                    .as_deref()
+                    .zip(env.frontend_tls_key_path.as_deref())
+                    .map(|(c, k)| (c.to_string(), k.to_string()));
+                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
+                if let Some((cert_path, key_path)) = dtls_cert_key {
+                    let swapped = proxy_state
+                        .stream_listener_manager
+                        .swap_active_dtls_frontend_configs(|| {
+                            crate::dtls::build_frontend_dtls_config(
+                                &cert_path,
+                                &key_path,
+                                dtls_client_ca.as_deref(),
+                                &crls,
+                            )
+                        })
+                        .await;
+                    if swapped > 0 {
+                        info!(
+                            mesh_slice_version = %slice.version,
+                            ?mtls_mode,
+                            dtls_listeners = swapped,
+                            "Mesh inbound PeerAuthentication DTLS configs reloaded"
+                        );
+                    }
+                }
+            }
             *last_snapshot = Some(snapshot);
             info!(
                 mesh_slice_version = %slice.version,
@@ -4147,7 +4213,8 @@ fn start_mesh_slice_apply_task(
                                         mtls_mode,
                                         plan,
                                         &mut inbound_tls_reload.last_snapshot,
-                                    );
+                                    )
+                                    .await;
                                 }
                                 if accepted && let Some(ref dns_proxy) = dns_proxy {
                                     dns_proxy.update_from_slice(slice);
@@ -8285,6 +8352,123 @@ mod tests {
             )])
         });
         wait_for_mesh_inbound_tls(&proxy_state, false).await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    /// T3-A: apply_mesh_inbound_tls_reload must also publish the swapped
+    /// TLS config into the stream-listener slot so mesh-shared TCP+TLS
+    /// listeners see the new `ServerConfig` on the next accept. Existing
+    /// HBONE/HTTP-frontend slot behavior is preserved (covered by the
+    /// neighbouring `mesh_runtime_apply_task_live_reloads_peer_auth_tls_slot`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_propagates_peer_auth_swap_to_stream_listener_slot() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: mesh_frontend_identity,
+                last_snapshot: Some(initial_snapshot),
+            },
+            shutdown_rx,
+            None,
+        );
+
+        // Baseline: stream listener slot starts empty (no startup TLS publish
+        // by this test harness).
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_none(),
+            "stream listener slot starts empty before any slice apply"
+        );
+
+        // Apply a Strict slice; the apply task must publish the new
+        // ServerConfig into BOTH the HBONE slot AND the stream-listener slot.
+        mesh_state.install_slice(MeshSlice {
+            version: "strict-stream".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, true).await;
+
+        let hbone_slot = proxy_state.mesh_inbound_tls.load_full();
+        let hbone_slot_ref = hbone_slot
+            .as_ref()
+            .as_ref()
+            .expect("HBONE slot populated by Strict apply");
+
+        // Poll briefly for the stream-listener slot publish (the apply path
+        // populates both slots in the same await, but the slot read here can
+        // race the publishing store on the read side).
+        let stream_slot = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(cfg) = proxy_state
+                    .stream_listener_manager
+                    .snapshot_frontend_tls_config()
+                {
+                    return cfg;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream listener slot should be populated by apply task");
+
+        assert!(
+            Arc::ptr_eq(hbone_slot_ref, &stream_slot),
+            "apply_mesh_inbound_tls_reload must publish the same ServerConfig Arc \
+             into both the HBONE and the stream-listener slots"
+        );
+
+        // Disable PeerAuth: both slots must clear.
+        mesh_state.install_slice(MeshSlice {
+            version: "disable-stream".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, false).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream-listener slot should clear when PeerAuth flips to Disable");
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)

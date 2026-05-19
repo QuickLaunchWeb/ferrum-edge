@@ -625,3 +625,101 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
         port
     );
 }
+
+// ============================================================================
+// Tests: PeerAuthentication live reload (T3-A) — frontend TLS slot semantics
+// ============================================================================
+
+/// `swap_frontend_tls_config` is the cold-path entry point used by mesh
+/// PeerAuthentication live reload. It must atomically replace the slot
+/// without triggering a reconcile (existing TCP+TLS listeners snapshot the
+/// slot per accept). Compare-by-pointer proves the swap actually replaced
+/// the inner `Arc` rather than mutating in place.
+#[tokio::test]
+async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
+    let manager = create_manager(empty_config());
+
+    // Seed a fake `Arc<rustls::ServerConfig>` so we can prove the swap
+    // replaced the pointer. Using a CryptoProvider-free ServerConfig isn't
+    // possible, but we can compare two Option<Arc<...>> by Arc::as_ptr
+    // after wrapping with Arc::new.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Build two distinct `Arc<rustls::ServerConfig>` instances. The actual
+    // crypto here doesn't matter — we never drive a handshake against it.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let cfg_a = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .expect("server-side protocol versions")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoopCertResolver)),
+    );
+    let cfg_b = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .expect("server-side protocol versions")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoopCertResolver)),
+    );
+
+    manager.swap_frontend_tls_config(Some(cfg_a.clone()));
+    // No reconcile call. Even with the slot populated, no listeners means
+    // we wouldn't have started anything; the test asserts the swap path
+    // is cold-path-only and does not depend on reconcile being invoked.
+    manager.swap_frontend_tls_config(Some(cfg_b.clone()));
+
+    // Confirm the slot now holds cfg_b, not cfg_a.
+    let observed = manager.snapshot_frontend_tls_config();
+    let observed = observed.as_ref().expect("slot should hold a config");
+    assert!(
+        Arc::ptr_eq(observed, &cfg_b),
+        "swap_frontend_tls_config must publish the most recent ServerConfig in the slot"
+    );
+
+    // Now swap to None — the slot must drop the config (PeerAuth Disable).
+    manager.swap_frontend_tls_config(None);
+    assert!(
+        manager.snapshot_frontend_tls_config().is_none(),
+        "swap to None should clear the slot"
+    );
+}
+
+/// `swap_active_dtls_frontend_configs` is a no-op when there are no active
+/// UDP+DTLS listeners. This proves the swap path doesn't crash on an empty
+/// manager (the common case when a PeerAuth slice apply fires before any
+/// stream listener has bound).
+#[tokio::test]
+async fn swap_active_dtls_frontend_configs_is_noop_with_no_listeners() {
+    let manager = create_manager(empty_config());
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(anyhow::anyhow!(
+                "build_config must not be called when no DTLS listeners exist"
+            ))
+        })
+        .await;
+    assert_eq!(swapped, 0, "no listeners should mean no swaps");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "build_config must not be invoked when there are no active DTLS listeners"
+    );
+}
+
+/// Minimal cert resolver for the swap-pointer test. Never gets driven, so
+/// the empty resolver result is fine — we only need a valid `ServerConfig`
+/// shape to populate the slot.
+#[derive(Debug)]
+struct NoopCertResolver;
+
+impl rustls::server::ResolvesServerCert for NoopCertResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        None
+    }
+}

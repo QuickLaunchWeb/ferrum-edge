@@ -362,7 +362,9 @@ async fn try_spawn_tcp_tls_gateway(
             config: config_swap,
             dns_cache: DnsCache::new(DnsConfig::default()),
             request_epoch,
-            frontend_tls_config: Some(build_frontend_tls_config()),
+            frontend_tls_slot: Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(
+                build_frontend_tls_config(),
+            )))),
             shutdown: shutdown_rx,
             global_shutdown: None,
             metrics: Arc::new(TcpProxyMetrics::default()),
