@@ -1624,6 +1624,11 @@ async fn test_doctype_entity_payload_rejected() {
 // ── Plugin metadata tests ───────────────────────────────────────────────────
 
 #[test]
+fn test_soap_ws_security_is_security_plugin() {
+    assert!(ferrum_edge::plugins::is_security_plugin("soap_ws_security"));
+}
+
+#[test]
 fn test_plugin_name() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     assert_eq!(plugin.name(), "soap_ws_security");

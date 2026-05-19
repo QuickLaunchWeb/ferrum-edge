@@ -2103,6 +2103,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "access_control"
             | "tcp_connection_throttle"
             | "ip_restriction"
+            | "soap_ws_security"
     )
 }
 
