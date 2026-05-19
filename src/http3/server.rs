@@ -602,7 +602,25 @@ async fn handle_h3_request(
     }
 
     // Track this request for overload monitoring and graceful drain.
-    let request_guard = crate::overload::RequestGuard::new(&state.overload);
+    let request_guard = match crate::overload::RequestGuard::try_new(
+        &state.overload,
+        state.env_config.max_requests,
+    ) {
+        Some(guard) => guard,
+        None => {
+            record_request(&state, 503);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Service overloaded"}"#,
+                crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+                "Service overloaded",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();

@@ -351,10 +351,30 @@ pub struct RequestGuard {
 
 impl RequestGuard {
     pub fn new(state: &Arc<OverloadState>) -> Self {
-        state.active_requests.fetch_add(1, Ordering::Relaxed);
-        Self {
-            state: state.clone(),
+        Self::try_new(state, 0).expect("unlimited request guard allocation should always succeed")
+    }
+
+    /// Try to reserve one request slot and create a guard.
+    ///
+    /// `max_requests=0` means unlimited.
+    pub fn try_new(state: &Arc<OverloadState>, max_requests: u64) -> Option<Self> {
+        if max_requests == 0 {
+            state.active_requests.fetch_add(1, Ordering::Relaxed);
+            return Some(Self {
+                state: state.clone(),
+            });
         }
+
+        let reservation =
+            state
+                .active_requests
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    (current < max_requests).then_some(current + 1)
+                });
+
+        reservation.ok().map(|_| Self {
+            state: state.clone(),
+        })
     }
 }
 

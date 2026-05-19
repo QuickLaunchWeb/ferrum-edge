@@ -130,6 +130,27 @@ fn request_guard_tracks_concurrent_requests() {
     assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn request_guard_try_new_enforces_max_requests() {
+    let state = Arc::new(OverloadState::new());
+
+    let g1 = RequestGuard::try_new(&state, 2).expect("first request should be admitted");
+    let g2 = RequestGuard::try_new(&state, 2).expect("second request should be admitted");
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+
+    let g3 = RequestGuard::try_new(&state, 2);
+    assert!(g3.is_none(), "third request must be rejected at capacity");
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+
+    drop(g1);
+    let g4 = RequestGuard::try_new(&state, 2).expect("slot should reopen after drop");
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+
+    drop(g2);
+    drop(g4);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn request_guard_notifies_drain_on_last_drop() {
     let state = Arc::new(OverloadState::new());

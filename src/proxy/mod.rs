@@ -7364,7 +7364,26 @@ async fn handle_proxy_request_on_frontend_port(
     // The guard is attached to the response body so it lives as long as hyper
     // is sending the response — critical for H2/gRPC streaming where the body
     // outlives this function scope.
-    let request_guard = crate::overload::RequestGuard::new(&state.overload);
+    let request_guard = match crate::overload::RequestGuard::try_new(
+        &state.overload,
+        state.env_config.max_requests,
+    ) {
+        Some(guard) => guard,
+        None => {
+            let is_grpc = grpc_proxy::is_grpc_request(&req);
+            record_request(&state, 503);
+            if is_grpc {
+                return Ok(grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::grpc_status::UNAVAILABLE,
+                    "Service overloaded",
+                ));
+            }
+            return Ok(build_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Service overloaded"}"#,
+            ));
+        }
+    };
 
     let response = handle_proxy_request_inner(
         req,
