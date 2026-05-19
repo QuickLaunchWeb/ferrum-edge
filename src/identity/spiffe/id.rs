@@ -116,6 +116,30 @@ impl SpiffeId {
         }
         None
     }
+
+    /// Return the Kubernetes namespace encoded into this SPIFFE ID per the
+    /// Istio convention `<...>/ns/<namespace>/sa/<service-account>`.
+    ///
+    /// Returns the segment immediately following the first `ns` segment in the
+    /// path. Returns `None` when the path does not contain an `ns` segment or
+    /// when `ns` is the trailing segment. Only the first `ns` segment is
+    /// considered — same canonicality rule as [`SpiffeId::service_account`].
+    /// The parser rejects empty path segments, so an `ns/` segment can never
+    /// resolve to an empty namespace here.
+    ///
+    /// This is the canonical helper for "source workload namespace" lookups
+    /// (e.g. VirtualService `match[].sourceNamespace` predicates). Callers
+    /// holding a validated [`SpiffeId`] should prefer this over re-parsing
+    /// the URI string by hand.
+    pub fn namespace(&self) -> Option<&str> {
+        let mut segments = self.path_segments();
+        while let Some(segment) = segments.next() {
+            if segment == "ns" {
+                return segments.next();
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Display for SpiffeId {

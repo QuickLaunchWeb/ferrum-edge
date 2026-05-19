@@ -7900,6 +7900,253 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_source_namespace_match_emits_plugin_with_string_predicate() {
+        // T1-B.4: VirtualService `sourceNamespace` is now a first-class
+        // mesh_route_dispatch predicate. The translator emits it as a bare
+        // string under the `source_namespace` field (Istio: exact-only, no
+        // `prefix`/`regex` arms in the CRD), and the plugin must load the
+        // shape successfully (predicate compiled at config-load time, not
+        // per request). Previously this predicate fell through to a
+        // proxy-scoped `request_termination` instead of being enforced.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "sourceNamespace": "prod"
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for sourceNamespace");
+        let source_ns = &plugin.config["rules"][0]["match"]["source_namespace"];
+        assert!(
+            source_ns.is_string(),
+            "sourceNamespace must emit as a bare string for wire shape, got: {source_ns}"
+        );
+        assert_eq!(source_ns.as_str(), Some("prod"));
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "sourceNamespace must NOT cause fail-closed request_termination anymore"
+        );
+
+        // The plugin must load successfully from the translator's JSON shape.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        let _ = MeshRouteDispatch::new(&plugin.config)
+            .expect("translator output must construct the plugin");
+    }
+
+    #[test]
+    fn virtual_service_uri_less_source_namespace_only_match_materializes_catch_all_proxy() {
+        // A URI-less entry whose only predicate is `sourceNamespace` is now
+        // first-class supported. It routes "any URI from this namespace" on
+        // the listed hosts, matching the existing header-only catch-all path
+        // (`URI_LESS_MATCH_LISTEN_PATH`). Without first-class support, this
+        // would have been silently dropped via the unsupported-key list.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"sourceNamespace": "prod"}
+                        ],
+                        "route": [{"destination": {"host": "prod.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect(
+                "mesh_route_dispatch plugin must be emitted for sourceNamespace-only catch-all",
+            );
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1, "single sourceNamespace-only rule emitted");
+        assert_eq!(rules[0]["match"]["source_namespace"].as_str(), Some("prod"));
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == plugin.proxy_id.as_deref()
+            }),
+            "sourceNamespace-only predicate must NOT cause fail-closed request_termination"
+        );
+    }
+
+    #[test]
+    fn virtual_service_non_string_source_namespace_still_fails_closed() {
+        // The Istio CRD types `sourceNamespace` as a bare string. Any other
+        // JSON shape (object with operator keys, array, bool, number) is
+        // outside the CRD and treated as unsupported so the route falls
+        // closed via `request_termination` rather than silently widening.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "sourceNamespace": {"prefix": "prod"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        assert!(
+            result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            }),
+            "non-string sourceNamespace shape must fail closed"
+        );
+    }
+
+    #[test]
+    fn virtual_service_empty_string_source_namespace_fails_closed_not_open() {
+        // Regression: an empty-string `sourceNamespace: ""` previously passed
+        // the translator's "supported predicate" check (because `Value::as_str`
+        // returns `Some("")`) and was emitted verbatim into the plugin rule.
+        // The plugin's `normalize_source_namespace` then rejected it at
+        // construction time, the whole `mesh_route_dispatch` plugin was
+        // silently dropped at cache rebuild, and `reject_unmatched: true`
+        // no longer fired — letting gated traffic flow to the default backend.
+        //
+        // The translator must classify empty / whitespace-only strings as
+        // unsupported predicates so the route is gated by `request_termination`
+        // (fail-closed) rather than relying on runtime plugin validation.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "sourceNamespace": ""}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        assert!(
+            result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            }),
+            "empty-string sourceNamespace must fail closed via request_termination"
+        );
+        // And the mesh_route_dispatch plugin (if any was emitted for the
+        // proxy) must not carry an empty `source_namespace` rule that the
+        // plugin would reject at construction.
+        for plugin in &result.config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch"
+                || plugin.proxy_id.as_deref() != Some(proxy.id.as_str())
+            {
+                continue;
+            }
+            let rules = plugin
+                .config
+                .get("rules")
+                .and_then(Value::as_array)
+                .expect("rules array");
+            for rule in rules {
+                let ns = rule
+                    .get("match")
+                    .and_then(|m| m.get("source_namespace"))
+                    .and_then(Value::as_str);
+                assert_ne!(
+                    ns,
+                    Some(""),
+                    "translator must not emit empty source_namespace into plugin rule"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_service_whitespace_only_source_namespace_fails_closed_not_open() {
+        // A whitespace-only `sourceNamespace: "   "` is also invalid (the
+        // plugin's `normalize_source_namespace` rejects whitespace). Same
+        // failure mode and same fail-closed remediation as empty-string.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "sourceNamespace": "   "}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        assert!(
+            result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            }),
+            "whitespace-only sourceNamespace must fail closed via request_termination"
+        );
+    }
+
+    #[test]
     fn virtual_service_header_only_match_materializes_catch_all() {
         // Codex P2 (#3237631709): a VirtualService whose `match[]`
         // contains only non-URI predicates (no `uri` block at all) is a
