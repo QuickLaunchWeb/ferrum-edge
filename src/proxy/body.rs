@@ -541,7 +541,20 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
+        // Security hardening: never forward inbound request trailer frames to
+        // upstream backends on the generic streaming path. The gateway's
+        // request validation/filtering operates on the initial header map; if
+        // trailers are forwarded here, attacker-controlled metadata could
+        // bypass those checks and be interpreted by downstream services.
+        //
+        // Loop until we see a data frame, error, end-of-stream, or Pending.
+        // Trailer frames are simply consumed and dropped.
+        loop {
+            match self.project().inner.poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
+                other => return other,
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {
@@ -2292,6 +2305,30 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].data_ref().unwrap().as_ref(), b"hello");
         assert_eq!(frames[1].data_ref().unwrap().as_ref(), b" world");
+    }
+
+    #[test]
+    fn sync_body_drops_trailer_frames_on_request_streaming_path() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("authorization", "Bearer attacker".parse().unwrap());
+
+        let inner = FrameSourceAsBody {
+            inner: MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("body")))),
+                MockStep::Frame(Ok(Frame::trailers(trailers))),
+                MockStep::End,
+            ]),
+            _marker: PhantomData,
+        };
+        let mut body = SyncBody::new(inner);
+
+        let frames = poll_all_strip(&mut body);
+        assert_eq!(
+            frames.len(),
+            1,
+            "request trailer frames must not be forwarded by SyncBody",
+        );
+        assert_eq!(frames[0].data_ref().unwrap().as_ref(), b"body");
     }
 
     #[test]
