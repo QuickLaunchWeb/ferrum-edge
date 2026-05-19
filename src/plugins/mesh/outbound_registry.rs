@@ -268,6 +268,30 @@ impl OutboundRegistry {
         });
     }
 
+    fn admit_decision_host_bucket(&self, host: &str, port: Option<u16>) -> &'static str {
+        HOST_NORMALISE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(host.len());
+            normalise_request_host_into(host, &mut buf);
+            if buf.is_empty() || self.hosts.contains(buf.as_str()) {
+                return EXPLICIT_HOST_BUCKET;
+            }
+            if let Some(port) = port {
+                if self.any_port_hosts.contains(buf.as_str()) {
+                    return EXPLICIT_HOST_BUCKET;
+                }
+                if !self.host_ports.is_empty() {
+                    let _ = write!(buf, ":{port}");
+                    if self.host_ports.contains(buf.as_str()) {
+                        return EXPLICIT_HOST_BUCKET;
+                    }
+                }
+            }
+            ADMITTED_WILDCARD_BUCKET
+        })
+    }
+
     /// Record a deny decision into the metrics registry under a fixed-
     /// cardinality `host` bucket. The Host header is attacker-controllable on
     /// the deny path; using the actual value as a Prometheus label exposes
@@ -283,6 +307,8 @@ impl OutboundRegistry {
 /// Constant Prometheus `host` label value used for every deny decision; see
 /// [`OutboundRegistry::record_deny_decision`].
 pub(crate) const DENIED_HOST_BUCKET: &str = "<denied>";
+pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
+pub(crate) const EXPLICIT_HOST_BUCKET: &str = "<admit_explicit>";
 
 fn normalise_registry_entry(entry: &str) -> Option<String> {
     let entry = entry.trim().to_ascii_lowercase();
@@ -432,7 +458,7 @@ impl Plugin for OutboundRegistry {
         };
         let (host, port) = split_host_header(host_header);
         if self.contains(host, port) {
-            self.record_decision(host, "admit");
+            self.record_decision(self.admit_decision_host_bucket(host, port), "admit");
         } else {
             // Deny path uses a constant bucket label so the Prometheus
             // `host` label remains bounded (the request Host header is
@@ -764,7 +790,7 @@ mod tests {
 
         let rendered = crate::plugins::prometheus_metrics::global_registry().render_uncached();
         assert!(rendered.contains(
-            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"reviews.svc\",decision=\"admit\""
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"<admit_explicit>\",decision=\"admit\""
         ));
         // Deny decisions always bucket under the fixed `<denied>` label to
         // keep Prometheus cardinality bounded against attacker-supplied Host
@@ -773,6 +799,37 @@ mod tests {
             "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-metrics\",host=\"<denied>\",decision=\"deny\""
         ));
         assert!(!rendered.contains("host=\"unknown.svc\",decision=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn buckets_wildcard_admit_decisions() {
+        let plugin = OutboundRegistry::new(&json!({
+            "namespace": "gap2n-wildcard-metrics",
+            "registry": ["*.example.com"],
+        }))
+        .expect("valid wildcard registry");
+
+        for i in 0..8 {
+            let mut admitted = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/api".to_string(),
+            );
+            admitted.headers = HashMap::from([(
+                "host".to_string(),
+                format!("a{i}.example.com"),
+            )]);
+            assert!(matches!(
+                plugin.on_request_received(&mut admitted).await,
+                PluginResult::Continue
+            ));
+        }
+
+        let rendered = crate::plugins::prometheus_metrics::global_registry().render_uncached();
+        assert!(rendered.contains(
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"gap2n-wildcard-metrics\",host=\"<admit_wildcard>\",decision=\"admit\""
+        ));
+        assert!(!rendered.contains("host=\"a0.example.com\",decision=\"admit\""));
     }
 
     #[tokio::test]
