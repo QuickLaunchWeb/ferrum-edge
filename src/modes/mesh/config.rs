@@ -2090,14 +2090,6 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
         return;
     }
 
-    let mut lowered = HashSet::with_capacity(headers.len());
-    if headers
-        .keys()
-        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
-    {
-        return;
-    }
-
     *headers = headers
         .drain()
         .map(|(key, value)| (key.to_ascii_lowercase(), value))
