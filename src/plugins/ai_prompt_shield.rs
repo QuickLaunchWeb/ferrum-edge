@@ -494,10 +494,22 @@ impl Plugin for AiPromptShield {
                 PluginResult::Continue
             }
             ShieldAction::Redact => {
-                // Detection done — actual redaction happens in transform_request_body.
-                // Store detected types for observability.
+                // Detection done — keep observability marker and eagerly update
+                // buffered metadata so before_proxy short-circuit plugins
+                // (e.g. ai_federation) consume the redacted body.
                 ctx.metadata
                     .insert("ai_shield_redacted".to_string(), detected.join(","));
+                if let Some(redacted) = self
+                    .transform_request_body(
+                        body.as_bytes(),
+                        Some(content_type),
+                        &std::collections::HashMap::new(),
+                    )
+                    .await
+                    && let Ok(redacted_str) = String::from_utf8(redacted)
+                {
+                    ctx.metadata.insert("request_body".to_string(), redacted_str);
+                }
                 PluginResult::Continue
             }
         }
