@@ -20,6 +20,14 @@ spec:
           annotations:
             summary: Ferrum mesh certificate is expiring soon
             description: "SVID {{ "{{ $labels.spiffe_id }}" }} from {{ "{{ $labels.source }}" }} expires in {{ "{{ $value }}" }} seconds."
+        - alert: FerrumMeshSvidExpiringCritical
+          expr: min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < {{ .Values.observability.alerts.svidExpiringCriticalSeconds }}
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Ferrum mesh SVID is critically close to expiry
+            description: "SVID {{ "{{ $labels.spiffe_id }}" }} from {{ "{{ $labels.source }}" }} expires in {{ "{{ $value }}" }}s. Rotation has almost certainly stalled — see docs/spire_deployment.md#failure-recovery-runbook."
         - alert: FerrumMeshCertificateRotationFailures
           expr: sum by (spiffe_id, source) (increase(ferrum_mesh_cert_rotation_failures_total[10m])) > 0
           for: 5m
@@ -35,7 +43,25 @@ spec:
             severity: critical
           annotations:
             summary: Ferrum mesh CA backend is unhealthy
-            description: "CA backend {{ "{{ $labels.ca_type }}" }} is reporting unhealthy."
+            description: "CA backend {{ "{{ $labels.ca_type }}" }} is reporting unhealthy. For ca_type=spire_agent this typically means the Workload API socket is unreachable — see docs/spire_deployment.md#spire-agent-uds-unreachable."
+    - name: ferrum.mesh.federation
+      rules:
+        - alert: FerrumMeshFederationBundleStale
+          expr: max by (trust_domain) (ferrum_mesh_federation_bundle_age_seconds) > {{ .Values.observability.alerts.federationBundleStaleSeconds }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh federated trust bundle is stale
+            description: "Trust bundle for {{ "{{ $labels.trust_domain }}" }} has not refreshed in {{ "{{ $value }}" }}s. Cross-cluster mTLS still verifies against the last-good bundle. See docs/spire_deployment.md#trust-bundle-rotation-failure."
+        - alert: FerrumMeshFederationPollFailures
+          expr: sum by (trust_domain, endpoint) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum mesh federation poll is failing
+            description: "SPIFFE federation poller hitting {{ "{{ $labels.endpoint }}" }} for trust domain {{ "{{ $labels.trust_domain }}" }} is failing. Pollers preserve the last-good bundle on failure; verifiers remain fail-closed against cached material."
     - name: ferrum.mesh.control-plane
       rules:
         - alert: FerrumMeshControlPlaneConfigStale
