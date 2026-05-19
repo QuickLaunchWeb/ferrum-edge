@@ -414,8 +414,8 @@ mod inner {
         /// The MongoDB Rust driver requires client cert + key in a single PEM file
         /// (`TlsOptions::cert_key_file_path`). The gateway's `FERRUM_DB_TLS_*` env
         /// vars use separate files (matching the PostgreSQL/MySQL convention).
-        /// This helper reads both files and writes a combined PEM to a temp file
-        /// that persists for the lifetime of the process.
+        /// This helper reads both files and writes a combined PEM to a securely
+        /// created temp file with restrictive permissions.
         fn combine_cert_key_pem(cert_path: &str, key_path: &str) -> Result<PathBuf, anyhow::Error> {
             let cert_data = std::fs::read_to_string(cert_path).map_err(|e| {
                 anyhow::anyhow!("Failed to read MongoDB client cert '{}': {}", cert_path, e)
@@ -424,12 +424,22 @@ mod inner {
                 anyhow::anyhow!("Failed to read MongoDB client key '{}': {}", key_path, e)
             })?;
 
-            // Write combined PEM to a temp file. Use a PID-scoped deterministic path
-            // so reconnect calls reuse the same file (no temp file leak) while multiple
-            // gateway instances on the same host don't collide.
-            let combined_path = std::env::temp_dir()
-                .join(format!("ferrum-mongo-client-{}.pem", std::process::id()));
+            // Write combined PEM to a securely-created temp file. `tempfile`
+            // creates files with restrictive permissions and random names,
+            // avoiding predictable-path and world-readable key leakage risks.
             let combined = format!("{}\n{}", cert_data.trim(), key_data.trim());
+            let temp_file = tempfile::Builder::new()
+                .prefix("ferrum-mongo-client-")
+                .suffix(".pem")
+                .tempfile()
+                .map_err(|e| anyhow::anyhow!("Failed to create temp PEM file: {}", e))?;
+            let (_file, combined_path) = temp_file.keep().map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to persist combined MongoDB client PEM '{}': {}",
+                    e.path.display(),
+                    e.error
+                )
+            })?;
             std::fs::write(&combined_path, combined).map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to write combined MongoDB client PEM to '{}': {}",
