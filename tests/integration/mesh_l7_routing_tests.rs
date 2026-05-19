@@ -1088,18 +1088,31 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_routes_both_casings() {
         );
     }
 
-    // A non-prefix-matching path falls through (the URI predicate fails,
-    // the dispatch rule does not route, and with `reject_unmatched: false`
-    // — URI-only entry — the plain Continue lets the proxy default handle
-    // it; here the broader regex listen_path would NOT have admitted the
-    // request, but defense-in-depth: the dispatch URI check fails too).
+    // A non-prefix-matching path does not match the URI predicate, so the
+    // dispatch rule does not fire and the override destination is not set.
+    // With `ignoreUriCase: true`, the dispatch rule carries an explicit URI
+    // predicate so its match_criteria is non-empty — `reject_unmatched: true`
+    // applies and the plugin returns a 404 Reject (Envoy parity). In real
+    // traffic the widened `~(?i)/Api.*` regex listen_path would not have
+    // admitted `/store/items` in the first place; the dispatch-level URI
+    // check is defense-in-depth.
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
         "/store/items".to_string(),
     );
     let mut headers = HashMap::new();
-    let _ = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    let result = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 404,
+                ..
+            }
+        ),
+        "non-matching path must trip reject_unmatched (Envoy parity)"
+    );
     assert!(
         ctx.route_override_upstream_id.is_none(),
         "non-matching path must not trigger the override destination"
