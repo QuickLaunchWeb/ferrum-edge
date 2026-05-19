@@ -24,7 +24,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, Ip6TablesMode, IptablesPlan, validate_cidr_list,
+    CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
+    include_outbound_ports_from_annotations, validate_cidr_list,
 };
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
@@ -41,9 +43,6 @@ const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
     "traffic.sidecar.istio.io/excludeOutboundPorts";
 const FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeOutboundPorts";
-const ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
-    "traffic.sidecar.istio.io/includeOutboundPorts";
-const FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/includeOutboundPorts";
 const ISTIO_EXCLUDE_INBOUND_PORTS_ANNOTATION: &str = "traffic.sidecar.istio.io/excludeInboundPorts";
 const FERRUM_EXCLUDE_INBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeInboundPorts";
 const ISTIO_EXCLUDE_OUTBOUND_IP_RANGES_ANNOTATION: &str =
@@ -293,56 +292,6 @@ fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
-}
-
-enum ParsedIncludePorts {
-    Absent,
-    All,
-    Ports(Vec<u16>),
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct IncludeOutboundPorts {
-    all_ports: bool,
-    ports: Vec<u16>,
-}
-
-fn parse_include_port_list(raw: Option<&str>) -> Result<ParsedIncludePorts, String> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(ParsedIncludePorts::Absent);
-    };
-
-    let mut ports = Vec::new();
-    let mut saw_wildcard = false;
-    for token in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        if token == "*" {
-            if saw_wildcard || !ports.is_empty() {
-                return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
-            }
-            saw_wildcard = true;
-            continue;
-        }
-        if saw_wildcard {
-            return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
-        }
-        let port = token
-            .parse::<u16>()
-            .map_err(|e| format!("port '{token}': {e}"))?;
-        if port == 0 {
-            return Err("port '0': port must be 1-65535".to_string());
-        }
-        ports.push(port);
-    }
-    if saw_wildcard {
-        return Ok(ParsedIncludePorts::All);
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    Ok(ParsedIncludePorts::Ports(ports))
 }
 
 fn parse_injector_proxy_uid(value: Option<String>) -> Result<Option<u32>, String> {
@@ -1012,65 +961,23 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
 }
 
 // includeOutboundPorts is annotation-only: unlike excludeOutboundPorts, there
-// is no injector-level/env default that seeds this list.
+// is no injector-level/env default that seeds this list. The parser lives in
+// `crate::capture` so the node-agent eBPF backend (`src/modes/node_agent.rs`)
+// reads the same annotations through the same code path.
 fn include_outbound_ports_for_pod(pod: &Value) -> Result<IncludeOutboundPorts, String> {
     let annotations = pod
         .pointer("/metadata/annotations")
         .and_then(Value::as_object);
-    let mut ports = Vec::new();
-    let mut saw_wildcard = false;
-    let mut wildcard_key: Option<&str> = None;
-    let mut explicit_ports_key: Option<&str> = None;
-    for key in [
-        ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
-        FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
-    ] {
-        match parse_include_port_list(
-            annotations
-                .and_then(|annotations| annotations.get(key))
-                .and_then(Value::as_str),
-        )
-        .map_err(|e| format!("invalid {key}: {e}"))?
-        {
-            ParsedIncludePorts::Absent => {}
-            ParsedIncludePorts::All => {
-                if !ports.is_empty() {
-                    let explicit_key =
-                        explicit_ports_key.unwrap_or("another includeOutboundPorts annotation");
-                    return Err(format!(
-                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts in {explicit_key}"
-                    ));
-                }
-                saw_wildcard = true;
-                wildcard_key.get_or_insert(key);
-            }
-            ParsedIncludePorts::Ports(annotation_ports) => {
-                if saw_wildcard && !annotation_ports.is_empty() {
-                    let wildcard_key =
-                        wildcard_key.unwrap_or("another includeOutboundPorts annotation");
-                    return Err(format!(
-                        "invalid {key}: explicit includeOutboundPorts cannot be combined with wildcard '*' in {wildcard_key}"
-                    ));
-                }
-                if !annotation_ports.is_empty() {
-                    explicit_ports_key.get_or_insert(key);
-                }
-                ports.extend(annotation_ports);
-            }
-        }
-    }
-    if saw_wildcard {
-        return Ok(IncludeOutboundPorts {
-            all_ports: true,
-            ports: Vec::new(),
-        });
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    Ok(IncludeOutboundPorts {
-        all_ports: false,
-        ports,
-    })
+    let lookup = |key: &'static str| -> (&'static str, Option<&str>) {
+        let value = annotations
+            .and_then(|annotations| annotations.get(key))
+            .and_then(Value::as_str);
+        (key, value)
+    };
+    include_outbound_ports_from_annotations([
+        lookup(ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION),
+        lookup(FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION),
+    ])
 }
 
 fn exclude_outbound_ports_for_pod(
@@ -1584,18 +1491,6 @@ mod tests {
 
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
         assert!(err.contains("wildcard '*' must be the only includeOutboundPorts token"));
-    }
-
-    #[test]
-    fn parse_include_port_list_rejects_repeated_wildcard() {
-        let err = parse_include_port_list(Some("*,*"))
-            .err()
-            .expect("repeated wildcard rejected");
-
-        assert_eq!(
-            err,
-            "wildcard '*' must be the only includeOutboundPorts token"
-        );
     }
 
     #[test]

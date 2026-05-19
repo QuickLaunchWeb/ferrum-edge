@@ -13,6 +13,16 @@ use crate::config::conf_file::resolve_ferrum_var;
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 pub(crate) const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
 
+/// Istio-compatible `includeOutboundPorts` annotation. The injector and the
+/// node-agent eBPF backend both read this key — keep the spelling exactly
+/// in sync with Istio so existing operator annotations apply unchanged.
+pub const ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
+    "traffic.sidecar.istio.io/includeOutboundPorts";
+/// Ferrum-native alias for [`ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION`]. Both
+/// keys are read; values from the two annotations merge per
+/// [`include_outbound_ports_from_annotations`].
+pub const FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/includeOutboundPorts";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
     Explicit,
@@ -192,6 +202,150 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
             Ok(port)
         })
         .collect()
+}
+
+/// Pod-level `includeOutboundPorts` annotation parsed once, shared by the
+/// injector (writes iptables rules in the init container) and the node-agent
+/// eBPF capture path (writes a per-cgroup BPF map entry). Keeping a single
+/// parser prevents the two surfaces from drifting apart on edge cases
+/// (wildcard handling, duplicates, malformed tokens).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IncludeOutboundPorts {
+    /// `true` when the annotation was `*` — capture all outbound ports.
+    pub all_ports: bool,
+    /// Explicit destination ports to capture. Sorted, deduplicated. Empty
+    /// when `all_ports == true`.
+    pub ports: Vec<u16>,
+}
+
+impl IncludeOutboundPorts {
+    /// Returns `true` when the annotation was absent / blank (capture
+    /// driven purely by include CIDRs).
+    pub fn is_absent(&self) -> bool {
+        !self.all_ports && self.ports.is_empty()
+    }
+}
+
+/// One annotation's parse result, before two annotations get merged together.
+/// Kept private so the merge contract stays in
+/// [`include_outbound_ports_from_annotations`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParsedIncludePorts {
+    Absent,
+    All,
+    Ports(Vec<u16>),
+}
+
+/// Parse a single `includeOutboundPorts` annotation value.
+///
+/// Returns:
+/// - `Absent` for `None`, empty string, or whitespace-only string.
+/// - `All` when the value is `*`.
+/// - `Ports(_)` for a comma-separated list of 1..=65535 integers.
+///
+/// Errors on: mixing `*` with explicit ports, repeated `*`, non-numeric
+/// tokens, port `0`, port outside `u16`.
+pub fn parse_include_port_list(raw: Option<&str>) -> Result<ParsedIncludePorts, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(ParsedIncludePorts::Absent);
+    };
+
+    let mut ports = Vec::new();
+    let mut saw_wildcard = false;
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if token == "*" {
+            if saw_wildcard || !ports.is_empty() {
+                return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
+            }
+            saw_wildcard = true;
+            continue;
+        }
+        if saw_wildcard {
+            return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
+        }
+        let port = token
+            .parse::<u16>()
+            .map_err(|e| format!("port '{token}': {e}"))?;
+        if port == 0 {
+            return Err("port '0': port must be 1-65535".to_string());
+        }
+        ports.push(port);
+    }
+    if saw_wildcard {
+        return Ok(ParsedIncludePorts::All);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ParsedIncludePorts::Ports(ports))
+}
+
+/// Merge the two parallel `includeOutboundPorts` annotations
+/// (Istio + Ferrum-native alias) into a single [`IncludeOutboundPorts`].
+///
+/// `annotations` is an iterator over `(annotation_key, raw_value)` pairs.
+/// Callers pass the keys they want to consider, in priority order — typically
+/// Istio first, then Ferrum's alias. The iterator should yield each key at
+/// most once; duplicates are tolerated but only the first non-absent entry
+/// per key sets the wildcard / explicit-ports keys for error messages.
+///
+/// Wildcard semantics: once any annotation says `*` no explicit ports may be
+/// added from another annotation, and vice-versa. This is the same rule
+/// `injector::include_outbound_ports_for_pod` previously enforced inline.
+pub fn include_outbound_ports_from_annotations<'a, I>(
+    annotations: I,
+) -> Result<IncludeOutboundPorts, String>
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
+{
+    let mut ports: Vec<u16> = Vec::new();
+    let mut saw_wildcard = false;
+    let mut wildcard_key: Option<&str> = None;
+    let mut explicit_ports_key: Option<&str> = None;
+    for (key, raw) in annotations {
+        match parse_include_port_list(raw).map_err(|e| format!("invalid {key}: {e}"))? {
+            ParsedIncludePorts::Absent => {}
+            ParsedIncludePorts::All => {
+                if !ports.is_empty() {
+                    let explicit_key =
+                        explicit_ports_key.unwrap_or("another includeOutboundPorts annotation");
+                    return Err(format!(
+                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts in {explicit_key}"
+                    ));
+                }
+                saw_wildcard = true;
+                wildcard_key.get_or_insert(key);
+            }
+            ParsedIncludePorts::Ports(annotation_ports) => {
+                if saw_wildcard && !annotation_ports.is_empty() {
+                    let wildcard_key =
+                        wildcard_key.unwrap_or("another includeOutboundPorts annotation");
+                    return Err(format!(
+                        "invalid {key}: explicit includeOutboundPorts cannot be combined with wildcard '*' in {wildcard_key}"
+                    ));
+                }
+                if !annotation_ports.is_empty() {
+                    explicit_ports_key.get_or_insert(key);
+                }
+                ports.extend(annotation_ports);
+            }
+        }
+    }
+    if saw_wildcard {
+        return Ok(IncludeOutboundPorts {
+            all_ports: true,
+            ports: Vec::new(),
+        });
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(IncludeOutboundPorts {
+        all_ports: false,
+        ports,
+    })
 }
 
 fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
@@ -1394,5 +1548,176 @@ mod tests {
             let result = CaptureConfig::from_env();
             assert!(result.is_err());
         });
+    }
+
+    // Parser tests for the shared `includeOutboundPorts` surface used by both
+    // the injector (iptables init container) and the node-agent eBPF backend.
+    // The injector previously owned a private copy of these tests; centralizing
+    // them here keeps the two surfaces from drifting.
+
+    #[test]
+    fn parse_include_port_list_absent_inputs() {
+        assert_eq!(
+            parse_include_port_list(None).expect("None"),
+            ParsedIncludePorts::Absent
+        );
+        assert_eq!(
+            parse_include_port_list(Some("")).expect("empty"),
+            ParsedIncludePorts::Absent
+        );
+        assert_eq!(
+            parse_include_port_list(Some("   ")).expect("blank"),
+            ParsedIncludePorts::Absent
+        );
+        // A list of nothing but separator whitespace is also absent — we
+        // never want to inject a phantom wildcard.
+        assert_eq!(
+            parse_include_port_list(Some(",")).expect("comma-only"),
+            ParsedIncludePorts::Ports(Vec::new())
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_wildcard() {
+        assert_eq!(
+            parse_include_port_list(Some("*")).expect("wildcard"),
+            ParsedIncludePorts::All
+        );
+        // Surrounding whitespace allowed.
+        assert_eq!(
+            parse_include_port_list(Some("  *  ")).expect("padded wildcard"),
+            ParsedIncludePorts::All
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_single_port() {
+        assert_eq!(
+            parse_include_port_list(Some("80")).expect("single port"),
+            ParsedIncludePorts::Ports(vec![80])
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_multiple_ports() {
+        assert_eq!(
+            parse_include_port_list(Some("80,443,5432")).expect("comma list"),
+            ParsedIncludePorts::Ports(vec![80, 443, 5432])
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_handles_whitespace_and_dups() {
+        // Sorted + deduped. Whitespace inside the list is tolerated to match
+        // what humans actually type in pod annotations.
+        assert_eq!(
+            parse_include_port_list(Some("80, 443, 80")).expect("padded list"),
+            ParsedIncludePorts::Ports(vec![80, 443])
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_rejects_mixed_wildcard() {
+        let err = parse_include_port_list(Some("*,80")).expect_err("mixed wildcard");
+        assert_eq!(
+            err,
+            "wildcard '*' must be the only includeOutboundPorts token"
+        );
+        let err = parse_include_port_list(Some("80,*")).expect_err("ports-then-wildcard");
+        assert_eq!(
+            err,
+            "wildcard '*' must be the only includeOutboundPorts token"
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_rejects_repeated_wildcard() {
+        let err = parse_include_port_list(Some("*,*")).expect_err("repeated wildcard");
+        assert_eq!(
+            err,
+            "wildcard '*' must be the only includeOutboundPorts token"
+        );
+    }
+
+    #[test]
+    fn parse_include_port_list_rejects_malformed() {
+        assert!(parse_include_port_list(Some("not-a-port")).is_err());
+        // Port `0` is reserved; iptables --dport 0 and BPF gate alike would
+        // be nonsensical.
+        assert!(parse_include_port_list(Some("0")).is_err());
+        // Out of range — `u16::MAX + 1`.
+        assert!(parse_include_port_list(Some("65536")).is_err());
+        assert!(parse_include_port_list(Some("80,bogus")).is_err());
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_absent() {
+        let result = include_outbound_ports_from_annotations([
+            ("traffic.sidecar.istio.io/includeOutboundPorts", None),
+            ("ferrum.io/includeOutboundPorts", None),
+        ])
+        .expect("absent annotations");
+        assert!(result.is_absent());
+        assert_eq!(result, IncludeOutboundPorts::default());
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_merges_two_aliases() {
+        let result = include_outbound_ports_from_annotations([
+            (
+                "traffic.sidecar.istio.io/includeOutboundPorts",
+                Some("80, 443"),
+            ),
+            ("ferrum.io/includeOutboundPorts", Some("5432, 80")),
+        ])
+        .expect("merged");
+        assert!(!result.all_ports);
+        // Sorted + deduped across both annotations.
+        assert_eq!(result.ports, vec![80, 443, 5432]);
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_wildcard_in_either_wins() {
+        let result = include_outbound_ports_from_annotations([
+            ("traffic.sidecar.istio.io/includeOutboundPorts", Some("*")),
+            ("ferrum.io/includeOutboundPorts", None),
+        ])
+        .expect("wildcard");
+        assert!(result.all_ports);
+        assert!(result.ports.is_empty());
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_rejects_mixed_aliases() {
+        let err = include_outbound_ports_from_annotations([
+            ("traffic.sidecar.istio.io/includeOutboundPorts", Some("80")),
+            ("ferrum.io/includeOutboundPorts", Some("*")),
+        ])
+        .expect_err("mixed wildcard across aliases");
+        assert!(err.contains("ferrum.io/includeOutboundPorts"));
+        assert!(err.contains("wildcard '*' cannot be combined"));
+        assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_wildcard_then_explicit_rejected() {
+        let err = include_outbound_ports_from_annotations([
+            ("traffic.sidecar.istio.io/includeOutboundPorts", Some("*")),
+            ("ferrum.io/includeOutboundPorts", Some("80")),
+        ])
+        .expect_err("explicit-after-wildcard");
+        assert!(err.contains("ferrum.io/includeOutboundPorts"));
+        assert!(err.contains("explicit includeOutboundPorts cannot be combined with wildcard"));
+        assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+    }
+
+    #[test]
+    fn include_outbound_ports_from_annotations_surfaces_parse_errors() {
+        let err = include_outbound_ports_from_annotations([(
+            "ferrum.io/includeOutboundPorts",
+            Some("80,bogus"),
+        )])
+        .expect_err("malformed token");
+        assert!(err.contains("invalid ferrum.io/includeOutboundPorts"));
     }
 }

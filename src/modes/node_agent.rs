@@ -21,7 +21,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
-use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan, XTABLES_LOCK_WAIT_SECONDS};
+use crate::capture::{
+    CaptureConfig, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
+    XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
+};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -29,8 +33,8 @@ use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
-    CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, NodeAgentMetrics,
-    PodAttachmentState, PodInfo,
+    CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
+    IncludePortsPolicy, NodeAgentMetrics, PodAttachmentState, PodInfo,
 };
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -449,6 +453,128 @@ fn pod_uid(pod: &Pod) -> Option<String> {
     pod.metadata.uid.clone()
 }
 
+/// Parse the `includeOutboundPorts` annotations from a pod's annotation map.
+/// Returns `None` when the pod has no relevant annotation (the BPF gate
+/// fail-opens on missing entries, so absent annotation => capture
+/// everything). Returns `Err` only when the annotation is structurally
+/// invalid (mixed wildcard / explicit, malformed token, out-of-range port);
+/// callers downgrade this to a `warn!` and leave the pod un-narrowed,
+/// matching the injector's "reject at admission time, then continue" policy
+/// for malformed values.
+fn parse_pod_include_outbound_ports(
+    annotations: &HashMap<String, String>,
+) -> Result<Option<IncludeOutboundPorts>, String> {
+    let lookup = |key: &'static str| -> (&'static str, Option<&str>) {
+        (key, annotations.get(key).map(String::as_str))
+    };
+    let result = include_outbound_ports_from_annotations([
+        lookup(ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION),
+        lookup(FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION),
+    ])?;
+    if result.is_absent() {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+/// Read the cgroup id (kernel inode number, which is what
+/// `bpf_get_current_cgroup_id` returns) for an enrolled pod's cgroup path.
+/// Returns `None` on stat error so the node-agent can warn and continue
+/// without aborting enrollment — losing per-pod narrowing is a graceful
+/// degradation, not a fatal condition.
+#[cfg(unix)]
+fn read_cgroup_id_for_pod(cgroup_path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(cgroup_path) {
+        Ok(meta) => Some(meta.ino()),
+        Err(e) => {
+            debug!(cgroup_path, error = %e, "Failed to stat cgroup for includeOutboundPorts; per-pod narrowing skipped");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_cgroup_id_for_pod(_cgroup_path: &str) -> Option<u64> {
+    // The node-agent only ships on Linux; this stub keeps non-Unix builds
+    // (developer macOS / Windows for tests) compiling without pulling in
+    // platform-specific deps.
+    None
+}
+
+/// Convert a parsed pod-level [`IncludeOutboundPorts`] into the BPF wire
+/// shape. Emits a `warn!` when the explicit-port list overflows the BPF
+/// map's per-entry cap; the resulting policy still narrows traffic but to
+/// the first `INCLUDE_PORTS_MAX` ports only. Operators that hit this cap
+/// in practice should split annotations across multiple pods or revisit
+/// `INCLUDE_PORTS_MAX`.
+fn include_outbound_ports_to_policy(
+    pod_uid: &str,
+    include: &IncludeOutboundPorts,
+) -> IncludePortsPolicy {
+    if include.all_ports {
+        return IncludePortsPolicy::all();
+    }
+    if include.ports.len() > INCLUDE_PORTS_MAX {
+        warn!(
+            pod_uid,
+            requested = include.ports.len(),
+            cap = INCLUDE_PORTS_MAX,
+            "includeOutboundPorts annotation exceeds BPF map capacity; truncating to first {INCLUDE_PORTS_MAX} ports"
+        );
+    }
+    IncludePortsPolicy::explicit(&include.ports)
+}
+
+/// Push the parsed per-pod include-port policy into the BPF map. Returns
+/// the cgroup id we wrote to so callers can stash it on
+/// `PodAttachmentState` for the eventual un-enrollment. Returns `None`
+/// when there's nothing to write (no annotation, malformed annotation, or
+/// cgroup-id stat failed) — none of which should abort enrollment.
+fn apply_include_outbound_ports(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    cgroup_path: &str,
+    annotations: &HashMap<String, String>,
+) -> Option<u64> {
+    let include = match parse_pod_include_outbound_ports(annotations) {
+        Ok(Some(include)) => include,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                pod_uid,
+                error = %e,
+                "Skipping includeOutboundPorts BPF narrowing; pod will capture all outbound ports"
+            );
+            return None;
+        }
+    };
+    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
+    let policy = include_outbound_ports_to_policy(pod_uid, &include);
+    match backend.update_pod_include_ports(cgroup_id, &policy) {
+        Ok(()) => {
+            debug!(
+                pod_uid,
+                cgroup_id,
+                all_ports = policy.is_all_ports(),
+                port_count = policy.port_count,
+                "Wrote per-pod includeOutboundPorts entry to BPF map"
+            );
+            Some(cgroup_id)
+        }
+        Err(e) => {
+            warn!(
+                pod_uid,
+                cgroup_id,
+                error = %e,
+                "Failed to update FERRUM_INCLUDE_PORTS for pod; capture will not narrow"
+            );
+            None
+        }
+    }
+}
+
 fn handle_kube_pod_applied(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -549,6 +675,7 @@ pub fn handle_pod_added(
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         attached: false,
+        include_ports_cgroup_id: None,
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -588,6 +715,13 @@ pub fn handle_pod_added(
                     return;
                 }
             }
+            // Per-pod `includeOutboundPorts` narrowing. Best-effort: any
+            // failure to parse or to write the BPF map leaves the pod
+            // captured at the cgroup level without per-port narrowing
+            // (which is the prior GAP-2K behavior). Enrollment itself
+            // must not abort on this.
+            state.include_ports_cgroup_id =
+                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations);
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -595,6 +729,7 @@ pub fn handle_pod_added(
                 pod_name,
                 namespace,
                 ?pod_ip,
+                include_ports_narrowing = state.include_ports_cgroup_id.is_some(),
                 "Pod enrolled for eBPF capture"
             );
         } else if let Err(e) = backend.detach_pod(pod_uid) {
@@ -667,6 +802,20 @@ pub fn handle_pod_removed(
             && let Err(e) = backend.remove_pod_ip(ip)
         {
             warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
+        }
+        // Pair with `apply_include_outbound_ports` — only annotated pods
+        // ever carried an entry. Use the stashed cgroup id so we don't
+        // re-stat the cgroup path, which may already have been torn down
+        // by kubelet.
+        if let Some(cgroup_id) = state.include_ports_cgroup_id
+            && let Err(e) = backend.remove_pod_include_ports(cgroup_id)
+        {
+            warn!(
+                pod_uid,
+                cgroup_id,
+                error = %e,
+                "Failed to remove pod includeOutboundPorts entry from BPF map"
+            );
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
@@ -900,10 +1049,12 @@ fn initialize_backend(
             .update_port_exclude(*port)
             .map_err(anyhow::Error::msg)?;
     }
-    // TODO(GAP-2K): Propagate `include_outbound_ports` to EbpfBackend when
-    // ambient/eBPF picks up per-pod annotations. Today this is fine because
-    // per-pod annotations are injector-only and CaptureConfig::from_env()
-    // seeds an empty Vec; the iptables init container is the only consumer.
+    // Per-pod `includeOutboundPorts` narrowing is applied later in
+    // `handle_pod_added` via `apply_include_outbound_ports` because the
+    // BPF map is keyed by per-pod cgroup id, not by the global
+    // capture-config slot. `initialize_backend` only seeds the
+    // node-global shape (CIDR includes/excludes, port excludes, proxy
+    // UID bypass).
 
     // Best-effort SOCK_OPS attach at cgroup root for TCP-layer observability.
     // A failure here only loses telemetry; capture (cgroup_sockaddr / tc)
@@ -1085,6 +1236,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
+                include_ports_cgroup_id: None,
             },
         );
         pod_states.insert(
@@ -1097,6 +1249,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: false,
+                include_ports_cgroup_id: None,
             },
         );
 
@@ -1458,6 +1611,7 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid2".to_string()),
                 veth_iface: None,
                 attached: true,
+                include_ports_cgroup_id: None,
             },
         );
         let config = NodeAgentConfig {
@@ -1534,6 +1688,7 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
+                include_ports_cgroup_id: None,
             },
         );
         backend
@@ -1592,6 +1747,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
+                include_ports_cgroup_id: None,
             },
         );
 
@@ -1636,6 +1792,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
+                include_ports_cgroup_id: None,
             },
         );
 
@@ -1843,5 +2000,352 @@ mod tests {
         let err = decide_admin_bind_address("not-an-ip", 9000, &signals(true, false))
             .expect_err("invalid IP should be rejected");
         assert!(err.to_string().contains("FERRUM_ADMIN_BIND_ADDRESS"));
+    }
+
+    // --- GAP-2K: per-pod includeOutboundPorts narrowing on eBPF capture ---
+
+    fn annotations_with(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_pod_include_outbound_ports_absent_returns_none() {
+        let result = parse_pod_include_outbound_ports(&HashMap::new())
+            .expect("absent annotation must not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_pod_include_outbound_ports_wildcard() {
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "*")]);
+        let result = parse_pod_include_outbound_ports(&annotations)
+            .expect("wildcard annotation parses")
+            .expect("wildcard is not absent");
+        assert!(result.all_ports);
+    }
+
+    #[test]
+    fn parse_pod_include_outbound_ports_explicit_ports() {
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let result = parse_pod_include_outbound_ports(&annotations)
+            .expect("explicit ports parse")
+            .expect("explicit ports are not absent");
+        assert!(!result.all_ports);
+        assert_eq!(result.ports, vec![5432, 8080]);
+    }
+
+    #[test]
+    fn parse_pod_include_outbound_ports_merges_alias() {
+        let annotations = annotations_with(&[
+            ("traffic.sidecar.istio.io/includeOutboundPorts", "80"),
+            ("ferrum.io/includeOutboundPorts", "443"),
+        ]);
+        let result = parse_pod_include_outbound_ports(&annotations)
+            .expect("aliases merge")
+            .expect("merged is not absent");
+        assert_eq!(result.ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn parse_pod_include_outbound_ports_surfaces_errors() {
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "0")]);
+        let err =
+            parse_pod_include_outbound_ports(&annotations).expect_err("port 0 must be rejected");
+        assert!(err.contains("includeOutboundPorts"));
+    }
+
+    #[test]
+    fn include_outbound_ports_to_policy_wildcard() {
+        let include = IncludeOutboundPorts {
+            all_ports: true,
+            ports: Vec::new(),
+        };
+        let policy = include_outbound_ports_to_policy("pod-uid", &include);
+        assert!(policy.is_all_ports());
+    }
+
+    #[test]
+    fn include_outbound_ports_to_policy_explicit() {
+        let include = IncludeOutboundPorts {
+            all_ports: false,
+            ports: vec![80, 443, 5432],
+        };
+        let policy = include_outbound_ports_to_policy("pod-uid", &include);
+        assert!(!policy.is_all_ports());
+        assert_eq!(policy.port_count, 3);
+        assert_eq!(&policy.ports[..3], &[80, 443, 5432]);
+    }
+
+    #[test]
+    fn include_outbound_ports_to_policy_truncates_when_over_cap() {
+        // Build a port list one element larger than the cap so the warn-and-truncate
+        // path is exercised. The resulting policy still narrows, just to the first
+        // INCLUDE_PORTS_MAX ports.
+        let mut ports = Vec::with_capacity(INCLUDE_PORTS_MAX + 1);
+        for i in 0..(INCLUDE_PORTS_MAX as u16 + 1) {
+            ports.push(1000 + i);
+        }
+        let include = IncludeOutboundPorts {
+            all_ports: false,
+            ports: ports.clone(),
+        };
+        let policy = include_outbound_ports_to_policy("pod-uid", &include);
+        assert_eq!(policy.port_count as usize, INCLUDE_PORTS_MAX);
+        for (policy_port, requested_port) in policy
+            .ports
+            .iter()
+            .zip(ports.iter())
+            .take(INCLUDE_PORTS_MAX)
+        {
+            assert_eq!(policy_port, requested_port);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_cgroup_id_returns_inode_for_real_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        // Both calls should return the same value because the directory is
+        // the same; we only assert the helper returns *something* truthy and
+        // is stable across reads. Exact inode value depends on filesystem.
+        let id1 = read_cgroup_id_for_pod(&path).expect("real path stats");
+        let id2 = read_cgroup_id_for_pod(&path).expect("repeat stats");
+        assert_eq!(id1, id2);
+        assert!(id1 > 0);
+    }
+
+    #[test]
+    fn read_cgroup_id_returns_none_on_missing_path() {
+        assert!(read_cgroup_id_for_pod("/nonexistent/cgroup/path/here").is_none());
+    }
+
+    #[test]
+    fn handle_pod_added_writes_include_ports_for_annotated_pod() {
+        // End-to-end happy path: an annotated pod gets a per-cgroup
+        // includeOutboundPorts entry in the mock BPF backend keyed by the
+        // resolved cgroup's inode (since this test uses a real tempdir for
+        // the cgroup path, the inode is deterministic per-run via stat()).
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup_path = cgroup_root.path().join("kubepods/podpod-uid-1");
+        std::fs::create_dir_all(&cgroup_path).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state = pod_states.get("pod-uid-1").expect("pod enrolled");
+        let cgroup_id = state
+            .include_ports_cgroup_id
+            .expect("cgroup id stashed for annotated pod");
+        let policy = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("BPF map populated for annotated pod");
+        assert!(!policy.is_all_ports());
+        assert_eq!(policy.port_count, 2);
+        assert_eq!(&policy.ports[..2], &[5432, 8080]);
+    }
+
+    #[test]
+    fn handle_pod_added_wildcard_annotation_writes_all_ports() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "*")]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state = pod_states.get("pod-uid-1").expect("pod enrolled");
+        let cgroup_id = state
+            .include_ports_cgroup_id
+            .expect("cgroup id stashed for wildcard annotation");
+        let policy = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("BPF map populated for wildcard annotation");
+        assert!(policy.is_all_ports());
+    }
+
+    #[test]
+    fn handle_pod_added_unannotated_skips_include_ports_map() {
+        // No annotation → no BPF map entry → no cgroup_id stashed. This is
+        // the regression guard for the BPF fail-open path: pods without
+        // includeOutboundPorts must remain captured exactly as they were
+        // before GAP-2K.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state = pod_states.get("pod-uid-1").expect("pod enrolled");
+        assert!(
+            state.include_ports_cgroup_id.is_none(),
+            "unannotated pod must not stash a cgroup id"
+        );
+        assert!(
+            backend.include_ports.is_empty(),
+            "unannotated pod must not write to FERRUM_INCLUDE_PORTS"
+        );
+    }
+
+    #[test]
+    fn handle_pod_added_malformed_annotation_does_not_block_enrollment() {
+        // Malformed annotation → log a warning, leave the pod un-narrowed,
+        // continue enrolling it. This matches the rest of the
+        // node-agent's "degrade gracefully" policy.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "bogus")]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state = pod_states.get("pod-uid-1").expect("pod still enrolls");
+        assert!(state.attached);
+        assert!(
+            state.include_ports_cgroup_id.is_none(),
+            "malformed annotation must not write a BPF entry"
+        );
+        assert!(backend.include_ports.is_empty());
+    }
+
+    #[test]
+    fn handle_pod_removed_removes_include_ports_entry() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432")]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert_eq!(backend.include_ports.len(), 1, "entry must be written");
+
+        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+        assert!(
+            backend.include_ports.is_empty(),
+            "removal must drop the include-ports entry"
+        );
+        assert!(!pod_states.contains_key("pod-uid-1"));
     }
 }
