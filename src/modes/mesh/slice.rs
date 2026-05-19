@@ -798,7 +798,13 @@ fn narrow_for_service_waypoint(
             // DR is admitted only when its host is one of the admitted
             // Service's canonical Kubernetes DNS aliases. Broad prefix
             // matches can accidentally admit unrelated external hosts.
-            destination_rule_matches_admitted_service(dr, &admitted_services, &admitted_hosts)
+            destination_rule_matches_admitted_service(
+                dr,
+                waypoint_namespace,
+                cluster_domain,
+                &admitted_services,
+                &admitted_hosts,
+            )
         })
         .collect();
     let admitted_service_entries: Vec<ServiceEntry> = resources
@@ -855,14 +861,45 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
 
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
+    waypoint_namespace: &str,
+    cluster_domain: &str,
     admitted_services: &[MeshService],
     admitted_hosts: &BTreeSet<String>,
 ) -> bool {
     let host = dr.host.trim_end_matches('.');
     host_matches_admitted_service(host, admitted_hosts)
+        && destination_rule_namespace_allowed_for_admitted_service(
+            dr,
+            waypoint_namespace,
+            cluster_domain,
+            admitted_services,
+            host,
+        )
         || admitted_services
             .iter()
             .any(|service| host == service.name && dr.namespace == service.namespace)
+}
+
+fn destination_rule_namespace_allowed_for_admitted_service(
+    dr: &MeshDestinationRule,
+    waypoint_namespace: &str,
+    cluster_domain: &str,
+    admitted_services: &[MeshService],
+    host: &str,
+) -> bool {
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    admitted_services.iter().any(|service| {
+        let host_matches = host == format!("{}.{}", service.name, service.namespace)
+            || host == format!("{}.{}.svc", service.name, service.namespace)
+            || (!cluster_domain.is_empty()
+                && host
+                    == format!(
+                        "{}.{}.svc.{}",
+                        service.name, service.namespace, cluster_domain
+                    ));
+        host_matches
+            && (dr.namespace == service.namespace || dr.namespace == waypoint_namespace)
+    })
 }
 
 fn host_matches_admitted_service(host: &str, admitted_hosts: &BTreeSet<String>) -> bool {
