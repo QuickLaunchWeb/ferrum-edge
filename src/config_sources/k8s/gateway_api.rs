@@ -879,12 +879,65 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
     Ok(services)
 }
 
+fn ensure_route_parent_refs_allowed(
+    object: &K8sObject,
+    acc: &mut K8sAccumulator,
+) -> Result<(), K8sTranslateError> {
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if parent_refs.is_empty() {
+        return Ok(());
+    }
+
+    for parent_ref in parent_refs {
+        let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        let parent_group =
+            string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if parent_namespace != object.metadata.namespace {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{} parentRef.namespace '{}' is not permitted; only same-namespace Gateway attachments are accepted",
+                    object.kind, parent_namespace
+                ),
+            ));
+        }
+
+        if let Some(section_name) = string_field(parent_ref, "sectionName") {
+            if !gateway_has_listener(acc, parent_namespace, section_name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{} parentRef.sectionName '{}' does not match any known Gateway listener in namespace '{}'",
+                        object.kind, section_name, parent_namespace
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn gateway_has_listener(acc: &K8sAccumulator, namespace: &str, listener_name: &str) -> bool {
+    acc.mesh.services.iter().any(|service| {
+        service.namespace == namespace && service.name.ends_with(&format!("-{listener_name}"))
+    })
+}
+
 type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
 
 fn http_route_resources(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<HttpRouteResources, K8sTranslateError> {
+    ensure_route_parent_refs_allowed(object, acc)?;
     let hostnames: Vec<String> = string_array(&object.spec, "hostnames")
         .into_iter()
         .map(|hostname| hostname.to_ascii_lowercase())
@@ -1492,6 +1545,7 @@ fn l4_route_proxies(
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+    ensure_route_parent_refs_allowed(object, acc)?;
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -2468,6 +2522,32 @@ mod tests {
         let rule_match = &rules[0]["match"];
         assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("c"));
         assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v3"));
+    }
+
+    #[test]
+    fn http_route_rejects_cross_namespace_gateway_parent_ref() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{
+                        "name": "shared-gw",
+                        "namespace": "platform"
+                    }],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                        "backendRefs": [{"name": "admin", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("cross-namespace parentRef should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("only same-namespace Gateway attachments are accepted")
+        );
     }
 
     #[test]
