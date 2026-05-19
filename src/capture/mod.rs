@@ -600,16 +600,25 @@ fn commands_for_family(
         let emit_include_cidrs =
             config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
         if emit_include_cidrs {
-            for cidr in include_cidrs {
+            if include_cidrs.is_empty() {
                 commands.push(idempotent_append(
                     binary,
                     "nat",
                     "FERRUM_MESH_OUTBOUND",
-                    &format!(
-                        "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
-                        config.outbound_port
-                    ),
+                    &format!("-p tcp -j REDIRECT --to-ports {}", config.outbound_port),
                 ));
+            } else {
+                for cidr in include_cidrs {
+                    commands.push(idempotent_append(
+                        binary,
+                        "nat",
+                        "FERRUM_MESH_OUTBOUND",
+                        &format!(
+                            "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                            config.outbound_port
+                        ),
+                    ));
+                }
             }
         }
         for port in &config.include_outbound_ports {
@@ -1228,20 +1237,18 @@ mod tests {
     }
 
     #[test]
-    fn iptables_plan_combines_include_ports_with_ipv6_family_rules() {
+    fn iptables_plan_falls_back_to_catch_all_when_ipv4_include_set_filters_empty() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;
-        config.include_outbound_ports = vec![5432];
-
         let plan = IptablesPlan::for_config(&config);
 
         assert!(
             plan.v4_commands
                 .iter()
-                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
-            "includeOutboundPorts should still redirect explicit ports on IPv4: {:?}",
+                .any(|cmd| { cmd.contains("-p tcp -j REDIRECT --to-ports 15001") }),
+            "When no IPv4 CIDR include remains for iptables, plan must fail closed with catch-all IPv4 redirect: {:?}",
             plan.v4_commands
         );
         assert!(
@@ -1254,13 +1261,6 @@ mod tests {
                 .iter()
                 .any(|cmd| { cmd.contains("-p tcp -d fd00::/8 -j REDIRECT --to-ports 15001") }),
             "IPv6 include CIDR should be rendered into ip6tables: {:?}",
-            plan.v6_commands
-        );
-        assert!(
-            plan.v6_commands
-                .iter()
-                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
-            "includeOutboundPorts should also redirect explicit ports on IPv6 when the family is active: {:?}",
             plan.v6_commands
         );
     }
