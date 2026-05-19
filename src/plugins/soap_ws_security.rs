@@ -971,9 +971,10 @@ impl SoapWsSecurity {
         // Must run before any other check — every other field is
         // attacker-controlled until we know the IdP signed this assertion.
         self.validate_saml_signature(&assertion)?;
+        let assertion_without_signature = remove_envelope_signature(&assertion);
 
         // ── 2. Issuer trust ───────────────────────────────────────────
-        let issuer = find_element_text(&assertion, "Issuer")
+        let issuer = find_element_text(&assertion_without_signature, "Issuer")
             .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
 
         if !self.saml_trusted_issuers.iter().any(|ti| ti == &issuer) {
@@ -984,7 +985,7 @@ impl SoapWsSecurity {
         }
 
         // ── 3. Conditions: NotBefore / NotOnOrAfter / Audience ────────
-        if let Some(conditions) = find_element_block(&assertion, "Conditions") {
+        if let Some(conditions) = find_element_block(&assertion_without_signature, "Conditions") {
             let skew = chrono::Duration::seconds(self.saml_clock_skew_seconds as i64);
 
             if let Some(not_before_str) = find_attribute(&conditions, "NotBefore") {
@@ -1038,7 +1039,7 @@ impl SoapWsSecurity {
         }
 
         // ── 4. Extract Subject NameID for downstream identity use ─────
-        let name_id = find_element_block(&assertion, "Subject")
+        let name_id = find_element_block(&assertion_without_signature, "Subject")
             .and_then(|subject| find_element_text(&subject, "NameID"));
 
         debug!("soap_ws_security: SAML assertion validated successfully");
