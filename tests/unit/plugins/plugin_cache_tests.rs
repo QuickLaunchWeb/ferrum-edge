@@ -244,6 +244,23 @@ fn test_disabled_plugins_excluded() {
 }
 
 #[test]
+fn test_removed_security_plugin_fails_closed() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "legacy-auth",
+            "oauth2_auth",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+
+    let err = PluginCache::new(&config).expect_err("expected fail-closed error");
+    assert!(err.contains("Removed security plugin 'oauth2_auth'"));
+}
+
+#[test]
 fn test_rebuild_produces_updated_plugin_set() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec![])],

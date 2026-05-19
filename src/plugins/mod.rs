@@ -2041,6 +2041,14 @@ pub fn is_security_plugin(name: &str) -> bool {
     )
 }
 
+/// Removed built-in plugins that were historically security-sensitive.
+///
+/// These names are intentionally fail-closed during config load so upgrades
+/// cannot silently drop authentication/authorization protections.
+pub fn is_removed_security_plugin(name: &str) -> bool {
+    matches!(name, "oauth2_auth")
+}
+
 pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
         "transaction_log_schema",
