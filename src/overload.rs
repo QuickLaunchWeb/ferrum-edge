@@ -502,11 +502,18 @@ impl Default for OverloadConfig {
 
 /// Count open file descriptors for the current process.
 #[cfg(target_os = "linux")]
+fn count_open_fds_linux(path: &str) -> u64 {
+    std::fs::read_dir(path)
+        .map(|d| d.count() as u64)
+        // Fail closed: if we cannot inspect /proc/self/fd (for example,
+        // EMFILE under descriptor exhaustion), force critical FD pressure.
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn count_open_fds() -> u64 {
     // On Linux, /proc/self/fd is the canonical way to count open FDs.
-    std::fs::read_dir("/proc/self/fd")
-        .map(|d| d.count() as u64)
-        .unwrap_or(0)
+    count_open_fds_linux("/proc/self/fd")
 }
 
 #[cfg(target_os = "macos")]
@@ -1128,6 +1135,13 @@ mod tests {
     fn fd_count_is_nonzero() {
         let count = count_open_fds();
         assert!(count > 0, "Process should have at least some open FDs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_count_failures_are_fail_closed() {
+        let count = count_open_fds_linux("/proc/self/fd/definitely-missing");
+        assert_eq!(count, u64::MAX);
     }
 
     /// `raise_fd_limit` must never return a soft cap above the hard cap, must
