@@ -6969,8 +6969,8 @@ components:
                 description: |
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
-                  `query_params` must be configured (an empty match is
-                  rejected at load time).
+                  `query_params`/`source_namespace` must be configured (an
+                  empty match is rejected at load time).
                 properties:
                   methods:
                     type: array
@@ -6987,6 +6987,21 @@ components:
                     additionalProperties:
                       type: string
                     description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+                  source_namespace:
+                    type: [string, "null"]
+                    description: |
+                      Source workload Kubernetes namespace (exact match).
+                      Mirrors Istio `VirtualService.http[].match.sourceNamespace`:
+                      the CRD models this as an exact-only string (no
+                      `prefix`/`regex` arms). Resolved from the peer's SPIFFE
+                      ID via the Istio convention
+                      `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>`.
+                      Matches are case-sensitive (Kubernetes namespace names
+                      are RFC 1123 lowercase). The predicate fails closed
+                      (returns no-match) when the request carries no resolved
+                      peer SPIFFE identity, so non-mesh requests and clients
+                      that present non-SPIFFE certificates do not match.
+                      Empty / whitespace-only values are rejected at load time.
               destination:
                 type: object
                 description: |

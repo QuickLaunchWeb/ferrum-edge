@@ -1254,13 +1254,15 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         // Istio `HTTPMatchRequest.sourceNamespace` is an exact-only string
         // predicate (no `prefix`/`regex` arms in the spec) that matches the
         // source workload's Kubernetes namespace. The hot path resolves the
-        // namespace from `ctx.peer_spiffe_id` via `SpiffeId::namespace`, so
-        // empty / whitespace values are caught by the plugin's
-        // `normalize_source_namespace` at config-load time — we emit the
-        // value verbatim here. A non-string `sourceNamespace` (object, array,
-        // bool, etc.) does not match the Istio CRD shape; the entry-level
-        // `had_unsupported_predicate` flag catches it below so the entry is
-        // dropped wholesale rather than partially extracted.
+        // namespace from `ctx.peer_spiffe_id` via `SpiffeId::namespace`. A
+        // non-string `sourceNamespace` (object, array, bool, etc.) does not
+        // match the Istio CRD shape, and empty / whitespace-only strings
+        // would be rejected by the plugin's `normalize_source_namespace` at
+        // config-load time; both shapes are surfaced by
+        // `mesh_route_dispatch_has_unsupported_predicate`, so the entry-level
+        // `had_unsupported_predicate` flag catches them below and the entry
+        // is dropped wholesale via `request_termination` rather than
+        // partially extracted or silently dropped at plugin-cache rebuild.
         if let Some(source_namespace) = entry.get("sourceNamespace").and_then(Value::as_str) {
             match_criteria.insert(
                 "source_namespace".to_string(),
@@ -1545,13 +1547,18 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
         return true;
     }
     // `sourceNamespace` is a string-typed exact predicate in the Istio CRD;
-    // when it's a string we can carry it through to the plugin. Non-string
-    // shapes fall through to `mesh_route_dispatch_has_unsupported_predicate`
-    // and fail closed via `request_termination`.
+    // when it's a non-empty, non-whitespace string we can carry it through to
+    // the plugin. Empty / whitespace-only strings and non-string shapes fall
+    // through to `mesh_route_dispatch_has_unsupported_predicate` and fail
+    // closed via `request_termination`. Without that guard, the plugin's
+    // construction-time validation in `normalize_source_namespace` would
+    // reject the whole rule and the plugin would be silently dropped at
+    // cache rebuild, defeating `reject_unmatched: true` and letting traffic
+    // the operator intended to gate flow to the default backend.
     if entry
         .get("sourceNamespace")
         .and_then(Value::as_str)
-        .is_some()
+        .is_some_and(|ns| !ns.is_empty() && !ns.chars().all(char::is_whitespace))
     {
         return true;
     }
@@ -1609,11 +1616,17 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
     // `sourceNamespace` is exact-only per the Istio CRD (a bare string). Any
     // other JSON shape (object with operator keys, array, bool, number) is
     // outside the CRD contract and treated as unsupported so the route falls
-    // closed via `request_termination` rather than silently widening.
-    if let Some(source_ns) = entry.get("sourceNamespace")
-        && source_ns.as_str().is_none()
-    {
-        return true;
+    // closed via `request_termination` rather than silently widening. The
+    // same fail-closed treatment applies to empty / whitespace-only strings:
+    // the plugin's construction-time validation in `normalize_source_namespace`
+    // rejects those, and without classifying them as unsupported here the
+    // plugin would be silently dropped at cache rebuild and `reject_unmatched`
+    // would no longer fire.
+    if let Some(source_ns) = entry.get("sourceNamespace") {
+        match source_ns.as_str() {
+            Some(ns) if !ns.is_empty() && !ns.chars().all(char::is_whitespace) => {}
+            _ => return true,
+        }
     }
 
     entry.as_object().is_some_and(|obj| {
