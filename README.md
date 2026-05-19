@@ -449,6 +449,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | Load balancing | [docs/load_balancing.md](docs/load_balancing.md) |
 | CP/DP distributed mode | [docs/cp_dp_mode.md](docs/cp_dp_mode.md) |
 | Kubernetes deployment | [docs/kubernetes_deployment.md](docs/kubernetes_deployment.md) |
+| SPIRE deployment for mesh identity | [docs/spire_deployment.md](docs/spire_deployment.md) |
 | TCP/UDP/DTLS proxy | [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) |
 | Frontend TLS/mTLS | [docs/frontend_tls.md](docs/frontend_tls.md) |
 | Backend mTLS | [docs/backend_mtls.md](docs/backend_mtls.md) |

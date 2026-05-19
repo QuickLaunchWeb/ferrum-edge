@@ -182,8 +182,8 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_EGRESS_LISTEN_ADDR` | No | `0.0.0.0:15090` | Egress gateway mTLS listener address for `egress_gateway` topology. Requires `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, and `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | No | — | Optional workload SPIFFE ID hint sent to native MeshSubscribe |
 | `FERRUM_MESH_WORKLOAD_LABELS` | No | — | Workload labels for this mesh data plane (`k1=v1,k2=v2`). Drives `mesh_authz` `PolicyScope` filtering and `PeerAuthentication` selector filtering. For authorization, only policies whose scope (`MeshWide`, `Namespace`, or `WorkloadSelector`) matches these labels apply to this proxy. Set explicitly for current Kubernetes and non-K8s deployments; the injector can later populate this from pod labels via the downward API |
-| `FERRUM_MESH_CA_BACKEND` | No | `none` | Mesh certificate authority backend: `internal` (Ferrum's own CA, requires `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH`), `spire` (delegate to a SPIRE Agent over UDS), `none` (mesh identity disabled) |
-| `FERRUM_MESH_SPIRE_AGENT_SOCKET` | No | `/run/spire/sockets/agent.sock` | Path to the SPIRE Agent's Workload API Unix domain socket. Only used when `FERRUM_MESH_CA_BACKEND=spire` |
+| `FERRUM_MESH_CA_BACKEND` | No | `none` | Mesh certificate authority backend: `internal` (Ferrum's own CA, requires `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH`), `spire` (delegate to a SPIRE Agent over UDS), `none` (mesh identity disabled). For production, use `spire` and see [docs/spire_deployment.md](spire_deployment.md) for the SPIRE installation and registration runbook |
+| `FERRUM_MESH_SPIRE_AGENT_SOCKET` | No | `/run/spire/sockets/agent.sock` | Path to the SPIRE Agent's Workload API Unix domain socket. Only used when `FERRUM_MESH_CA_BACKEND=spire`. See [docs/spire_deployment.md](spire_deployment.md) for socket mount options (hostPath vs SPIFFE CSI driver) |
 | `FERRUM_MESH_CERT_TTL_SECONDS` | No | `3600` | SVID lifetime hint (seconds) passed to the CA backend. The CA may clamp or ignore this value |
 | `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
@@ -381,7 +381,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
-| `FERRUM_GATEWAY_SVID_CERT_PATH` | No | — | Leaf-first PEM X.509-SVID certificate chain used as the gateway's SPIFFE identity for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SVID_CERT_PATH` | No | — | Leaf-first PEM X.509-SVID certificate chain used as the gateway's SPIFFE identity for gateway-to-mesh TLS. Watched for content changes; rotation drains old backend pool entries. See [docs/spire_deployment.md](spire_deployment.md) for how to wire SPIRE-issued SVIDs into these files via [SPIFFE Helper](https://github.com/spiffe/spiffe-helper) |
 | `FERRUM_GATEWAY_SVID_KEY_PATH` | No | — | Unencrypted PKCS#8 private key for `FERRUM_GATEWAY_SVID_CERT_PATH`; legacy `BEGIN RSA PRIVATE KEY` / `BEGIN EC PRIVATE KEY` files are rejected |
 | `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` | No | — | PEM trust bundle used to verify mesh SPIFFE peers for gateway-to-mesh TLS |
 | `FERRUM_GATEWAY_SPIFFE_ID` | No | — | Explicit SPIFFE URI fallback when the gateway SVID certificate has no SPIFFE URI SAN |

@@ -119,10 +119,18 @@ observability:
   alerts:
     enabled: true
     certExpiringSeconds: 604800
+    # Critical alert when an SVID has less than this long until expiry.
+    # Default 3600s (1h) matches the SPIRE default workload SVID TTL — at this
+    # point rotation has almost certainly stalled.
+    svidExpiringCriticalSeconds: 3600
     cpStaleConfigSeconds: 300
     policyDenyRatePerSecond: 1
     mtlsHandshakeFailureRatePerSecond: 0
     injectorFailureRatePerSecond: 0
+    # Warn when a federated trust bundle has not been refreshed in this many
+    # seconds. Default 600s = 2 * FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS
+    # (which defaults to 300s).
+    federationBundleStaleSeconds: 600
 
 nodeAgent:
   enabled: false

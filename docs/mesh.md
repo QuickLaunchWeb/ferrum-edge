@@ -488,6 +488,13 @@ The `spiffe_identity` plugin (priority 940) extracts the peer SPIFFE ID from TLS
 - Workload metrics labels (`source.principal`, `destination.principal`)
 - Transaction summary `auth_method` tracking
 
+For production deployments, Ferrum delegates SVID issuance and trust-bundle
+distribution to a separately operated [SPIRE](https://spiffe.io/docs/latest/spire-about/)
+installation. See [docs/spire_deployment.md](spire_deployment.md) for the
+operator runbook covering trust-domain choice, registration entries, single-
+and multi-cluster topologies, SVID rotation cadence, alert wiring, and failure
+recovery.
+
 ### HBONE Protocol
 
 HBONE (HTTP-Based Overlay Network Environment) is HTTP/2 CONNECT over mTLS, used by the ambient topology on port 15008.
