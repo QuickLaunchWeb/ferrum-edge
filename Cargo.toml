@@ -248,7 +248,9 @@ panic = "abort"         # skip unwind tables — smaller binary, faster panics
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
-tempfile = "3"
+# `tempfile` is intentionally also declared in `[dependencies]` for
+# `src/config/mongo_store.rs`. Keeping it dev-only would re-introduce the
+# `cargo check --lib` break (see the dependency-section comment).
 wiremock = "0.6"
 # Functional testing dependencies
 rand = "0.10"

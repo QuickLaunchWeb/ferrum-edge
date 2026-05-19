@@ -233,14 +233,42 @@ pub fn generate_dp_jwt_with_issuer(
     node_id: &str,
     issuer: &str,
 ) -> Result<String, anyhow::Error> {
+    generate_dp_jwt_with_issuer_and_namespace(secret, node_id, issuer, None)
+}
+
+/// Generate a short-lived HS256 JWT with an optional `ns` claim pinning the
+/// authorised namespace(s).
+///
+/// Self-minted DP tokens carry a single-namespace `ns` claim derived from
+/// `FERRUM_NAMESPACE` so that CPs running with
+/// `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` still accept DP self-mint flows
+/// out of the box. Operator-minted tokens that should grant access to
+/// multiple namespaces should bypass this helper and embed the claim as an
+/// array — the CP accepts both shapes.
+pub fn generate_dp_jwt_with_issuer_and_namespace(
+    secret: &str,
+    node_id: &str,
+    issuer: &str,
+    namespace: Option<&str>,
+) -> Result<String, anyhow::Error> {
     let now = chrono::Utc::now().timestamp();
-    let claims = json!({
-        "sub": node_id,
-        "iat": now,
-        "exp": now + DP_JWT_TTL_SECONDS,
-        "iss": issuer,
-        "role": "data_plane",
-    });
+    let claims = match namespace {
+        Some(ns) if !ns.is_empty() => json!({
+            "sub": node_id,
+            "iat": now,
+            "exp": now + DP_JWT_TTL_SECONDS,
+            "iss": issuer,
+            "role": "data_plane",
+            "ns": ns,
+        }),
+        _ => json!({
+            "sub": node_id,
+            "iat": now,
+            "exp": now + DP_JWT_TTL_SECONDS,
+            "iss": issuer,
+            "role": "data_plane",
+        }),
+    };
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
@@ -676,12 +704,21 @@ pub async fn connect_and_subscribe_with_startup_ready(
     // Mint a fresh short-lived JWT for this connection attempt. The `iss`
     // claim is set from the operator-configured issuer carried alongside
     // the shared secret; the CP rejects any token with a mismatched `iss`.
-    let auth_token =
-        generate_dp_jwt_with_issuer(jwt_secret.as_str(), node_id, jwt_secret.issuer())?;
+    // The `ns` claim is set from the DP's own FERRUM_NAMESPACE so
+    // multi-namespace CPs configured with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`
+    // accept self-minted DP tokens. Single-namespace CPs ignore the extra
+    // claim — it never restricts the back-compat path.
+    let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+        jwt_secret.as_str(),
+        node_id,
+        jwt_secret.issuer(),
+        Some(namespace),
+    )?;
     info!(
-        "Generated fresh DP JWT (TTL={}s, iss='{}') for CP authentication",
+        "Generated fresh DP JWT (TTL={}s, iss='{}', ns='{}') for CP authentication",
         DP_JWT_TTL_SECONDS,
-        jwt_secret.issuer()
+        jwt_secret.issuer(),
+        namespace,
     );
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 

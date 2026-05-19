@@ -17,6 +17,7 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
+use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
@@ -41,12 +42,14 @@ pub struct ReconcileBroadcasters {
     pub mesh_registry: Arc<MeshNodeRegistry>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
     broadcasters: ReconcileBroadcasters,
     reconciler_config: ReconcilerConfig,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
+    istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -99,6 +102,7 @@ pub fn spawn_reconcile_loop(
                 trust_domain: &trust_domain,
                 pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                 gateway_status_writer: gateway_status_writer.as_ref(),
+                istio_status_writer: istio_status_writer.as_ref(),
                 metrics: &metrics,
             },
         )
@@ -131,6 +135,7 @@ pub fn spawn_reconcile_loop(
                             trust_domain: &trust_domain,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             gateway_status_writer: gateway_status_writer.as_ref(),
+                            istio_status_writer: istio_status_writer.as_ref(),
                             metrics: &metrics,
                         },
                     ).await;
@@ -157,6 +162,7 @@ pub fn spawn_reconcile_loop(
                             trust_domain: &trust_domain,
                             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             gateway_status_writer: gateway_status_writer.as_ref(),
+                            istio_status_writer: istio_status_writer.as_ref(),
                             metrics: &metrics,
                         },
                     ).await;
@@ -320,6 +326,11 @@ struct ReconcileContext<'a> {
     trust_domain: &'a TrustDomain,
     pod_discovery_enabled: bool,
     gateway_status_writer: Option<&'a GatewayApiStatusWriter>,
+    /// T2-B: Istio CRD status sub-resource patcher. `None` when the
+    /// controller couldn't be built (no Istio CRD watching, or the
+    /// kube client isn't available). The reconciler short-circuits to
+    /// a no-op when None — every other code path stays unchanged.
+    istio_status_writer: Option<&'a IstioStatusWriter>,
     metrics: &'a ControllerMetrics,
 }
 
@@ -366,10 +377,11 @@ async fn do_reconcile(
         patch_gateway_api_statuses(
             ctx.gateway_status_writer,
             &objects,
-            options,
+            options.clone(),
             &translation.route_conflicts,
         )
         .await;
+        patch_istio_statuses(ctx.istio_status_writer, &objects, options).await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
@@ -388,10 +400,11 @@ async fn do_reconcile(
     patch_gateway_api_statuses(
         ctx.gateway_status_writer,
         &objects,
-        options,
+        options.clone(),
         &translation.route_conflicts,
     )
     .await;
+    patch_istio_statuses(ctx.istio_status_writer, &objects, options).await;
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
@@ -426,6 +439,32 @@ async fn patch_gateway_api_statuses(
             error = %error,
             updates = updates.len(),
             "Failed to patch Gateway API status"
+        );
+    }
+}
+
+/// T2-B: emit `status.conditions[]` patches for the Istio CRDs supported
+/// by [`plan_istio_status_updates`]. No-op when the writer wasn't built
+/// (Istio CRD watching is off, or kube client unavailable) or when the
+/// plan is empty (no supported Istio CRDs in the snapshot). Failures
+/// are logged and never abort reconcile.
+async fn patch_istio_statuses(
+    writer: Option<&IstioStatusWriter>,
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let updates = plan_istio_status_updates(objects, options);
+    if updates.is_empty() {
+        return;
+    }
+    if let Err(error) = writer.patch_updates(&updates).await {
+        warn!(
+            error = %error,
+            updates = updates.len(),
+            "Failed to patch Istio status (CRD may not have a status subresource)"
         );
     }
 }

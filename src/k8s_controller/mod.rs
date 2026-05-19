@@ -5,6 +5,7 @@
 //! Layer 2 mesh model. Enabled in CP mode with `FERRUM_K8S_CONTROLLER_ENABLED=true`.
 
 pub mod convert;
+pub mod istio_status;
 pub mod metrics;
 pub mod reconciler;
 pub mod resource_store;
@@ -23,6 +24,7 @@ use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::MeshConfigBroadcast;
 use crate::grpc::proto::ConfigUpdate;
+use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
 use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
@@ -128,6 +130,13 @@ pub async fn start_k8s_controller(
     let gateway_status_writer = controller_config
         .watch_gateway_api
         .then(|| GatewayApiStatusWriter::new(client.clone()));
+    // T2-B: the Istio status writer mirrors the Gateway API writer's
+    // construction — only build it when the controller is actually
+    // watching Istio CRDs, so non-Istio installs don't pay the (tiny)
+    // overhead of an unused writer carrying a kube client clone.
+    let istio_status_writer = controller_config
+        .watch_istio
+        .then(|| IstioStatusWriter::new(client.clone()));
 
     let reconciler_handle = spawn_reconcile_loop(
         store_set.clone(),
@@ -140,6 +149,7 @@ pub async fn start_k8s_controller(
         },
         reconciler_config,
         gateway_status_writer,
+        istio_status_writer,
         metrics.clone(),
         shutdown.clone(),
     );

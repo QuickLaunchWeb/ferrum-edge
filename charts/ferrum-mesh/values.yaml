@@ -14,11 +14,25 @@ controlPlane:
     gatewayApi: true
     istio: true
     meshConfig: true
-    podDiscovery: false
+    # T2-B: flipped to true by default so the chart matches the binary's
+    # in-cluster default-on behavior. The K8s controller defaults to ON
+    # inside a pod (detected via KUBERNETES_SERVICE_HOST), so pod
+    # discovery RBAC must be present for the controller to actually run
+    # its native Pod/Service/EndpointSlice watches without falling back
+    # to a no-op startup warn. Override to `false` only when explicitly
+    # disabling the controller via `FERRUM_K8S_CONTROLLER_ENABLED=false`.
+    podDiscovery: true
     nodeLocality: false
   env:
     FERRUM_MODE: cp
     FERRUM_XDS_ENABLED: "true"
+    # T2-B: FERRUM_K8S_CONTROLLER_ENABLED and
+    # FERRUM_K8S_POD_DISCOVERY_ENABLED auto-default to true in pods.
+    # The chart deliberately does NOT set them here so operators can
+    # turn them off with a one-line env override without editing the
+    # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
+    # unset, the controller follows the T2-A CP namespace scope
+    # (FERRUM_CP_NAMESPACES).
 
 injector:
   enabled: true

@@ -4341,3 +4341,188 @@ fn test_k8s_istio_root_namespace_rejects_invalid_k8s_namespace() {
         },
     );
 }
+
+// ── FERRUM_CP_NAMESPACES / FERRUM_CP_REQUIRE_NAMESPACE_CLAIM (MESH-T2-A) ─
+
+#[test]
+fn test_cp_namespaces_defaults_to_empty_for_back_compat() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_CP_NAMESPACES");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.cp_namespaces.is_empty(),
+                "default cp_namespaces must be empty (back-compat single-namespace CP)"
+            );
+            assert!(
+                !config.cp_require_namespace_claim,
+                "default cp_require_namespace_claim must be false (back-compat)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_star_for_cluster_wide() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.cp_namespaces, vec!["*".to_string()]);
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_csv() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,staging,dev"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.cp_namespaces,
+                vec!["prod".to_string(), "staging".to_string(), "dev".to_string()]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_star_combined_with_explicit() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*,prod"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES") && err.contains("`*`"),
+                "error should mention FERRUM_CP_NAMESPACES + `*` constraint, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_invalid_namespace_entry() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,Bad Namespace!"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES"),
+                "error should mention FERRUM_CP_NAMESPACES, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_require_namespace_claim_parses_true() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.cp_require_namespace_claim);
+        },
+    );
+}
+
+// ── T2-B: K8s controller / pod discovery default-on inside a pod ──────────
+//
+// `EnvConfig::from_env()` invokes the helper that's unit-tested in
+// `src/config/env_config.rs::tests`; this layer exercises the
+// end-to-end full-config path so a future refactor of the helper can't
+// silently drop the integration with the K8s switches.
+
+#[test]
+fn test_k8s_controller_default_on_inside_kubernetes_pod() {
+    // Pod-like environment: KUBERNETES_SERVICE_HOST set, FERRUM_K8S_* unset.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+        ],
+        || {
+            // Make sure neither switch is set, then load.
+            remove_var("FERRUM_K8S_CONTROLLER_ENABLED");
+            remove_var("FERRUM_K8S_POD_DISCOVERY_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.k8s_controller_enabled,
+                "in-cluster default should flip k8s_controller_enabled to true"
+            );
+            assert!(
+                config.k8s_pod_discovery_enabled,
+                "in-cluster default should flip k8s_pod_discovery_enabled to true"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_k8s_controller_default_off_outside_pod() {
+    // CLI / docker-style environment: KUBERNETES_SERVICE_HOST absent.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("KUBERNETES_SERVICE_HOST");
+            remove_var("FERRUM_K8S_CONTROLLER_ENABLED");
+            remove_var("FERRUM_K8S_POD_DISCOVERY_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.k8s_controller_enabled,
+                "outside-cluster default must remain false (back-compat)"
+            );
+            assert!(!config.k8s_pod_discovery_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_k8s_controller_explicit_false_overrides_in_cluster_default() {
+    // Pod-like environment + operator explicitly opting OUT.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_K8S_POD_DISCOVERY_ENABLED", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.k8s_controller_enabled,
+                "explicit =false must win over the in-cluster default"
+            );
+            assert!(!config.k8s_pod_discovery_enabled);
+        },
+    );
+}
