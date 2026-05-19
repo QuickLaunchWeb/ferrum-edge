@@ -455,7 +455,7 @@ async fn array_claim_authorises_multiple_namespaces() {
     let token = mint_token_with_ns("dp-multi", Some(json!(["prod", "staging"])));
 
     // Connect for `prod` — must succeed.
-    let mut client_prod = connect_with_token(addr, token.clone()).await;
+    let mut client_prod = connect_with_token!(addr, token.clone());
     let req_prod = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-multi".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),

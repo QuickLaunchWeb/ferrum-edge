@@ -199,11 +199,13 @@ impl NamespaceBroadcasts {
 
     /// Total namespaces with active or previously-active broadcast channels.
     /// Exposed for observability and tests.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.channels.len()
     }
 
     /// Whether any broadcast channels exist.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
@@ -377,6 +379,7 @@ impl CpGrpcServer {
             .build()
     }
 
+    #[allow(dead_code)]
     pub fn with_channel_capacity_and_registry(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
@@ -427,6 +430,7 @@ impl CpGrpcServer {
     /// configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) and the
     /// CP namespace (`FERRUM_NAMESPACE`). Kept for back-compat call sites;
     /// new call sites should use [`Self::builder`] directly.
+    #[allow(dead_code)]
     pub fn with_channel_capacity_registry_issuer_and_namespace(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
@@ -523,6 +527,7 @@ impl CpGrpcServer {
 
     /// Access the scope this CP was configured with. Used by the CP polling
     /// loop to decide which namespaces to load from the database.
+    #[allow(dead_code)]
     pub fn scope(&self) -> &CpScope {
         &self.scope
     }
@@ -677,6 +682,7 @@ impl CpGrpcServer {
     }
 
     /// Broadcast an incremental delta to all connected DPs (with registry update).
+    #[allow(dead_code)]
     pub fn broadcast_delta_with_registry(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,

@@ -90,6 +90,7 @@ async fn resolve_polled_namespaces(
 /// A would look like an unknown ID in namespace B's list and incorrectly
 /// surface). For the back-compat `Single` case, the call collapses to a
 /// single per-namespace fetch identical to the pre-T2-A path.
+#[allow(clippy::too_many_arguments)]
 async fn load_incremental_config_multi(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
@@ -336,6 +337,7 @@ fn partition_incremental_by_namespace(
 /// the multi-namespace incremental path so removal IDs (which don't carry
 /// their own namespace) can still be routed to the right per-namespace
 /// broadcast channel.
+#[allow(clippy::type_complexity)]
 fn build_namespace_lookups(
     config: &GatewayConfig,
 ) -> (
@@ -495,7 +497,7 @@ pub async fn run(
     // Discover the initial namespace list. For `Single`/`Set` this is the
     // explicit set; for `All` we query the DB and re-discover on every poll
     // cycle so newly created namespaces are picked up automatically.
-    let mut polled_namespaces =
+    let polled_namespaces =
         resolve_polled_namespaces(db.as_ref(), &cp_scope, &env_config.namespace).await;
     if matches!(cp_scope, CpScope::All) {
         info!(
