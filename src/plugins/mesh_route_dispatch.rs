@@ -220,6 +220,8 @@ impl MeshRouteDispatchConfig {
             rule.headers_compiled = compile_header_matchers(idx, &rule.match_.headers)?;
             rule.authority_compiled =
                 compile_authority_matcher(idx, rule.match_.authority.as_ref())?;
+            rule.uri_compiled =
+                compile_uri_matcher(idx, &rule.match_.uri, rule.match_.ignore_uri_case)?;
         }
         Ok(())
     }
@@ -351,6 +353,14 @@ pub struct RouteRule {
     /// predicate per rule, so this is `Option<_>` (not `Vec<_>`).
     #[serde(skip)]
     authority_compiled: Option<AuthorityMatcher>,
+    /// Pre-compiled URI matcher built during normalize. When the rule has no
+    /// `match.uri` predicate this stays `None` and the hot path skips URI
+    /// evaluation entirely (preserving the legacy behavior of routing solely
+    /// by the proxy's `listen_path`). When set, the matcher already carries
+    /// the case-folded operand (exact / prefix) or the `(?i)`-flagged regex,
+    /// so the hot path is one allocation-free compare against `ctx.path`.
+    #[serde(skip)]
+    uri_compiled: Option<UriMatcher>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -428,6 +438,29 @@ pub struct MatchCriteria {
     /// `None` = no authority restriction (any host permitted by the proxy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<AuthorityMatchOp>,
+    /// Optional URI predicate (Istio `StringMatch` shape — one of `exact` /
+    /// `prefix` / `regex`). Routing-to-this-rule is normally selected by the
+    /// proxy's `listen_path`; an explicit `uri` predicate is only set when
+    /// the rule needs additional URI evaluation at the dispatch layer, e.g.,
+    /// VirtualService `match[].ignoreUriCase: true`. In that case the
+    /// translator widens the proxy's `listen_path` to a case-insensitive
+    /// regex (so both casings reach the proxy) and emits this predicate
+    /// here so the original Istio match precision is preserved.
+    ///
+    /// `None` (the legacy shape) preserves "no URI re-evaluation in the
+    /// plugin"; the proxy's `listen_path` already gates the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<UriMatchOp>,
+    /// When `true`, the URI predicate above (and any URI evaluation at this
+    /// rule) folds ASCII case before comparing. Mirrors Istio's
+    /// `HTTPMatchRequest.ignoreUriCase` semantics: only the URI predicate is
+    /// affected (not headers / methods / authority / etc.), and only ASCII
+    /// case is folded. Non-ASCII bytes match byte-for-byte. The plugin
+    /// rejects `ignore_uri_case: true` when no `uri` predicate is set,
+    /// because the flag would have no observable effect (catches a likely
+    /// operator misconfiguration at config-load time).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_uri_case: bool,
 }
 
 impl MatchCriteria {
@@ -437,6 +470,7 @@ impl MatchCriteria {
             && self.query_params.is_empty()
             && self.source_namespace.is_none()
             && self.authority.is_none()
+            && self.uri.is_none()
     }
 }
 
@@ -609,6 +643,95 @@ impl HeaderMatcher {
     }
 }
 
+/// Per-URI match operator. Mirrors the Istio `StringMatch` shape (one of
+/// `exact` / `prefix` / `regex`). Unlike header / method matchers, there is
+/// no legacy bare-string back-compat arm because the URI predicate was not
+/// previously expressible on `MatchCriteria` — `mesh_route_dispatch` rules
+/// inherited URI selection from the parent proxy's `listen_path`. New
+/// callers MUST use the tagged form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum UriMatchOp {
+    Exact(String),
+    Prefix(String),
+    Regex(String),
+}
+
+/// Compiled hot-path representation of a `UriMatchOp`. `Exact` / `Prefix`
+/// store the operand (lowercased at compile time when `ignore_uri_case`); the
+/// hot path uses `eq_ignore_ascii_case` / a manual byte-level prefix compare
+/// so it never allocates. `Regex` stores a pre-compiled `Regex`; when
+/// `ignore_uri_case` is set the pattern is wrapped with `(?i)` at compile
+/// time so the same `is_match` call covers both casings. The `regex` crate's
+/// `Regex` is `Arc`-backed internally — `Clone` is a refcount bump.
+#[derive(Debug, Clone)]
+pub(crate) enum UriMatcher {
+    /// Exact-path equality. `case_insensitive` controls whether the hot path
+    /// compares with `eq_ignore_ascii_case` (true) or `==` (false).
+    Exact {
+        value: String,
+        case_insensitive: bool,
+    },
+    /// Path-prefix match. Same case-insensitive flag semantics as `Exact`.
+    /// Hot path does a byte-level `starts_with` (case-sensitive) or a manual
+    /// case-folded scan; both stay allocation-free.
+    Prefix {
+        value: String,
+        case_insensitive: bool,
+    },
+    /// Compiled regex. When `ignore_uri_case` is true at compile time the
+    /// pattern is wrapped with `(?i)` so the matcher itself carries the flag
+    /// and the hot path is one `is_match` call.
+    Regex(Regex),
+}
+
+impl UriMatcher {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            UriMatcher::Exact {
+                value,
+                case_insensitive,
+            } => {
+                if *case_insensitive {
+                    path.eq_ignore_ascii_case(value)
+                } else {
+                    path == value.as_str()
+                }
+            }
+            UriMatcher::Prefix {
+                value,
+                case_insensitive,
+            } => {
+                if *case_insensitive {
+                    starts_with_ignore_ascii_case(path, value)
+                } else {
+                    path.starts_with(value.as_str())
+                }
+            }
+            UriMatcher::Regex(re) => re.is_match(path),
+        }
+    }
+}
+
+/// Allocation-free byte-level case-insensitive `starts_with`. ASCII fold
+/// only: non-ASCII bytes match byte-for-byte (matches Istio's semantics and
+/// is documented as such in the operator-facing docs). Returns `false` when
+/// `path` is shorter than `prefix`.
+fn starts_with_ignore_ascii_case(path: &str, prefix: &str) -> bool {
+    let path_bytes = path.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if path_bytes.len() < prefix_bytes.len() {
+        return false;
+    }
+    // `u8::eq_ignore_ascii_case` is a one-instruction compare that handles
+    // ASCII upper / lower folding; non-ASCII bytes compare byte-for-byte.
+    // Faster than `make_ascii_lowercase`-then-compare and never allocates.
+    path_bytes
+        .iter()
+        .zip(prefix_bytes.iter())
+        .all(|(p, q)| p.eq_ignore_ascii_case(q))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteDestination {
     /// Override the proxy's `upstream_id`. Wins over `proxy.upstream_id`
@@ -747,6 +870,123 @@ fn compile_authority_matcher(
         }
     };
     Ok(Some(matcher))
+}
+
+/// Compile the optional URI predicate into its hot-path representation.
+///
+/// `ignore_uri_case` is a rule-level flag mirroring Istio's
+/// `HTTPMatchRequest.ignoreUriCase` — it folds ASCII case for the URI
+/// predicate only (not headers / methods / authority). For `Exact` and
+/// `Prefix` the operand is lowercased at compile time so the hot-path
+/// compare can stay byte-level (the path is matched via `eq_ignore_ascii_case`
+/// / manual case-folded prefix scan — both allocation-free). For `Regex` the
+/// pattern is wrapped with `(?i)` if it isn't already case-insensitive so
+/// the same `is_match` call covers both casings. `regex` is idempotent with
+/// nested `(?i)` flags, so wrapping a pattern that already starts with
+/// `(?i)` is harmless — operator can opt into case-folding for one rule
+/// even when `ignore_uri_case` is false by writing `(?i)` themselves.
+///
+/// Invalid regex (or an empty pattern after the operator-provided string) is
+/// a hard error from `Plugin::new()`, per CLAUDE.md's
+/// "no Ok-with-runtime-panic" plugin-config-validation rule. The function
+/// also rejects `ignore_uri_case: true` when no URI predicate is present —
+/// the flag would have no observable effect and is almost always a
+/// misconfiguration.
+fn compile_uri_matcher(
+    rule_idx: usize,
+    uri: &Option<UriMatchOp>,
+    ignore_uri_case: bool,
+) -> Result<Option<UriMatcher>, String> {
+    let Some(uri) = uri else {
+        if ignore_uri_case {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].match.ignore_uri_case=true requires a \
+                 uri predicate (exact / prefix / regex); without one the flag would have no \
+                 effect"
+            ));
+        }
+        return Ok(None);
+    };
+    let matcher = match uri {
+        UriMatchOp::Exact(value) => {
+            if value.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.exact must not be empty"
+                ));
+            }
+            let value = if ignore_uri_case {
+                value.to_ascii_lowercase()
+            } else {
+                value.clone()
+            };
+            UriMatcher::Exact {
+                value,
+                case_insensitive: ignore_uri_case,
+            }
+        }
+        UriMatchOp::Prefix(value) => {
+            if value.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.prefix must not be empty \
+                     (every path would match — likely a misconfiguration)"
+                ));
+            }
+            let value = if ignore_uri_case {
+                value.to_ascii_lowercase()
+            } else {
+                value.clone()
+            };
+            UriMatcher::Prefix {
+                value,
+                case_insensitive: ignore_uri_case,
+            }
+        }
+        UriMatchOp::Regex(pattern) => {
+            if pattern.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
+                ));
+            }
+            // Wrap with `(?i)` when `ignore_uri_case` is set and the pattern
+            // doesn't already carry a case-insensitive flag. We check `(?i)`
+            // and `(?si)` / `(?im)` etc. by scanning the leading flag-group
+            // form `(?<flags>)` for the `i` flag. `regex` accepts nested
+            // `(?i)` wrappers, so this is a "don't double-wrap if already
+            // present" optimization, not a correctness requirement.
+            let wrapped = if ignore_uri_case && !regex_pattern_is_case_insensitive(pattern) {
+                format!("(?i){pattern}")
+            } else {
+                pattern.clone()
+            };
+            let re = Regex::new(&wrapped).map_err(|e| {
+                format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
+            })?;
+            UriMatcher::Regex(re)
+        }
+    };
+    Ok(Some(matcher))
+}
+
+/// Return `true` when the regex pattern's leading flag group sets the `i`
+/// flag. Accepts `(?i)`, `(?si)`, `(?-x i)`, etc. — anything starting with
+/// `(?` and containing `i` before the closing `)` or `:`. Conservative:
+/// patterns that don't start with `(?` return `false` and the caller wraps
+/// them. False negatives are harmless because `regex` tolerates duplicate
+/// `(?i)` flags.
+fn regex_pattern_is_case_insensitive(pattern: &str) -> bool {
+    let Some(after_open) = pattern.strip_prefix("(?") else {
+        return false;
+    };
+    // Scan until the group terminator (`)` for a group-only directive like
+    // `(?i)`, or `:` for an inline group like `(?i:...)`).
+    for ch in after_open.chars() {
+        match ch {
+            'i' => return true,
+            ')' | ':' => return false,
+            _ => continue,
+        }
+    }
+    false
 }
 
 fn normalize_header_match_keys(
@@ -975,6 +1215,15 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
         // there is at least one rule to apply.
         return rule.request_transform_compiled.is_some()
             || rule.response_transform_compiled.is_some();
+    }
+    // URI predicate (when set): evaluate first because it cheaply rejects
+    // requests that the broader (case-insensitive) `listen_path` lets
+    // through. The compiled matcher already carries the case-folding
+    // contract, so this stays allocation-free.
+    if let Some(uri_matcher) = rule.uri_compiled.as_ref()
+        && !uri_matcher.matches(ctx.path.as_str())
+    {
+        return false;
     }
     // Method match: any-of across the compiled matchers. Matchers are
     // pre-compiled (regex included) at config load — the hot path is one
@@ -3183,5 +3432,425 @@ mod tests {
             "tagged form must round-trip as an object, got: {raw_tagged}"
         );
         assert_eq!(raw_tagged["prefix"].as_str(), Some("admin."));
+    }
+
+    // ── UriMatchOp + ignore_uri_case (T1-B.5) ─────────────────────────────
+    //
+    // Istio `HTTPMatchRequest.ignoreUriCase: true` folds ASCII case for the
+    // URI predicate only (not headers / methods / authority). The plugin
+    // pre-folds the operand at compile time so the hot path uses
+    // `eq_ignore_ascii_case` / a byte-level manual prefix scan — both
+    // allocation-free. Regex URIs get `(?i)` wrapped at compile time when
+    // not already case-insensitive.
+
+    #[test]
+    fn accepts_uri_exact_match_at_load() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"exact": "/api"}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Exact {
+                value,
+                case_insensitive,
+            }) => {
+                assert_eq!(value, "/api");
+                assert!(!case_insensitive);
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_uri_prefix_match_at_load() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/api"}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Prefix {
+                value,
+                case_insensitive,
+            }) => {
+                assert_eq!(value, "/api");
+                assert!(!case_insensitive);
+            }
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_uri_regex_match_at_load() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"regex": "^/api/v[0-9]+"}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Regex(re)) => {
+                assert!(re.is_match("/api/v1"));
+                assert!(!re.is_match("/API/v1"), "case-sensitive without flag");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uri_exact_with_ignore_uri_case_pre_folds_operand() {
+        // Pre-fold at compile time: store the lowercased operand. Hot path
+        // uses `eq_ignore_ascii_case` which is symmetric, so the pre-fold is
+        // a micro-opt rather than a correctness requirement — but the
+        // compiled form should still carry the lowercased value (visible in
+        // debug output / introspection).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"exact": "/Api"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Exact {
+                value,
+                case_insensitive,
+            }) => {
+                assert_eq!(value, "/api", "pre-folded lowercase at compile time");
+                assert!(*case_insensitive);
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uri_prefix_with_ignore_uri_case_pre_folds_operand() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/Api"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Prefix {
+                value,
+                case_insensitive,
+            }) => {
+                assert_eq!(value, "/api", "pre-folded lowercase at compile time");
+                assert!(*case_insensitive);
+            }
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uri_regex_with_ignore_uri_case_wraps_with_inline_flag() {
+        // Regex compilation should accept either ASCII casing once the
+        // `(?i)` flag is wrapped on; we assert positive cases instead of
+        // peeking at the pattern string (an `Arc<Box<[u8]>>` internal to
+        // the regex crate).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"regex": "^/api/v[0-9]+"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].uri_compiled {
+            Some(UriMatcher::Regex(re)) => {
+                assert!(re.is_match("/api/v1"));
+                assert!(re.is_match("/API/v1"));
+                assert!(re.is_match("/Api/V2"));
+                assert!(!re.is_match("/store/v1"));
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uri_regex_with_existing_case_flag_is_not_double_wrapped() {
+        // Operator-supplied `(?i)` patterns should compile + match without
+        // double-wrapping; the `regex` crate tolerates duplicates but the
+        // listen_path / pattern string is the operator-visible key and we
+        // shouldn't churn it.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"regex": "(?i)^/api"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        if let Some(UriMatcher::Regex(re)) = &plugin.rules()[0].uri_compiled {
+            assert!(re.is_match("/API"));
+        } else {
+            panic!("expected Regex");
+        }
+    }
+
+    #[test]
+    fn rejects_ignore_uri_case_without_uri_predicate_at_load() {
+        // The flag would be a no-op without a URI predicate — fail loud
+        // instead of silently accepting a misconfiguration.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"ignore_uri_case": true, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("ignore_uri_case"), "got: {err}");
+        assert!(err.contains("uri predicate"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_uri_exact_at_load() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"exact": ""}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("uri.exact"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_uri_prefix_at_load() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": ""}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("uri.prefix"), "got: {err}");
+        assert!(err.contains("not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_uri_regex_at_load() {
+        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
+        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"regex": "["}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("uri.regex"), "got: {err}");
+        assert!(err.contains("invalid"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_uri_match_operator_at_load() {
+        // `deny_unknown_fields` on `UriMatchOp` catches typos like
+        // `{"prefiks": "..."}` at load time so we never compile and ship a
+        // rule that silently never fires.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefiks": "/api"}, "methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("mesh_route_dispatch") || err.contains("unknown"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_match_with_ignore_uri_case_routes_for_both_casings() {
+        // Hot-path contract: the same dispatch rule matches `/api/users`
+        // AND `/API/users` AND `/Api/Users` when `ignore_uri_case: true`.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/Api"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        for path in ["/api/users", "/API/users", "/Api/Users", "/api"] {
+            let mut ctx = ctx_with("GET", path);
+            let mut headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(
+                ctx.route_override_upstream_id.as_deref(),
+                Some("canary"),
+                "case-insensitive prefix must match {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uri_match_without_ignore_uri_case_is_case_sensitive() {
+        // Defense in depth: without the flag, the URI predicate matches
+        // case-sensitively even if the proxy's listen_path admitted the
+        // request via some upstream rewrite.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/Api"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api/users");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            ctx.route_override_upstream_id.is_none(),
+            "case-sensitive prefix must NOT match /api when matcher is /Api"
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_match_with_ignore_uri_case_does_not_widen_non_ascii() {
+        // ASCII-only fold: non-ASCII bytes match byte-for-byte. The matcher
+        // `/café` stays distinct from `/CAFé` because only the leading
+        // ASCII bytes get case-folded; the `é` (0xC3 0xA9 in UTF-8) is
+        // byte-equal in both, and `c` ≡ `C` under fold. So this case
+        // actually MATCHES — let's pick a more discriminating example.
+        //
+        // `é` (U+00E9) lowercase vs `É` (U+00C9) uppercase. The ASCII-only
+        // fold does NOT equate these — a path with `/É` does NOT match a
+        // prefix `/é` even with `ignore_uri_case: true`.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/é"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+
+        // ASCII fold leaves `é` alone, so `/é/foo` matches and `/É/foo`
+        // does NOT. This deterministic behavior is what we promise in
+        // docs — operators on non-ASCII paths should not expect Unicode
+        // case folding.
+        let mut ctx = ctx_with("GET", "/é/foo");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            ctx.route_override_upstream_id.as_deref(),
+            Some("x"),
+            "non-ASCII bytes must match byte-for-byte (matcher matches itself)"
+        );
+
+        let mut ctx = ctx_with("GET", "/É/foo");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            ctx.route_override_upstream_id.is_none(),
+            "ASCII fold does NOT equate é (U+00E9) and É (U+00C9) — \
+             non-ASCII bytes compare byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_match_with_ignore_uri_case_combined_with_other_predicates() {
+        // All-of: URI fold AND header AND method must all hold for the
+        // rule to fire.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {
+                    "uri": {"prefix": "/Api"},
+                    "ignore_uri_case": true,
+                    "methods": ["POST"],
+                    "headers": {"x-canary": "v2"}
+                },
+                "destination": {"upstream_id": "all-match"}
+            }]
+        }))
+        .unwrap();
+
+        // All three match.
+        let mut ctx = ctx_with("POST", "/api/items");
+        let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("all-match"));
+
+        // URI matches case-insensitively but method wrong.
+        let mut ctx = ctx_with("GET", "/api/items");
+        let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+
+        // URI fold misses (different prefix), method/header right.
+        let mut ctx = ctx_with("POST", "/store/items");
+        let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn uri_exact_with_ignore_uri_case_rejects_longer_path() {
+        // Exact != prefix: `/Api` exact does NOT match `/api/users` even
+        // case-insensitively — exact is a full-equality match.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"exact": "/Api"}, "ignore_uri_case": true},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/API");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("x"));
+
+        let mut ctx = ctx_with("GET", "/api/users");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            ctx.route_override_upstream_id.is_none(),
+            "exact match must not admit longer paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_match_without_other_predicates_evaluates_uri_only() {
+        // Schema: a URI predicate alone is sufficient — the empty-match
+        // rejection only fires when methods/headers/query_params/uri are
+        // ALL empty.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"uri": {"prefix": "/api"}},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api/users");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn legacy_match_criteria_without_uri_field_round_trips() {
+        // Wire compat: existing configs that don't carry `uri` / `ignore_uri_case`
+        // continue to deserialize cleanly. Serialization skips the empty
+        // fields so the JSON shape stays byte-stable for downstream tooling.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"x-canary": "v2"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        let raw = serde_json::to_value(&plugin.rules()[0].match_).unwrap();
+        assert!(raw.get("uri").is_none(), "uri must be omitted when absent");
+        assert!(
+            raw.get("ignore_uri_case").is_none(),
+            "ignore_uri_case=false must be omitted from the wire form"
+        );
     }
 }

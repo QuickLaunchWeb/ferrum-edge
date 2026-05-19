@@ -1290,3 +1290,147 @@ async fn mesh_l7_routing_virtual_service_authority_regex_match_routes_and_misses
         }
     ));
 }
+
+// ── VirtualService ignoreUriCase URI matcher (T1-B.5) ──────────────────────
+//
+// `ignoreUriCase: true` on a VirtualService match entry is now first-class.
+// The translator widens the URI's listen_path to a case-insensitive regex
+// so the proxy router admits both casings, and emits a `mesh_route_dispatch`
+// rule carrying the original URI predicate + `ignore_uri_case: true`. The
+// plugin re-evaluates with ASCII-only case folding (no Unicode equivalence
+// — non-ASCII bytes compare byte-for-byte) and routes both casings to the
+// override destination without per-request allocation.
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_routes_both_casings() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/Api"},
+                        "ignoreUriCase": true
+                    }],
+                    "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    // The proxy's listen_path is widened to a case-insensitive regex.
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i)/Api.*"))
+        .expect("widened case-insensitive listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    // The dispatch rule carries the operator's original URI predicate AND
+    // the `ignore_uri_case: true` flag.
+    let match_obj = &plugin_config.config["rules"][0]["match"];
+    assert_eq!(match_obj["uri"]["prefix"].as_str(), Some("/Api"));
+    assert_eq!(match_obj["ignore_uri_case"].as_bool(), Some(true));
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Both casings match — neither hits the implicit deny.
+    for path in ["/api/items", "/API/items", "/Api/items"] {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        let mut headers = HashMap::new();
+        assert!(
+            matches!(
+                dispatch.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "case-insensitive prefix must match {path}"
+        );
+    }
+
+    // A non-prefix-matching path falls through (the URI predicate fails,
+    // the dispatch rule does not route, and with `reject_unmatched: false`
+    // — URI-only entry — the plain Continue lets the proxy default handle
+    // it; here the broader regex listen_path would NOT have admitted the
+    // request, but defense-in-depth: the dispatch URI check fails too).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/store/items".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let _ = dispatch.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        ctx.route_override_upstream_id.is_none(),
+        "non-matching path must not trigger the override destination"
+    );
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_with_method_and_headers() {
+    // Mixed: case-folded URI prefix + case-sensitive method + case-insensitive
+    // header. All-of semantics: every predicate must hold.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/Api"},
+                        "ignoreUriCase": true,
+                        "method": {"exact": "POST"},
+                        "headers": {"x-canary": {"exact": "v2"}}
+                    }],
+                    "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i)/Api.*"))
+        .expect("widened listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // All three predicates hold → route override applies.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    // URI fold matches, method wrong → reject (reject_unmatched is true for
+    // multi-predicate routes, matching Envoy semantics).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/items".to_string(),
+    );
+    let mut headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
