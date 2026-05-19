@@ -709,11 +709,14 @@ impl ResponseCaching {
 
     fn shared_cache_allows_authorized_response(
         &self,
-        request_headers: &HashMap<String, String>,
+        ctx: &RequestContext,
         directives: CacheControlDirectives,
     ) -> bool {
-        if self.config.cache_key_include_consumer || !request_headers.contains_key("authorization")
-        {
+        if self.config.cache_key_include_consumer {
+            return true;
+        }
+
+        if ctx.effective_identity().is_none() {
             return true;
         }
 
@@ -1051,7 +1054,7 @@ impl Plugin for ResponseCaching {
         // `ctx.headers`. See `restore_request_headers_view` for why.
         let lookup_headers = self.restore_request_headers_view(ctx);
 
-        if !self.shared_cache_allows_authorized_response(&lookup_headers, directives) {
+        if !self.shared_cache_allows_authorized_response(ctx, directives) {
             self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
