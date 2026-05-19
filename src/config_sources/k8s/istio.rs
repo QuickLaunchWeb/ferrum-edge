@@ -7947,10 +7947,11 @@ extensionProviders:
         // forward requests the operator gated (e.g., requests sneaking past
         // a route that only allows GET via `.exact` and hoped to allow
         // matching traffic via a sibling predicate the translator does not
-        // honor). `method.regex` is now first-class supported (T1-B.2), so
-        // we use `authority` here to keep exercising the fail-closed
-        // sibling path — sibling PRs cover `authority` /
-        // `sourceNamespace` / `ignoreUriCase` separately.
+        // honor). `method.regex` is now first-class supported (T1-B.2) and
+        // `authority` is now first-class supported (T1-B.3); use
+        // `sourceLabels` here (still unsupported -- sibling PRs cover
+        // `sourceNamespace` / `ignoreUriCase` separately) to keep
+        // exercising the fail-closed sibling path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -7959,7 +7960,7 @@ extensionProviders:
                     "http": [{
                         "match": [
                             {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
-                            {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
+                            {"uri": {"prefix": "/api"}, "sourceLabels": {"app": "billing"}}
                         ],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
                     }]
@@ -7982,7 +7983,7 @@ extensionProviders:
         assert_eq!(
             rules.len(),
             1,
-            "supported method.exact rule emitted; unsupported authority sibling skipped"
+            "supported method.exact rule emitted; unsupported sourceLabels sibling skipped"
         );
         assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
         assert_eq!(
@@ -8713,11 +8714,11 @@ extensionProviders:
         // Unsupported URI-less predicates cannot be represented by
         // mesh_route_dispatch. If they were skipped, the later default route
         // would serve requests that Istio gated. Collapse a terminating plugin
-        // onto the selected default proxy instead. `authority` remains an
-        // unsupported predicate type (sibling PRs cover method.regex /
-        // authority / sourceNamespace separately), so we use it here to keep
-        // exercising the fail-closed path now that header regex/prefix are
-        // first-class predicates.
+        // onto the selected default proxy instead. `authority` is now
+        // first-class supported (T1-B.3); use `sourceLabels` (still
+        // unsupported -- sibling PRs cover `sourceNamespace` separately) to
+        // keep exercising the fail-closed path now that header regex/prefix
+        // and authority are first-class predicates.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -8726,7 +8727,7 @@ extensionProviders:
                     "http": [
                         {
                             "match": [
-                                {"authority": {"exact": "tier.example.com"}}
+                                {"sourceLabels": {"app": "billing"}}
                             ],
                             "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                         },
@@ -8864,7 +8865,8 @@ extensionProviders:
         // If some other predicate is unsupported, an explicit
         // `ignoreUriCase: false` should not broaden the fail-closed proxy to
         // the synthetic URI-less catch-all. `method.regex` is now first-class
-        // supported (T1-B.2); use `authority` (still unsupported) to keep
+        // supported (T1-B.2) and `authority` is now first-class supported
+        // (T1-B.3); use `sourceLabels` (still unsupported) to keep
         // exercising the fail-closed sibling path.
         let result = translate_k8s_objects(
             &[object(
@@ -8875,7 +8877,7 @@ extensionProviders:
                         "match": [{
                             "uri": {"prefix": "/Api"},
                             "ignoreUriCase": false,
-                            "authority": {"exact": "internal.example.com"}
+                            "sourceLabels": {"app": "billing"}
                         }],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                     }]
@@ -8899,7 +8901,7 @@ extensionProviders:
                 p.plugin_name == "request_termination"
                     && p.proxy_id.as_deref() == Some(proxy.id.as_str())
             })
-            .expect("unsupported authority predicate terminates the URI-scoped proxy");
+            .expect("unsupported sourceLabels predicate terminates the URI-scoped proxy");
         assert!(proxy_has_plugin(proxy, plugin));
         assert!(
             !result
@@ -9001,8 +9003,9 @@ extensionProviders:
         // keep reject_unmatched enabled after collapse. Otherwise traffic that
         // might have matched the unsupported predicate would leak to the later
         // default route. `method.regex` is now first-class supported
-        // (T1-B.2); use `authority` (still unsupported) here to keep
-        // exercising the fail-closed sibling path.
+        // (T1-B.2) and `authority` is now first-class supported (T1-B.3);
+        // use `sourceLabels` (still unsupported) here to keep exercising the
+        // fail-closed sibling path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -9012,7 +9015,7 @@ extensionProviders:
                         {
                             "match": [
                                 {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
-                                {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
+                                {"uri": {"prefix": "/api"}, "sourceLabels": {"app": "billing"}}
                             ],
                             "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                         },
@@ -9397,8 +9400,8 @@ extensionProviders:
         // the route's backend would silently widen past the operator's
         // intent. Emit a terminating catch-all instead, so a later broader
         // route cannot accidentally serve the guarded traffic. `authority`
-        // is still unsupported (sibling PRs cover method.regex / authority /
-        // sourceNamespace separately).
+        // is now first-class supported (T1-B.3); use `sourceLabels` (still
+        // unsupported -- sibling PRs cover `sourceNamespace` separately).
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -9406,7 +9409,7 @@ extensionProviders:
                     "hosts": ["api.example.com"],
                     "http": [{
                         "match": [
-                            {"authority": {"exact": "tier.example.com"}}
+                            {"sourceLabels": {"app": "billing"}}
                         ],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
                     }]
@@ -9447,9 +9450,9 @@ extensionProviders:
         // predicate is unsafe to materialize: mesh_route_dispatch would skip
         // the partial rule, leaving an unguarded catch-all proxy behind. The
         // translator emits a terminating catch-all instead. Header regex /
-        // prefix are now first-class supported predicates, so we use a
-        // still-unsupported sibling key (`authority`) to keep exercising
-        // partial-extraction fail-closed.
+        // prefix and `authority` are now first-class supported predicates, so
+        // we use a still-unsupported sibling key (`sourceLabels`) to keep
+        // exercising partial-extraction fail-closed.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -9461,7 +9464,7 @@ extensionProviders:
                                 "headers": {
                                     "x-canary": {"exact": "v2"}
                                 },
-                                "authority": {"exact": "tier.example.com"}
+                                "sourceLabels": {"app": "billing"}
                             }
                         ],
                         "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
@@ -9629,14 +9632,15 @@ extensionProviders:
     fn virtual_service_partial_predicate_extraction_skips_rule() {
         // Codex P1 (#3237631705) follow-on: an entry with one supported
         // and one unsupported predicate is also unsafe to emit as a
-        // partial rule. `method=GET + authority` cannot be honored
-        // (the authority predicate is dropped), so emitting a rule with
+        // partial rule. `method=GET + sourceLabels` cannot be honored
+        // (the sourceLabels predicate is dropped), so emitting a rule with
         // only `methods=[GET]` would silently widen the route to match GET
-        // regardless of the gated authority. Skip the entry entirely;
+        // regardless of the gated workload. Skip the entry entirely;
         // `reject_unmatched: true` 404s the request, which is the
-        // fail-closed VirtualService semantic. Header regex / prefix are
-        // now first-class supported predicates, so we use a still-unsupported
-        // sibling key (`authority`) to exercise this partial-extraction path.
+        // fail-closed VirtualService semantic. Header regex / prefix and
+        // `authority` are now first-class supported predicates, so we use a
+        // still-unsupported sibling key (`sourceLabels`) to exercise this
+        // partial-extraction path.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -9648,7 +9652,7 @@ extensionProviders:
                             {
                                 "uri": {"prefix": "/api"},
                                 "method": {"exact": "GET"},
-                                "authority": {"exact": "tier.example.com"}
+                                "sourceLabels": {"app": "billing"}
                             }
                         ],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
