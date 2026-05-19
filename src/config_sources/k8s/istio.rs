@@ -755,11 +755,22 @@ fn translate_traffic_policy(
     object: &K8sObject,
     value: &Value,
 ) -> Result<MeshTrafficPolicy, K8sTranslateError> {
-    let connect_timeout_ms = value
-        .get("connectionPool")
-        .and_then(|cp| cp.get("tcp"))
+    let tcp = value.get("connectionPool").and_then(|cp| cp.get("tcp"));
+
+    let connect_timeout_ms = tcp
         .and_then(|tcp| string_field(tcp, "connectTimeout"))
         .and_then(parse_istio_duration_ms);
+
+    let max_connections = tcp
+        .map(|tcp| translate_tcp_max_connections(object, tcp))
+        .transpose()?
+        .flatten();
+
+    let tcp_keepalive = tcp
+        .and_then(|tcp| tcp.get("tcpKeepalive"))
+        .map(|ka| translate_tcp_keepalive(object, ka))
+        .transpose()?
+        .filter(|cfg| !cfg.is_empty());
 
     let outlier_detection = value
         .get("outlierDetection")
@@ -797,7 +808,140 @@ fn translate_traffic_policy(
         load_balancer,
         tls,
         locality_lb_setting,
+        max_connections,
+        tcp_keepalive,
     })
+}
+
+/// Parse `connectionPool.tcp.maxConnections`. Istio's schema typing is
+/// `int32`; values <= 0 are rejected with an error so operators see the
+/// misconfiguration at translate time rather than silently dropping the cap.
+/// Values > `u32::MAX` cannot occur because the upper bound is already the
+/// Istio CRD's `int32` validation, but the explicit clamp keeps the parse
+/// total even when callers feed us unvalidated JSON.
+fn translate_tcp_max_connections(
+    object: &K8sObject,
+    tcp: &Value,
+) -> Result<Option<u32>, K8sTranslateError> {
+    let Some(value) = tcp.get("maxConnections") else {
+        return Ok(None);
+    };
+    let raw = value.as_i64().ok_or_else(|| {
+        invalid_resource(
+            object,
+            "trafficPolicy.connectionPool.tcp.maxConnections must be an integer",
+        )
+    })?;
+    if raw <= 0 {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.connectionPool.tcp.maxConnections must be positive, got {raw}"),
+        ));
+    }
+    if raw > i64::from(u32::MAX) {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.connectionPool.tcp.maxConnections ({raw}) exceeds u32::MAX"),
+        ));
+    }
+    Ok(Some(raw as u32))
+}
+
+/// Translate Istio `connectionPool.tcp.tcpKeepalive` into Ferrum's typed
+/// keepalive override. Each subfield is independently optional. `time` and
+/// `interval` are `google.protobuf.Duration` strings; sub-second values are
+/// rejected because the underlying `TCP_KEEPIDLE` / `TCP_KEEPINTVL` socket
+/// options are specified in seconds on every supported platform. `probes` is
+/// `uint32`; zero is rejected because the socket option requires at least one
+/// probe before declaring the connection dead.
+fn translate_tcp_keepalive(
+    object: &K8sObject,
+    keepalive: &Value,
+) -> Result<crate::config::types::TcpKeepaliveCfg, K8sTranslateError> {
+    let time_seconds = match string_field(keepalive, "time") {
+        Some(raw) => Some(parse_keepalive_duration_seconds(object, "time", raw)?),
+        None => None,
+    };
+    let interval_seconds = match string_field(keepalive, "interval") {
+        Some(raw) => Some(parse_keepalive_duration_seconds(object, "interval", raw)?),
+        None => None,
+    };
+    let probes = match keepalive.get("probes") {
+        Some(value) => {
+            let raw = value.as_u64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes must be a non-negative integer",
+                )
+            })?;
+            if raw == 0 {
+                return Err(invalid_resource(
+                    object,
+                    "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes must be positive",
+                ));
+            }
+            if raw > u64::from(u32::MAX) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes ({raw}) exceeds u32::MAX"
+                    ),
+                ));
+            }
+            Some(raw as u32)
+        }
+        None => None,
+    };
+    Ok(crate::config::types::TcpKeepaliveCfg {
+        time_seconds,
+        interval_seconds,
+        probes,
+    })
+}
+
+/// Parse an Istio duration into whole seconds. Sub-second values (e.g.,
+/// `"500ms"`) are rejected — TCP_KEEPIDLE / TCP_KEEPINTVL are specified in
+/// seconds on every supported platform, and rounding silently would let an
+/// operator's intent (idle probe at 1.5s) come up at 1s with no warning.
+fn parse_keepalive_duration_seconds(
+    object: &K8sObject,
+    field: &str,
+    raw: &str,
+) -> Result<u32, K8sTranslateError> {
+    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' is not a valid Istio duration"
+            ),
+        )
+    })?;
+    if ms == 0 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} must be at least 1s, got '{raw}'"
+            ),
+        ));
+    }
+    if ms % 1000 != 0 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' must be a whole number of seconds (sub-second precision is not supported by TCP keepalive socket options)"
+            ),
+        ));
+    }
+    let seconds = ms / 1000;
+    if seconds > u64::from(u32::MAX) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' exceeds u32::MAX seconds"
+            ),
+        ));
+    }
+    Ok(seconds as u32)
 }
 
 fn translate_locality_lb_setting(
@@ -10244,6 +10388,287 @@ extensionProviders:
         assert!(
             msg.contains("corp.example"),
             "error must show the configured cluster domain: {msg}"
+        );
+    }
+
+    // ── DestinationRule connectionPool TCP (maxConnections, tcpKeepalive) ─
+
+    #[test]
+    fn destination_rule_translates_top_level_tcp_max_connections() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "connectTimeout": "1s",
+                                "maxConnections": 50
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        assert_eq!(tp.connect_timeout_ms, Some(1000));
+        assert_eq!(tp.max_connections, Some(50));
+        assert!(tp.tcp_keepalive.is_none());
+    }
+
+    #[test]
+    fn destination_rule_translates_top_level_tcp_keepalive_full() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "tcpKeepalive": {
+                                    "time": "300s",
+                                    "interval": "30s",
+                                    "probes": 3
+                                }
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        let keepalive = tp.tcp_keepalive.as_ref().expect("tcp_keepalive");
+        assert_eq!(keepalive.time_seconds, Some(300));
+        assert_eq!(keepalive.interval_seconds, Some(30));
+        assert_eq!(keepalive.probes, Some(3));
+    }
+
+    #[test]
+    fn destination_rule_translates_partial_tcp_keepalive() {
+        // Operators commonly tune only `time` (idle delay) and rely on
+        // sysctl defaults for the rest. Each subfield independently optional.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "tcpKeepalive": {"time": "600s"}
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let keepalive = dr
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .tcp_keepalive
+            .as_ref()
+            .unwrap();
+        assert_eq!(keepalive.time_seconds, Some(600));
+        assert!(keepalive.interval_seconds.is_none());
+        assert!(keepalive.probes.is_none());
+    }
+
+    #[test]
+    fn destination_rule_translates_port_level_tcp_max_connections() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "tcp": {
+                                        "maxConnections": 25,
+                                        "tcpKeepalive": {
+                                            "time": "120s",
+                                            "interval": "10s",
+                                            "probes": 5
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let port_policy = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        assert_eq!(port_policy.max_connections, Some(25));
+        let keepalive = port_policy.tcp_keepalive.as_ref().expect("keepalive");
+        assert_eq!(keepalive.time_seconds, Some(120));
+        assert_eq!(keepalive.interval_seconds, Some(10));
+        assert_eq!(keepalive.probes, Some(5));
+    }
+
+    #[test]
+    fn destination_rule_rejects_negative_max_connections() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"tcp": {"maxConnections": -1}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative cap must fail");
+        assert!(
+            err.to_string().contains("maxConnections must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_max_connections() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"tcp": {"maxConnections": 0}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero cap must fail");
+        assert!(
+            err.to_string().contains("maxConnections must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_sub_second_tcp_keepalive_time() {
+        // TCP_KEEPIDLE / TCP_KEEPALIVE are second-granular on every supported
+        // OS. Silently rounding `500ms` to `1s` would change the operator's
+        // configured idle delay; rejecting at translate time surfaces the
+        // misconfiguration immediately.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"tcpKeepalive": {"time": "500ms"}}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("sub-second keepalive time must fail");
+        assert!(
+            err.to_string().contains("whole number of seconds"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_tcp_keepalive_interval() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"tcpKeepalive": {"interval": "0s"}}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero keepalive interval must fail");
+        assert!(
+            err.to_string().contains("must be at least 1s"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_tcp_keepalive_probes() {
+        // `TCP_KEEPCNT` requires at least one probe — zero would yield no
+        // detection at all (the socket would never declare the peer dead).
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"tcpKeepalive": {"probes": 0}}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero probes must fail");
+        assert!(
+            err.to_string().contains("probes must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_translates_negative_keepalive_duration_rejected() {
+        // Negative durations fall out of `parse_istio_duration_ms` as `None`,
+        // which the translator surfaces as a "not a valid Istio duration"
+        // error rather than silently dropping the field.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"tcpKeepalive": {"time": "-1s"}}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative duration must fail");
+        assert!(
+            err.to_string().contains("not a valid Istio duration"),
+            "unexpected: {err}"
         );
     }
 

@@ -1257,6 +1257,28 @@ fn apply_destination_rules(
                 upstream.targets.iter().map(|t| t.port).collect();
             let has_service_discovery = upstream.service_discovery.is_some();
 
+            // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
+            // out to every port served by this upstream. Per-port
+            // `portLevelSettings` may overwrite either field below. We only
+            // expand when there is at least one target port; service-discovery
+            // upstreams skip the fan-out because their target ports aren't
+            // known at apply time (the per-port loop still applies if the
+            // operator explicitly listed `portLevelSettings`).
+            if let Some(ref tp) = dr.traffic_policy
+                && (tp.max_connections.is_some() || tp.tcp_keepalive.is_some())
+                && !has_service_discovery
+            {
+                for port in &upstream_target_ports {
+                    let override_slot = upstream.port_overrides.entry(*port).or_default();
+                    if let Some(max_conn) = tp.max_connections {
+                        override_slot.max_connections = Some(max_conn);
+                    }
+                    if let Some(ref keepalive) = tp.tcp_keepalive {
+                        override_slot.tcp_keepalive = Some(keepalive.clone());
+                    }
+                }
+            }
+
             // Second pass: per-port traffic policy overrides land on the
             // upstream's `port_overrides` slot. Pool-level dispatch already
             // keys per destination port, so per-port policy naturally scopes
@@ -1419,6 +1441,18 @@ fn apply_traffic_policy_to_port_override(
         .locality_lb_setting
         .as_ref()
         .map(into_upstream_locality);
+    // Per-port `connectionPool.tcp.{maxConnections,tcpKeepalive}`. Per-port
+    // overrides win over any top-level fan-out applied above; an unset
+    // per-port field leaves the existing slot value (which may have come from
+    // the top-level fan-out) in place rather than clearing it. This matches
+    // Istio's "per-port settings layer over top-level" semantics for
+    // connectionPool fields.
+    if let Some(max_conn) = policy.max_connections {
+        slot.max_connections = Some(max_conn);
+    }
+    if let Some(ref keepalive) = policy.tcp_keepalive {
+        slot.tcp_keepalive = Some(keepalive.clone());
+    }
 }
 
 /// Project a mesh-derived `MeshLocalityLbSetting` onto its Ferrum

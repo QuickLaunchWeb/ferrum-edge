@@ -80,6 +80,13 @@ pub enum StreamSetupKind {
     /// Backend-side: the gateway is shedding traffic away from a known-bad
     /// upstream, not rejecting the client.
     CircuitBreakerOpen,
+    /// DestinationRule `connectionPool.tcp.maxConnections` cap was already
+    /// reached for the resolved backend target. Backend-side: the upstream
+    /// is configured with a hard inflight ceiling and the gateway is
+    /// applying the operator's intent. Distinct from `CircuitBreakerOpen`
+    /// (which is a failure-rate gate) and from runtime port exhaustion
+    /// (which is a host-level resource exhaustion).
+    BackendMaxConnectionsExceeded,
 }
 
 impl StreamSetupKind {
@@ -93,7 +100,10 @@ impl StreamSetupKind {
         match self {
             Self::FrontendTlsHandshake => Some(TlsErrorSide::Frontend),
             Self::BackendTlsHandshake | Self::BackendDtlsHandshake => Some(TlsErrorSide::Backend),
-            Self::RejectedByPlugin | Self::NoHealthyTargets | Self::CircuitBreakerOpen => None,
+            Self::RejectedByPlugin
+            | Self::NoHealthyTargets
+            | Self::CircuitBreakerOpen
+            | Self::BackendMaxConnectionsExceeded => None,
         }
     }
 
@@ -151,6 +161,9 @@ impl StreamSetupKind {
             Self::RejectedByPlugin => crate::proxy::tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN,
             Self::NoHealthyTargets => crate::proxy::tcp_proxy::STREAM_ERR_NO_HEALTHY_TARGETS,
             Self::CircuitBreakerOpen => crate::proxy::tcp_proxy::STREAM_ERR_CIRCUIT_BREAKER_OPEN,
+            Self::BackendMaxConnectionsExceeded => {
+                crate::proxy::tcp_proxy::STREAM_ERR_BACKEND_MAX_CONNECTIONS
+            }
         }
     }
 }
@@ -276,6 +289,10 @@ mod tests {
         assert_eq!(StreamSetupKind::RejectedByPlugin.tls_side(), None);
         assert_eq!(StreamSetupKind::NoHealthyTargets.tls_side(), None);
         assert_eq!(StreamSetupKind::CircuitBreakerOpen.tls_side(), None);
+        assert_eq!(
+            StreamSetupKind::BackendMaxConnectionsExceeded.tls_side(),
+            None
+        );
     }
 
     #[test]
@@ -299,6 +316,7 @@ mod tests {
             StreamSetupKind::BackendDtlsHandshake,
             StreamSetupKind::NoHealthyTargets,
             StreamSetupKind::CircuitBreakerOpen,
+            StreamSetupKind::BackendMaxConnectionsExceeded,
         ] {
             assert!(
                 !kind.is_client_side(),
@@ -335,6 +353,10 @@ mod tests {
         assert_eq!(
             StreamSetupKind::CircuitBreakerOpen.prefix(),
             "circuit breaker open"
+        );
+        assert_eq!(
+            StreamSetupKind::BackendMaxConnectionsExceeded.prefix(),
+            "Backend maxConnections reached"
         );
     }
 

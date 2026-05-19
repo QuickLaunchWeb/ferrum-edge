@@ -238,7 +238,8 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         // express.
         StreamSetupKind::RejectedByPlugin
         | StreamSetupKind::NoHealthyTargets
-        | StreamSetupKind::CircuitBreakerOpen => ErrorClass::RequestError,
+        | StreamSetupKind::CircuitBreakerOpen
+        | StreamSetupKind::BackendMaxConnectionsExceeded => ErrorClass::RequestError,
     }
 }
 
