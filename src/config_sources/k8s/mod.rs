@@ -1190,8 +1190,29 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
             let mut headers = serde_json::Map::new();
             for (name, value) in headers_obj {
+                // Istio `StringMatch` shape: exactly one of `exact` / `prefix`
+                // / `regex` should be present on each header entry. `exact`
+                // emits as the bare-string back-compat form so older binaries
+                // (and existing wire snapshots) keep deserializing it as an
+                // `Exact` matcher; `prefix` and `regex` emit as the tagged
+                // form so the plugin compiles them as the matching predicate
+                // type at config-load time. Entries without any of the three
+                // supported keys are skipped here — the entry-level
+                // `had_unsupported_predicate` flag (computed up-front)
+                // ensures such an entry is dropped wholesale below, never
+                // partially.
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     headers.insert(name.to_ascii_lowercase(), Value::String(exact.to_string()));
+                } else if let Some(prefix) = value.get("prefix").and_then(Value::as_str) {
+                    headers.insert(
+                        name.to_ascii_lowercase(),
+                        serde_json::json!({ "prefix": prefix }),
+                    );
+                } else if let Some(regex) = value.get("regex").and_then(Value::as_str) {
+                    headers.insert(
+                        name.to_ascii_lowercase(),
+                        serde_json::json!({ "regex": regex }),
+                    );
                 }
             }
             if !headers.is_empty() {
@@ -1451,6 +1472,15 @@ pub(crate) fn mesh_route_dispatch_plugin_from_rules(
     })
 }
 
+/// Returns `true` if any header value object carries one of the predicate
+/// operators that `mesh_route_dispatch` supports today. Header `StringMatch`
+/// support tracks Istio: `exact`, `prefix`, `regex`.
+fn header_value_has_supported_predicate(value: &Value) -> bool {
+    value.get("exact").and_then(Value::as_str).is_some()
+        || value.get("prefix").and_then(Value::as_str).is_some()
+        || value.get("regex").and_then(Value::as_str).is_some()
+}
+
 pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
     if entry
         .get("method")
@@ -1462,9 +1492,7 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
         return true;
     }
     if let Some(headers) = entry.get("headers").and_then(Value::as_object)
-        && headers
-            .values()
-            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+        && headers.values().any(header_value_has_supported_predicate)
     {
         return true;
     }
@@ -1502,9 +1530,13 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         let Some(headers) = headers.as_object() else {
             return true;
         };
+        // Header `StringMatch` supports `exact` / `prefix` / `regex`. Any
+        // other shape (missing op, unknown op, non-string value) is treated
+        // as an unsupported predicate so the route falls closed via
+        // `request_termination` rather than silently widening traffic.
         if headers
             .values()
-            .any(|v| v.get("exact").and_then(Value::as_str).is_none())
+            .any(|v| !header_value_has_supported_predicate(v))
         {
             return true;
         }

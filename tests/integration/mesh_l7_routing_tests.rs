@@ -578,3 +578,167 @@ async fn mesh_l7_routing_virtual_service_headers_route_scope_does_not_leak_acros
     assert!(v1_has_xform);
     assert!(!v2_has_xform);
 }
+
+// ── VirtualService regex / prefix header matchers (T1-B.1) ─────────────────
+//
+// VirtualService `match[].headers.X.regex` and `match[].headers.X.prefix`
+// are now first-class mesh_route_dispatch predicates. Each test below
+// exercises the full translator → plugin construction → request hot path:
+// the translator emits the tagged StringMatch shape, the plugin compiles
+// the regex once at config-load time, and the request path routes vs
+// falls through (or 404s, depending on `reject_unmatched`) based on the
+// pre-compiled matcher.
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_header_regex_match_routes_and_misses_fall_closed() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/api"},
+                        "headers": {"x-user": {"regex": "^admin-.*"}}
+                    }],
+                    "route": [{"destination": {"host": "admin.default.svc.cluster.local", "port": {"number": 9090}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    // Translator emits the tagged regex shape, NOT a request_termination.
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["headers"]["x-user"]["regex"].as_str(),
+        Some("^admin-.*")
+    );
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true),
+        "guarded-route VS still enforces match semantics via reject_unmatched"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match: header value satisfies the regex → route override applies.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("x-user".to_string(), "admin-acme".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("admin.default.svc.cluster.local")
+    );
+    assert_eq!(ctx.route_override_backend_port, Some(9090));
+
+    // Miss: header present but regex misses → 404, not silent fall-through to
+    // the default backend (Envoy parity for VirtualService match semantics).
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("x-user".to_string(), "user-acme".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_header_prefix_match_routes_and_falls_through_on_miss() {
+    // Soft-fallback flavor of the regex test: a URI-only sibling branch
+    // disables `reject_unmatched`, so prefix misses fall through to the
+    // default backend rather than 404. This is the existing
+    // `mesh_l7_routing_mixed_uri_only_and_header_match` shape, extended
+    // with a prefix predicate instead of exact.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [
+                        {"uri": {"prefix": "/api"}},
+                        {
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-tenant": {"prefix": "admin-"}}
+                        }
+                    ],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("/api proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["rules"][0]["match"]["headers"]["x-tenant"]["prefix"].as_str(),
+        Some("admin-")
+    );
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(false),
+        "URI-only sibling disables reject_unmatched"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    // Match.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut headers = HashMap::from([("x-tenant".to_string(), "admin-acme".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Prefix match emits the same proxy's default backend on this VS, so the
+    // override and the proxy's defaults agree — that's the intentional
+    // shape of this fixture. The assertion is that the plugin Continued.
+
+    // Miss: fall through to the default proxy backend (Continue, no override).
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("x-tenant".to_string(), "user-acme".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(miss_ctx.route_override_backend_host.is_none());
+}
