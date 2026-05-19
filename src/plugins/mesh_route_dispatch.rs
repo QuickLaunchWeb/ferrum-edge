@@ -1011,18 +1011,30 @@ async fn apply_fault_action(
     rule: &RouteRule,
     fault: &FaultActionConfig,
 ) -> Option<PluginResult> {
+    // Mirror `fault_injection::before_proxy`'s guard: when another fault
+    // surface (e.g. a global / proxy-scoped `fault_injection` plugin running
+    // at priority 2940, before mesh_route_dispatch at 2995) already injected
+    // a fault on this request, skip the per-rule action so the two surfaces
+    // do not stack a second delay + abort on the same request. The matched
+    // route-overrides from the calling site still apply.
+    if ctx.metadata.contains_key("fault_injected") {
+        return None;
+    }
     // `fault_roller` is `Some` for every fault-carrying rule (set in
-    // `normalize_and_validate`). The defensive fallback avoids any panic on
-    // a future code path that builds rules without the constructor.
-    let roller = rule
-        .fault_roller
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(FaultRoller::new()));
-    let outcome = roller.roll_pair(
-        fault.delay.as_ref().map(|d| d.percentage),
-        fault.abort.as_ref().map(|a| a.percentage),
-    );
+    // `normalize_and_validate`). Borrow the per-rule roller directly to
+    // avoid an Arc clone on every match. The defensive fallback to a
+    // throwaway roller protects future code paths that build rules without
+    // the constructor (e.g. a test that constructs a `RouteRule` literal).
+    let outcome = match rule.fault_roller.as_ref() {
+        Some(roller) => roller.roll_pair(
+            fault.delay.as_ref().map(|d| d.percentage),
+            fault.abort.as_ref().map(|a| a.percentage),
+        ),
+        None => FaultRoller::new().roll_pair(
+            fault.delay.as_ref().map(|d| d.percentage),
+            fault.abort.as_ref().map(|a| a.percentage),
+        ),
+    };
 
     if !outcome.delay_triggered && !outcome.abort_triggered {
         return None;
@@ -3233,5 +3245,35 @@ mod tests {
                 "expected 502 for {method}, got {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fault_skips_when_prior_plugin_already_injected_fault() {
+        // Composition with the proxy-scoped `fault_injection` plugin: when
+        // a prior plugin already marked `fault_injected=true` (e.g. a
+        // global `fault_injection` instance that delayed but did not
+        // abort), the per-rule fault action must NOT stack a second
+        // delay + abort onto the same request. Route overrides still apply.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"http_status": 503, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/api");
+        ctx.metadata
+            .insert("fault_injected".to_string(), "true".to_string());
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        // No reject — the rule matched but the fault action was skipped.
+        assert!(matches!(result, PluginResult::Continue));
+        // Route override still applied even though the fault action was a no-op.
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+        // `fault_source` is not stamped by mesh_route_dispatch on the
+        // skipped path — the original fault_injected stays as is.
+        assert!(!ctx.metadata.contains_key("fault_source"));
     }
 }
