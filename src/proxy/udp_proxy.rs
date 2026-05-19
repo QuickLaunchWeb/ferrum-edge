@@ -1862,6 +1862,7 @@ async fn handle_dtls_client_inner(
         .find(|p| p.id == proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", proxy_id))?
         .clone();
+    let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
     // Resolve backend target
     let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
@@ -2084,9 +2085,10 @@ async fn handle_dtls_client_inner(
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
         loop {
-            let data = match client_conn.recv().await {
-                Ok(d) if d.is_empty() => break,
-                Ok(d) => d,
+            let data = match tokio::time::timeout(idle_timeout, client_conn.recv()).await {
+                Ok(Ok(d)) if d.is_empty() => break,
+                Ok(Ok(d)) => d,
+                Ok(Err(_)) => break,
                 Err(_) => break,
             };
             let len = data.len();
@@ -2158,15 +2160,17 @@ async fn handle_dtls_client_inner(
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
             let data = if let Some(ref dtls) = backend_dtls {
-                match dtls.recv().await {
-                    Ok(d) if d.is_empty() => break,
-                    Ok(d) => d,
+                match tokio::time::timeout(idle_timeout, dtls.recv()).await {
+                    Ok(Ok(d)) if d.is_empty() => break,
+                    Ok(Ok(d)) => d,
+                    Ok(Err(_)) => break,
                     Err(_) => break,
                 }
             } else if let Some(ref sock) = backend_udp {
-                match sock.recv(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => buf[..n].to_vec(),
+                match tokio::time::timeout(idle_timeout, sock.recv(&mut buf)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => buf[..n].to_vec(),
+                    Ok(Err(_)) => break,
                     Err(_) => break,
                 }
             } else {
