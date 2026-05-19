@@ -1735,7 +1735,7 @@ async fn handle_h3_request(
             bytes_received: outcome.bytes_streamed,
             error_class: outcome.error_class,
             mirror: false,
-            metadata: ctx.metadata.clone(),
+            metadata: crate::proxy::clone_log_metadata(&ctx),
         };
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
@@ -1879,7 +1879,7 @@ async fn handle_h3_request(
                     // Backend connection failed before any streaming began — the 502
                     // response body is built and sent synchronously below.
                     error_class: Some(h3_error_class),
-                    metadata: ctx.metadata.clone(),
+                    metadata: crate::proxy::clone_log_metadata(&ctx),
                     ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2164,7 +2164,7 @@ async fn handle_h3_request(
             // streaming loop above as `bytes_streamed`.
             bytes_received: bytes_streamed,
             mirror: false,
-            metadata: ctx.metadata.clone(),
+            metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2426,7 +2426,7 @@ async fn handle_h3_request(
             // it into the unified `bytes_received` field.
             bytes_received: h3_stream_result.bytes_streamed,
             mirror: false,
-            metadata: ctx.metadata.clone(),
+            metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2794,7 +2794,7 @@ async fn handle_h3_request(
             error_class: h3_error_class,
             bytes_sent: raw_request_body_bytes,
             bytes_received: response_body.len() as u64,
-            metadata: ctx.metadata.clone(),
+            metadata: crate::proxy::clone_log_metadata(&ctx),
             ..TransactionSummary::default()
         };
 

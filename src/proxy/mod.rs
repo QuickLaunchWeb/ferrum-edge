@@ -1216,6 +1216,16 @@ pub(crate) fn store_request_body_metadata(
     }
 }
 
+pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove("request_body");
+}
+
+pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
+    let mut metadata = ctx.metadata.clone();
+    redact_request_body_from_log_metadata(&mut metadata);
+    metadata
+}
+
 /// Parse an HTTP method string into a `hyper::Method`.
 fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
     match method {
@@ -4866,7 +4876,7 @@ async fn handle_websocket_request_authenticated(
                             ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                         let ws_gateway_overhead_ms =
                             (ws_total_ms - ws_plugin_execution_ms).max(0.0);
-                        let mut metadata = ctx.metadata.clone();
+                        let mut metadata = clone_log_metadata(ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "websocket_backend_error".to_string(),
@@ -4966,7 +4976,7 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
+        metadata: clone_log_metadata(ctx),
         ..TransactionSummary::default()
     };
 
@@ -5111,7 +5121,7 @@ async fn handle_websocket_request_authenticated(
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
-        metadata: ctx.metadata.clone(),
+        metadata: clone_log_metadata(ctx),
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
@@ -6897,7 +6907,7 @@ pub async fn log_rejected_request(
     let gateway_overhead_ms = (total_ms - plugin_execution_ms).max(0.0);
     let proxy = ctx.matched_proxy.as_ref();
 
-    let mut metadata = ctx.metadata.clone();
+    let mut metadata = clone_log_metadata(ctx);
     metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
 
     // Uses `..TransactionSummary::default()` for the boilerplate tail
@@ -8821,7 +8831,7 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let mut metadata = ctx.metadata.clone();
+                    let mut metadata = clone_log_metadata(ctx);
                     metadata
                         .entry("request_protocol".to_string())
                         .or_insert_with(|| "grpc".to_string());
@@ -9169,7 +9179,7 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         bytes_sent,
                         bytes_received,
-                        metadata: ctx.metadata.clone(),
+                        metadata: clone_log_metadata(ctx),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -9280,7 +9290,7 @@ async fn handle_proxy_request_inner(
                 if !plugins.is_empty() {
                     {
                         let proxy_ref = ctx.matched_proxy.as_ref();
-                        let mut metadata = ctx.metadata.clone();
+                        let mut metadata = clone_log_metadata(ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "grpc_backend_error".to_string(),
@@ -9851,7 +9861,7 @@ async fn handle_proxy_request_inner(
                 error_class: backend_error_class,
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
-                metadata: ctx.metadata.clone(),
+                metadata: clone_log_metadata(ctx),
                 ..TransactionSummary::default()
             };
 
