@@ -474,7 +474,10 @@ fn test_requires_response_body_buffering() {
     )));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
     assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
-    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+    // Spec change (PR #956 / commit 55a59396): non-POST AI responses must
+    // also be buffered for guard validation; previously the POST-only
+    // shortcut let GET-style chat history endpoints bypass the guard.
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 
     let mut sse_accept = ctx_with_content_type("POST", "application/json");
     sse_accept

@@ -513,10 +513,22 @@ async fn test_plugin_complex_configurations() {
 
 #[tokio::test]
 async fn test_response_caching_stores_transformed_body() {
+    // `create_test_context` populates an authenticated consumer. After the
+    // PR d34d3508 fix (shared cache leak across authenticated users), the
+    // plugin refuses to store cache entries for authenticated requests
+    // unless the cache key includes the consumer identity OR the response
+    // explicitly opts in via `Cache-Control: public/must-revalidate/
+    // s-maxage`. Enable `cache_key_include_consumer` so the test exercises
+    // the storage+lookup symmetry while staying compatible with the
+    // post-fix shared-cache policy.
     let plugins = sort_plugins(vec![
         create_plugin(
             "response_caching",
-            &json!({"ttl_seconds": 60, "add_cache_status_header": true}),
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true,
+            }),
         )
         .unwrap()
         .unwrap(),
@@ -554,7 +566,14 @@ async fn test_response_caching_stores_transformed_body() {
     assert_eq!(String::from_utf8(body).unwrap(), r#"{"message":"gateway"}"#);
 
     let mut hit_ctx = create_response_context("/cache-transform");
-    let mut proxy_headers = HashMap::new();
+    // Mirror the production hot path: `before_proxy` receives a cloned (or
+    // moved) copy of `ctx.headers`, never an empty map. After PR #863's
+    // header-snapshot fix and PR d34d3508's auto-merge of `authorization`
+    // into the cache vary list, the storage cache key is keyed by the
+    // authorization value seen in `ctx.headers`; the lookup MUST be done
+    // against the same view or it lands on a different `authorization=`
+    // shard and misses. See `src/proxy/mod.rs` `before_proxy` dispatch.
+    let mut proxy_headers = hit_ctx.headers.clone();
     let mut cache_hit = None;
     for plugin in &plugins {
         match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {

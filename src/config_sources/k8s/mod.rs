@@ -1076,18 +1076,19 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 ///
 /// Entries carrying predicates we cannot represent in the rule
 /// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
-/// `queryParams.X.regex`, or fully-unsupported keys like `authority`,
-/// `scheme`, `port`, `sourceLabels`, `gateways`, `withoutHeaders`,
-/// `ignoreUriCase`) are skipped by the dispatch-rule extractor — they do NOT
-/// collapse onto the URI-only catch-all branch. The VirtualService translator
-/// emits a separate proxy-scoped `request_termination` artifact for
+/// `queryParams.X.regex`, or fully-unsupported keys like `scheme`, `port`,
+/// `sourceLabels`, `gateways`, `withoutHeaders`, `ignoreUriCase`) are
+/// skipped by the dispatch-rule extractor — they do NOT collapse onto the
+/// URI-only catch-all branch. The VirtualService translator emits a
+/// separate proxy-scoped `request_termination` artifact for
 /// unsupported-only route candidates so later broader routes do not silently
 /// serve gated traffic. If unsupported entries collapsed here, a mixed
 /// `match[]` with one supported exact rule plus one unsupported regex sibling
 /// would disable `reject_unmatched` and silently forward exactly the requests
-/// the operator gated. `sourceNamespace` is supported as a first-class
-/// exact-string predicate; the request hot path resolves the source workload
-/// namespace from `ctx.peer_spiffe_id`.
+/// the operator gated. `authority` is supported as a first-class
+/// `StringMatch` predicate (exact / prefix / regex), and `sourceNamespace`
+/// is supported as a first-class exact-string predicate; the request hot
+/// path resolves the source workload namespace from `ctx.peer_spiffe_id`.
 ///
 /// The rule's destination overrides to the route's own destination
 /// (`backend_host`/`backend_port` or `upstream_id`). The destination is
@@ -1268,6 +1269,32 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
                 "source_namespace".to_string(),
                 Value::String(source_namespace.to_string()),
             );
+        }
+
+        // Istio `HTTPMatchRequest.authority` is a single `StringMatch`
+        // predicate per rule (exactly one of `exact` / `prefix` / `regex`).
+        // `exact` emits as the bare-string back-compat form so older
+        // binaries (and existing wire snapshots) keep deserializing it as
+        // an `Exact` matcher; `prefix` and `regex` emit as the tagged form
+        // so the plugin compiles them as the matching predicate type at
+        // config-load time. An entry whose `authority` is missing any of
+        // the three supported keys is treated as unsupported via the
+        // entry-level `had_unsupported_predicate` flag and dropped wholesale
+        // below — never partially extracted.
+        if let Some(authority_obj) = entry.get("authority").and_then(Value::as_object) {
+            if let Some(exact) = authority_obj.get("exact").and_then(Value::as_str) {
+                match_criteria.insert("authority".to_string(), Value::String(exact.to_string()));
+            } else if let Some(prefix) = authority_obj.get("prefix").and_then(Value::as_str) {
+                match_criteria.insert(
+                    "authority".to_string(),
+                    serde_json::json!({ "prefix": prefix }),
+                );
+            } else if let Some(regex) = authority_obj.get("regex").and_then(Value::as_str) {
+                match_criteria.insert(
+                    "authority".to_string(),
+                    serde_json::json!({ "regex": regex }),
+                );
+            }
         }
 
         if had_unsupported_predicate {
@@ -1528,6 +1555,18 @@ fn header_value_has_supported_predicate(value: &Value) -> bool {
         || value.get("regex").and_then(Value::as_str).is_some()
 }
 
+/// Returns `true` if the `authority` value object carries one of the
+/// predicate operators that `mesh_route_dispatch` supports today. Authority
+/// `StringMatch` support tracks Istio: `exact`, `prefix`, `regex`. The Istio
+/// CRD models `authority` as exactly one predicate per rule (NOT a list),
+/// so this mirrors the single-field shape rather than the headers / query
+/// params collection shape.
+fn authority_value_has_supported_predicate(value: &Value) -> bool {
+    value.get("exact").and_then(Value::as_str).is_some()
+        || value.get("prefix").and_then(Value::as_str).is_some()
+        || value.get("regex").and_then(Value::as_str).is_some()
+}
+
 pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
     if let Some(method) = entry.get("method")
         && method_value_has_supported_predicate(method)
@@ -1559,6 +1598,11 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
         .get("sourceNamespace")
         .and_then(Value::as_str)
         .is_some_and(|ns| !ns.is_empty() && !ns.chars().all(char::is_whitespace))
+    {
+        return true;
+    }
+    if let Some(authority) = entry.get("authority")
+        && authority_value_has_supported_predicate(authority)
     {
         return true;
     }
@@ -1629,11 +1673,24 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         }
     }
 
+    // Authority `StringMatch` supports `exact` / `prefix` / `regex`. Any other
+    // shape (non-object, missing every supported op, unknown op only) is
+    // treated as an unsupported predicate so the route falls closed via
+    // `request_termination` rather than silently widening traffic.
+    if let Some(authority) = entry.get("authority") {
+        if !authority.is_object() {
+            return true;
+        }
+        if !authority_value_has_supported_predicate(authority) {
+            return true;
+        }
+    }
+
     entry.as_object().is_some_and(|obj| {
         obj.keys().any(|key| {
             matches!(
                 key.as_str(),
-                "authority" | "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
+                "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
             )
         })
     })
